@@ -36,6 +36,7 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -58,10 +59,11 @@ export const COMMANDS = [
 	"monitors",
 	"work",
 	"services",
+	"update",
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|update [--check] [--force] [--bin-dir DIR] [--no-restart] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -92,6 +94,8 @@ export interface MainOptions {
 		readonly launch?: Omit<LaunchRestartOptions, "home">;
 		readonly run?: Omit<RunRestartOptions, "home" | "id">;
 	};
+	/** Test seams for `update`; the real path hits GitHub and the service manager. */
+	readonly update?: UpdateDeps;
 }
 
 export type ServicesAction = "install" | "repair";
@@ -869,6 +873,16 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				});
 				console.log(`services ${service.action}: wrote ${written.length} service definitions`);
 				for (const definition of written) console.log(definition);
+				break;
+			}
+			case "update": {
+				const update = parseUpdateArgs(parsed.rest);
+				const result = await runUpdate({
+					args: update,
+					home: gatewayHome(),
+					...(options.update === undefined ? {} : { deps: options.update }),
+				});
+				for (const line of renderUpdate(result)) console.log(line);
 				break;
 			}
 			default:

@@ -25,6 +25,21 @@ A production host does not need a source checkout, `node_modules`, or Bun to run
 
 The gateway requires GJC 0.16.0 or newer. GJC 0.17.6 requires `--json` for machine-readable `sdk session` errors; the gateway adds it to those commands. The `sdk serve --stdio` relay arguments and environment binding are unchanged.
 
+## Upgrades
+
+`gajaeway update` upgrades a binary install in place from the project's GitHub releases — the same model `gjc update` uses — so a production host never needs the source checkout it was first installed from:
+
+```sh
+gajaeway update --check                 # report only; touches nothing
+gajaeway update                         # download, replace, and queue the stack restart
+gajaeway update --no-restart            # replace binaries; restart later with ops restart-stack
+gajaeway update --bin-dir /opt/gajaeway # when driving the update from elsewhere
+```
+
+The update resolves the latest `vX.Y.Z` release, downloads this platform's `gajaeway-<platform>-<arch>.tar.gz`, stages and size-checks the binaries, backs the previous ones up into `<bin-dir>/backup-<version>-<timestamp>/`, replaces them in place, records the installed release in `<bin-dir>/.gajaeway-release`, and queues the existing `ops restart-stack` supervisor (gateway first, then adapters). Only binaries the host already installed are replaced, plus the `gajaeway`/`gajaeway-gateway` core pair; a release never installs adapters the operator did not choose. One update runs at a time per bin dir (`.gajaeway-update.lock`; a lock naming a live pid refuses, a stale one is taken over), and `--force` reinstalls the current release.
+
+A source checkout keeps upgrading through `git` + `bun run build` + `services repair`; `update` refuses to guess a bin dir when run under `bun`, so pass `--bin-dir` in that case. `GAJAEWAY_UPDATE_REPO=owner/name` redirects update checks at a fork's releases; the default comes from the package's declared repository.
+
 ## Home and configuration
 
 `GAJAEWAY_HOME` selects the state directory; it defaults to `~/.gajaeway`. The gateway makes the home directory private (`0700`). A typical layout is:
