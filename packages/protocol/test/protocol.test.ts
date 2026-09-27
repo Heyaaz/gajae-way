@@ -8,6 +8,7 @@ import {
 	FrameDecoder,
 	isChatPlatform,
 	isSilenceToken,
+	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	MAX_FRAME_BYTES,
 	negotiate,
@@ -207,17 +208,15 @@ describe("silence tokens", () => {
 		expect(containsSilenceToken(text.slice(0, 2048))).toBe(false);
 	});
 
-	for (const text of [
-		"ordinary text",
-		"preamble SILENT",
-		"preamble [Silent]",
-		"preamble [NO_REPLY]",
-		"preamble [ SILENT ]",
-	]) {
+	for (const text of ["ordinary text", "preamble SILENT", "preamble [NO_REPLY]", "preamble [ SILENT ]"]) {
 		test(`does not broaden embedded grammar for ${JSON.stringify(text)}`, () => {
 			expect(containsSilenceToken(text)).toBe(false);
 		});
 	}
+
+	test(`embedded [Silent] is not recognized (case-sensitive)`, () => {
+		expect(containsSilenceToken("preamble [Silent]")).toBe(false);
+	});
 
 	for (const text of ["SILENT", "[SILENT]", "silent", "NO_REPLY", "NO REPLY", "[NO_REPLY]", "[NO REPLY]"]) {
 		test(`preserves exact-body alias ${text}`, () => {
@@ -225,4 +224,40 @@ describe("silence tokens", () => {
 			expect(isSilenceToken(`  ${text}\n`)).toBe(true);
 		});
 	}
+});
+
+describe("isSilentOutput", () => {
+	test("exact-match tokens are silent", () => {
+		expect(isSilentOutput("[SILENT]")).toBe(true);
+		expect(isSilentOutput("SILENT")).toBe(true);
+		expect(isSilentOutput("silent")).toBe(true);
+		expect(isSilentOutput("NO_REPLY")).toBe(true);
+		expect(isSilentOutput("NO REPLY")).toBe(true);
+		expect(isSilentOutput("[NO_REPLY]")).toBe(true);
+		expect(isSilentOutput("[NO REPLY]")).toBe(true);
+		expect(isSilentOutput("  [SILENT]\n")).toBe(true);
+		expect(isSilentOutput("  silent  ")).toBe(true);
+	});
+
+	test("embedded [SILENT] or [silent] markers anywhere silence (issue #338: propagate.ts must use this)", () => {
+		// Leading markers
+		expect(isSilentOutput("[SILENT] This is a status update")).toBe(true);
+		expect(isSilentOutput("[SILENT]\nMultiline status")).toBe(true);
+		expect(isSilentOutput("[silent] lowercase marker with text")).toBe(true);
+		// Trailing markers
+		expect(isSilentOutput("Nothing to report. [SILENT]")).toBe(true);
+		expect(isSilentOutput("Finished processing. [silent]")).toBe(true);
+		// Mid-text markers
+		expect(isSilentOutput("Please see [SILENT] in docs")).toBe(true);
+		expect(isSilentOutput("This bug is about [SILENT] marker support")).toBe(true);
+	});
+
+	test("non-silent text is not silent", () => {
+		expect(isSilentOutput("ordinary text")).toBe(false);
+		expect(isSilentOutput("hello world")).toBe(false);
+		expect(isSilentOutput("")).toBe(false);
+		expect(isSilentOutput("This is a real response")).toBe(false);
+		// Case-sensitive embedded markers: [Silent], [silent] only, not mixed case
+		expect(isSilentOutput("preamble [Silent]")).toBe(false);
+	});
 });

@@ -2,7 +2,7 @@ import {
 	CATCH_ALL_EVENT_ORIGIN,
 	type ChatMessagePayload,
 	eventTypeOrigin,
-	isSilenceToken,
+	isSilentOutput,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	type OriginRef,
@@ -511,8 +511,8 @@ export class MonitorPropagator {
 				// A silent note is never delivered, so `authored` would wait forever for a
 				// confirmation that cannot come (#94): settle it as authored_no_delivery.
 				if (output && !hasMemory)
-					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilenceToken(output), row);
-				else if (output && row.stage === "authored" && isSilenceToken(output))
+					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilentOutput(output), row);
+				else if (output && row.stage === "authored" && isSilentOutput(output))
 					this.#database.withTransaction(() => this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery"));
 				else if (!output && this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
@@ -844,16 +844,32 @@ export class MonitorPropagator {
 				// fenced event still holding its lease (same transaction). A stale
 				// attempt therefore cannot emit a second delivery.
 				const deliveryId = crypto.randomUUID();
-				const deliveryText = authored
+				// Evaluate silence PER NOTE BEFORE joining: a silent note in a batch
+				// must not leak, and a real note must not be swallowed by a neighbour's marker.
+				const nonSilentEntries = authored
 					.filter(
 						(entry): entry is { eventId: string; note: string } =>
 							typeof entry.eventId === "string" &&
 							typeof entry.note === "string" &&
 							fenced.some((row) => row.event_id === entry.eventId),
 					)
-					.map((entry) => entry.note)
-					.join("\n");
-				if (!isSilenceToken(deliveryText)) {
+					.filter((entry) => !isSilentOutput(entry.note));
+				const silentEntries = authored
+					.filter(
+						(entry): entry is { eventId: string; note: string } =>
+							typeof entry.eventId === "string" &&
+							typeof entry.note === "string" &&
+							fenced.some((row) => row.event_id === entry.eventId),
+					)
+					.filter((entry) => isSilentOutput(entry.note));
+				// Mark all silent notes as authored_no_delivery
+				for (const entry of silentEntries) {
+					if (this.#database.authoredOutput(entry.eventId) === undefined) continue;
+					this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId);
+				}
+				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
+				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
+				if (deliveryText.length > 0) {
 					const origin = target.origin;
 					// Typed mentions (issue #180) are added here, in code: the author is
 					// never asked to remember who to ping, and the recipient list never
@@ -881,13 +897,6 @@ export class MonitorPropagator {
 					// until the next adapter reconnect flushed redeliveries (live finding:
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
-				} else {
-					// A silent batch creates no delivery, so nothing would ever confirm it:
-					// settle terminally instead of stranding it at `authored` (#94).
-					for (const row of fenced) {
-						if (this.#database.authoredOutput(row.event_id) === undefined) continue;
-						this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId);
-					}
 				}
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
