@@ -2275,6 +2275,7 @@ async function createInboundTurnLifecycle(
 		systemPreamble,
 		...(effectiveModel ? { effectiveModel } : {}),
 		...(runtime.config.serviceTier ? { effectiveServiceTier: runtime.config.serviceTier } : {}),
+		contextMessageIds: new Set(contextMessageIds),
 		renderSteer,
 		steerContextMessageId,
 		onSteerAccepted,

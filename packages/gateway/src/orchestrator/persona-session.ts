@@ -80,6 +80,11 @@ export interface PersonaTurnLifecycle {
 	/** Legacy/send-time fallback only; persistent persona turns leave this unset. */
 	readonly sendModelFallback?: GjcModelSelection;
 	/**
+	 * Message IDs that are included in this turn's unread context.
+	 * Used to prevent double-delivery when a message in context is also steered.
+	 */
+	readonly contextMessageIds?: ReadonlySet<string>;
+	/**
 	 * Renders a message that arrives while this turn runs into the steer text.
 	 * Owns the same speaker/place/reply header as the trigger so the model can
 	 * tell who spoke; the actor wraps the result with the steer framing.
@@ -1505,6 +1510,28 @@ class OriginActor {
 			this.#quarantinedTurn(current.turn.opRef)
 		)
 			return false;
+		// The row's message was already rendered into this turn's unread context
+		// (e.g. the row was requeued by recovery and the next turn's prompt picked
+		// it up). Steering it too would make the model answer it twice. Close it as
+		// done input of this turn WITHOUT sending: leaving it pending would make
+		// the #steerPending loop re-read the same row forever.
+		// Exact id only: an edit row carries new text for an old message and must
+		// still be steered even when the original is in the context window.
+		if (current.lifecycle.contextMessageIds?.has(row.message_id)) {
+			const contextMessageId = current.lifecycle.steerContextMessageId?.(row);
+			const closed = this.#manager.database.inboundSteerAccepted({
+				messageId: row.message_id,
+				epoch: current.epoch,
+				opRef: current.turn.opRef,
+				contextMessageId,
+			});
+			if (!closed) return false;
+			await current.lifecycle.onSteerAccepted?.({ ...current, row });
+			this.#manager.log(
+				`steer_skip origin=${this.originKey} message=${row.message_id} opRef=${current.turn.opRef} reason=already_in_context`,
+			);
+			return true;
+		}
 		{
 			assertControlAllowed("turn.steer", { operatorApproval: true });
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, current.epoch, row.message_id);
