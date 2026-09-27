@@ -293,7 +293,10 @@ export class ScriptedSessionPort implements SessionPort {
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
 	omitStartedAt = false;
 
-	readonly failureEvidence = new Map<string, { reason: "unsupported_input_status" | "context_exhausted" }>();
+	readonly failureEvidence = new Map<
+		string,
+		{ reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted" }
+	>();
 	readonly failureEvidenceProbes: Array<{
 		sessionId: string;
 		repo: string;
@@ -301,7 +304,10 @@ export class ScriptedSessionPort implements SessionPort {
 		terminalAtMs: number;
 	}> = [];
 
-	setFailedTurnEvidence(sessionId: string, reason: "unsupported_input_status" | "context_exhausted"): void {
+	setFailedTurnEvidence(
+		sessionId: string,
+		reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted",
+	): void {
 		this.failureEvidence.set(sessionId, { reason });
 	}
 

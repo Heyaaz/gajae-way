@@ -546,6 +546,33 @@ for (const reason of ["unsupported_input_status", "context_exhausted"] as const)
 		expect(port.sends[1]!.opRef).toBe(personaTurnOpRef("instance-test", KEY, 1, "next"));
 	});
 
+test("provider quota exhaustion gives a safe notice and does not reset or rebind the session", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	enqueue("provider-quota", "work");
+	await activeManager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("quota turn was not dispatched");
+	port.setFailedTurnEvidence(first.sessionId, "provider_quota_exhausted");
+	port.fail(first.opRef, '402 "Grok Build usage balance exhausted"');
+	await eventually(() => activeManager.state(KEY) === "idle", "quota failure did not settle");
+
+	expect(notices).toEqual([
+		"[turn failed] provider_quota_exhausted: model provider quota/billing is exhausted (HTTP 402); switch the model preset",
+	]);
+	expect(notices.join("\n")).not.toContain("Grok Build");
+	expect(logs).toContain(`failed_turn_classified origin=${KEY} opRef=${first.opRef} reason=provider_quota_exhausted`);
+	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
+	expect(port.sends).toHaveLength(1);
+	expect(activeDatabase.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+	expect(activeDatabase.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+});
+
 for (const restart of [false, true])
 	test(`origin reset cap stops repeated fresh-session failures (restart=${restart})`, async () => {
 		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });

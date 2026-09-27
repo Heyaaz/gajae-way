@@ -2054,6 +2054,7 @@ class OriginActor {
 				`terminal_status_reconciled origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} tail_evidence=unavailable`,
 			);
 		}
+		let failedTurnEvidence: FailedTurnEvidence | undefined;
 		try {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
 				// The owned relay is the live authority: its last assistant message
@@ -2113,10 +2114,11 @@ class OriginActor {
 				this.#manager.log(
 					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}${openTool ? ` open_tool=${openTool.name} open_tool_elapsed_ms=${openTool.elapsedMs}` : ""}`,
 				);
+				failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
 				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
 				await bound.lifecycle.onFailure?.({
 					...bound,
-					error: terminalError(report, openTool),
+					error: terminalError(report, openTool, failedTurnEvidence?.reason),
 					status: report,
 					...(recoveredText ? { recoveredText } : {}),
 				});
@@ -2130,7 +2132,7 @@ class OriginActor {
 		// Persist the failure notice before settling its trigger. If delivery fails,
 		// recovery can retry the same deterministic notice without losing it. Reset
 		// completion and its budget are then committed atomically below.
-		const resetApplied = await this.#resetFailedTurn(bound, report);
+		const resetApplied = this.#resetFailedTurn(bound, report, failedTurnEvidence);
 		const completed = resetApplied
 			? 1
 			: this.#manager.database.withTransaction(() => {
@@ -2492,8 +2494,8 @@ class OriginActor {
 		return this.#manager.database.getSessionRecord(this.originKey)?.epoch ?? 0;
 	}
 
-	/** Exact failure resets only the binding for subsequent input; the failed trigger is completed, never resent. */
-	async #resetFailedTurn(bound: BoundTurn, report: StatusReport): Promise<boolean> {
+	/** Reads only bounded saved-transcript evidence for a current failed turn. */
+	async #classifyFailedTurn(bound: BoundTurn, report: StatusReport): Promise<FailedTurnEvidence | undefined> {
 		const port = this.#manager.port;
 		const startedAt = report.status.startedAt;
 		const terminalAt = report.status.terminalAt;
@@ -2515,10 +2517,9 @@ class OriginActor {
 			bound.dispatchedAtMs === undefined ||
 			startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
-			return false;
-		let evidence: FailedTurnEvidence | undefined;
+			return undefined;
 		try {
-			evidence = await port.failedTurnEvidence({
+			return await port.failedTurnEvidence({
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
 				startedAtMs: startedAt,
@@ -2526,19 +2527,39 @@ class OriginActor {
 			});
 		} catch {
 			this.#manager.log(`failed_turn_evidence_unavailable origin=${this.originKey} opRef=${bound.turn.opRef}`);
-			return false;
+			return undefined;
 		}
-		if (!evidence || !["unsupported_input_status", "context_exhausted"].includes(evidence.reason)) return false;
+	}
+
+	/** Exact context/request failures reset only the next binding; quota failures never reset. */
+	#resetFailedTurn(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
+		if (
+			!evidence ||
+			!["unsupported_input_status", "context_exhausted", "provider_quota_exhausted"].includes(evidence.reason)
+		)
+			return false;
 		this.#manager.log(
 			`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
 		);
+		if (evidence.reason === "provider_quota_exhausted") return false;
 		if (
+			report.status.status !== "failed" ||
+			report.operationRef !== bound.turn.opRef ||
 			this.#current !== bound ||
 			bound.retired ||
 			bound.epoch !== this.#epoch() ||
 			bound.brokerGeneration !== this.#manager.brokerGeneration ||
 			this.#stopped ||
-			this.#manager.stopped
+			this.#manager.stopped ||
+			typeof report.status.startedAt !== "number" ||
+			!Number.isFinite(report.status.startedAt) ||
+			report.status.startedAt <= 0 ||
+			typeof report.status.terminalAt !== "number" ||
+			!Number.isFinite(report.status.terminalAt) ||
+			report.status.terminalAt < report.status.startedAt ||
+			report.status.terminalAt > this.#manager.now() ||
+			bound.dispatchedAtMs === undefined ||
+			report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
 			return false;
 		const nextEpoch = this.#manager.database.inboundFailedTurnReset({
@@ -2567,7 +2588,15 @@ class OriginActor {
 function terminalError(
 	status: StatusReport,
 	openTool?: { readonly name: string; readonly elapsedMs: number },
+	evidenceReason?: FailedTurnEvidence["reason"],
 ): GjcRuntimeError {
+	if (evidenceReason === "provider_quota_exhausted") {
+		const message = "model provider quota/billing is exhausted (HTTP 402); switch the model preset";
+		return new GjcRuntimeError(`provider_quota_exhausted: ${message}`, {
+			code: "provider_quota_exhausted",
+			message,
+		});
+	}
 	const failure = status.status.error;
 	const outcome = status.status.outcome;
 	const code = sanitizeDiagnostic(failure?.code ?? outcome?.code ?? "") || undefined;

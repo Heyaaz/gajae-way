@@ -3,7 +3,7 @@ import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export type FailedTurnEvidence = {
-	readonly reason: "unsupported_input_status" | "context_exhausted";
+	readonly reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted";
 };
 
 export type FailedTurnEvidenceInput = {
@@ -32,6 +32,10 @@ function reason(message: Row): FailedTurnEvidence["reason"] | undefined {
 	if (message.role !== "assistant" || message.stopReason !== "error") return undefined;
 	const facts = record(message.transportFailure);
 	const status = message.errorStatus ?? facts?.status;
+	if (status === 402) {
+		if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== 402)) return undefined;
+		return "provider_quota_exhausted";
+	}
 	if (status !== 400 && status !== 413) return undefined;
 	if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== status)) return undefined;
 	const codes = [facts?.providerCode, facts?.openaiErrorCode, facts?.anthropicErrorType, message.errorCode];
