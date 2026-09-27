@@ -95,7 +95,7 @@ Create the Slack app from a manifest with:
 - Socket Mode **enabled**, and an app-level token with the `connections:write` scope (`appTokenFile`).
 - Bot token scopes: `app_mentions:read channels:history channels:read chat:write groups:history groups:read im:history im:read im:write mpim:history mpim:read reactions:read reactions:write users:read files:read commands`.
 - Event subscriptions (bot events): `message.channels message.groups message.im message.mpim reaction_added reaction_removed`.
-- Slash commands `/new`, `/reset`, and `/restart` (any request URL; Socket Mode delivers them over the socket).
+- Slash commands `/new`, `/reset`, `/restart`, and `/model` (any request URL; Socket Mode delivers them over the socket). Register `/model` even if you never plan to type it: Slack delivers a slash command to whichever workspace app registered its name, so if this app does not register `/model`, typing `/model` anywhere — including this bot's own DM — reaches whichever other app claimed it instead.
 
 Invite the bot to every channel it should read; Slack delivers no history or events for channels the bot is not a member of.
 
