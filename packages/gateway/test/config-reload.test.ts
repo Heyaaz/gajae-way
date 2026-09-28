@@ -193,3 +193,29 @@ test("bot audience budgets parse, default to unset, and reject non-positive coun
 		"channels.c1 contains an unknown field",
 	);
 });
+
+test("interim speech config parses non-negative integers and requires restart", () => {
+	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("interimSpeech");
+	expect(parseConfigFile({ schemaVersion: 1, interimSpeech: { maxPerTurn: 0 } }).interimSpeech).toEqual({
+		maxPerTurn: 0,
+	});
+	expect(
+		parseConfigFile({ schemaVersion: 1, interimSpeech: { maxPerTurn: 2, minGapMs: 45000 } }).interimSpeech,
+	).toEqual({
+		maxPerTurn: 2,
+		minGapMs: 45000,
+	});
+	// Reject negative integers and non-integers
+	for (const invalid of [-1, 2.5, "0", null])
+		expect(() => parseConfigFile({ schemaVersion: 1, interimSpeech: { maxPerTurn: invalid } })).toThrow(
+			"interimSpeech.maxPerTurn must be a non-negative integer",
+		);
+	for (const invalid of [-1, 2.5, "45000"])
+		expect(() => parseConfigFile({ schemaVersion: 1, interimSpeech: { minGapMs: invalid } })).toThrow(
+			"interimSpeech.minGapMs must be a non-negative integer",
+		);
+	// Reject unknown fields
+	expect(() => parseConfigFile({ schemaVersion: 1, interimSpeech: { maxPerTurn: 2, unknownField: true } })).toThrow(
+		"interimSpeech contains an unknown field",
+	);
+});

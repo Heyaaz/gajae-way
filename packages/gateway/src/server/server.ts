@@ -1880,10 +1880,8 @@ async function createInboundTurnLifecycle(
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
 	// Mid-work speech gate (issue #71): suppress procedural narration and rate-limit interim messages.
-	// maxPerTurn: 0 disables the gate entirely; messages pass through without filtering.
-	const interimSpeech = new InterimSpeechGate(
-		options.interimSpeech?.maxPerTurn === 0 ? { maxPerTurn: 999 } : options.interimSpeech,
-	);
+	// maxPerTurn: 0 means no interim messages are delivered; maxPerTurn >= 1 is the cap.
+	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	/**
 	 * Raw messages whose reaction tokens have already been claimed this turn. The
 	 * terminal path re-runs over text the tail already shipped as interim (to

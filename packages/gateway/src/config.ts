@@ -344,6 +344,27 @@ function parseBotAudience(value: unknown): BotAudienceConfig | undefined {
 	};
 }
 
+function parseNonNegativeInteger(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 0)
+		throw new ConfigError("config_invalid", `${field} must be a non-negative integer`);
+	return value as number;
+}
+
+function parseInterimSpeech(value: unknown): InterimSpeechConfig | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "interimSpeech");
+	for (const key of Object.keys(input))
+		if (key !== "maxPerTurn" && key !== "minGapMs")
+			throw new ConfigError("config_invalid", "interimSpeech contains an unknown field");
+	const maxPerTurn = parseNonNegativeInteger(input.maxPerTurn, "interimSpeech.maxPerTurn");
+	const minGapMs = parseNonNegativeInteger(input.minGapMs, "interimSpeech.minGapMs");
+	return {
+		...(maxPerTurn === undefined ? {} : { maxPerTurn }),
+		...(minGapMs === undefined ? {} : { minGapMs }),
+	};
+}
+
 function parseStallTimeout(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) < 1_000 || (value as number) > 3_600_000)
 		throw new ConfigError("config_invalid", "stallTimeoutMs must be an integer between 1000 and 3600000");
@@ -488,6 +509,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 						input.monitorContextFailureRollThreshold,
 					),
 				}),
+		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
 	};
 }
 
@@ -604,6 +626,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
 	"work",
+	"interimSpeech",
 ] as const;
 
 /**

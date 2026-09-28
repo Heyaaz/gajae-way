@@ -160,6 +160,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						startedAt,
 						onStop: close,
 						overrides: options.overrides,
+						interimSpeech: config.interimSpeech,
 					})
 				: await startUnixServer({
 						config,
@@ -170,6 +171,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						startedAt,
 						onStop: close,
 						overrides: options.overrides,
+						interimSpeech: config.interimSpeech,
 					});
 			console.error(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
 			return { stop: (reason) => server.stop(reason), broker: supervisor };
