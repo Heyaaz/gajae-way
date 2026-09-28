@@ -64,16 +64,51 @@ test("accepts exact engagement modes and audiences while preserving omitted audi
 		expect(config.channels?.collab).toEqual({ engagement: "mention-open", audience: "all" });
 		expect(config.channels?.locked).toEqual({ engagement: "closed", audience: "bot-only" });
 
-		for (const channels of [
-			{ c: { engagement: "open-mention-only" } },
-			{ c: { engagement: "open", audience: "sometimes" } },
-			{ c: { engagement: "open", extra: true } },
-		]) {
-			await writeFile(join(home, "adapter-discord.json"), JSON.stringify({ tokenFile: "token", channels }));
+	for (const channels of [
+		{ c: { engagement: "open-mention-only" } },
+		{ c: { engagement: "open", audience: "sometimes" } },
+		{ c: { engagement: "open", extra: true } },
+	]) {
+		await writeFile(join(home, "adapter-discord.json"), JSON.stringify({ tokenFile: "token", channels }));
+		await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
+			DiscordAdapterStartupError,
+		);
+	}
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("accepts and validates statusReactions configuration option", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-status-"));
+	try {
+		await writeFile(join(home, "token"), "secret-token");
+
+		// Valid options
+		for (const mode of ["gradient", "static", "off"] as const) {
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({ tokenFile: "token", statusReactions: mode }),
+			);
+			const config = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+			expect(config.statusReactions).toBe(mode);
+		}
+
+		// Invalid options should be rejected
+		for (const invalid of ["disabled", "on", "both", 123, true]) {
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({ tokenFile: "token", statusReactions: invalid }),
+			);
 			await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
 				DiscordAdapterStartupError,
 			);
 		}
+
+		// Omitted statusReactions should use default (undefined, which means gradient at runtime)
+		await writeFile(join(home, "adapter-discord.json"), JSON.stringify({ tokenFile: "token" }));
+		const defaultConfig = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+		expect(defaultConfig.statusReactions).toBeUndefined();
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -681,4 +716,127 @@ test("our own presence markers are never reported inbound as engagement", () => 
 	expect(isPresenceReaction("✍️")).toBe(true);
 	expect(isPresenceReaction("✍")).toBe(true);
 	expect(isPresenceReaction("👍")).toBe(false);
+});
+
+test("statusReactions 'static' mode shows only phase marker, not clock or effort", async () => {
+	const { discord, reacted, removed } = presenceDiscord();
+	let clock = 0;
+	const status = new WorkingStatus(
+		discord,
+		{ error: () => {} },
+		() => ({ id: "bot-1" }),
+		() => clock,
+		"static", // static mode
+	);
+	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	const engagement = { group: false, mentioned: false }; // DM
+	status.arm("channel-1", "m-1", engagement);
+	await Bun.sleep(1);
+	expect(reacted).toEqual(["⏳"]);
+	clock += PRESENCE_MIN_SWAP_MS;
+	await status.update({
+		turnId: "t",
+		origin,
+		elapsedMs: 61_000, // One minute elapsed
+		toolCalls: 1,
+		outputTokens: 210,
+		activity: { kind: "tool", label: "bash" },
+	});
+	// In static mode: only phase marker changes, no clock (🕐) or effort (1️⃣)
+	expect(reacted).toEqual(["⏳", "🔧"]);
+	expect(removed).toEqual(["⏳:bot-1"]);
+});
+
+test("statusReactions 'off' mode silences reactions on group channels without mention", async () => {
+	const { discord, reacted } = presenceDiscord();
+	const status = new WorkingStatus(
+		discord,
+		{ error: () => {} },
+		() => ({ id: "bot-1" }),
+		Date.now,
+		"off", // off mode
+	);
+	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	const groupNoMention = { group: true, mentioned: false }; // Group channel, not mentioned
+	status.arm("channel-1", "m-1", groupNoMention);
+	await Bun.sleep(1);
+	expect(reacted).toEqual([]); // No reactions shown
+});
+
+test("statusReactions 'off' mode shows reactions on mentioned turns in group channels", async () => {
+	const { discord, reacted } = presenceDiscord();
+	const status = new WorkingStatus(
+		discord,
+		{ error: () => {} },
+		() => ({ id: "bot-1" }),
+		Date.now,
+		"off", // off mode
+	);
+	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	const groupWithMention = { group: true, mentioned: true }; // Group channel, but mentioned
+	status.arm("channel-1", "m-1", groupWithMention);
+	await Bun.sleep(1);
+	expect(reacted).toEqual(["⏳"]); // Reactions shown for mentioned turns
+});
+
+test("statusReactions 'off' mode shows reactions on DMs", async () => {
+	const { discord, reacted } = presenceDiscord();
+	const status = new WorkingStatus(
+		discord,
+		{ error: () => {} },
+		() => ({ id: "bot-1" }),
+		Date.now,
+		"off", // off mode
+	);
+	const origin = { platform: "discord", kind: "dm", conversationId: "dm-1", peerId: "user-1" } as const;
+	const dm = { group: false, mentioned: false }; // DM (not a group)
+	status.arm("dm-1", "m-1", dm);
+	await Bun.sleep(1);
+	expect(reacted).toEqual(["⏳"]); // Reactions shown on DMs
+});
+
+test("statusReactions 'off' mode silences reactions on bot-audience channels", async () => {
+	const { discord, reacted } = presenceDiscord();
+	const status = new WorkingStatus(
+		discord,
+		{ error: () => {} },
+		() => ({ id: "bot-1" }),
+		Date.now,
+		"off", // off mode
+	);
+	const origin = { platform: "discord", kind: "channel", conversationId: "bot-channel" } as const;
+	const botAudience = { group: true, mentioned: false, audience: "bot" }; // Bot-only audience
+	status.arm("bot-channel", "m-1", botAudience);
+	await Bun.sleep(1);
+	expect(reacted).toEqual([]); // No reactions shown on bot-audience channels
+});
+
+test("statusReactions 'gradient' mode is default and shows full reaction gradient", async () => {
+	const { discord, reacted } = presenceDiscord();
+	let clock = 0;
+	const status = new WorkingStatus(
+		discord,
+		{ error: () => {} },
+		() => ({ id: "bot-1" }),
+		() => clock,
+		"gradient", // gradient mode (default)
+	);
+	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	const groupNoMention = { group: true, mentioned: false }; // Even group channels without mention show gradient
+	status.arm("channel-1", "m-1", groupNoMention);
+	await Bun.sleep(1);
+	expect(reacted).toEqual(["⏳"]);
+	clock += PRESENCE_MIN_SWAP_MS;
+	await status.update({
+		turnId: "t",
+		origin,
+		elapsedMs: 61_000,
+		toolCalls: 1,
+		outputTokens: 210,
+		activity: { kind: "tool", label: "bash" },
+	});
+	// Gradient mode shows phase + clock + effort
+	expect(reacted).toContain("🔧");
+	expect(reacted).toContain("🕐");
+	expect(reacted).toContain("1️⃣");
 });
