@@ -3,11 +3,22 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type ChannelEngagementPolicy, ENGAGEMENT_AUDIENCES, ENGAGEMENT_MODES } from "@gajae-gateway/protocol";
 
+export type StatusReactionsMode = "gradient" | "static" | "off";
+
 export interface SlackAdapterConfig {
 	readonly botTokenFile: string;
 	readonly appTokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly channels?: Readonly<Record<string, ChannelEngagementPolicy>>;
+	/**
+	 * Controls WorkingStatus reaction behavior:
+	 * - "gradient" (default): show phase marker + clock + effort gradient
+	 * - "static": show only phase marker (⏳ → 🔧 → 💭 → ✍️)
+	 * - "off": disable reactions entirely (silent on group/bot channels, gradient on DMs/mentions)
+	 *
+	 * When "off", group/bot-audience channels never show reactions; DMs and mentioned turns show gradient.
+	 */
+	readonly statusReactions?: StatusReactionsMode;
 }
 
 export interface LoadedSlackAdapterConfig extends SlackAdapterConfig {
@@ -53,6 +64,11 @@ export async function loadSlackAdapterConfig(env: NodeJS.ProcessEnv = process.en
 			`Slack adapter channels entries may only set engagement to ${ENGAGEMENT_MODES.join(", ")} and audience to ${ENGAGEMENT_AUDIENCES.join(", ")}.`,
 		);
 	}
+	if (config.statusReactions !== undefined && !isStatusReactionsMode(config.statusReactions)) {
+		throw new SlackAdapterStartupError(
+			`Slack adapter statusReactions must be "gradient", "static", or "off" when set.`,
+		);
+	}
 	const bot = await loadToken(config.botTokenFile as string, "botTokenFile", "xoxb-", configPath);
 	const app = await loadToken(config.appTokenFile as string, "appTokenFile", "xapp-", configPath);
 	return {
@@ -85,6 +101,10 @@ async function loadToken(
 	if (!token.startsWith(prefix))
 		throw new SlackAdapterStartupError(`Slack token credential file ${path} must start with ${prefix}.`);
 	return { path, token };
+}
+
+function isStatusReactionsMode(value: unknown): value is StatusReactionsMode {
+	return value === "gradient" || value === "static" || value === "off";
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

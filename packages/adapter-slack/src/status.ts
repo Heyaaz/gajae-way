@@ -1,5 +1,7 @@
 import {
 	type ChatProgressPayload,
+	type ChannelEngagementPolicy,
+	type EngagementContext,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
 	type PresenceSnapshot,
@@ -8,6 +10,7 @@ import {
 	presenceMarkersFor,
 	presenceTransition,
 } from "@gajae-gateway/protocol";
+import type { StatusReactionsMode } from "./config";
 import type { SlackWebApi } from "./api";
 import { parseSlackMessageId } from "./origin";
 
@@ -30,6 +33,8 @@ type Entry = {
 	reconciling: boolean;
 	/** A change arrived while a pass was running; the loop re-diffs before it exits. */
 	pending: boolean;
+	/** Engagement context for determining if reactions should be shown. */
+	engagement?: Pick<EngagementContext, "group" | "mentioned" | "audience">;
 };
 
 /** Bound on re-diff passes in one reconcile run; retirement cleanup runs regardless. */
@@ -85,6 +90,8 @@ export function presenceStatusText(snapshot: PresenceSnapshot): string {
 export class WorkingStatus {
 	readonly #entries = new Map<string, Entry>();
 	readonly #staleTimers = new Map<string, Timer>();
+	readonly #statusReactionsMode: StatusReactionsMode;
+	readonly #channels: Readonly<Record<string, ChannelEngagementPolicy>>;
 
 	constructor(
 		readonly api: Pick<SlackWebApi, "addReaction" | "removeReaction" | "setThreadStatus">,
@@ -92,14 +99,31 @@ export class WorkingStatus {
 		readonly setTimer: (fn: () => void, ms: number) => Timer = setTimeout,
 		readonly clearTimer: (timer: unknown) => void = (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
 		readonly now: () => number = Date.now,
-	) {}
+		statusReactionsMode: StatusReactionsMode = "gradient",
+		channels: Readonly<Record<string, ChannelEngagementPolicy>> = {},
+	) {
+		this.#statusReactionsMode = statusReactionsMode;
+		this.#channels = channels;
+	}
+
+	#shouldShowReactions(engagement?: Pick<EngagementContext, "group" | "mentioned" | "audience">): boolean {
+		if (this.#statusReactionsMode === "off") {
+			// In "off" mode: silent on group/bot channels, but show gradient on DMs or mentioned turns
+			if (!engagement) return false;
+			if (engagement.group && !engagement.mentioned) return false; // Group channel and not mentioned
+			if (engagement.audience === "bot") return false; // Bot-audience channel
+			return true; // Show on DMs (not group) or mentioned turns
+		}
+		// "gradient" and "static" modes both show reactions
+		return true;
+	}
 
 	/**
 	 * An addressed turn was accepted for `messageId` (channel:ts). The queued
 	 * marker goes on immediately: it is the room's only sign the message was
 	 * seen until the first progress tick. Best-effort, never awaited by callers.
 	 */
-	arm(origin: OriginRef, messageId: string): void {
+	arm(origin: OriginRef, messageId: string, engagement?: Pick<EngagementContext, "group" | "mentioned" | "audience">): void {
 		if (origin.platform !== "slack") return;
 		const target = parseSlackMessageId(messageId);
 		if (!target) return;
@@ -109,7 +133,8 @@ export class WorkingStatus {
 			// Same message re-armed (an accepted edit): keep the ownership record
 			// - the markers already on the message are still ours - and just
 			// restart the gradient from queued.
-			prior.wanted = true;
+			prior.engagement = engagement;
+			prior.wanted = this.#shouldShowReactions(engagement);
 			prior.state = presenceInitial(this.now());
 			this.#armStale(key);
 			void this.#reconcile(key, prior);
@@ -129,9 +154,10 @@ export class WorkingStatus {
 			state: presenceInitial(this.now()),
 			shown: new Set(),
 			shownStatus: "",
-			wanted: true,
+			wanted: this.#shouldShowReactions(engagement),
 			reconciling: false,
 			pending: false,
+			engagement,
 		};
 		this.#entries.set(key, entry);
 		this.#armStale(key);
@@ -194,7 +220,12 @@ export class WorkingStatus {
 		try {
 			for (let pass = 0; pass < RECONCILE_MAX_PASSES; pass++) {
 				entry.pending = false;
-				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.slackName) : []);
+				let markers = presenceMarkersFor(entry.state.snapshot);
+				if (this.#statusReactionsMode === "static" && markers.length > 0) {
+					// Static mode: only show the phase marker (index 0)
+					markers = [markers[0]];
+				}
+				const desired = new Set(entry.wanted ? markers.map((m) => m.slackName) : []);
 				const remove = [...entry.shown].filter((name) => !desired.has(name));
 				const add = [...desired].filter((name) => !entry.shown.has(name));
 				const desiredStatus = entry.wanted ? presenceStatusText(entry.state.snapshot) : "";

@@ -603,7 +603,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					}
 					try {
 						const result = await client.request<{ engaged?: boolean } | undefined>("chat.edit", edit);
-						if (result?.engaged) this.status?.arm(edit.origin, edit.messageId);
+						if (result?.engaged) this.status?.arm(edit.origin, edit.messageId, edit.engagement);
 						// A superseding edit queued during the request must drain in this pass too.
 						if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					} catch (error) {
@@ -704,7 +704,7 @@ export async function startSlackAdapter(
 		...(auth.team ? { teamName: auth.team } : {}),
 	};
 	const directory = new SlackDirectory(api);
-	const status = new WorkingStatus(api, log);
+	const status = new WorkingStatus(api, log, setTimeout, clearTimeout, undefined, config.statusReactions ?? "gradient", config.channels);
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? join(adapterHome(), "gateway.sock"),
 		api,
@@ -805,7 +805,10 @@ export async function startSlackAdapter(
 					engagement,
 					timestamp(message.ts),
 				);
-				if (result?.engaged) await rememberThread(admitted.origin);
+				if (result?.engaged) {
+					await rememberThread(admitted.origin);
+					status.arm(admitted.origin, slackMessageId(message.channel, message.ts), engagement);
+				}
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
 			const reaction = event as unknown as SlackReactionEvent;
