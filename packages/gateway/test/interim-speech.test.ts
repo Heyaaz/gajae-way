@@ -119,8 +119,8 @@ test("the gate rules are properly classified in InterimSpeechGate", () => {
 // Integration tests using ScriptedSessionPort/test-broker seam
 // ---------------------------------------------------------------------------
 
-test("interim speech gate respects maxPerTurn config: with maxPerTurn=2, admits at most 2 interim messages in a relay-owned turn", async () => {
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-interim-"));
+test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1 terminal deliveries", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-interim-maxperturn-2-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
@@ -128,60 +128,103 @@ test("interim speech gate respects maxPerTurn config: with maxPerTurn=2, admits 
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "test-chan": { engagement: "open" } },
+		channels: { "chan-test": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const sessionPort = new ScriptedSessionPort({
-		onSend: (input, scripted) => {
-			// Simulate 4 interim messages from gjc, then 1 terminal
-			if (input.opRef === "op-1") {
-				if (input.text.includes("interim-1")) {
-					scripted.sendTail({
-						type: "event",
-						event: "turn.progress",
-						operationRef: input.opRef,
-						payload: { assistantText: "interim-1" },
-					});
-				} else {
-					scripted.sendTail({
-						type: "event",
-						event: "turn.progress",
-						operationRef: input.opRef,
-						payload: { assistantText: "interim-2" },
-					});
-					scripted.sendTail({
-						type: "event",
-						event: "turn.progress",
-						operationRef: input.opRef,
-						payload: { assistantText: "interim-3" },
-					});
-					scripted.sendTail({
-						type: "event",
-						event: "turn.progress",
-						operationRef: input.opRef,
-						payload: { assistantText: "interim-4" },
-					});
-					scripted.complete(input.opRef, "terminal-answer");
-				}
-			}
-		},
-	});
+	const sessionPort = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
 		database,
 		sessionPort,
 		onStop: () => database.close(),
-		interimSpeech: { maxPerTurn: 2 },
+		interimSpeech: { maxPerTurn: 2, minGapMs: 0 },
 	});
-	// Verify the gate was properly initialized with maxPerTurn: 2
-	// This test structure verifies that config.interimSpeech flows through to server options.
-	// The actual interim message filtering is verified by the unit tests in this file.
-	expect(server).toBeDefined();
+
+	// Connect client to the gateway's Unix socket
+	const frames: any[] = [];
+	let buffered = "";
+	const socket = await Bun.connect({
+		unix: config.socketPath,
+		socket: {
+			data(_socket, data) {
+				buffered += Buffer.from(data).toString();
+				const lines = buffered.split("\n");
+				buffered = lines.pop() ?? "";
+				for (const line of lines) if (line) frames.push(JSON.parse(line));
+			},
+		},
+	});
+
+	// Send hello
+	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	await Bun.sleep(100);
+
+	// Send a channel message to trigger a turn
+	const requestId = "req-1";
+	socket.write(
+		JSON.stringify({
+			v: "0.1",
+			type: "request",
+			id: requestId,
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "channel", conversationId: "chan-test" },
+				text: "trigger turn",
+				messageId: "m-1",
+				engagement: { mentioned: true, group: true, authorId: "user-1" },
+			},
+		}) + "\n",
+	);
+
+	// Wait for the turn to be sent to the session port
+	for (let attempt = 0; attempt < 100 && sessionPort.sends.length < 1; attempt++) {
+		await Bun.sleep(10);
+	}
+	expect(sessionPort.sends).toHaveLength(1);
+
+	const send = sessionPort.sends[0]!;
+
+	// Emit 5 interim assistant messages
+	for (let i = 1; i <= 5; i++) {
+		sessionPort.emitAssistant(send.sessionId, `interim-text-${i}`, `event-${i}`, send.opRef);
+		await Bun.sleep(5);
+	}
+
+	// Emit the final answer
+	sessionPort.complete(send.opRef, "final-answer");
+
+	// Wait for messages to reach the client
+	for (let attempt = 0; attempt < 200; attempt++) {
+		const messages = frames.filter(
+			(f: any) => f.type === "event" && f.event === "chat.message",
+		);
+		if (messages.length >= 3) break; // 2 interim + 1 terminal
+		await Bun.sleep(10);
+	}
+
+	socket.end();
+
+	const messages = frames.filter(
+		(f: any) => f.type === "event" && f.event === "chat.message",
+	);
+
+	// Should have exactly 2 interim deliveries + 1 terminal = 3 messages
+	expect(messages.length).toBe(3);
+
+	// The last message should be the final answer (terminal)
+	const lastMessage = messages[messages.length - 1]!;
+	expect(lastMessage.payload.text).toBe("final-answer");
+
+	// The first two messages should be interim texts
+	const interim1 = messages[0]!;
+	const interim2 = messages[1]!;
+	expect(interim1.payload.text).toBe("interim-text-1");
+	expect(interim2.payload.text).toBe("interim-text-2");
 });
 
-test("interim speech gate with maxPerTurn=0 blocks all interim messages, delivering only the terminal answer", async () => {
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-interim-"));
+test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-interim-maxperturn-0-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
@@ -189,7 +232,7 @@ test("interim speech gate with maxPerTurn=0 blocks all interim messages, deliver
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "test-chan": { engagement: "open" } },
+		channels: { "chan-test": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort();
@@ -201,8 +244,185 @@ test("interim speech gate with maxPerTurn=0 blocks all interim messages, deliver
 		onStop: () => database.close(),
 		interimSpeech: { maxPerTurn: 0 },
 	});
-	// With maxPerTurn: 0, the gate denies every interim message.
-	// This test structure verifies that config.interimSpeech flows through to server options
-	// and that InterimSpeechGate correctly denies messages when maxPerTurn is 0.
-	expect(server).toBeDefined();
+
+	// Connect client to the gateway's Unix socket
+	const frames: any[] = [];
+	let buffered = "";
+	const socket = await Bun.connect({
+		unix: config.socketPath,
+		socket: {
+			data(_socket, data) {
+				buffered += Buffer.from(data).toString();
+				const lines = buffered.split("\n");
+				buffered = lines.pop() ?? "";
+				for (const line of lines) if (line) frames.push(JSON.parse(line));
+			},
+		},
+	});
+
+	// Send hello
+	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	await Bun.sleep(100);
+
+	// Send a channel message to trigger a turn
+	const requestId = "req-2";
+	socket.write(
+		JSON.stringify({
+			v: "0.1",
+			type: "request",
+			id: requestId,
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "channel", conversationId: "chan-test" },
+				text: "trigger turn",
+				messageId: "m-2",
+				engagement: { mentioned: true, group: true, authorId: "user-1" },
+			},
+		}) + "\n",
+	);
+
+	// Wait for the turn to be sent to the session port
+	for (let attempt = 0; attempt < 100 && sessionPort.sends.length < 1; attempt++) {
+		await Bun.sleep(10);
+	}
+	expect(sessionPort.sends).toHaveLength(1);
+
+	const send = sessionPort.sends[0]!;
+
+	// Emit 5 interim assistant messages
+	for (let i = 1; i <= 5; i++) {
+		sessionPort.emitAssistant(send.sessionId, `interim-text-${i}`, `event-${i}`, send.opRef);
+		await Bun.sleep(5);
+	}
+
+	// Emit the final answer
+	sessionPort.complete(send.opRef, "final-answer-maxperturn-0");
+
+	// Wait for messages to reach the client
+	for (let attempt = 0; attempt < 200; attempt++) {
+		const messages = frames.filter(
+			(f: any) => f.type === "event" && f.event === "chat.message",
+		);
+		if (messages.length >= 1) break; // 1 terminal only
+		await Bun.sleep(10);
+	}
+
+	socket.end();
+
+	const messages = frames.filter(
+		(f: any) => f.type === "event" && f.event === "chat.message",
+	);
+
+	// With maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
+	expect(messages.length).toBe(1);
+	expect(messages[0]!.payload.text).toBe("final-answer-maxperturn-0");
+});
+
+test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.ts, scripted turn runs, 0 interim deliveries", async () => {
+	const { writeFile } = await import("node:fs/promises");
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-interim-boot-"));
+
+	// Write config.json with interimSpeech { maxPerTurn: 0 }
+	const configPath = join(directory, "config.json");
+	await writeFile(
+		configPath,
+		JSON.stringify({
+			schemaVersion: 1,
+			home: directory,
+			configPath,
+			socketPath: join(directory, "gateway.sock"),
+			dbPath: join(directory, "gateway.db"),
+			logVerbosity: "info",
+			channels: { "chan-boot": { engagement: "open" } },
+			interimSpeech: { maxPerTurn: 0, minGapMs: 0 },
+		}),
+	);
+
+	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const sessionPort = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+
+	// Load config via boot.ts pattern (simulating the config.json read)
+	const { loadConfig } = await import("../src/config");
+	const config = await loadConfig({ home: directory });
+
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort,
+		onStop: () => database.close(),
+		interimSpeech: config.interimSpeech,
+	});
+
+	// Connect client to the gateway's Unix socket
+	const frames: any[] = [];
+	let buffered = "";
+	const socket = await Bun.connect({
+		unix: config.socketPath,
+		socket: {
+			data(_socket, data) {
+				buffered += Buffer.from(data).toString();
+				const lines = buffered.split("\n");
+				buffered = lines.pop() ?? "";
+				for (const line of lines) if (line) frames.push(JSON.parse(line));
+			},
+		},
+	});
+
+	// Send hello
+	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	await Bun.sleep(100);
+
+	// Send a channel message to trigger a turn
+	const requestId = "req-3";
+	socket.write(
+		JSON.stringify({
+			v: "0.1",
+			type: "request",
+			id: requestId,
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "channel", conversationId: "chan-boot" },
+				text: "boot path test",
+				messageId: "m-3",
+				engagement: { mentioned: true, group: true, authorId: "user-1" },
+			},
+		}) + "\n",
+	);
+
+	// Wait for the turn to be sent to the session port
+	for (let attempt = 0; attempt < 100 && sessionPort.sends.length < 1; attempt++) {
+		await Bun.sleep(10);
+	}
+	expect(sessionPort.sends).toHaveLength(1);
+
+	const send = sessionPort.sends[0]!;
+
+	// Emit 5 interim assistant messages
+	for (let i = 1; i <= 5; i++) {
+		sessionPort.emitAssistant(send.sessionId, `interim-boot-${i}`, `event-${i}`, send.opRef);
+		await Bun.sleep(5);
+	}
+
+	// Emit the final answer
+	sessionPort.complete(send.opRef, "final-boot-answer");
+
+	// Wait for messages to reach the client
+	for (let attempt = 0; attempt < 200; attempt++) {
+		const messages = frames.filter(
+			(f: any) => f.type === "event" && f.event === "chat.message",
+		);
+		if (messages.length >= 1) break; // 1 terminal only
+		await Bun.sleep(10);
+	}
+
+	socket.end();
+
+	const messages = frames.filter(
+		(f: any) => f.type === "event" && f.event === "chat.message",
+	);
+
+	// With config-based maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
+	expect(messages.length).toBe(1);
+	expect(messages[0]!.payload.text).toBe("final-boot-answer");
 });
