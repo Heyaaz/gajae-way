@@ -533,7 +533,7 @@ export class WorkingStatus {
 	readonly #log: Pick<Console, "error">;
 	readonly #getBotUser: () => unknown;
 	readonly #now: () => number;
-	readonly #statusReactionsMode: StatusReactionsMode;
+	readonly #statusReactionsMode: StatusReactionsMode | undefined;
 	readonly #channels: Readonly<Record<string, ChannelEngagementPolicy>>;
 	readonly #entries = new Map<string, PresenceEntry>();
 	readonly #staleTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -543,24 +543,29 @@ export class WorkingStatus {
 		log: Pick<Console, "error"> = console,
 		getBotUser: () => unknown = () => undefined,
 		now: () => number = Date.now,
-		statusReactionsMode: StatusReactionsMode = "gradient",
+		statusReactionsMode: StatusReactionsMode | undefined = undefined,
 		channels: Readonly<Record<string, ChannelEngagementPolicy>> = {},
 	) {
 		this.#discord = discord;
 		this.#log = log;
 		this.#getBotUser = getBotUser;
 		this.#now = now;
-		this.#statusReactionsMode = statusReactionsMode;
+		this.#statusReactionsMode = statusReactionsMode ?? undefined;
 		this.#channels = channels;
 	}
 
 	#shouldShowReactions(engagement?: Pick<EngagementContext, "group" | "mentioned" | "audience">): boolean {
 		if (this.#statusReactionsMode === "off") {
-			// In "off" mode: silent on group/bot channels, but show gradient on DMs or mentioned turns
-			if (!engagement) return false;
-			if (engagement.group && !engagement.mentioned) return false; // Group channel and not mentioned
+			// In "off" mode: zero reactions for all engagement types
+			return false;
+		}
+		if (this.#statusReactionsMode === undefined) {
+			// Default behavior when unset: off for group/bot-audience, gradient for DMs
+			// If engagement is not provided, default to showing reactions
+			if (!engagement) return true;
 			if (engagement.audience === "bot") return false; // Bot-audience channel
-			return true; // Show on DMs (not group) or mentioned turns
+			if (engagement.group && !engagement.mentioned) return false; // Group channel without mention
+			return true; // DMs and mentioned turns show gradient
 		}
 		// "gradient" and "static" modes both show reactions
 		return true;
@@ -981,7 +986,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		partials: REQUIRED_PARTIALS,
 	});
 	const typing = new TypingIndicator(discord);
-	const status = new WorkingStatus(discord, console, () => discord.user, Date.now, config.statusReactions ?? "gradient", config.channels);
+	const status = new WorkingStatus(discord, console, () => discord.user, Date.now, config.statusReactions, config.channels);
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? defaultGatewaySocket(),
 		discord,

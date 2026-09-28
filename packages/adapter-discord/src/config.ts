@@ -64,11 +64,12 @@ export interface DiscordAdapterConfig {
 	readonly voice?: DiscordVoiceConfig;
 	/**
 	 * Controls WorkingStatus reaction behavior:
-	 * - "gradient" (default): show phase marker + clock + effort gradient
+	 * - "gradient": show phase marker + clock + effort gradient
 	 * - "static": show only phase marker (⏳ → 🔧 → 💭 → ✍️)
-	 * - "off": disable reactions entirely (silent on group/bot channels, gradient on DMs/mentions)
-	 *
-	 * When "off", group/bot-audience channels never show reactions; DMs and mentioned turns show gradient.
+	 * - "off": disable reactions entirely, zero calls for all engagement types
+	 * - undefined (default): apply per-engagement defaults
+	 *   * DMs: "gradient"
+	 *   * group/bot-audience channels: "off"
 	 */
 	readonly statusReactions?: StatusReactionsMode;
 }
