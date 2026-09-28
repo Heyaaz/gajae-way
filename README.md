@@ -54,7 +54,7 @@ The Bun workspace under `packages/` is divided by responsibility:
 | `@gajae-gateway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
 | `@gajae-gateway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the reaction-gradient presence. |
 | `@gajae-gateway/adapter-telegram` | Telegram ingress and outbound delivery. |
-| `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, reaction-gradient working presence, and missed-message recovery. |
+| `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, reaction-gradient working presence, opt-in live replies, and missed-message recovery. |
 
 `@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` are npm-publishable as standalone packages — see [Publishing packages](#publishing-packages) below for the release workflow. The gateway, adapters, admin console, and `@gajae-gateway/subsession` stay private application code and ship only as the compiled binaries below; `@gajae-gateway/conformance` is a private, unshipped CI/test-only package.
 

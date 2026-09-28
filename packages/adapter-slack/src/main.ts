@@ -13,6 +13,7 @@ import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi
 import { describeInboundBody, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
+import { LiveReplyTracker } from "./live-reply";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type MentionDirectory, repairMentions } from "./mentions";
 import { chunkSlackMessage, markdownToMrkdwn } from "./mrkdwn";
@@ -291,6 +292,7 @@ export async function settleSlackDelivery(
 	_log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
+	live?: LiveReplyTracker,
 ): Promise<void> {
 	if (message.origin.platform !== "slack" || !message.deliveryId) return;
 	if (message.reaction) {
@@ -311,6 +313,24 @@ export async function settleSlackDelivery(
 		// a real ping instead of literal text. Unknown or ambiguous names are left alone.
 		const repaired = mentions ? repairMentions(message.text, mentions) : message.text;
 		const text = markdownToMrkdwn(message.duplicateWarning ? `[recovered - may be a duplicate] ${repaired}` : repaired);
+		// Live replies (opt-in): the first mid-turn part of a turn posts the live
+		// message and later parts are edited into it. `untracked` covers every
+		// case the tracker does not own - a single-part turn, a sealed entry, a
+		// refusal to edit - and falls through to the ordinary post below.
+		if (live) {
+			const outcome = await live.deliver({
+				turnId: message.turnId,
+				deliveryId,
+				channel,
+				...(threadTs === undefined ? {} : { threadTs }),
+				text,
+				final: message.final,
+			});
+			if (outcome.kind !== "untracked") {
+				await gateway.request("delivery.confirm", { deliveryId });
+				return;
+			}
+		}
 		// Every chunk must stay in the same Slack thread, not just the first chunk.
 		for (const chunk of chunkSlackMessage(text)) await api.postMessage(channel, chunk, threadTs);
 		// voiceText is intentionally ignored: Slack has no bot voice messages.
@@ -375,9 +395,10 @@ export function subscribeSlackDeliveries(
 	log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
+	live?: LiveReplyTracker,
 ): () => void {
 	return gateway.onChatMessage((message) => {
-		void settleSlackDelivery(gateway, api, message, log, status, mentions).catch((error) =>
+		void settleSlackDelivery(gateway, api, message, log, status, mentions, live).catch((error) =>
 			log.error(`Slack delivery settlement request failed: ${errorText(error)}`),
 		);
 	});
@@ -385,13 +406,18 @@ export function subscribeSlackDeliveries(
 
 export function subscribeSlackProgress(
 	gateway: GatewayClientLike,
-	status: Pick<WorkingStatus, "update" | "clear">,
+	status?: Pick<WorkingStatus, "update" | "clear">,
 	log: Pick<Console, "error"> = console,
+	live?: Pick<LiveReplyTracker, "close">,
 ): () => void {
 	if (!gateway.onChatProgress) return () => {};
 	return gateway.onChatProgress((progress) => {
 		if (progress.origin.platform !== "slack") return;
 		// Final arrives even when a turn delivers nothing; delivery-only cleanup leaves silent turns orphaned.
+		// It is also the authoritative end-of-turn signal, so a live reply entry
+		// closes here even when the turn ended without a terminal text delivery.
+		if (progress.final) live?.close(progress.turnId);
+		if (!status) return;
 		const action = progress.final ? status.clear(progress.origin.conversationId) : status.update(progress);
 		void action.catch((error) =>
 			log.error(`Slack working status ${progress.final ? "clear" : "update"} failed: ${errorText(error)}`),
@@ -441,6 +467,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		readonly mentions?: MentionDirectory,
 		private readonly monitorIntervals = { healthy: 30_000, degraded: 5_000 },
 		private readonly reconnectDelayMs = 500,
+		readonly live?: LiveReplyTracker,
 	) {
 		if (initialClient) this.adoptClient(initialClient);
 	}
@@ -458,8 +485,9 @@ export class ReconnectingGateway implements GatewayClientLike {
 		this.#client = client;
 		this.#attempt = 0;
 		this.#deliveryOff?.();
-		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions);
-		const progressOff = this.status ? subscribeSlackProgress(client, this.status) : undefined;
+		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions, this.live);
+		const progressOff =
+			this.status || this.live ? subscribeSlackProgress(client, this.status, console, this.live) : undefined;
 		const handlersOff = client.onChatMessage((message) => {
 			for (const handler of this.#handlers) handler(message);
 		});
@@ -744,12 +772,16 @@ export async function startSlackAdapter(
 	};
 	const directory = new SlackDirectory(api);
 	const status = new WorkingStatus(api, log);
+	const live = config.liveReplies === true ? new LiveReplyTracker(api, log) : undefined;
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? join(adapterHome(), "gateway.sock"),
 		api,
 		undefined,
 		status,
 		directory,
+		{ healthy: 30_000, degraded: 5_000 },
+		500,
+		live,
 	);
 	const ingress = new OrderedIngress();
 	const now = ports.now ?? Date.now;
