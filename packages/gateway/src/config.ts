@@ -96,6 +96,21 @@ export interface GatewayConfigFile {
 	readonly work?: WorkLaneConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
+	/** Mid-work speech gating (issue #71); maxPerTurn: 0 disables the gate entirely. */
+	readonly interimSpeech?: InterimSpeechConfig;
+}
+
+export interface InterimSpeechConfig {
+	/**
+	 * Hard cap on delivered mid-work messages within one turn.
+	 * Set to 0 to disable the gate entirely; messages will be delivered without filtering.
+	 */
+	readonly maxPerTurn?: number;
+	/**
+	 * Minimum spacing between delivered mid-work messages in milliseconds.
+	 * The first message is never delayed.
+	 */
+	readonly minGapMs?: number;
 }
 
 export interface BotAudienceConfig {
