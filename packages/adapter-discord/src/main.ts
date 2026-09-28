@@ -560,12 +560,12 @@ export class WorkingStatus {
 			return false;
 		}
 		if (this.#statusReactionsMode === undefined) {
-			// Default behavior when unset: off for group/bot-audience, gradient for DMs
-			// If engagement is not provided, default to showing reactions
-			if (!engagement) return true;
+			// Default behavior when unset: off for group/bot-audience, gradient for DMs only
+			// When engagement is not provided, fail quiet (no reactions)
+			if (!engagement) return false;
 			if (engagement.audience === "bot") return false; // Bot-audience channel
-			if (engagement.group && !engagement.mentioned) return false; // Group channel without mention
-			return true; // DMs and mentioned turns show gradient
+			if (engagement.group) return false; // ANY group channel (mentioned or not) gets off
+			return true; // DMs only show gradient
 		}
 		// "gradient" and "static" modes both show reactions
 		return true;
@@ -668,12 +668,15 @@ export class WorkingStatus {
 			const botId = typeof botUser?.id === "string" ? botUser.id : undefined;
 			for (let pass = 0; pass < RECONCILE_MAX_PASSES; pass++) {
 				entry.pending = false;
-				let markers = presenceMarkersFor(entry.state.snapshot);
-				if (this.#statusReactionsMode === "static" && markers.length > 0) {
-					// Static mode: only show the phase marker (index 0)
-					markers = [markers[0]];
-				}
-				const desired = new Set(entry.wanted ? markers.map((m) => m.unicode) : []);
+				const desired = new Set(
+					this.#statusReactionsMode === "static"
+						? entry.wanted
+							? ["⏳"] // Static mode: show only queued phase marker, never transition
+							: []
+						: entry.wanted
+						? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode)
+						: [],
+				);
 				const remove = [...entry.shown].filter((unicode) => !desired.has(unicode));
 				const add = [...desired].filter((unicode) => !entry.shown.has(unicode));
 				if (remove.length === 0 && add.length === 0) {

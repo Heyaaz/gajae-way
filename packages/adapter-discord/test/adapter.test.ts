@@ -507,7 +507,9 @@ test("working status is a reaction gradient on the triggering message and clears
 		() => clock,
 	);
 	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
-	status.arm("channel-1", "m-1");
+	// Explicitly pass engagement to show reactions; this is a DM (not a group)
+	const engagement = { group: false, mentioned: false };
+	status.arm("channel-1", "m-1", engagement);
 	await Bun.sleep(1);
 	expect(reacted).toEqual(["⏳"]);
 	clock += PRESENCE_MIN_SWAP_MS;
@@ -701,7 +703,9 @@ test("an unaddressed public-channel turn shows no presence until it is armed; cl
 	await status.update(tick);
 	await status.update(tick);
 	expect(reacted).toEqual([]);
-	status.arm("public-1", "m-9");
+	// Explicitly pass engagement to show reactions when arming; this is a DM (not a group)
+	const engagement = { group: false, mentioned: false };
+	status.arm("public-1", "m-9", engagement);
 	await Bun.sleep(1);
 	expect(reacted).toEqual(["⏳"]);
 	await status.clear("public-1");
@@ -742,9 +746,9 @@ test("statusReactions 'static' mode shows only phase marker, not clock or effort
 		outputTokens: 210,
 		activity: { kind: "tool", label: "bash" },
 	});
-	// In static mode: only phase marker changes, no clock (🕐) or effort (1️⃣)
-	expect(reacted).toEqual(["⏳", "🔧"]);
-	expect(removed).toEqual(["⏳:bot-1"]);
+	// In static mode: no phase swap, no clock (🕐) or effort (1️⃣); stays at ⏳
+	expect(reacted).toEqual(["⏳"]);
+	expect(removed).toEqual([]);
 });
 
 test("statusReactions 'off' mode produces zero reactions on group channels without mention", async () => {
@@ -897,34 +901,19 @@ test("statusReactions defaults to 'gradient' for DMs when unset", async () => {
 	expect(reacted).toContain("1️⃣");
 });
 
-test("statusReactions defaults to 'gradient' for mentioned turns in group channels when unset", async () => {
+test("statusReactions defaults to 'off' for mentioned turns in group channels when unset", async () => {
 	const { discord, reacted } = presenceDiscord();
-	let clock = 0;
 	const status = new WorkingStatus(
 		discord,
 		{ error: () => {} },
 		() => ({ id: "bot-1" }),
-		() => clock,
+		Date.now,
 		// statusReactions unset (undefined)
 	);
-	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
 	const groupWithMention = { group: true, mentioned: true }; // Group channel, mentioned
 	status.arm("channel-1", "m-1", groupWithMention);
 	await Bun.sleep(1);
-	expect(reacted).toEqual(["⏳"]); // Default gradient behavior for mentioned turns
-	clock += PRESENCE_MIN_SWAP_MS;
-	await status.update({
-		turnId: "t",
-		origin,
-		elapsedMs: 61_000,
-		toolCalls: 1,
-		outputTokens: 210,
-		activity: { kind: "tool", label: "bash" },
-	});
-	// Gradient mode shows phase + clock + effort
-	expect(reacted).toContain("🔧");
-	expect(reacted).toContain("🕐");
-	expect(reacted).toContain("1️⃣");
+	expect(reacted).toEqual([]); // Default is 'off' for ANY group channel, even when mentioned
 });
 
 test("statusReactions 'static' mode through full sequence: arm, update phase/clock/effort, clear", async () => {
@@ -939,11 +928,11 @@ test("statusReactions 'static' mode through full sequence: arm, update phase/clo
 	);
 	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
 	const engagement = { group: false, mentioned: false }; // DM
-	// ARM: adds exactly one phase marker
+	// ARM: adds exactly one ⏳ marker
 	status.arm("channel-1", "m-1", engagement);
 	await Bun.sleep(1);
 	expect(reacted).toEqual(["⏳"]);
-	// UPDATE 1: phase changes to working, no clock or effort added
+	// UPDATE 1: no phase swap, no clock or effort added
 	clock += PRESENCE_MIN_SWAP_MS;
 	await status.update({
 		turnId: "t",
@@ -953,9 +942,9 @@ test("statusReactions 'static' mode through full sequence: arm, update phase/clo
 		outputTokens: 210,
 		activity: { kind: "tool", label: "bash" },
 	});
-	// In static mode: only phase marker changes, no clock (🕐) or effort (1️⃣)
-	expect(reacted).toEqual(["⏳", "🔧"]);
-	expect(removed).toEqual(["⏳:bot-1"]);
+	// In static mode: ⏳ stays, no phase swap to 🔧, no clock (🕐) or effort (1️⃣)
+	expect(reacted).toEqual(["⏳"]);
+	expect(removed).toEqual([]);
 	// UPDATE 2: continue with more elapsed time
 	clock += PRESENCE_MIN_SWAP_MS;
 	await status.update({
@@ -967,9 +956,25 @@ test("statusReactions 'static' mode through full sequence: arm, update phase/clo
 		activity: { kind: "tool", label: "bash" },
 	});
 	// In static mode, no new reactions added for additional time/effort
-	expect(removed).not.toContain("🔧:bot-1"); // Phase marker still shown
-	// CLEAR: removes all reactions
+	expect(reacted).toEqual(["⏳"]); // Still just ⏳
+	expect(removed).toEqual([]); // Nothing removed
+	// CLEAR: removes ⏳
 	await status.clear("channel-1");
 	await Bun.sleep(1);
-	expect(removed).toContain("🔧:bot-1"); // Removes the phase marker
+	expect(removed).toEqual(["⏳:bot-1"]); // Removes the ⏳ marker
+});
+
+test("statusReactions with undefined engagement produces zero reaction calls", async () => {
+	const { discord, reacted } = presenceDiscord();
+	const status = new WorkingStatus(
+		discord,
+		{ error: () => {} },
+		() => ({ id: "bot-1" }),
+		Date.now,
+		// statusReactions unset (undefined)
+	);
+	// Arm with undefined engagement (not passed)
+	status.arm("channel-1", "m-1", undefined);
+	await Bun.sleep(1);
+	expect(reacted).toEqual([]); // No reactions when engagement is undefined
 });

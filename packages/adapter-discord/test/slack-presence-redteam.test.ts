@@ -67,7 +67,9 @@ test("RT-SLACK-55 Discord gradient coalesces buckets and removes variation-selec
 		final: false,
 		...extra,
 	});
-	status.arm("C1", "123");
+	// Explicitly pass engagement to enable gradient; this is a DM (not a group)
+	const engagement = { group: false, mentioned: false };
+	status.arm("C1", "123", engagement);
 	await flush();
 	expect(added).toEqual(["⏳"]);
 	for (let i = 1; i <= 30; i++) {
@@ -105,7 +107,9 @@ test("RT-SLACK-55 Discord gradient coalesces buckets and removes variation-selec
 		return originalTimer(callback, ms);
 	}) as typeof setTimeout);
 	try {
-		status.arm("C1", "124");
+		// Explicitly pass engagement to enable presence; this is a DM (not a group)
+		const engagementForArm = { group: false, mentioned: false };
+		status.arm("C1", "124", engagementForArm);
 	} finally {
 		timer.mockRestore();
 	}
@@ -194,7 +198,9 @@ test("RT-SLACK-68 rejected message fetch logs without markers and later update r
 		() => ({ id: "BOT" }),
 		() => now,
 	);
-	status.arm("C1", "123");
+	// Explicitly pass engagement to enable gradient; this is a DM (not a group)
+	const engagement = { group: false, mentioned: false };
+	status.arm("C1", "123", engagement);
 	await flush();
 	expect(fetches).toBe(1);
 	expect(errors).toHaveLength(1);
