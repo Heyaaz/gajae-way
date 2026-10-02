@@ -107,11 +107,11 @@ test("adds last_error to existing deliveries without touching their state (#171)
 		current.close();
 
 		const legacy = new Database(path);
-		legacy.exec("ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version = 26");
+		legacy.exec("ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 26");
 		legacy.close();
 
 		const migrated = await GatewayDatabase.open(path);
-		expect(migrated.schemaVersion).toBe(26);
+		expect(migrated.schemaVersion).toBe(27);
 		expect(migrated.deliveryRows()[0]).toMatchObject({
 			delivery_id: "legacy-delivery",
 			state: "pending",
