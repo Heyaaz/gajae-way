@@ -23,7 +23,14 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
-import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";
+import {
+	type FailedTransportCause,
+	type FailedTurnEvidence,
+	type FailedTurnEvidenceInput,
+	readFailedTransportCause,
+	readFailedTurnEvidence,
+} from "./failed-turn-evidence";
+import { isSessionGoneCode } from "./gjc-contract";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,
@@ -52,7 +59,13 @@ export interface SessionPort {
 		repo: string;
 	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
-	queueEmpty?(input: { sessionId: string; repo: string }): Promise<boolean>;
+	queueEmpty?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean>;
+	/**
+	 * Background jobs (async `task` sub-lanes, async bash) still running inside the
+	 * session host (`runtime.jobs.list`). Ending the host ends them, so a caller
+	 * about to do that reads this first. Throws when the host cannot answer.
+	 */
+	runningJobs?(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]>;
 	/**
 	 * Ends the host process of a session this gateway created and has retired.
 	 * Ownership is the point: the shared GJC daemon and broker are never touched,
@@ -62,6 +75,8 @@ export interface SessionPort {
 	terminateHost?(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome>;
 	/** Recognized current-session provider failure, never authorization to replay an operation. */
 	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
+	/** Transport failure cause from the same session transcript. */
+	failedTransportCause?(input: FailedTurnEvidenceInput): Promise<FailedTransportCause | undefined>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
@@ -70,16 +85,24 @@ export interface SessionPort {
 		sessionId: string;
 		repo: string;
 		selection: GjcModelSelection;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }>;
 	setServiceTier(input: {
 		sessionId: string;
 		repo: string;
 		tier: GjcServiceTier;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }>;
-	status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<StatusReport>;
+	status(input: {
+		sessionId: string;
+		repo: string;
+		opRef: string;
+		relay?: TailHandle;
+		priority?: "interactive" | "background";
+	}): Promise<StatusReport>;
 	/** Exact invocation-owned original output; never falls back to a latest-assistant heuristic. */
 	fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult>;
-	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
+	fetchLastAssistant(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<LastAssistantResult>;
 	/**
 	 * Last assistant row NOT older than `notBeforeMs`. Callers pass the op's
 	 * reported startedAt when present, otherwise the turn's `dispatched_at`
@@ -92,6 +115,7 @@ export interface SessionPort {
 		sessionId: string;
 		repo: string;
 		notBeforeMs: number;
+		relay?: TailHandle;
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
 	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
@@ -109,6 +133,12 @@ export interface SessionPort {
 	 * delete, so the gateway retires lanes by closing and rebinding instead.
 	 */
 	close(input: { sessionId: string; repo: string }): Promise<void>;
+}
+
+export interface RunningHostJob {
+	readonly id: string;
+	readonly type: string;
+	readonly label: string;
 }
 
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
@@ -177,7 +207,21 @@ export interface WorkerOutputInput {
 	readonly signal?: AbortSignal;
 	/** Generation/attempt fence, checked before and after transport I/O. */
 	readonly isCurrent?: () => boolean;
+	/** The session's live relay; the read goes over it instead of a CLI spawn. */
+	readonly relay?: TailHandle;
 }
+
+/**
+ * One session-scoped SDK request (`raw control|query`). Answers in the CLI's
+ * printed shape so a relay answer and a CLI answer feed the same parsers.
+ * `input: undefined` keeps the CLI argv without `--json-input`.
+ */
+type SdkTransport = (
+	kind: "control" | "query",
+	name: string,
+	input: Record<string, unknown> | undefined,
+	options?: { readonly timeoutMs?: number; readonly cursor?: string },
+) => Promise<CliResult>;
 
 export type WorkerOutputResult =
 	| {
@@ -347,7 +391,7 @@ export class BrokerSessionPort implements SessionPort {
 					result?: { session?: { live?: unknown; deleted?: unknown } };
 					error?: { code?: unknown };
 				};
-				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
+				if (envelope.ok === false) indexed = !isSessionGoneCode(envelope.error?.code);
 				if (envelope.ok === true && envelope.result?.session?.live === false) {
 					if (envelope.result.session.deleted !== true) {
 						try {
@@ -373,7 +417,7 @@ export class BrokerSessionPort implements SessionPort {
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 			}
 			const rebound = this.#database.rebindEpoch(input.originKey);
-			console.error(
+			console.info(
 				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
 			);
 			return await this.bind({ ...input, epoch: rebound });
@@ -384,7 +428,8 @@ export class BrokerSessionPort implements SessionPort {
 			created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			if (input.epochRecovery === false || !isRebindableCode(sdkErrorCode(error))) throw error;
+			const poisonedCode = poisonedCreateKeyCode(error, idempotencyKey);
+			if (input.epochRecovery === false || poisonedCode === undefined) throw error;
 			const rotations = this.#createRotations(input.originKey);
 			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
 				console.error(
@@ -394,8 +439,8 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			this.#database.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
 			const nextEpoch = this.#database.rebindEpoch(input.originKey);
-			console.error(
-				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
+			console.info(
+				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key code=${poisonedCode}`,
 			);
 			return await this.bind({ ...input, epoch: nextEpoch, epochRecovery: false });
 		}
@@ -461,7 +506,7 @@ export class BrokerSessionPort implements SessionPort {
 				// Only a broker that explicitly reports the id as not indexed / not
 				// live keeps us waiting; anything else is treated as ready (the send
 				// path still has its own recovery if that turns out to be wrong).
-				const disowned = envelope.ok === false && envelope.error?.code === "session_unavailable";
+				const disowned = envelope.ok === false && isSessionGoneCode(envelope.error?.code);
 				const notLive =
 					envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
 				if (!disowned && !notLive) return;
@@ -469,7 +514,7 @@ export class BrokerSessionPort implements SessionPort {
 			} catch (error) {
 				if (error instanceof BrokerAuthorityError) throw error;
 				const code = sdkErrorCode(error);
-				if (code !== "session_unavailable") return;
+				if (!isSessionGoneCode(code)) return;
 				lastCode = code;
 			}
 			if (Date.now() >= deadline)
@@ -551,12 +596,12 @@ export class BrokerSessionPort implements SessionPort {
 				result?: { session?: { live?: unknown } };
 				error?: { code?: unknown };
 			};
-			if (envelope.ok === false) return { live: undefined, disowned: envelope.error?.code === "session_unavailable" };
+			if (envelope.ok === false) return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
 			const live = envelope.result?.session?.live;
 			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			return { live: undefined, disowned: sdkErrorCode(error) === "session_unavailable" };
+			return { live: undefined, disowned: isSessionGoneCode(sdkErrorCode(error)) };
 		}
 	}
 
@@ -597,7 +642,7 @@ export class BrokerSessionPort implements SessionPort {
 			live = typeof session?.live === "boolean" ? session.live : undefined;
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			return sdkErrorCode(error) === "session_unavailable"
+			return isSessionGoneCode(sdkErrorCode(error))
 				? { outcome: "already_gone" }
 				: { outcome: "refused", reason: `inspect_failed:${sanitizeDiagnostic(String(error))}` };
 		}
@@ -665,7 +710,7 @@ export class BrokerSessionPort implements SessionPort {
 				const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
 				this.#database.assertBrokerAuthority(this.#authority);
 				if (response.ok) {
-					const result = response.result ?? {};
+					const result = recordOf(response.result) ?? {};
 					const receipt = recordOf(result.receipt) ?? result;
 					return {
 						sessionId: input.sessionId,
@@ -686,7 +731,7 @@ export class BrokerSessionPort implements SessionPort {
 				if (this.#now() >= deadline) throw error;
 				if (!waited) {
 					waited = true;
-					console.error(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
+					console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
 				}
 				await this.#sleep(BUSY_POLL_MS);
 			}
@@ -743,80 +788,66 @@ export class BrokerSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		selection: GjcModelSelection;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }> {
 		this.#assertOwned(input);
-		if (typeof input.selection !== "string") {
-			const activation = parseEnvelope<boolean | { changed?: unknown; id?: unknown }>(
-				await this.#cli([
-					"sdk",
-					"session",
-					"raw",
-					"control",
-					input.sessionId,
-					"--op",
+		const selection = input.selection;
+		if (typeof selection !== "string") {
+			return await this.#overRelay(input, "model.profile.set", async (sdk) => {
+				const activation = parseEnvelope<boolean | { changed?: unknown; id?: unknown }>(
+					await sdk("control", "model.profile.set", { id: selection.preset }),
 					"model.profile.set",
-					"--json-input",
-					JSON.stringify({ id: input.selection.preset }),
-				]),
-				"model.profile.set",
-			);
-			const changed = typeof activation === "boolean" ? activation : activation.changed;
-			if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
-			return { changed };
+				);
+				const changed = typeof activation === "boolean" ? activation : activation?.changed;
+				if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
+				return { changed };
+			});
 		}
-		const result = parseEnvelope<{ changed?: unknown }>(
-			await this.#cli([
-				"sdk",
-				"session",
-				"raw",
-				"control",
-				input.sessionId,
-				"--op",
+		return await this.#overRelay(input, "model.set", async (sdk) => {
+			const result = parseEnvelope<{ changed?: unknown } | undefined>(
+				await sdk("control", "model.set", { id: selection }),
 				"model.set",
-				"--json-input",
-				JSON.stringify({ id: input.selection }),
-			]),
-			"model.set",
-		);
-		if (typeof result.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
-		return { changed: result.changed };
+			);
+			if (typeof result?.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
+			return { changed: result.changed };
+		});
 	}
 
 	async setServiceTier(input: {
 		sessionId: string;
 		repo: string;
 		tier: GjcServiceTier;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }> {
 		this.#assertOwned(input);
-		const result = parseEnvelope<{ changed?: unknown }>(
-			await this.#cli([
-				"sdk",
-				"session",
-				"raw",
-				"control",
-				input.sessionId,
-				"--op",
+		return await this.#overRelay(input, "service_tier.set", async (sdk) => {
+			const result = parseEnvelope<{ changed?: unknown } | undefined>(
+				await sdk("control", "service_tier.set", { tier: input.tier }),
 				"service_tier.set",
-				"--json-input",
-				JSON.stringify({ tier: input.tier }),
-			]),
-			"service_tier.set",
-		);
-		if (typeof result.changed !== "boolean") throw new Error("service_tier.set succeeded without a changed receipt");
-		return { changed: result.changed };
+			);
+			if (typeof result?.changed !== "boolean") throw new Error("service_tier.set succeeded without a changed receipt");
+			return { changed: result.changed };
+		});
 	}
 
-	async status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<StatusReport> {
+	async status(input: {
+		sessionId: string;
+		repo: string;
+		opRef: string;
+		relay?: TailHandle;
+		priority?: "interactive" | "background";
+	}): Promise<StatusReport> {
 		this.#assertOwned(input);
 		// With a live relay the read is one round-trip on the owned connection;
 		// without one (retired holds, work lanes, terminal recovery) the CLI's
 		// `session status` performs the identical `turn.result` query.
-		if (!input.relay) return await fetchOpState(this.#controller(input.repo), input.sessionId, input.opRef);
+		if (!input.relay)
+			return await fetchOpState(this.#controller(input.repo, input.priority), input.sessionId, input.opRef);
 		this.#database.assertBrokerAuthority(this.#authority);
 		const response = await input.relay.query("turn.result", { kind: "prompt", clientRef: input.opRef });
 		this.#database.assertBrokerAuthority(this.#authority);
 		if (!response.ok) throw relayFailure("turn.result", response);
-		const status = response.result ?? {};
+		const status = recordOf(response.result) ?? {};
 		const raw = typeof status.status === "string" ? status.status : "unknown";
 		return parseStatusReport({
 			exitCode: 0,
@@ -843,19 +874,11 @@ export class BrokerSessionPort implements SessionPort {
 		const read = async (): Promise<WorkerOutputResult> => {
 			if (workerOutputCancelled(input)) return { status: "unavailable", code: "cancelled" };
 			try {
-				const raw = await this.#cli(
-					[
-						"sdk",
-						"session",
-						"raw",
-						"query",
-						input.sessionId,
-						"--query",
-						"turn.result",
-						"--json-input",
-						JSON.stringify({ kind: "prompt", clientRef: input.opRef }),
-					],
-					{ timeoutMs: 15_000 },
+				const raw = await this.#overRelay(
+					input,
+					"turn.result",
+					async (sdk) =>
+						await sdk("query", "turn.result", { kind: "prompt", clientRef: input.opRef }, { timeoutMs: 15_000 }),
 				);
 				return parseWorkerOutputResponse(input, raw, this.#now());
 			} catch (error) {
@@ -882,14 +905,24 @@ export class BrokerSessionPort implements SessionPort {
 		}
 	}
 
-	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {
+	async queueEmpty(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean> {
 		this.#assertOwned(input);
-		const result = await this.#cli(
-			["sdk", "session", "raw", "query", input.sessionId, "--query", "queue.messages.list", "--json-input", "{}"],
-			{ timeoutMs: 10_000 },
+		const result = await this.#overRelay(
+			input,
+			"queue.messages.list",
+			async (sdk) => await sdk("query", "queue.messages.list", {}, { timeoutMs: 10_000 }),
 		);
 		const page = (JSON.parse(result.stdout) as { ok?: unknown; page?: { items?: unknown[]; complete?: unknown } }).page;
 		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
+	}
+
+	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
+		this.#assertOwned(input);
+		const result = await this.#cli(
+			["sdk", "session", "raw", "query", input.sessionId, "--query", "runtime.jobs.list", "--json-input", "{}"],
+			{ timeoutMs: 10_000 },
+		);
+		return parseRunningJobs(result.stdout);
 	}
 
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
@@ -922,29 +955,23 @@ export class BrokerSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		notBeforeMs: number;
+		relay?: TailHandle;
 	}): Promise<LastAssistantResult | undefined> {
 		this.#assertOwned(input);
+		return await this.#overRelay(input, "transcript.list", async (sdk) => await this.#assistantSince(input, sdk));
+	}
+
+	async #assistantSince(input: { notBeforeMs: number }, sdk: SdkTransport): Promise<LastAssistantResult | undefined> {
 		let cursor: string | undefined;
 		let latest: { role?: string; ts?: string; textSummary?: string; body?: string } | undefined;
 		const seenCursors = new Set<string>();
 		for (let pages = 1; pages <= 1_000; pages++) {
-			const result = await this.#cli(
-				[
-					"sdk",
-					"session",
-					"raw",
-					"query",
-					input.sessionId,
-					"--query",
-					"transcript.list",
-					"--json-input",
-					"{}",
-					...(cursor ? ["--cursor", cursor] : []),
-				],
-				{ timeoutMs: 15_000 },
-			);
+			const result = await sdk("query", "transcript.list", {}, { timeoutMs: 15_000, ...(cursor ? { cursor } : {}) });
+			const envelope = JSON.parse(result.stdout) as { ok?: unknown };
+			// A refusal is the host's answer: surface its code, not a missing page.
+			if (envelope.ok === false) parseEnvelope(result, "transcript.list");
 			const page = (
-				JSON.parse(result.stdout) as {
+				envelope as {
 					page?: {
 						items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string }>;
 						complete?: unknown;
@@ -977,34 +1004,13 @@ export class BrokerSessionPort implements SessionPort {
 		throw new TranscriptIncompleteError("transcript.list exceeded 1000 recovery pages", 1_000);
 	}
 
-	async fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult> {
+	async fetchLastAssistant(input: {
+		sessionId: string;
+		repo: string;
+		relay?: TailHandle;
+	}): Promise<LastAssistantResult> {
 		this.#assertOwned(input);
-		const maxPages = 50;
-		const chunks: string[] = [];
-		let cursor: string | undefined;
-		for (let pages = 1; pages <= maxPages; pages++) {
-			const page = parseLastAssistantPage(
-				await this.#cli([
-					"sdk",
-					"session",
-					"raw",
-					"query",
-					input.sessionId,
-					"--query",
-					"session.last_assistant",
-					...(cursor ? ["--cursor", cursor] : []),
-				]),
-			);
-			chunks.push(page.text);
-			if (page.complete) return { text: chunks.join(""), pages, complete: true };
-			if (!page.cursor)
-				throw new TranscriptIncompleteError(
-					`session.last_assistant page ${pages} is incomplete but returned no continuation cursor`,
-					pages,
-				);
-			cursor = page.cursor;
-		}
-		throw new TranscriptIncompleteError(`session.last_assistant did not complete within ${maxPages} pages`, maxPages);
+		return await this.#overRelay(input, "session.last_assistant", async (sdk) => await lastAssistant(sdk));
 	}
 
 	async attachTail(input: TailAttachInput): Promise<TailHandle> {
@@ -1096,7 +1102,7 @@ export class BrokerSessionPort implements SessionPort {
 				lastActivityAt = this.#now();
 			},
 			onStall: ({ elapsedMs }) =>
-				console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
+				console.warn(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
 		});
 		relay.beginTurn(input.opRef);
 		relay.setTurnRunning(true);
@@ -1153,7 +1159,7 @@ export class BrokerSessionPort implements SessionPort {
 			return {
 				receipt,
 				status,
-				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo }),
+				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }),
 			};
 		} finally {
 			relay.setTurnRunning(false);
@@ -1165,9 +1171,125 @@ export class BrokerSessionPort implements SessionPort {
 		this.#database.assertOwnedSession(input.sessionId, input.repo, this.#authority);
 	}
 
-	#controller(repo: string): ControllerOptions {
-		return { run: this.#cli, repo };
+	/**
+	 * Runs one session-scoped read or control on the caller's live relay, and on
+	 * the CLI only when the relay transport failed (closed, timed out) - the same
+	 * rule as `status()`. A relay refusal (`ok: false`) is the host's answer and
+	 * surfaces exactly as the CLI's envelope would; it is never retried there.
+	 * Without a relay the CLI is the transport: opening a relay (itself a
+	 * `serve --stdio` spawn) for one request would buy nothing. A paged read that
+	 * tears mid-way restarts on the CLI: relay cursors are grants of the relay
+	 * connection and do not carry over.
+	 */
+	async #overRelay<T>(
+		input: { readonly sessionId: string; readonly relay?: TailHandle },
+		operation: string,
+		work: (sdk: SdkTransport) => Promise<T>,
+	): Promise<T> {
+		const cli = this.#cliTransport(input.sessionId);
+		if (!input.relay) return await work(cli);
+		try {
+			return await work(this.#relayTransport(input.relay));
+		} catch (error) {
+			if (!isRelayTransportFailure(error)) throw error;
+			console.error(
+				`relay_request_unavailable session=${input.sessionId} op=${operation} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+			);
+			return await work(cli);
+		}
 	}
+
+	#cliTransport(sessionId: string): SdkTransport {
+		return async (kind, name, input, options) =>
+			await this.#cli(
+				[
+					"sdk",
+					"session",
+					"raw",
+					kind,
+					sessionId,
+					kind === "control" ? "--op" : "--query",
+					name,
+					...(input === undefined ? [] : ["--json-input", JSON.stringify(input)]),
+					...(options?.cursor ? ["--cursor", options.cursor] : []),
+				],
+				options?.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs },
+			);
+	}
+
+	/**
+	 * The relay answer printed in the CLI's shape (`{ ok, result | page | error }`, exit 0).
+	 * The CLI timeouts budget a process spawn plus broker attach; a request on an
+	 * open connection keeps the runner's own request timeout.
+	 */
+	#relayTransport(relay: TailHandle): SdkTransport {
+		return async (kind, name, input, options) => {
+			const requestOptions = options?.cursor ? { cursor: options.cursor } : {};
+			this.#database.assertBrokerAuthority(this.#authority);
+			const response =
+				kind === "control"
+					? await relay.control(name, input ?? {}, requestOptions)
+					: await relay.query(name, input ?? {}, requestOptions);
+			this.#database.assertBrokerAuthority(this.#authority);
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					...(kind === "query" ? { type: "query_response" } : {}),
+					ok: response.ok,
+					...(response.result === undefined ? {} : { result: response.result }),
+					...(response.page === undefined ? {} : { page: response.page }),
+					...(response.ok ? {} : { error: response.error ?? {} }),
+				}),
+				stderr: "",
+			};
+		};
+	}
+
+	#controller(repo: string, priority?: "interactive" | "background"): ControllerOptions {
+		const run: CliRunner = priority ? (args, opts) => this.#cli(args, { ...opts, priority }) : this.#cli;
+		return { run, repo };
+	}
+}
+
+/** `session.last_assistant`, paged by the host's continuation cursor until complete. */
+async function lastAssistant(sdk: SdkTransport): Promise<LastAssistantResult> {
+	const maxPages = 50;
+	const chunks: string[] = [];
+	let cursor: string | undefined;
+	for (let pages = 1; pages <= maxPages; pages++) {
+		const page = parseLastAssistantPage(
+			await sdk("query", "session.last_assistant", undefined, cursor ? { cursor } : undefined),
+		);
+		chunks.push(page.text);
+		if (page.complete) return { text: chunks.join(""), pages, complete: true };
+		if (!page.cursor)
+			throw new TranscriptIncompleteError(
+				`session.last_assistant page ${pages} is incomplete but returned no continuation cursor`,
+				pages,
+			);
+		cursor = page.cursor;
+	}
+	throw new TranscriptIncompleteError(`session.last_assistant did not complete within ${maxPages} pages`, maxPages);
+}
+
+/**
+ * `runtime.jobs.list` answers one page item `{running, recent, delivery}`. Only
+ * `running` matters to a caller about to end the host. Anything unparseable
+ * throws: an unreadable job list is not an empty one.
+ */
+export function parseRunningJobs(stdout: string): readonly RunningHostJob[] {
+	const envelope = JSON.parse(stdout) as { ok?: unknown; page?: { items?: unknown } };
+	const items = envelope.ok === true ? envelope.page?.items : undefined;
+	const running = Array.isArray(items) ? (recordOf(items[0])?.running as unknown) : undefined;
+	if (!Array.isArray(running)) throw new Error("runtime.jobs.list returned no running-job list");
+	return running.map((entry) => {
+		const job = recordOf(entry) ?? {};
+		return {
+			id: typeof job.id === "string" ? job.id : "unknown",
+			type: typeof job.type === "string" ? job.type : "unknown",
+			label: typeof job.label === "string" ? job.label : "",
+		};
+	});
 }
 
 /**
@@ -1196,17 +1318,17 @@ export function parseWorkerOutputResponse(
 		const code = workerRecord(envelope.error)?.code;
 		if (
 			typeof code === "string" &&
-			[
-				"session_unavailable",
-				"resource_gone",
-				"unavailable",
-				"unsupported_operation",
-				"unknown_operation",
-				"unknown_query",
-				"unsupported_query",
-				"not_supported",
-				"operation_not_session_owned",
-			].includes(code)
+			(isSessionGoneCode(code) ||
+				[
+					"resource_gone",
+					"unavailable",
+					"unsupported_operation",
+					"unknown_operation",
+					"unknown_query",
+					"unsupported_query",
+					"not_supported",
+					"operation_not_session_owned",
+				].includes(code))
 		)
 			return { status: "unavailable", code: "output_unavailable" };
 		return { status: "absent", code: "transport_error" };
@@ -1351,7 +1473,9 @@ function parseLastAssistantPage(result: CliResult): LastAssistantPage {
 	const items = (page as Record<string, unknown>).items;
 	if (!Array.isArray(items) || items.some((item) => typeof item !== "string"))
 		throw new Error("session.last_assistant query page contained non-text items");
-	const cursor = (page as Record<string, unknown>).cursor;
+	// gjc hosts grant `continuationCursor`; older CLI prints carried `cursor`.
+	const record = page as Record<string, unknown>;
+	const cursor = typeof record.continuationCursor === "string" ? record.continuationCursor : record.cursor;
 	return {
 		text: items.join(""),
 		complete: (page as Record<string, unknown>).complete === true,
@@ -1407,13 +1531,56 @@ function stableErrorCode(value: unknown): string | undefined {
 	return value;
 }
 
+/**
+ * The rebindable code of a session.create failure whose idempotency key can
+ * never succeed, or undefined when the same key must be retried.
+ *
+ * gjc <= 0.17 reported a condemned key by its internal code (`terminal_uncertain`,
+ * `spawn_failed`, ...). gjc 0.18's public error contract collapses every
+ * internal code to `operation_failed`; the only remaining evidence that the key
+ * itself is undecidable is `outcomeCertainty: "unknown"` with that exact key
+ * named as a reference. Measured on gaebal-gajae 2026-09-30: 32 creates left
+ * `terminal_uncertain` by a broker kill loop answered exactly that envelope,
+ * deterministically, on every replay, and six channels stayed mute for hours.
+ * A bare `operation_failed` without the key reference stays a same-key retry.
+ */
+function poisonedCreateKeyCode(error: unknown, idempotencyKey: string): string | undefined {
+	const code = sdkErrorCode(error);
+	if (isRebindableCode(code)) return code;
+	if (code !== "operation_failed" || !(error instanceof GjcCliError)) return undefined;
+	const details = recordOf(error.details);
+	if (details?.outcomeCertainty !== "unknown") return undefined;
+	const references = Array.isArray(details.references) ? details.references : [];
+	const namesKey = references.some((reference) => {
+		const ref = recordOf(reference);
+		return ref?.kind === "idempotencyKey" && ref.value === idempotencyKey;
+	});
+	return namesKey ? code : undefined;
+}
+
+const OUTCOME_CERTAINTIES = new Set(["applied", "not-applied", "unknown"]);
+
 function sanitizedDetails(details: unknown): unknown {
 	const code = stableErrorCode(envelopeErrorCode(details));
-	const message =
-		typeof details === "object" && details !== null && typeof (details as { message?: unknown }).message === "string"
-			? sanitizeDiagnostic((details as { message: string }).message)
+	const record = recordOf(details);
+	const message = typeof record?.message === "string" ? sanitizeDiagnostic(record.message) : undefined;
+	const outcomeCertainty =
+		typeof record?.outcomeCertainty === "string" && OUTCOME_CERTAINTIES.has(record.outcomeCertainty)
+			? record.outcomeCertainty
 			: undefined;
-	return { ...(code ? { code } : {}), ...(message ? { message } : {}) };
+	// Only idempotency-key references survive: the gateway minted them, and
+	// poisonedCreateKeyCode matches them exactly against the key it sent.
+	const references = (Array.isArray(record?.references) ? record.references : []).flatMap((reference) => {
+		const ref = recordOf(reference);
+		const value = stableErrorCode(ref?.value);
+		return ref?.kind === "idempotencyKey" && value ? [{ kind: "idempotencyKey", value }] : [];
+	});
+	return {
+		...(code ? { code } : {}),
+		...(message ? { message } : {}),
+		...(outcomeCertainty ? { outcomeCertainty } : {}),
+		...(references.length > 0 ? { references } : {}),
+	};
 }
 
 function sanitizeSdkFailure(error: unknown): Error {

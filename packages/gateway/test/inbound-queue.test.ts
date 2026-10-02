@@ -104,6 +104,39 @@ test("messages arriving while a turn is running become steers in arrival order",
 	expect(db.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
 });
 
+test("#247: completion keeps a delivery claim, and a claim replaces a no-delivery reason", async () => {
+	const db = await open();
+	for (const [id, opRef] of [
+		["m1", "gw-p-claimed"],
+		["m2", "gw-p-marked"],
+	] as const) {
+		db.inboundEnqueue(message(id, id));
+		db.inboundBindTurn({ messageId: id, originKey: ORIGIN_KEY, epoch: id === "m1" ? 0 : 1, opRef, sessionId: "s" });
+	}
+	expect(db.inboundTurnClaimTerminal("gw-p-claimed", 0, "gw-t-a")).toBe("gw-t-a");
+	expect(db.inboundTurnComplete("gw-p-claimed", "silent")).toBe(1);
+	expect(db.inboundTurnRow("gw-p-claimed")?.terminal_delivery_id).toBe('{"0":"gw-t-a"}');
+
+	db.inboundTurnMarkUnlinked("gw-p-marked", "silent");
+	db.inboundTurnMarkUnlinked("gw-p-marked", "turn_failed");
+	expect(db.inboundTurnRow("gw-p-marked")?.terminal_delivery_id).toBe('{"none":"silent"}');
+	expect(db.inboundTurnClaimTerminal("gw-p-marked", 0, "gw-t-b")).toBe("gw-t-b");
+	expect(db.inboundTurnRow("gw-p-marked")?.terminal_delivery_id).toBe('{"0":"gw-t-b"}');
+});
+
+test("the terminal link audit counts done triggers with a NULL link", async () => {
+	const db = await open();
+	db.inboundEnqueue(message("m1", "hello"));
+	db.inboundBindTurn({ messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef: "gw-p-a", sessionId: "s" });
+	expect(db.inboundTurnComplete("gw-p-a")).toBe(1);
+	const since = new Date(Date.now() - 60_000).toISOString();
+	expect(db.inboundTerminalLinkAudit(since)).toEqual({ done: 1, unlinked: 0 });
+	const raw = new (await import("bun:sqlite")).Database(join(home, "gateway.db"));
+	raw.query("UPDATE inbound_messages SET terminal_delivery_id = NULL").run();
+	raw.close();
+	expect(db.inboundTerminalLinkAudit(since)).toEqual({ done: 1, unlinked: 1 });
+});
+
 test("an old pending message remains eligible for a turn", async () => {
 	const db = await open();
 	const now = Date.now();
@@ -125,7 +158,12 @@ test("completed turns are never pending or nonterminal", async () => {
 	expect(db.inboundTurnAccept(opRef)).toBe(true);
 	expect(db.inboundTurnComplete(opRef)).toBe(1);
 
-	expect(db.inboundTurnRow(opRef)).toMatchObject({ state: "done", turn_role: "trigger", turn_state: "done" });
+	expect(db.inboundTurnRow(opRef)).toMatchObject({
+		state: "done",
+		turn_role: "trigger",
+		turn_state: "done",
+		terminal_delivery_id: '{"none":"no_delivery"}',
+	});
 	expect(db.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
 	expect(db.inboundNonterminalTurns(ORIGIN_KEY)).toEqual([]);
 	expect(db.inboundPendingCount(ORIGIN_KEY)).toBe(0);
@@ -204,6 +242,33 @@ test("discarding at /new touches only unbound pending rows and terminal completi
 	);
 	expect(db.inboundTurnComplete(opRef)).toBe(1);
 	expect(db.inboundTurnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
+});
+
+test("an abandoned held steer is closed as done input and its message leaves the unread window in the same write", async () => {
+	const db = await open();
+	const now = Date.now();
+	const opRef = "gw-p-abandoned";
+	db.inboundEnqueue({ ...message("trigger", "start"), receivedAt: timestamp(now, 0) });
+	db.inboundBindTurn({ messageId: "trigger", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" });
+	expect(db.inboundTurnAccept(opRef)).toBe(true);
+	db.inboundEnqueue({ ...message("held", "while you work"), receivedAt: timestamp(now, 1) });
+	db.contextRecord({ messageId: "held", originKey: ORIGIN_KEY, body: "while you work", receivedAt: timestamp(now, 1) });
+	expect(db.inboundSteerIssued({ messageId: "held", epoch: 0, opRef })).toBe(true);
+	expect(db.inboundTurnComplete(opRef)).toBe(1);
+	expect(db.inboundSteersHeld(opRef).map((row) => row.message_id)).toEqual(["held"]);
+	expect(db.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).toContain("held");
+
+	expect(db.inboundSteerAbandoned("held", opRef, "held")).toBe(true);
+	expect(db.inboundSteersHeld(opRef)).toEqual([]);
+	expect(db.inboundTurnRows(opRef).find((row) => row.message_id === "held")).toMatchObject({
+		state: "done",
+		turn_state: "done",
+	});
+	// Never presented to the next turn as unread, and never pending for re-dispatch.
+	expect(db.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).not.toContain("held");
+	expect(db.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+	// Idempotent: a second close is a no-op.
+	expect(db.inboundSteerAbandoned("held", opRef, "held")).toBe(false);
 });
 
 test("one nonterminal trigger per epoch permits steers and retired epochs", async () => {

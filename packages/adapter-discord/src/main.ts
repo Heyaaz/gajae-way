@@ -7,7 +7,6 @@ import {
 	type EngagementContext,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
-	type PresenceMarker,
 	type PresenceState,
 	presenceInitial,
 	presenceMarkersFor,
@@ -25,6 +24,7 @@ import {
 	type LoadedDiscordAdapterConfig,
 	type LoadedDiscordVoiceConfig,
 	loadDiscordAdapterConfig,
+	type StatusReactionsMode,
 } from "./config";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
@@ -173,6 +173,8 @@ export interface DiscordTypingChannelLike {
 
 export interface TypingPort {
 	begin(conversationId: string): void;
+	/** Re-sends the hint now for a running turn (a posted message clears it); no-op when none runs. */
+	refresh(conversationId: string): void;
 	end(conversationId: string): void;
 }
 
@@ -423,7 +425,7 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
  * because the typing hint is cosmetic and must never compete with delivery.
  */
 export class TypingIndicator implements TypingPort {
-	readonly #runs = new Map<string, { deadline: number; timer: ReturnType<typeof setTimeout> | undefined }>();
+	readonly #runs = new Map<string, TypingRun>();
 
 	constructor(
 		readonly discord: DiscordClientLike,
@@ -438,8 +440,22 @@ export class TypingIndicator implements TypingPort {
 			existing.deadline = Date.now() + this.maxMs;
 			return;
 		}
-		const run = { deadline: Date.now() + this.maxMs, timer: undefined };
+		const run: TypingRun = { deadline: Date.now() + this.maxMs, timer: undefined, pulsing: false, again: false };
 		this.#runs.set(conversationId, run);
+		void this.#pulse(conversationId, run);
+	}
+
+	refresh(conversationId: string): void {
+		const run = this.#runs.get(conversationId);
+		if (!run) return;
+		// A pulse already in flight may have landed before the message that
+		// cleared the hint; it re-pulses as soon as it settles.
+		if (run.pulsing) {
+			run.again = true;
+			return;
+		}
+		if (run.timer) clearTimeout(run.timer);
+		run.timer = undefined;
 		void this.#pulse(conversationId, run);
 	}
 
@@ -450,11 +466,10 @@ export class TypingIndicator implements TypingPort {
 		this.#runs.delete(conversationId);
 	}
 
-	async #pulse(
-		conversationId: string,
-		run: { deadline: number; timer: ReturnType<typeof setTimeout> | undefined },
-	): Promise<void> {
+	async #pulse(conversationId: string, run: TypingRun): Promise<void> {
 		if (this.#runs.get(conversationId) !== run) return;
+		run.pulsing = true;
+		run.again = false;
 		try {
 			const channel = await this.discord.channels.fetch(conversationId);
 			if (!isDiscordTypingChannel(channel)) {
@@ -468,15 +483,30 @@ export class TypingIndicator implements TypingPort {
 			);
 			this.#runs.delete(conversationId);
 			return;
+		} finally {
+			run.pulsing = false;
 		}
 		if (this.#runs.get(conversationId) !== run) return;
 		if (Date.now() >= run.deadline) {
 			this.#runs.delete(conversationId);
 			return;
 		}
+		if (run.again) {
+			void this.#pulse(conversationId, run);
+			return;
+		}
 		run.timer = setTimeout(() => void this.#pulse(conversationId, run), this.refreshMs);
 	}
 }
+
+type TypingRun = {
+	deadline: number;
+	timer: ReturnType<typeof setTimeout> | undefined;
+	/** A sendTyping round-trip is in flight. */
+	pulsing: boolean;
+	/** A refresh arrived mid-pulse; pulse again once it settles. */
+	again: boolean;
+};
 
 /** The slice of a fetched Discord message presence needs: react, and remove our own reaction. */
 export interface PresenceMessageLike {
@@ -528,6 +558,8 @@ export class WorkingStatus {
 	readonly #log: Pick<Console, "error">;
 	readonly #getBotUser: () => unknown;
 	readonly #now: () => number;
+	readonly #statusReactionsMode: StatusReactionsMode | undefined;
+	readonly #channels: Readonly<Record<string, ChannelEngagementPolicy>>;
 	readonly #entries = new Map<string, PresenceEntry>();
 	readonly #staleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -536,11 +568,23 @@ export class WorkingStatus {
 		log: Pick<Console, "error"> = console,
 		getBotUser: () => unknown = () => undefined,
 		now: () => number = Date.now,
+		statusReactionsMode: StatusReactionsMode | undefined = undefined,
+		channels: Readonly<Record<string, ChannelEngagementPolicy>> = {},
 	) {
 		this.#discord = discord;
 		this.#log = log;
 		this.#getBotUser = getBotUser;
 		this.#now = now;
+		this.#statusReactionsMode = statusReactionsMode ?? undefined;
+		this.#channels = channels;
+	}
+
+	#shouldShowReactions(conversationId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): boolean {
+		if (this.#statusReactionsMode === "off") return false;
+		if (this.#statusReactionsMode !== undefined) return true;
+		if (!engagement) return false;
+		if (this.#channels[conversationId]?.audience === "bot-only") return false;
+		return !engagement.group;
 	}
 
 	/**
@@ -548,12 +592,12 @@ export class WorkingStatus {
 	 * queued marker goes on immediately; it is the room's only sign the message
 	 * was seen until the first progress tick. Best-effort, never awaited.
 	 */
-	arm(conversationId: string, messageId: string): void {
+	arm(conversationId: string, messageId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): void {
 		const prior = this.#entries.get(conversationId);
 		if (prior && prior.messageId === messageId) {
 			// Same message re-armed (an accepted edit): the markers on it are still
 			// ours; restart the gradient from queued without losing ownership.
-			prior.wanted = true;
+			prior.wanted = this.#shouldShowReactions(conversationId, engagement);
 			prior.state = presenceInitial(this.#now());
 			this.#armStale(conversationId);
 			void this.#reconcile(prior);
@@ -565,7 +609,7 @@ export class WorkingStatus {
 			messageId,
 			state: presenceInitial(this.#now()),
 			shown: new Set(),
-			wanted: true,
+			wanted: this.#shouldShowReactions(conversationId, engagement),
 			reconciling: false,
 			pending: false,
 		};
@@ -588,7 +632,7 @@ export class WorkingStatus {
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "discord") return;
 		const entry = this.#entries.get(progress.origin.conversationId);
-		if (!entry || !entry.wanted) return;
+		if (!entry?.wanted) return;
 		this.#armStale(progress.origin.conversationId);
 		const swap = presenceTransition(entry.state, progress, this.#now());
 		if (!swap) return;
@@ -638,7 +682,15 @@ export class WorkingStatus {
 			const botId = typeof botUser?.id === "string" ? botUser.id : undefined;
 			for (let pass = 0; pass < RECONCILE_MAX_PASSES; pass++) {
 				entry.pending = false;
-				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode) : []);
+				const desired = new Set(
+					this.#statusReactionsMode === "static"
+						? entry.wanted
+							? ["⏳"] // Static mode: show only queued phase marker, never transition
+							: []
+						: entry.wanted
+							? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode)
+							: [],
+				);
 				const remove = [...entry.shown].filter((unicode) => !desired.has(unicode));
 				const add = [...desired].filter((unicode) => !entry.shown.has(unicode));
 				if (remove.length === 0 && add.length === 0) {
@@ -725,8 +777,7 @@ export async function settleDiscordDelivery(
 		try {
 			await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
 		} finally {
-			await status?.clear(message.origin.conversationId);
-			typing?.end(message.origin.conversationId);
+			await settleTurnPresence(message, typing, status);
 		}
 		return;
 	}
@@ -760,9 +811,28 @@ export async function settleDiscordDelivery(
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
 	} finally {
-		await status?.clear(message.origin.conversationId);
-		typing?.end(message.origin.conversationId);
+		await settleTurnPresence(message, typing, status);
 	}
+}
+
+/**
+ * Only the turn's final reply ends its working status. Mid-turn speech and
+ * reactions arrive with `final: false` while the persona is still streaming:
+ * tearing presence down on them left the room looking idle for the rest of the
+ * turn. Posting a message does clear Discord's typing hint, so it is re-sent
+ * at once instead of waiting for the next refresh tick.
+ */
+async function settleTurnPresence(
+	message: ChatMessagePayload,
+	typing: TypingPort | undefined,
+	status: WorkingStatus | undefined,
+): Promise<void> {
+	if (!message.final) {
+		if (!message.reaction) typing?.refresh(message.origin.conversationId);
+		return;
+	}
+	await status?.clear(message.origin.conversationId);
+	typing?.end(message.origin.conversationId);
 }
 
 interface ArchivableThreadLike {
@@ -951,7 +1021,14 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		partials: REQUIRED_PARTIALS,
 	});
 	const typing = new TypingIndicator(discord);
-	const status = new WorkingStatus(discord, console, () => discord.user);
+	const status = new WorkingStatus(
+		discord,
+		console,
+		() => discord.user,
+		Date.now,
+		config.statusReactions,
+		config.channels,
+	);
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? defaultGatewaySocket(),
 		discord,
@@ -1737,7 +1814,7 @@ export class ReconnectingGateway {
 					// was queued behind this one meanwhile.
 					if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					if (result?.engaged && addressedTurn(edit.engagement)) {
-						this.status?.arm(edit.origin.conversationId, edit.messageId);
+						this.status?.arm(edit.origin.conversationId, edit.messageId, edit.engagement);
 						this.typing?.begin(edit.origin.conversationId);
 					}
 				} catch (error) {
@@ -1833,7 +1910,7 @@ export class ReconnectingGateway {
 				// `mentioned` by the time engagement is built). A public channel the
 				// persona merely overhears shows nothing until the reply itself lands.
 				if (result?.engaged && addressedTurn(engagement)) {
-					this.status?.arm(origin.conversationId, messageId);
+					this.status?.arm(origin.conversationId, messageId, engagement);
 					this.typing?.begin(origin.conversationId);
 				}
 				return "acked";

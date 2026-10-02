@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import type { LogLevel } from "@gajae-gateway/log";
 import type { SessionRelayStream } from "./broker";
+import { isSessionGoneCode } from "./gjc-contract";
 import { sanitizeDiagnostic } from "./rebind";
 
 /**
@@ -41,6 +43,24 @@ export type TailEventKind =
  */
 const PROGRESS_EVENT_KINDS: ReadonlySet<string> = new Set(["message_update"]);
 
+/**
+ * gjc >= 0.17.5 relays every lifecycle frame twice: the top-level form
+ * (`{type:"agent_start", commandId, turnId}`) that this gateway decodes, and a
+ * ring-sequenced mirror (`{type:"event", kind:"agent_start", payload:{...},
+ * generation, seq}`) carrying the same fields inside `payload`. Decoding both
+ * would apply every start/end/activity twice, so the mirror is recognised and
+ * dropped. `bash_folded` is a host notice that a running foreground command was
+ * moved to the background (a steer interrupted it); the turn's own frames carry
+ * everything the gateway delivers.
+ */
+const MIRRORED_EVENT_KINDS: ReadonlySet<string> = new Set([
+	"agent_start",
+	"agent_end",
+	"agent_failed",
+	"activity",
+	"bash_folded",
+]);
+
 export interface TailFrame {
 	readonly kind: TailEventKind;
 	readonly rawKind: string;
@@ -76,16 +96,21 @@ export interface TailAttachInput {
 	onRelayLost?: (input: { sessionId: string; brokerGeneration: number }) => void | Promise<void>;
 	/** The relay could not be kept open (repeated immediate deaths); the handle is closed and will not reopen. */
 	onRelayDead?: (input: { sessionId: string; brokerGeneration: number }) => void | Promise<void>;
-	onDiagnostic?: (line: string) => void;
+	onDiagnostic?: (line: string, level?: LogLevel) => void;
 }
 
 export interface RelayRequestOptions {
 	readonly timeoutMs?: number;
+	/** Continuation cursor of a paged query, sent as the top-level `cursor` of `query_request` (as gjc's CLI does). */
+	readonly cursor?: string;
 }
 
 export type RelayResponse = {
 	readonly ok: boolean;
-	readonly result?: Record<string, unknown>;
+	/** The host's `result` as sent: controls answer records or bare values (`model.profile.set` answers a boolean). */
+	readonly result?: unknown;
+	/** Paged queries answer `page: { items, complete, continuationCursor | cursor }` instead of `result`. */
+	readonly page?: Record<string, unknown>;
 	readonly error?: { readonly code?: string; readonly message?: string };
 };
 
@@ -122,7 +147,7 @@ export interface TailRunnerOptions {
 	readonly requestTimeoutMs?: number;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
-	readonly log?: (line: string) => void;
+	readonly log?: (line: string, level?: LogLevel) => void;
 }
 
 const DEFAULT_MAX_TAIL_PROCESSES = 64;
@@ -160,7 +185,7 @@ export class RelayRefusedError extends Error {
 	constructor(sessionId: string, code: string, message: string | undefined) {
 		super(`relay for ${sessionId} refused: ${code}${message ? ` - ${message}` : ""}`);
 		this.name = "RelayRefusedError";
-		this.code = code === "endpoint_stale" || code === "not_found" ? "session_unavailable" : code;
+		this.code = isSessionGoneCode(code) ? "session_unavailable" : code;
 	}
 }
 
@@ -187,7 +212,7 @@ export class TailRunner {
 	readonly #requestTimeoutMs: number;
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
-	readonly #log: (line: string) => void;
+	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #handles = new Set<ManagedTailHandle>();
 	readonly #waiters: Array<() => void> = [];
 	#lastSaturationAlertAt: number | undefined;
@@ -201,7 +226,7 @@ export class TailRunner {
 		this.#requestTimeoutMs = positiveInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, "requestTimeoutMs");
 		this.#now = options.now ?? (() => Date.now());
 		this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
-		this.#log = options.log ?? ((line: string) => console.error(line));
+		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 	}
 
 	get activeCount(): number {
@@ -304,7 +329,7 @@ export class TailRunner {
 		const now = this.#now();
 		if (this.#lastSaturationAlertAt !== undefined && now - this.#lastSaturationAlertAt < 60_000) return;
 		this.#lastSaturationAlertAt = now;
-		this.#log(`tail_saturation active=${this.#handles.size} limit=${this.#maxTailProcesses}`);
+		this.#log(`tail_saturation active=${this.#handles.size} limit=${this.#maxTailProcesses}`, "warn");
 	}
 }
 
@@ -413,7 +438,12 @@ class ManagedTailHandle implements TailHandle {
 	}
 
 	query(name: string, input: Record<string, unknown>, options?: RelayRequestOptions): Promise<RelayResponse> {
-		return this.#request("query_request", "query_response", { query: name, input }, options);
+		return this.#request(
+			"query_request",
+			"query_response",
+			{ query: name, input, ...(options?.cursor ? { cursor: options.cursor } : {}) },
+			options,
+		);
 	}
 
 	async #request(
@@ -467,6 +497,7 @@ class ManagedTailHandle implements TailHandle {
 				}
 				this.#input.onDiagnostic?.(
 					`tail_stream_spawn_failed session=${this.sessionId} detail=${sanitizeDiagnostic(messageOf(error)) || "sdk_error"}`,
+					"error",
 				);
 				this.#reopenFailures += 1;
 				if (!(await this.#backoff())) return;
@@ -512,6 +543,7 @@ class ManagedTailHandle implements TailHandle {
 				}
 				this.#input.onDiagnostic?.(
 					`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(messageOf(error)) || "sdk_error"}`,
+					"error",
 				);
 			} finally {
 				this.#helloResolve = undefined;
@@ -526,7 +558,7 @@ class ManagedTailHandle implements TailHandle {
 			// host contract). The actor reconciles through status and the
 			// transcript; this handle only reopens so later commands have a channel.
 			if (this.#running) {
-				this.#input.onDiagnostic?.(`tail_relay_lost session=${this.sessionId} opRef=${this.#opRef ?? "-"}`);
+				this.#input.onDiagnostic?.(`tail_relay_lost session=${this.sessionId} opRef=${this.#opRef ?? "-"}`, "warn");
 				await this.#input.onRelayLost?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
 			}
 			const sinceOpen = this.#runner.now() - openedAt;
@@ -538,13 +570,13 @@ class ManagedTailHandle implements TailHandle {
 	/** Exponential backoff between reopen attempts; false once the relay is declared dead. */
 	async #backoff(): Promise<boolean> {
 		if (this.#reopenFailures >= STREAM_REOPEN_GIVE_UP) {
-			this.#input.onDiagnostic?.(`tail_stream_dead session=${this.sessionId} reopens=${this.#reopenFailures}`);
+			this.#input.onDiagnostic?.(`tail_stream_dead session=${this.sessionId} reopens=${this.#reopenFailures}`, "error");
 			await this.close();
 			await this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
 			return false;
 		}
 		const backoff = Math.min(30_000, REOPEN_BASE_BACKOFF_MS * 2 ** this.#reopenFailures);
-		this.#input.onDiagnostic?.(`tail_stream_reopen session=${this.sessionId} backoffMs=${backoff}`);
+		this.#input.onDiagnostic?.(`tail_stream_reopen session=${this.sessionId} backoffMs=${backoff}`, "warn");
 		await this.#runner.sleep(backoff);
 		return !this.#closed;
 	}
@@ -604,6 +636,7 @@ class ManagedTailHandle implements TailHandle {
 		if (frame.type === "transport_error") {
 			this.#input.onDiagnostic?.(
 				`tail_transport_error session=${this.sessionId} code=${sanitizeDiagnostic(String(frame.code ?? "unknown"))}`,
+				"error",
 			);
 			return;
 		}
@@ -613,7 +646,7 @@ class ManagedTailHandle implements TailHandle {
 	#accept(frame: TailFrame): void {
 		if (frame.kind === "unknown" && this.#unknownDiagnostics < UNKNOWN_KIND_DIAGNOSTIC_CAP) {
 			this.#unknownDiagnostics++;
-			this.#input.onDiagnostic?.(`unknown_runtime_event session=${this.sessionId} kind=${frame.rawKind}`);
+			this.#input.onDiagnostic?.(`unknown_runtime_event session=${this.sessionId} kind=${frame.rawKind}`, "warn");
 		}
 		if (frame.commandId === undefined && frame.turnId === undefined) {
 			// Uncorrelated: lifecycle noise (activity, identity_header, notifications
@@ -623,6 +656,7 @@ class ManagedTailHandle implements TailHandle {
 			if (this.#droppedForeign++ === 0)
 				this.#input.onDiagnostic?.(
 					`tail_frame_foreign session=${this.sessionId} kind=${frame.rawKind} commandId=${frame.commandId ?? "-"} turnId=${frame.turnId ?? "-"} expected=${this.#correlation.commandId ?? "-"}/${this.#correlation.turnId ?? "-"}`,
+					"warn",
 				);
 			return;
 		}
@@ -638,6 +672,7 @@ class ManagedTailHandle implements TailHandle {
 			.catch((error: unknown) => {
 				this.#input.onDiagnostic?.(
 					`tail_frame_delivery_failed session=${this.sessionId} detail=${sanitizeDiagnostic(messageOf(error)) || "sdk_error"}`,
+					"error",
 				);
 			});
 	}
@@ -690,7 +725,8 @@ function decodeResponse(frame: Record<string, unknown>): RelayResponse {
 	const error = recordOf(frame.error);
 	return {
 		ok: frame.ok === true,
-		...(recordOf(frame.result) ? { result: recordOf(frame.result) } : {}),
+		...(frame.result !== undefined ? { result: frame.result } : {}),
+		...(recordOf(frame.page) ? { page: recordOf(frame.page) } : {}),
 		...(error
 			? {
 					error: {
@@ -714,6 +750,7 @@ export function decodeStreamFrame(frame: Record<string, unknown>): readonly Tail
 		...(typeof frame.turnId === "string" ? { turnId: frame.turnId } : {}),
 	};
 	if (type === "event" && typeof frame.kind === "string") {
+		if (MIRRORED_EVENT_KINDS.has(frame.kind)) return [];
 		const wrapper = recordOf(frame.payload) ?? {};
 		const event = recordOf(wrapper.event) ?? wrapper;
 		return [decodeEvent(frame.kind, event, correlation)];

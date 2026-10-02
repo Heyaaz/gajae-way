@@ -52,7 +52,7 @@ export class MonitorRuntime {
 								{ at: slotAt.toISOString(), ...(catchUp ? { catchUp } : {}) },
 								slotAt,
 							) !== null,
-						{ now: this.#clock, since: this.#propagator.slotBoundary(monitor) },
+						{ now: this.#clock, since: this.#propagator.slotBoundary(monitor), timezone: monitor.trigger.timezone },
 					),
 				);
 			if (monitor.trigger.kind === "watcher") {
