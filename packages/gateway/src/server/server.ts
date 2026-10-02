@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { unlink } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	CAPABILITIES,
@@ -15,6 +15,7 @@ import {
 	isChatPlatform,
 	isPlatformMessageId,
 	isSilenceToken,
+	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	type MonitorEventRecord,
 	negotiate,
@@ -31,6 +32,7 @@ import {
 	reactionAllowlistDescription,
 	resolveReactionEmoji,
 	validateOriginRef,
+	type WorkRetireResult,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
@@ -56,6 +58,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
+import { BrokerSpawnerGuard } from "../orchestrator/broker-spawner-guard";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
 	type PersonaBindHoldInput,
@@ -85,6 +88,19 @@ import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
+import {
+	buildHandoffDigest,
+	extendHandoffChain,
+	type HandoffProvenance,
+	type HandoffReply,
+	handoffMessageId,
+	parseHandoffReply,
+	readHandoffProvenance,
+	renderHandoffFailure,
+	renderHandoffPointer,
+	renderHandoffTurn,
+	resolveHandoffTarget,
+} from "./handoff";
 import { applyModelCommand, listModelChoices } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -102,6 +118,32 @@ const RECENT_HISTORY_MAX = 300;
 const KEV_SHADOW_CONTEXT_TURNS = 16;
 const KEV_SHADOW_CONTEXT_WINDOW_MS = 6 * 60 * 60_000;
 const RESTART_EXIT_CODE = 75;
+const AGENTS_MD_MISSING_DIGEST = "missing";
+const UPDATED_AGENTS_MD_HEADING =
+	"## AGENTS.md (updated since this session started; supersedes the project-context copy loaded at session start)";
+
+interface AgentsMdSnapshot {
+	readonly digest: string;
+	readonly text?: string;
+}
+
+async function readWorkspaceAgentsMd(home: string): Promise<AgentsMdSnapshot> {
+	try {
+		const content = await readFile(join(home, "workspace", "AGENTS.md"));
+		return {
+			digest: createHash("sha256").update(content).digest("hex"),
+			text: content.toString("utf8"),
+		};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return { digest: AGENTS_MD_MISSING_DIGEST };
+	}
+}
+
+function updatedAgentsMdSection(snapshot: AgentsMdSnapshot): string {
+	return `${UPDATED_AGENTS_MD_HEADING}\n${snapshot.text ?? "[AGENTS.md was deleted from the workspace after this session started.]"}`;
+}
+
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -596,7 +638,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
 		void work
 			.recover()
-			.then(() => lanes.sweep())
+			.then(async () => {
+				await lanes.sweep();
+				// Also release dead/disowned lanes via reconciliation
+				await lanes.retireAllDead();
+			})
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	const deliverySweepTimer = setInterval(() => {
@@ -635,6 +681,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const brokerWithGeneration = options.broker as
 		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
 		| undefined;
+	const spawnerGuard =
+		brokerWithGeneration?.agentDir && brokerWithGeneration.executable
+			? new BrokerSpawnerGuard({ agentDir: brokerWithGeneration.agentDir, executable: brokerWithGeneration.executable })
+			: undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
 			? brokerWithGeneration.onGeneration((generation) => {
@@ -646,6 +696,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 						.catch((error: unknown) =>
 							console.error(`persona broker-generation reconciliation failed: ${diagnostic(error)}`),
 						);
+					// A new broker is the first observable sign of a gjc upgrade: re-check
+					// the runtime version and whether a pre-upgrade process is killing brokers.
+					if (typeof brokerWithGeneration.refreshVersion === "function")
+						void brokerWithGeneration
+							.refreshVersion()
+							.catch((error: unknown) => console.error(`gjc version refresh failed: ${diagnostic(error)}`));
+					void spawnerGuard
+						?.observe()
+						.catch((error: unknown) => console.error(`broker spawner guard failed: ${diagnostic(error)}`));
 				})
 			: undefined;
 	runtime = {
@@ -669,6 +728,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		cycle: new RuntimeCycleProjector(options.database, memory, {
 			maxLanes: lanes.maxLanes,
 			agentDir: options.broker?.agentDir,
+			gjcVersion: () => options.broker?.gjcVersion,
 		}),
 		lanes,
 		work,
@@ -977,7 +1037,42 @@ async function handleRequest(
 			return;
 		}
 		case "work.retire": {
-			const params = request.params as { name?: unknown } | undefined;
+			const params = request.params as { name?: unknown; force?: unknown; allDead?: unknown } | undefined;
+			const force = params?.force === true;
+			const allDead = params?.allDead === true;
+			if (force && allDead) throw new ProtocolError("invalid_params", "force and allDead are mutually exclusive");
+			if (allDead) {
+				// Retire all dead lanes
+				await runtime.work.recover();
+				const { count, names } = await runtime.lanes.retireAllDead();
+				// Return result with count and names of retired lanes
+				const result: Record<string, unknown> = {
+					retired: count > 0,
+					count,
+					names,
+					sessionKey: "work/*",
+					sessionId: "",
+					closed: true,
+				};
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result,
+				});
+				return;
+			}
+			if (force) {
+				if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
+					throw new ProtocolError(
+						"invalid_params",
+						"work.retire --force requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+					);
+				await runtime.work.recover();
+				const outcome = await runtime.lanes.forceRetire(params.name);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: outcome });
+				return;
+			}
 			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
 				throw new ProtocolError("invalid_params", "work.retire requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
 			await runtime.work.recover();
@@ -1049,8 +1144,9 @@ async function handleRequest(
 		case "memory.autolink": {
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
+			// Runs through shared lock to serialize with intent commits (#341).
 			const root = await initializeMemory(options.config.home);
-			const report = await autolinkCorpus(root);
+			const report = await autolinkCorpus(root, runtime.memory);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
 			return;
 		}
@@ -1754,8 +1850,12 @@ async function createInboundTurnLifecycle(
 	// One inbound message is one turn; it carries the live requester/voice context.
 	const row = input.trigger;
 	const laneReport = row.source === "lane_report";
+	// The requester context (turnId, connection, voice) outlives this lifecycle:
+	// a turn released before its prompt landed (attach/model/send refusal, or
+	// recovery requeueing an unaccepted turn) re-dispatches the same trigger under
+	// a new lifecycle, which must still answer the original request. It is
+	// dropped once the trigger settles (onSettled) or is discarded (onInboundDiscard).
 	const context = runtime.inbound.get(row.message_id);
-	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? [...runtime.connections][0];
 	const turnId = context?.turnId ?? crypto.randomUUID();
 	const voiceTurn = context?.voice === true;
@@ -1777,13 +1877,26 @@ async function createInboundTurnLifecycle(
 				replyTo?: { messageId?: string; authorName?: string; fromSelf?: boolean; excerpt?: string };
 				/** Set at intake by the speech gate (#260); absent means the reply is never judged. */
 				speechGated?: boolean;
+				/** Present when this row is a relayed handoff from another conversation (#72). */
+				handoff?: unknown;
 			})
 		: undefined;
+	const incomingHandoff = readHandoffProvenance(engagement?.handoff);
 	const speaker = composeSpeakerLabel(engagement);
 	const place =
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
 	const bootstrapState = options.database.getSessionBootstrap(key);
+	const bootstrapPending = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
+	const agentsMdSnapshot = await readWorkspaceAgentsMd(runtime.config.home);
+	const hasAgentsMdBaseline = bootstrapState?.agentsMdEpoch === input.epoch;
+	const legacyBootstrappedSession = !bootstrapPending && !hasAgentsMdBaseline;
+	const agentsMdChanged = hasAgentsMdBaseline
+		? bootstrapState.agentsMdDigest !== agentsMdSnapshot.digest
+		: legacyBootstrappedSession;
+	if (!hasAgentsMdBaseline || agentsMdChanged)
+		options.database.recordSessionAgentsBaseline(key, input.epoch, agentsMdSnapshot.digest);
+	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
 	let turnText = laneReport ? laneReportTriggerText(userText) : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
@@ -1811,7 +1924,7 @@ async function createInboundTurnLifecycle(
 		// A fresh session (new epoch) also gets the recent thread it is joining,
 		// not only the unread diff: without it the persona answers as if the
 		// conversation had just started.
-		const isFreshSession = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
+		const isFreshSession = bootstrapPending;
 		const recent = isFreshSession
 			? options.database.recentConversation(
 					key,
@@ -1837,18 +1950,18 @@ async function createInboundTurnLifecycle(
 		turnText = `${header}${laneReport ? laneReportTriggerText(userText) : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
 	}
 
-	const bootstrap =
-		!bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch
-			? await buildSessionBootstrap({
-					home: runtime.config.home,
-					origin,
-					epoch: input.epoch,
-					engagement,
-					config: runtime.config,
-				})
-			: undefined;
+	const bootstrap = bootstrapPending
+		? await buildSessionBootstrap({
+				home: runtime.config.home,
+				origin,
+				epoch: input.epoch,
+				engagement,
+				config: runtime.config,
+			})
+		: undefined;
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
+		...(agentsMdSection ? [agentsMdSection] : []),
 		currentConversationNotice(origin),
 		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
@@ -1897,8 +2010,85 @@ async function createInboundTurnLifecycle(
 		}
 		return verdict;
 	};
+	/**
+	 * Delivers one line into THIS conversation under the trigger's terminal slot,
+	 * so a replayed or reconciled answer can never post it twice.
+	 */
+	const deliverTerminalLine = (text: string) => {
+		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0);
+		if (options.database.inboundTurnClaimTerminal(input.turn.opRef, 0, deliveryId) !== deliveryId) return;
+		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, undefined, deliveryId);
+		if (!payload) return;
+		deliveredParts.push(text);
+		assistantDeliveryStarted = true;
+		broadcastDelivery(runtime, payload);
+	};
+	/**
+	 * A `[HANDOFF:<target>]` answer (#72): the target conversation's session gets
+	 * one durable, relayed inbound row and answers there; this conversation gets
+	 * a pointer. Anything that cannot be handed off is said here, and nothing runs.
+	 */
+	const handOff = async (handoff: HandoffReply) => {
+		const resolved = resolveHandoffTarget(handoff.target, runtime.config);
+		const hop = resolved.ok
+			? extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey)
+			: { ok: false as const, reason: resolved.reason };
+		if (!hop.ok || !resolved.ok) {
+			const reason = hop.ok ? "unresolvable target" : hop.reason;
+			console.error(`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${reason}`);
+			deliverTerminalLine(renderHandoffFailure(handoff.target, reason));
+			return;
+		}
+		const sourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
+		const provenance: HandoffProvenance = {
+			chain: hop.chain,
+			sourceOriginKey: key,
+			sourceMessageId,
+			...(incomingHandoff
+				? {
+						...(incomingHandoff.requesterId ? { requesterId: incomingHandoff.requesterId } : {}),
+						...(incomingHandoff.requesterName ? { requesterName: incomingHandoff.requesterName } : {}),
+					}
+				: {
+						...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
+						...(speaker ? { requesterName: speaker } : {}),
+					}),
+			at: row.received_at,
+		};
+		const digest = buildHandoffDigest(
+			options.database.recentConversation(
+				key,
+				origin.conversationId,
+				RECENT_HISTORY_MAX,
+				new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
+			),
+		);
+		// No author identity on the relayed row: nobody in the target conversation
+		// sent it, so it must not read (or authorise) as the requester speaking there.
+		const accepted = options.database.inboundEnqueue({
+			messageId: handoffMessageId(key, sourceMessageId, resolved.originKey),
+			originKey: resolved.originKey,
+			originRefJson: JSON.stringify(resolved.origin),
+			body: renderHandoffTurn({ provenance, sourcePlace: place, note: handoff.note, digest }),
+			engagementJson: JSON.stringify({ mentioned: false, group: resolved.origin.kind !== "dm", handoff: provenance }),
+		});
+		if (accepted) {
+			console.error(`gateway handoff enqueued origin=${key} target=${resolved.originKey} chain=${hop.chain.length}`);
+			// Not awaited: the target actor runs its own turn under its own serialization.
+			void runtime.personaSessions
+				.notifyInbound(resolved.originKey)
+				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
+		}
+		deliverTerminalLine(renderHandoffPointer(handoff.target));
+	};
 	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
+		const handoff = parseHandoffReply(rawMessage);
+		if (handoff) {
+			// The work itself never posts here; only the final answer hands off.
+			if (source === "terminal") await handOff(handoff);
+			return;
+		}
 		let message = rawMessage;
 		const reactionReply = parseReactionReply(message);
 		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
@@ -1946,7 +2136,7 @@ async function createInboundTurnLifecycle(
 		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
+			.filter((part) => part.length > 0 && !isSilentOutput(part))
 			.slice(0, 5);
 		// A persona that decided not to speak often says so instead of emitting
 		// the token (#260). On gated traffic, such a part is dropped like one.
@@ -2021,7 +2211,18 @@ async function createInboundTurnLifecycle(
 				);
 				if (owner !== deliveryId) continue;
 			}
-			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
+			// Mid-work speech is not the end of the turn: `final: false` keeps the
+			// adapter's working status (typing, presence, Slack status line) alive
+			// while the persona keeps streaming. Only the terminal reply - or the
+			// unconditional final progress tick - tears it down.
+			const payload = runtime.delivery.prepare(
+				crypto.randomUUID(),
+				origin,
+				step.body,
+				step.replyTo,
+				deliveryId,
+				source === "terminal",
+			);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
 			deliveredIds.push(payload.deliveryId as string);
@@ -2171,7 +2372,7 @@ async function createInboundTurnLifecycle(
 					`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
 				);
 			});
-			if (deliveredParts.length === 0 && isSilenceToken(text)) return;
+			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
 			if (!nonLoopback) {
 				if (connection)
 					connection.write({
@@ -2253,6 +2454,16 @@ async function createInboundTurnLifecycle(
 					broadcastDelivery(runtime, notice);
 				}
 			}
+			// A loopback requester waits for a final chat.message on its turnId; without
+			// this it waits out its whole turn timeout for a turn that already failed.
+			if (!nonLoopback && connection)
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "event",
+					event: "chat.message",
+					...(context ? { id: context.requestId } : {}),
+					payload: { turnId, origin, role: "assistant", text: failureNotice, final: true },
+				});
 			// The `[turn failed]` notice is a diagnostic, not an answer: it never
 			// claims the slot, but visible interim output before the failure does.
 			closeTerminalLink(nonLoopback ? "turn_failed" : "loopback");
@@ -2261,6 +2472,7 @@ async function createInboundTurnLifecycle(
 		}
 	};
 	const onSettled = ({ terminalDeliveryId }: PersonaTurnSettledInput) => {
+		if (runtime.inbound.get(row.message_id) === context) runtime.inbound.delete(row.message_id);
 		if (engagement?.authorIsBot !== true || terminalDeliveryId !== null) return;
 		// A delivered `[turn failed]` notice is a diagnostic, not an answer: it is
 		// deliberately emitted under a different delivery/turn identity, so it does
@@ -2274,6 +2486,7 @@ async function createInboundTurnLifecycle(
 		systemPreamble,
 		...(effectiveModel ? { effectiveModel } : {}),
 		...(runtime.config.serviceTier ? { effectiveServiceTier: runtime.config.serviceTier } : {}),
+		contextMessageIds: new Set(contextMessageIds),
 		renderSteer,
 		steerContextMessageId,
 		onSteerAccepted,
@@ -2536,6 +2749,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
+				]
+			: []),
+		...(isChatPlatform(origin.platform)
+			? [
+					"Handoffs: when the work belongs to another conversation, make the FIRST line of your final reply [HANDOFF:<target>] (a configured handoff alias or an origin such as discord:<channel id>) and write below it what that conversation's session needs to know and do. That session answers there; this conversation only gets a pointer. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",
 				]
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence

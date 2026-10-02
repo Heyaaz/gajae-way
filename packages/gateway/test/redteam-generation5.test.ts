@@ -449,7 +449,7 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 		enqueue(fixture, "first", "first request");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
 		const goneAttempts = fixture.logs
-			.filter((line) => line.startsWith("persona_send_session_gone"))
+			.filter((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))
 			.map((line) => /attempt=(\d+)/.exec(line)?.[1]);
 		expect(goneAttempts).toEqual(["1", "2", "3"]);
 		expect(
@@ -474,7 +474,7 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 		await eventually(() => port.sends.length === 2, "second request did not recover after one unavailable send");
 		expect(
 			fixture.logs
-				.filter((line) => line.startsWith("persona_send_session_gone"))
+				.filter((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))
 				.map((line) => /attempt=(\d+)/.exec(line)?.[1]),
 		).toEqual(["1", "2", "3", "1"]);
 		expect(
@@ -534,7 +534,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(24);
+		expect(upgraded.schemaVersion).toBe(25);
 		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
 			[
 				["ride-trigger", "trigger", "bound"],

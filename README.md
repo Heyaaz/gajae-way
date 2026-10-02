@@ -38,7 +38,7 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 - Send a DM that your `dmPolicy` accepts (`owner-only`, `allowlist`, or `open`) and talk normally. Your bot responds in that conversation's own ongoing context.
 - In a group, it stays out of the way until you mention it. You can explicitly open a configured channel for normal conversation.
 - Send `/new` when you want a fresh start in that conversation. It confirms that a fresh session has started.
-- When the gateway accepts a DM or an addressed group turn (a real mention or native reply), Discord and Slack both show a reaction-gradient presence — phase markers, an advancing clock, and an effort digit (tool calls, falling back to output tokens) reacted directly onto the message it is answering; Discord also shows the platform's native typing indicator, and Slack also drives Slack's native assistant status line (`<app> <status>`, via `assistant.threads.setStatus`) under the reply thread. Slack additionally promotes messages in an adapter-configured `open` channel to addressed; Discord does not treat `open`-channel messages as addressed without a real mention. The reaction-gradient markers themselves are never a posted or edited message. In a channel it merely overhears, nothing is shown until it actually replies.
+- When the gateway accepts a DM or an addressed group turn (a real mention or native reply), Discord and Slack both show a reaction-gradient presence — phase markers, an advancing clock, and an effort digit (tool calls, falling back to output tokens) reacted directly onto the message it is answering; Discord also shows the platform's native typing indicator, and Slack also drives Slack's native assistant status line (`<app> <status>`, via `assistant.threads.setStatus`) under the reply thread. Slack additionally promotes messages in an adapter-configured `open` channel to addressed; Discord does not treat `open`-channel messages as addressed without a real mention. The reaction-gradient markers themselves are never a posted or edited message. Presence stays up through mid-work messages while the turn keeps working and comes off only when the turn ends. In a channel it merely overhears, nothing is shown until it actually replies.
 - Replies are protected by a durable delivery record. After a crash, a send whose outcome was uncertain may be reissued; when it was, it is visibly labeled as a duplicate rather than silently pretending it was not.
 - Conversations and useful monitor output are captured under your own `$GAJAEWAY_HOME/memory` directory as readable Markdown, not hidden in a proprietary store.
 
@@ -54,7 +54,7 @@ The Bun workspace under `packages/` is divided by responsibility:
 | `@gajae-gateway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
 | `@gajae-gateway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the reaction-gradient presence. |
 | `@gajae-gateway/adapter-telegram` | Telegram ingress and outbound delivery. |
-| `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, reaction-gradient working presence, and missed-message recovery. |
+| `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, reaction-gradient working presence, opt-in live replies, and missed-message recovery. |
 
 `@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` are npm-publishable as standalone packages — see [Publishing packages](#publishing-packages) below for the release workflow. The gateway, adapters, admin console, and `@gajae-gateway/subsession` stay private application code and ship only as the compiled binaries below; `@gajae-gateway/conformance` is a private, unshipped CI/test-only package.
 
@@ -92,7 +92,7 @@ For how memory, monitors, and the gateway work end to end, see [the documentatio
 
 ## Make it yours
 
-Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. They are read for each turn and that workspace is also your persona's working directory. Keep the home directory private: it contains configuration, the gateway database, your workspace, and memory.
+Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. `SOUL.md` and `USER.md` are read for each turn. gjc discovers `AGENTS.md` when a session starts; a later edit or deletion supersedes that project-context copy on the next turn. The workspace is also your persona's working directory. Keep the home directory private: it contains configuration, the gateway database, your workspace, and memory.
 
 - [Deployment guide](docs/deployment.md) — configuration, credentials, and service-manager setup
 - [Memory guide](docs/memory.md) — readable memory and search
