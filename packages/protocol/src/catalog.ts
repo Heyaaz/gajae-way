@@ -408,6 +408,7 @@ export type TriggerSpec =
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
 
 export type BurstPolicyKind = "coalesce" | "dedupe" | "serialize" | "drop";
+export type MonitorOverlapPolicy = "queue" | "skip";
 export type MonitorModelSelection = string | { readonly preset: string };
 export type MonitorServiceTier =
 	| "none"
@@ -440,6 +441,14 @@ export interface MonitorSpec {
 	readonly eventTypes: readonly string[];
 	/** Burst policy; coalesce when unspecified (spec fact 12). */
 	readonly burstPolicy?: BurstPolicyKind;
+	/**
+	 * What a new fire does while an earlier event of the same monitor is still
+	 * awaiting authoring (admitted, batched, dispatched or failed-and-retrying).
+	 * `queue` (default) admits it behind the predecessor; `skip` records it as
+	 * the terminal stage `skipped` and never authors it, so a monitor slower
+	 * than its own cadence cannot stack stale reports (issue #83).
+	 */
+	readonly overlap?: MonitorOverlapPolicy;
 	/** Channel target for authored output: at most one (spec fact 7). */
 	readonly channelTarget?: MonitorChannelTarget | null;
 	/**
@@ -467,6 +476,7 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly monitorId: string;
 	readonly createdAt: string;
 	readonly burstPolicy: BurstPolicyKind;
+	readonly overlap: MonitorOverlapPolicy;
 	readonly enabled: boolean;
 }
 
@@ -494,6 +504,8 @@ export interface MonitorEventRecord {
 	readonly eventType: string;
 	readonly firedAt: string;
 	readonly stage: string;
+	/** For a `skipped` event: the in-flight predecessor that held the monitor's slot (issue #83). */
+	readonly skippedBy?: string;
 	/** Historical authority hold; stage remains the recorded historical stage. */
 	readonly quarantined?: boolean;
 	readonly reason?: string;

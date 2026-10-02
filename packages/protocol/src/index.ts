@@ -32,6 +32,7 @@ export {
 	type MemorySearchResult,
 	type MonitorChannelTarget,
 	type MonitorEventRecord,
+	type MonitorOverlapPolicy,
 	type MonitorProcedureVersion,
 	type MonitorRecord,
 	type MonitorScheduleProjection,

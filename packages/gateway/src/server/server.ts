@@ -1263,6 +1263,7 @@ async function handleRequest(
 					firedAt: row.fired_at,
 					stage: row.stage,
 					...(row.procedure_json ? { procedure: JSON.parse(row.procedure_json) } : {}),
+					...(row.skipped_by ? { skippedBy: row.skipped_by } : {}),
 					...(options.database.isBrokerQuarantined("monitor", row.event_id)
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
