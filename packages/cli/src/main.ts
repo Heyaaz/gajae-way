@@ -37,6 +37,7 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
 import { performUpgrade } from "./upgrade";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
@@ -61,10 +62,11 @@ export const COMMANDS = [
 	"work",
 	"services",
 	"migrate",
+	"update",
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -95,6 +97,8 @@ export interface MainOptions {
 		readonly launch?: Omit<LaunchRestartOptions, "home">;
 		readonly run?: Omit<RunRestartOptions, "home" | "id">;
 	};
+	/** Test seams for `update`; the real path hits GitHub and the service manager. */
+	readonly update?: UpdateDeps;
 }
 
 export type ServicesAction = "install" | "repair";
@@ -927,6 +931,16 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "migrate":
 				await migrate(parseMigrateArgs(parsed.rest));
 				break;
+			case "update": {
+				const update = parseUpdateArgs(parsed.rest);
+				const result = await runUpdate({
+					args: update,
+					home: gatewayHome(),
+					...(options.update === undefined ? {} : { deps: options.update }),
+				});
+				for (const line of renderUpdate(result)) console.log(line);
+				break;
+			}
 			default:
 				throw new Error(CLI_USAGE);
 		}
