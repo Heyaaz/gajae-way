@@ -390,19 +390,16 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 			legacy.exec(`DROP TABLE ${table}`);
 		}
 		legacy.exec(
-			"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source",
+			"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; ALTER TABLE deliveries DROP COLUMN last_error",
 		);
-		legacy.exec("DELETE FROM schema_migrations WHERE version = 25");
-		legacy.exec("DELETE FROM schema_migrations WHERE version = 24");
-		legacy.exec("DELETE FROM schema_migrations WHERE version = 23");
-		legacy.exec("DELETE FROM schema_migrations WHERE version = 22");
+		legacy.exec("DELETE FROM schema_migrations WHERE version >= 22");
 		legacy.close();
 		const report = await main(f.apply);
 		expect(report.mode).toBe("apply");
 		if (report.mode !== "apply") throw new Error("wrong mode");
 		expect(report.census.schema).toBe(21);
 		expect(report.backup.schema).toBe(21);
-		expect(report.targetSchema).toBe(25);
+		expect(report.targetSchema).toBe(26);
 		const backup = new Database(f.backup, { readonly: true });
 		try {
 			expect(backup.query("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 21 });
@@ -412,7 +409,7 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		}
 		const database = await GatewayDatabase.open(f.path);
 		try {
-			expect(database.schemaVersion).toBe(25);
+			expect(database.schemaVersion).toBe(26);
 			expect(database.inspectBrokerAuthority().authority).toEqual(report.targetAuthority);
 		} finally {
 			database.close();
