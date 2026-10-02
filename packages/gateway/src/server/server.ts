@@ -2039,8 +2039,8 @@ async function createInboundTurnLifecycle(
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
-	// Mid-work speech gate (issue #71): suppress procedural narration and rate-limit interim messages.
-	// maxPerTurn: 0 means no interim messages are delivered; maxPerTurn >= 1 is the cap.
+	// Mid-work speech gate (issue #71/#351): holds back pure procedural narration and
+	// near-repeats; count/pacing limits apply only when configured.
 	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	/**
 	 * Raw messages whose reaction tokens have already been claimed this turn. The
@@ -2350,11 +2350,8 @@ async function createInboundTurnLifecycle(
 			};
 			try {
 				const decision = interimSpeech.admit(frame.assistantText, Date.now());
-				if (!decision.deliver) {
-					console.error(`gateway mid-work speech suppressed (${turnId}, ${(decision as any).reason}).`);
-				} else {
-					await deliverAssistantText(frame.assistantText, "interim");
-				}
+				if (decision.deliver) await deliverAssistantText(frame.assistantText, "interim");
+				else console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
