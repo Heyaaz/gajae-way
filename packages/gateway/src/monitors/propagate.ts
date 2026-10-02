@@ -91,6 +91,14 @@ type DispatchFailureCode =
 	| "internal_error";
 
 /**
+ * Failures that say nothing about the dispatch path, so the #179 retry backoff
+ * does not apply: `session_busy` sent nothing (and the #263 roll moves the next
+ * attempt to a fresh session), `gateway_shutdown` was this process's own stop
+ * (#225: the next boot re-dispatches at once). Both still consume the budget.
+ */
+const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode>(["session_busy", "gateway_shutdown"]);
+
+/**
  * How long shutdown waits for in-flight authoring turns before marking them
  * interrupted. Together with the persona drain (5s) and connection settle (5s)
  * this keeps an ordered stop inside a 30s `TimeoutStopSec` (#225).
@@ -468,7 +476,7 @@ export class MonitorPropagator {
 	 * an event that keeps failing lands on `failed_no_retry` — operator-visible,
 	 * never an infinite dispatch loop. `failed` rows are reclaimed on the
 	 * MONITOR_EVENT_RETRY_BACKOFF_MS schedule, so the budget spans hours rather
-	 * than five consecutive sweeps (#179).
+	 * than five consecutive sweeps (#179); BACKOFF_EXEMPT_FAILURES retry at once.
 	 */
 	async reconcile(): Promise<void> {
 		if (this.#reconciling) {
@@ -537,7 +545,8 @@ export class MonitorPropagator {
 					}
 					if (
 						row.stage === "failed" &&
-						this.#now() - Date.parse(row.updated_at) < (MONITOR_EVENT_RETRY_BACKOFF_MS[row.dispatch_attempts] ?? 0)
+						this.#now() - Date.parse(row.updated_at) < (MONITOR_EVENT_RETRY_BACKOFF_MS[row.dispatch_attempts] ?? 0) &&
+						!BACKOFF_EXEMPT_FAILURES.has(this.#database.monitorFailure(row.event_id)?.code ?? "")
 					)
 						continue;
 					this.#database.monitorEventIncrementAttempts(row.event_id);
@@ -1146,7 +1155,7 @@ export class MonitorPropagator {
 			// jip-gajae `sns-threads`, 19/19 ticks in one day).
 			if (liveBinding && state.protocolFailures >= this.#protocolFailureRollThreshold) {
 				state.pendingRoll = "protocol_failures_off_contract";
-				console.error(
+				console.warn(
 					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=protocol_failures_off_contract protocol_failures=${state.protocolFailures}/${this.#protocolFailureRollThreshold} last_reason=${protocolReason} turns=${state.turns}`,
 				);
 			}
@@ -1154,7 +1163,7 @@ export class MonitorPropagator {
 		}
 		if (!liveBinding) {
 			state.staleContextFailures += 1;
-			console.error(
+			console.info(
 				`monitor context failure not counted for ${sessionOriginKey} (monitor ${monitor.monitorId}): replayed=${replayed} current_epoch=${currentEpoch}`,
 			);
 			return;
@@ -1171,7 +1180,7 @@ export class MonitorPropagator {
 		// Arm, do not roll here: the roll must happen at the dispatch boundary
 		// where no batch is in flight.
 		state.pendingRoll = reason;
-		console.error(
+		console.warn(
 			`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} context_failures=${state.contextFailures}/${this.#contextFailureRollThreshold} native_compaction=${status} turns=${state.turns}`,
 		);
 	}
@@ -1238,7 +1247,7 @@ export class MonitorPropagator {
 		state.protocolFailures = 0;
 		state.busyFailures = 0;
 		state.turns = 0;
-		console.error(
+		console.info(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
 		);
 		return digest;

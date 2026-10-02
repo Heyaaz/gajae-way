@@ -18,6 +18,8 @@ import {
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	type MonitorEventRecord,
+	type MonitorRecord,
+	type MonitorScheduleProjection,
 	negotiate,
 	type OriginRef,
 	originKey,
@@ -55,6 +57,7 @@ import { validateMemory } from "../memory/validator";
 import { MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
+import { nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
@@ -101,6 +104,7 @@ import {
 	renderHandoffTurn,
 	resolveHandoffTarget,
 } from "./handoff";
+import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -233,7 +237,8 @@ export interface GatewayServerOptions {
 	readonly stallCheckIntervalMs?: number;
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
 	readonly deliverySweepIntervalMs?: number;
-	/** Mid-work speech pacing (issue #71). */
+	/** Mid-work speech gating configuration (issue #71). */
+	readonly interimSpeech?: { readonly maxPerTurn?: number; readonly minGapMs?: number };
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -277,7 +282,7 @@ async function applyConfigReload(
 	}
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
-	console.error(
+	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
 	return result;
@@ -546,7 +551,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				return;
 			}
 			if (origin.platform === "loopback") {
-				console.error(notice);
+				console.warn(notice);
 				return;
 			}
 			const context = runtime.inbound.get(trigger.message_id);
@@ -646,9 +651,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	const deliverySweepTimer = setInterval(() => {
-		if (![...connections].some((connection) => connection.negotiated)) return;
 		try {
-			const sweep = delivery.sweep();
+			// The age TTL runs with or without an adapter: an unsettled row must reach
+			// a terminal state even while nothing is connected to retry it (#171).
+			const connected = [...connections].some((connection) => connection.negotiated);
+			const sweep = delivery.sweep(Date.now(), false, connected);
 			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
 			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
 		} catch (error) {
@@ -729,6 +736,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			maxLanes: lanes.maxLanes,
 			agentDir: options.broker?.agentDir,
 			gjcVersion: () => options.broker?.gjcVersion,
+			brokerRespawnChurn: () =>
+				typeof options.broker?.respawnChurn === "function" ? options.broker.respawnChurn() : false,
 		}),
 		lanes,
 		work,
@@ -811,6 +820,37 @@ async function handleFrame(
 		writeError(connection, error, frame.type === "request" ? frame.id : undefined);
 	}
 }
+
+function localCronFireTime(at: Date, timezone: string): string {
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone: timezone,
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+		hourCycle: "h23",
+	}).formatToParts(at);
+	const part = (type: Intl.DateTimeFormatPartTypes): string => {
+		const value = parts.find((entry) => entry.type === type)?.value;
+		if (!value) throw new Error(`missing ${type} in cron timestamp`);
+		return value;
+	};
+	return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+}
+
+function scheduleProjection(monitor: MonitorRecord, now: Date): MonitorScheduleProjection {
+	if (monitor.trigger.kind !== "cron") return { effectiveTimezone: null, nextFireAt: null };
+	const timezone = monitor.trigger.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+	if (!monitor.enabled) return { effectiveTimezone: timezone, nextFireAt: null };
+	const next = nextCronFire(monitor.trigger.schedule, now, timezone);
+	return {
+		effectiveTimezone: timezone,
+		nextFireAt: next ? { local: localCronFireTime(next, timezone), utc: next.toISOString() } : null,
+	};
+}
+
 async function handleRequest(
 	connection: Connection,
 	request: RequestFrame,
@@ -907,7 +947,7 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack (the
 			// adapter may be retrying a stale outcome).
-			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous);
+			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous, params.reason);
 			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);
@@ -1194,14 +1234,20 @@ async function handleRequest(
 			}
 			return;
 		}
-		case "monitor.list":
+		case "monitor.list": {
+			const now = new Date();
+			const monitors = runtime.registry.list();
+			const schedules = Object.fromEntries(
+				monitors.map((monitor) => [monitor.monitorId, scheduleProjection(monitor, now)] as const),
+			);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { monitors: runtime.registry.list() },
+				result: { monitors, schedules },
 			});
 			return;
+		}
 		case "monitor.inspect": {
 			const monitorId = (request.params as { monitorId?: unknown } | undefined)?.monitorId;
 			if (typeof monitorId !== "string") throw new ProtocolError("invalid_params", "unknown monitorId");
@@ -1221,7 +1267,12 @@ async function handleRequest(
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
 				}));
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { monitor, recentEvents } });
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { monitor, schedule: scheduleProjection(monitor, new Date()), recentEvents },
+			});
 			return;
 		}
 		case "monitor.test": {
@@ -1498,7 +1549,7 @@ async function sendChat(
 						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
 			}
 		}
-		console.error(`gateway restart requested by owner via ${key}`);
+		console.info(`gateway restart requested by owner via ${key}`);
 		// Let the ack leave the socket, then exit cleanly; the supervisor restarts us.
 		setTimeout(() => {
 			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
@@ -1585,7 +1636,7 @@ async function sendChat(
 		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
-			console.error(
+			console.warn(
 				`gateway bot audience admission declined origin=${key} message=${typeof params.messageId === "string" ? params.messageId : "unidentified"} reason=${botAudienceAdmission.reason} consecutive=${runtime.botAudienceTurns.consecutiveTurns(key)} window=${runtime.botAudienceTurns.windowedTurns(key)} declines=${runtime.botAudienceTurns.botAudienceDeclines()} rateLimited=${runtime.botAudienceTurns.botAudienceRateLimited()}`,
 			);
 	}
@@ -1811,7 +1862,7 @@ async function editChat(
 		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
-			console.error(
+			console.warn(
 				`gateway bot audience admission declined origin=${key} message=${params.messageId} reason=${botAudienceAdmission.reason} consecutive=${runtime.botAudienceTurns.consecutiveTurns(key)} window=${runtime.botAudienceTurns.windowedTurns(key)} declines=${runtime.botAudienceTurns.botAudienceDeclines()} rateLimited=${runtime.botAudienceTurns.botAudienceRateLimited()}`,
 			);
 	}
@@ -1991,6 +2042,9 @@ async function createInboundTurnLifecycle(
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
+	// Mid-work speech gate (issue #71/#351): holds back pure procedural narration and
+	// near-repeats; count/pacing limits apply only when configured.
+	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	/**
 	 * Raw messages whose reaction tokens have already been claimed this turn. The
 	 * terminal path re-runs over text the tail already shipped as interim (to
@@ -2100,7 +2154,7 @@ async function createInboundTurnLifecycle(
 			reactionTokensSeen = true;
 			for (const wanted of reactionReply.reactions) {
 				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
-					console.error(
+					console.warn(
 						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
 					);
 					continue;
@@ -2298,7 +2352,9 @@ async function createInboundTurnLifecycle(
 				outputTokens: lastKnown.outputTokens + Math.ceil(frame.assistantText.length / 4),
 			};
 			try {
-				await deliverAssistantText(frame.assistantText, "interim");
+				const decision = interimSpeech.admit(frame.assistantText, Date.now());
+				if (decision.deliver) await deliverAssistantText(frame.assistantText, "interim");
+				else console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}

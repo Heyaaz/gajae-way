@@ -25,6 +25,21 @@ A production host does not need a source checkout, `node_modules`, or Bun to run
 
 The gateway requires GJC 0.16.0 or newer. Its error-code handling is verified through the gjc minor named by `VERIFIED_GJC_THROUGH` (`packages/gateway/src/orchestrator/gjc-contract.ts`); a newer minor still runs but raises the `gjc_unverified_version` cycle gate until `GAJAEWAY_E2E_GJC=1 bun test packages/gateway/test/gjc-contract.e2e.test.ts` passes against it and the constant is raised. After upgrading gjc on a host, run that test there; the gateway ends a pre-upgrade `gjc` process that keeps killing the shared broker on its own (see the runbook). GJC 0.17.6 requires `--json` for machine-readable `sdk session` errors; the gateway adds it to those commands. The `sdk serve --stdio` relay arguments and environment binding are unchanged.
 
+## Upgrades
+
+`gajaeway update` upgrades a binary install in place from the project's GitHub releases — the same model `gjc update` uses — so a production host never needs the source checkout it was first installed from:
+
+```sh
+gajaeway update --check                 # report only; touches nothing
+gajaeway update                         # download, replace, and queue the stack restart
+gajaeway update --no-restart            # replace binaries; restart later with ops restart-stack
+gajaeway update --bin-dir /opt/gajaeway # when driving the update from elsewhere
+```
+
+The update resolves the latest `vX.Y.Z` release, downloads this platform's `gajaeway-<platform>-<arch>.tar.gz`, stages and size-checks the binaries, backs the previous ones up into `<bin-dir>/backup-<version>-<timestamp>/`, replaces them in place, records the installed release in `<bin-dir>/.gajaeway-release`, and queues the existing `ops restart-stack` supervisor (gateway first, then adapters). Only binaries the host already installed are replaced, plus the `gajaeway`/`gajaeway-gateway` core pair; a release never installs adapters the operator did not choose. One update runs at a time per bin dir (`.gajaeway-update.lock`; a lock naming a live pid refuses, a stale one is taken over), and `--force` reinstalls the current release.
+
+A source checkout keeps upgrading through `git` + `bun run build` + `services repair`; `update` refuses to guess a bin dir when run under `bun`, so pass `--bin-dir` in that case. `GAJAEWAY_UPDATE_REPO=owner/name` redirects update checks at a fork's releases; the default comes from the package's declared repository.
+
 ## Home and configuration
 
 `GAJAEWAY_HOME` selects the state directory; it defaults to `~/.gajaeway`. The gateway makes the home directory private (`0700`). A typical layout is:
@@ -73,7 +88,7 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
 
 ## Slack adapter
 
@@ -114,7 +129,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 The reload is fail-safe and reports exactly what it did:
 
 - `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]` replies). Verify the next event through the path consuming the changed policy.
-- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, and `work`. They are reported and deliberately NOT applied; restart to pick them up.
+- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `work`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 
@@ -186,7 +201,7 @@ Run the Discord, Telegram, and Slack binaries as separate managed services after
 
 A gateway restart does not kill an adapter. The adapter reconnects and keeps serving the previous generation: nothing dies, nothing is lost, `delivery.pending` stays 0, and the only symptom is replies arriving a beat late. The service definitions therefore bind the stack together instead of relying on an operator following a restart order.
 
-On systemd each adapter and the admin unit carry `BindsTo=`, `After=`, and `PartOf=gajaeway-gateway.service`, so `systemctl --user restart gajaeway-gateway` realigns the whole stack in one command, and `WantedBy=gajaeway-gateway.service` means enabling the gateway enables them. Only the gateway unit carries `KillMode=process`, because GJC daemon and session hosts share its cgroup.
+On systemd each adapter and the admin unit carry `BindsTo=`, `After=`, and `PartOf=gajaeway-gateway.service`, so `systemctl --user restart gajaeway-gateway` realigns the whole stack in one command, and `WantedBy=gajaeway-gateway.service` means enabling the gateway enables them. Only the gateway unit carries `KillMode=mixed` and `TimeoutStopSec=30s`; see below for why that cannot reach the shared GJC broker.
 
 launchd has no `BindsTo`/`PartOf` equivalent, and `WatchPaths` does not restart an already-running job. Use the single entry point instead, on either host:
 
@@ -211,17 +226,23 @@ The gateway daemon is always started and stopped by launchd or systemd; never st
 
 Restart with the host's service manager: on the systemd deployment reached on SSH port 24, use `systemctl --user restart gajaeway-gateway`; on macOS launchd, use `launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway`. These are alternatives, not consecutive steps. Give ordered shutdown at least 30 seconds with systemd `TimeoutStopSec` or launchd `ExitTimeOut`. Two gateways on one home can race over the database and delivery state even though neither owns the user broker.
 
-### systemd: preserve shared GJC hosts across gateway restarts
+### systemd: no gateway child outlives the unit
 
-Where the shared GJC daemon or SDK session hosts share the gateway's systemd cgroup, the gateway unit must use:
+The gateway unit must use:
 
 ```ini
 [Service]
-KillMode=process
+KillMode=mixed
 TimeoutStopSec=30s
 ```
 
-`TimeoutStopSec` must be at least 30 seconds; the installed unit pins it. On SIGTERM/SIGINT the gateway stops admitting work, waits up to 10 seconds for in-flight monitor authoring turns, marks any that are still running as `gateway_shutdown` (failure detail names the session and the stop time; lease released so the next boot's reconcile re-dispatches them at once), and exits by itself within 25 seconds, logging `gateway_shutdown_timeout` if teardown could not settle. A stop that reaches the service manager's SIGKILL is therefore a defect, not the expected path. `KillMode=process` limits service-manager termination to the gateway main process: SDK turns must outlive the gateway. `KillMode=control-group` and `KillMode=mixed` can kill the shared user daemon and session hosts during a restart, destroying in-flight turns even though session files remain durable. Do not restore cgroup-wide killing merely because an authority cutover completed; process-only termination remains required while those hosts share the gateway cgroup.
+`TimeoutStopSec` must be at least 30 seconds; the installed unit pins it. On SIGTERM/SIGINT the gateway stops admitting work, waits up to 10 seconds for in-flight monitor authoring turns, marks any that are still running as `gateway_shutdown` (failure detail names the session and the stop time; lease released so the next boot's reconcile re-dispatches them at once), and exits by itself within 25 seconds, logging `gateway_shutdown_timeout` if teardown could not settle. A stop that reaches the service manager's SIGKILL is therefore a defect, not the expected path.
+
+`KillMode=mixed` sends SIGTERM to the gateway main process for its ordered shutdown, then SIGKILLs everything still left in the unit's cgroup. Without it, every `gjc sdk serve` relay and `gjc sdk session` command the gateway spawned outlived each stop, and the next start re-adopted them (`Found left-over process ... in control group while starting unit. Ignoring.`). Those orphans held gigabytes of memory for days and kept writing into state owned by the new incarnation (#183, #227). `KillMode=process` is what caused this, and it is not supported.
+
+The shared GJC broker is not the gateway's child to kill. GJC autostarts it detached from whichever SDK command first finds it absent. When that command is the gateway's, the broker and every session host it forks would otherwise land in the gateway cgroup. The gateway therefore checks each broker generation it observes. If that broker runs inside the gateway's own unit, the gateway moves it and its descendants into a transient `gajaeway-gjc-broker-<pid>.scope` and logs `broker_scope_released`. A broker started anywhere else is never touched. SDK turns outlive gateway restarts because they run in the broker's scope, not because the unit spares its children.
+
+Upgrading a host that still has `KillMode=process` in the unit or in a drop-in: deploy this gateway first, and confirm `broker_scope_released` in its log (or `systemd-cgls --user-unit gajaeway-gateway.service` no longer listing `broker-internal`). Only then change the drop-in to `KillMode=mixed`, run `systemctl --user daemon-reload`, and restart. Changing the kill mode before the broker has been released stops the broker along with the gateway.
 
 Normal gateway stop/start closes its own SDK calls and relays and reconnects as a client. It never kills the shared user broker, reaps old hosts, deletes discovery files, copies settings, or runs global session GC. A readiness failure is not permission to repair or replace the user's daemon. If the shared broker is unavailable at boot (for example while it clears a stale lock after a host reboot), the gateway does not exit: it retries the preflight and readiness steps with exponential backoff (1s doubling to 30s) for up to 10 minutes, logging one `gateway_boot_waiting_for_broker step=… attempt=… retry_in_ms=…` line per retry, and exits 1 only after that deadline. A wrong gjc version or a rejected relay argv is still fatal immediately. For a database changing broker authority, complete the explicit cutover in the runbook before starting recovery; changing service environment alone does not migrate old work.
 

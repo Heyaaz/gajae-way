@@ -5,6 +5,7 @@ import { isAbsolute, join } from "node:path";
 import type {
 	MonitorEventRecord,
 	MonitorRecord,
+	MonitorScheduleProjection,
 	MonitorSpec,
 	OpsCycleResult,
 	WorkJobsResult,
@@ -21,11 +22,13 @@ import {
 	columnNames,
 	type ListOptions,
 	MONITOR_COLUMNS,
+	type MonitorListRow,
 	parseListOptions,
 	renderList,
 	SESSION_COLUMNS,
 	type SessionListRow,
 } from "./list";
+import { migrate, parseMigrateArgs } from "./migrate";
 import {
 	effectiveRestartState,
 	type LaunchRestartOptions,
@@ -36,6 +39,9 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+import { type RunSetupOptions, runSetup } from "./setup";
+import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
+import { performUpgrade } from "./upgrade";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -58,10 +64,13 @@ export const COMMANDS = [
 	"monitors",
 	"work",
 	"services",
+	"migrate",
+	"update",
+	"setup",
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -87,11 +96,15 @@ function gatewayHome(): string {
 
 export interface MainOptions {
 	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
+	/** Test seams for `setup`: the platform fetch and the prompter. */
+	readonly setup?: Pick<RunSetupOptions, "fetch" | "prompter" | "env">;
 	/** Test seams for `ops restart-stack`; the real path spawns the service manager. */
 	readonly restartStack?: {
 		readonly launch?: Omit<LaunchRestartOptions, "home">;
 		readonly run?: Omit<RunRestartOptions, "home" | "id">;
 	};
+	/** Test seams for `update`; the real path hits GitHub and the service manager. */
+	readonly update?: UpdateDeps;
 }
 
 export type ServicesAction = "install" | "repair";
@@ -589,7 +602,28 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				break;
 			}
 			case "ops": {
-				const [command, path] = parsed.rest;
+				const [command, path, ...extraArgs] = parsed.rest;
+				if (command === "upgrade") {
+					// gajaeway ops upgrade [--gjc X.Y.Z]
+					const home = gatewayHome();
+					let gjcVersion: string | undefined;
+					if (path === "--gjc" && extraArgs[0]) {
+						gjcVersion = extraArgs[0];
+					} else if (path && path !== "--gjc") {
+						throw new Error("usage: gajaeway ops upgrade [--gjc X.Y.Z]");
+					}
+					const result = await performUpgrade({ home, gjcVersion });
+					console.log(result.detail);
+					if (result.status !== "ok") {
+						process.exitCode = 1;
+						break;
+					}
+					// After upgrade, trigger restart-stack
+					const { receipt, supervisorPid } = await launchRestartStack({ home });
+					console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
+					console.log("read the outcome with: gajaeway ops restart-stack --status");
+					break;
+				}
 				if (command === "restore" && path) {
 					await restoreDatabase(parsed.socket, path);
 					break;
@@ -650,7 +684,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						process.exitCode = cycleExitCode(cycle);
 					} else
 						throw new Error(
-							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|restart-stack [--status]",
+							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|upgrade [--gjc X.Y.Z]|restart-stack [--status]",
 						);
 				} finally {
 					await client.close();
@@ -695,10 +729,18 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(JSON.stringify(await client.request<{ monitorId: string }>("monitor.update", update.params)));
 					else if (command === "list") {
 						const options = listOptions as ListOptions;
-						const result = await client.request<{ monitors: MonitorRecord[] }>("monitor.list");
-						for (const line of renderList(MONITOR_COLUMNS, result.monitors, options, {
+						const result = await client.request<{
+							monitors: MonitorRecord[];
+							schedules: Record<string, MonitorScheduleProjection>;
+						}>("monitor.list");
+						const rows: MonitorListRow[] = result.monitors.map((monitor) => ({
+							monitor,
+							schedule: result.schedules[monitor.monitorId] ?? null,
+						}));
+						for (const line of renderList(MONITOR_COLUMNS, rows, options, {
 							key: "monitors",
 							result,
+							serializeRow: (row) => row.monitor,
 						}))
 							console.log(line);
 					} else if (command === "inspect" && args[0])
@@ -898,6 +940,24 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				});
 				console.log(`services ${service.action}: wrote ${written.length} service definitions`);
 				for (const definition of written) console.log(definition);
+				break;
+			}
+			case "migrate":
+				await migrate(parseMigrateArgs(parsed.rest));
+				break;
+			case "update": {
+				const update = parseUpdateArgs(parsed.rest);
+				const result = await runUpdate({
+					args: update,
+					home: gatewayHome(),
+					...(options.update === undefined ? {} : { deps: options.update }),
+				});
+				for (const line of renderUpdate(result)) console.log(line);
+				break;
+			}
+			case "setup": {
+				// Socket-free: setup runs before any gateway exists.
+				await runSetup(parsed.rest, { home: gatewayHome(), ...options.setup });
 				break;
 			}
 			default:

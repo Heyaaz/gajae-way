@@ -575,7 +575,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 28;
+const LATEST_SCHEMA_VERSION = 27;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -2056,6 +2056,21 @@ export class GatewayDatabase {
 			.sort((a, b) => a.eventType.localeCompare(b.eventType));
 	}
 
+	/**
+	 * Cycle projection source: how many of the most recently settled monitor
+	 * events, newest first, ended `failed_no_retry` before the first success.
+	 * Dispatch outcome, not process liveness, is what a monitor outage looks like.
+	 */
+	monitorConsecutiveTerminalFailures(limit = 100): number {
+		const rows = this.#database
+			.query<{ stage: string }, [number]>(
+				`SELECT stage FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND ${REPLAYABLE_MONITOR} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
+			)
+			.all(limit);
+		const streak = rows.findIndex((row) => row.stage !== "failed_no_retry");
+		return streak < 0 ? rows.length : streak;
+	}
+
 	addRecall(originKey: string, originRefJson: string, text: string): void {
 		this.#database
 			.query("INSERT INTO recall_snippets (origin_key, origin_ref_json, text, at) VALUES (?, ?, ?, ?)")
@@ -3248,10 +3263,12 @@ export class GatewayDatabase {
 		);
 	}
 
-	deliveryUpdate(id: string, state: string, attempts?: number): void {
+	deliveryUpdate(id: string, state: string, attempts?: number, lastError?: string): void {
 		this.#database
-			.query("UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), updated_at = ? WHERE delivery_id = ?")
-			.run(state, attempts ?? null, new Date().toISOString(), id);
+			.query(
+				"UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), last_error = COALESCE(?, last_error), updated_at = ? WHERE delivery_id = ?",
+			)
+			.run(state, attempts ?? null, lastError ?? null, new Date().toISOString(), id);
 	}
 
 	deliveryExpireBefore(
@@ -3262,10 +3279,11 @@ export class GatewayDatabase {
 		origin_key: string;
 		attempts: number;
 		updated_at: string;
+		last_error: string | null;
 	}> {
 		const rows = this.#database
-			.query<{ delivery_id: string; origin_key: string; attempts: number }, [string]>(
-				"SELECT delivery_id, origin_key, attempts FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
+			.query<{ delivery_id: string; origin_key: string; attempts: number; last_error: string | null }, [string]>(
+				"SELECT delivery_id, origin_key, attempts, last_error FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
 			)
 			.all(before);
 		if (rows.length === 0) return [];
@@ -3310,10 +3328,11 @@ export class GatewayDatabase {
 		attempts: number;
 		created_at: string;
 		updated_at: string;
+		last_error: string | null;
 	}> {
 		return this.#database
 			.query(
-				"SELECT delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at FROM deliveries ORDER BY created_at",
+				"SELECT delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error FROM deliveries ORDER BY created_at",
 			)
 			.all() as Array<{
 			delivery_id: string;
@@ -3324,6 +3343,7 @@ export class GatewayDatabase {
 			attempts: number;
 			created_at: string;
 			updated_at: string;
+			last_error: string | null;
 		}>;
 	}
 
@@ -4583,21 +4603,18 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 		}
 		if (current < 26) {
 			this.withTransaction(() => {
-				// PR #293 owns schema 26; reserve it as an empty step on this standalone branch.
+				// Issue #171: the allowlisted classification of the latest failed attempt.
+				const columns = this.#database
+					.query<{ name: string }, []>("PRAGMA table_info(deliveries)")
+					.all()
+					.map((row) => row.name);
+				if (!columns.includes("last_error")) this.#database.exec("ALTER TABLE deliveries ADD COLUMN last_error TEXT");
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(26, new Date().toISOString());
 			});
 		}
 		if (current < 27) {
-			this.withTransaction(() => {
-				// PR #295 owns schema 27; reserve it as an empty step on this standalone branch.
-				this.#database
-					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-					.run(27, new Date().toISOString());
-			});
-		}
-		if (current < 28) {
 			this.withTransaction(() => {
 				// Issue #82: declared procedure files are re-read per firing and each
 				// authoring event records the procedure version it was given.
@@ -4614,7 +4631,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 					this.#database.exec("ALTER TABLE monitor_events ADD COLUMN procedure_json TEXT");
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-					.run(28, new Date().toISOString());
+					.run(27, new Date().toISOString());
 			});
 		}
 	}

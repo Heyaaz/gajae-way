@@ -10,6 +10,19 @@ import type { ReactionAction, ReactionRef } from "./reactions";
  * delivery settlement verbs, and redelivery labeling on chat.message.
  */
 
+/**
+ * Allowlisted classification of a failed delivery attempt. Adapter failure
+ * reasons are free text (platform bodies, credentials); only this code is kept.
+ */
+export type DeliveryErrorCode =
+	| "rate_limited"
+	| "timeout"
+	| "network"
+	| "not_found"
+	| "forbidden"
+	| "invalid_request"
+	| "other";
+
 export interface GatewayStatusResult {
 	readonly profileVersion: string;
 	readonly capabilities: readonly string[];
@@ -28,6 +41,17 @@ export interface GatewayStatusResult {
 			readonly originKey: string;
 			readonly attempts: number;
 			readonly expiredAt: string;
+			readonly lastError: DeliveryErrorCode | null;
+		}[];
+		/** The five oldest unsettled rows with their retry diagnostics (metadata only). */
+		readonly recentPending: readonly {
+			readonly deliveryId: string;
+			readonly originKey: string;
+			readonly state: "pending" | "inflight" | "failed_ambiguous";
+			readonly attempts: number;
+			readonly lastError: DeliveryErrorCode | null;
+			readonly nextRetryAt: string | null;
+			readonly createdAt: string;
 		}[];
 	};
 	/** Aggregate-only conversation diff health; never includes message bodies. */
@@ -378,7 +402,7 @@ export interface MemorySearchResult {
  * at creation, never inferred; unknown types route to the catch-all session.
  */
 export type TriggerSpec =
-	| { readonly kind: "cron"; readonly schedule: string }
+	| { readonly kind: "cron"; readonly schedule: string; readonly timezone?: string }
 	| { readonly kind: "webhook"; readonly route: string }
 	| { readonly kind: "watcher"; readonly root: string; readonly debounceMs?: number }
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
@@ -452,6 +476,10 @@ export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger"
 	readonly trigger?: TriggerSpec;
 	/** Change the schedule while retaining the monitor's existing cron trigger. */
 	readonly schedule?: string;
+}
+export interface MonitorScheduleProjection {
+	readonly effectiveTimezone: string | null;
+	readonly nextFireAt: { readonly local: string; readonly utc: string } | null;
 }
 
 export interface MonitorTestParams {
@@ -732,7 +760,9 @@ export type CycleGateReason =
 	| "lane_capacity_exhausted"
 	| "inbound_starved"
 	| "agent_disk_headroom"
-	| "gjc_unverified_version";
+	| "gjc_unverified_version"
+	| "monitor_dispatch_failing"
+	| "broker_respawn_churn";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -844,10 +874,20 @@ export interface VerbCatalogV01 {
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
-	"monitor.list": { params: undefined; result: { readonly monitors: readonly MonitorRecord[] } };
+	"monitor.list": {
+		params: undefined;
+		result: {
+			readonly monitors: readonly MonitorRecord[];
+			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
+		};
+	};
 	"monitor.inspect": {
 		params: { readonly monitorId: string };
-		result: { readonly monitor: MonitorRecord; readonly recentEvents: readonly MonitorEventRecord[] };
+		result: {
+			readonly monitor: MonitorRecord;
+			readonly schedule: MonitorScheduleProjection;
+			readonly recentEvents: readonly MonitorEventRecord[];
+		};
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };

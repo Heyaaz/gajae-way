@@ -7,7 +7,6 @@ import {
 	type EngagementContext,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
-	type PresenceMarker,
 	type PresenceState,
 	presenceInitial,
 	presenceMarkersFor,
@@ -25,6 +24,7 @@ import {
 	type LoadedDiscordAdapterConfig,
 	type LoadedDiscordVoiceConfig,
 	loadDiscordAdapterConfig,
+	type StatusReactionsMode,
 } from "./config";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
@@ -558,6 +558,8 @@ export class WorkingStatus {
 	readonly #log: Pick<Console, "error">;
 	readonly #getBotUser: () => unknown;
 	readonly #now: () => number;
+	readonly #statusReactionsMode: StatusReactionsMode | undefined;
+	readonly #channels: Readonly<Record<string, ChannelEngagementPolicy>>;
 	readonly #entries = new Map<string, PresenceEntry>();
 	readonly #staleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -566,11 +568,23 @@ export class WorkingStatus {
 		log: Pick<Console, "error"> = console,
 		getBotUser: () => unknown = () => undefined,
 		now: () => number = Date.now,
+		statusReactionsMode: StatusReactionsMode | undefined = undefined,
+		channels: Readonly<Record<string, ChannelEngagementPolicy>> = {},
 	) {
 		this.#discord = discord;
 		this.#log = log;
 		this.#getBotUser = getBotUser;
 		this.#now = now;
+		this.#statusReactionsMode = statusReactionsMode ?? undefined;
+		this.#channels = channels;
+	}
+
+	#shouldShowReactions(conversationId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): boolean {
+		if (this.#statusReactionsMode === "off") return false;
+		if (this.#statusReactionsMode !== undefined) return true;
+		if (!engagement) return false;
+		if (this.#channels[conversationId]?.audience === "bot-only") return false;
+		return !engagement.group;
 	}
 
 	/**
@@ -578,12 +592,12 @@ export class WorkingStatus {
 	 * queued marker goes on immediately; it is the room's only sign the message
 	 * was seen until the first progress tick. Best-effort, never awaited.
 	 */
-	arm(conversationId: string, messageId: string): void {
+	arm(conversationId: string, messageId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): void {
 		const prior = this.#entries.get(conversationId);
 		if (prior && prior.messageId === messageId) {
 			// Same message re-armed (an accepted edit): the markers on it are still
 			// ours; restart the gradient from queued without losing ownership.
-			prior.wanted = true;
+			prior.wanted = this.#shouldShowReactions(conversationId, engagement);
 			prior.state = presenceInitial(this.#now());
 			this.#armStale(conversationId);
 			void this.#reconcile(prior);
@@ -595,7 +609,7 @@ export class WorkingStatus {
 			messageId,
 			state: presenceInitial(this.#now()),
 			shown: new Set(),
-			wanted: true,
+			wanted: this.#shouldShowReactions(conversationId, engagement),
 			reconciling: false,
 			pending: false,
 		};
@@ -618,7 +632,7 @@ export class WorkingStatus {
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "discord") return;
 		const entry = this.#entries.get(progress.origin.conversationId);
-		if (!entry || !entry.wanted) return;
+		if (!entry?.wanted) return;
 		this.#armStale(progress.origin.conversationId);
 		const swap = presenceTransition(entry.state, progress, this.#now());
 		if (!swap) return;
@@ -668,7 +682,15 @@ export class WorkingStatus {
 			const botId = typeof botUser?.id === "string" ? botUser.id : undefined;
 			for (let pass = 0; pass < RECONCILE_MAX_PASSES; pass++) {
 				entry.pending = false;
-				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode) : []);
+				const desired = new Set(
+					this.#statusReactionsMode === "static"
+						? entry.wanted
+							? ["⏳"] // Static mode: show only queued phase marker, never transition
+							: []
+						: entry.wanted
+							? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode)
+							: [],
+				);
 				const remove = [...entry.shown].filter((unicode) => !desired.has(unicode));
 				const add = [...desired].filter((unicode) => !entry.shown.has(unicode));
 				if (remove.length === 0 && add.length === 0) {
@@ -999,7 +1021,14 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		partials: REQUIRED_PARTIALS,
 	});
 	const typing = new TypingIndicator(discord);
-	const status = new WorkingStatus(discord, console, () => discord.user);
+	const status = new WorkingStatus(
+		discord,
+		console,
+		() => discord.user,
+		Date.now,
+		config.statusReactions,
+		config.channels,
+	);
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? defaultGatewaySocket(),
 		discord,
@@ -1785,7 +1814,7 @@ export class ReconnectingGateway {
 					// was queued behind this one meanwhile.
 					if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					if (result?.engaged && addressedTurn(edit.engagement)) {
-						this.status?.arm(edit.origin.conversationId, edit.messageId);
+						this.status?.arm(edit.origin.conversationId, edit.messageId, edit.engagement);
 						this.typing?.begin(edit.origin.conversationId);
 					}
 				} catch (error) {
@@ -1881,7 +1910,7 @@ export class ReconnectingGateway {
 				// `mentioned` by the time engagement is built). A public channel the
 				// persona merely overhears shows nothing until the reply itself lands.
 				if (result?.engaged && addressedTurn(engagement)) {
-					this.status?.arm(origin.conversationId, messageId);
+					this.status?.arm(origin.conversationId, messageId, engagement);
 					this.typing?.begin(origin.conversationId);
 				}
 				return "acked";
