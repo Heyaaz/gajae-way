@@ -8,6 +8,7 @@ import {
 	monitorSessionOrigin,
 	type OriginRef,
 	originKey,
+	type ProtocolFailureReason,
 } from "@gajae-gateway/protocol";
 import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
@@ -38,7 +39,6 @@ import {
 	MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD,
 	type MonitorDigestNote,
 	type NativeCompactionStatus,
-	type ProtocolFailureReason,
 	type SessionRollReason,
 	unavailableCompactionPort,
 } from "./compaction";
@@ -733,6 +733,9 @@ export class MonitorPropagator {
 			// old, and the failure may well have been produced against a session that
 			// no longer exists.
 			const replayedBatch = claimed.some((row) => row.dispatch_attempts > 0);
+			let protocolResponseByteLength: number | undefined;
+			let protocolResponseEntryCount: number | null = null;
+			let protocolValidationActive = false;
 			try {
 				// Safety-net roll boundary (issue #68). It sits HERE, after the
 				// per-origin turn chain has been acquired and before this batch's
@@ -827,6 +830,7 @@ export class MonitorPropagator {
 						opRef,
 					})
 				).assistant.text;
+				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
 				// The turn settled: a later retry must author afresh, never re-read it.
 				this.#database.withTransaction(() => {
 					for (const row of claimed) this.#database.metaDelete(authoringTurnKey(row.event_id));
@@ -856,8 +860,10 @@ export class MonitorPropagator {
 					this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
 				);
 				if (!fenced.length) return;
+				protocolValidationActive = true;
 				for (const row of fenced) this.#emitStage(row, "dispatched");
 				const authored = parseAuthoredArray(response) as Array<{ eventId?: unknown; note?: unknown }>;
+				protocolResponseEntryCount = authored.length;
 				if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
 				// Strict response contract: exactly one valid entry per claimed event —
 				// a partial/missing/duplicate/extra response is a structured failure.
@@ -880,6 +886,7 @@ export class MonitorPropagator {
 				for (const id of claimedIds) {
 					if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
 				}
+				protocolValidationActive = false;
 				for (const entry of authored)
 					if (
 						typeof entry.eventId === "string" &&
@@ -987,6 +994,16 @@ export class MonitorPropagator {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
 				const failureClass = classifyAuthoringFailure(error);
+				const protocolFailure =
+					protocolValidationActive && failureClass === "protocol" && protocolResponseByteLength !== undefined
+						? {
+								protocolFailure: {
+									reason: classifyProtocolFailure(error),
+									responseByteLength: protocolResponseByteLength,
+									responseEntryCount: protocolResponseEntryCount,
+								},
+							}
+						: undefined;
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
 				for (const row of leased) {
 					const failed = this.#database.monitorEventFencedFail(
@@ -997,6 +1014,8 @@ export class MonitorPropagator {
 						// #64: the detail must carry the actual cause (sanitized), not echo the code.
 						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, operation: dispatchOperation, operation_args: dispatchOperationArgs, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 						now(),
+						false,
+						protocolFailure,
 					);
 					if (failed) this.#emitStage(row, "failed");
 				}
@@ -1407,19 +1426,19 @@ export function parseAuthoredArray(response: string): unknown {
 		}
 	}
 	attempts.push(...spans.reverse());
-	let lastError: unknown;
+	let parsedNonArray = false;
 	for (const candidate of attempts) {
 		if (!candidate) continue;
 		try {
 			const parsed = JSON.parse(candidate) as unknown;
 			if (Array.isArray(parsed)) return parsed;
-		} catch (error) {
-			lastError = error;
+			parsedNonArray = true;
+		} catch {
+			// Raw parser errors can echo attacker-controlled response text.
 		}
 	}
-	throw new Error(
-		`authoring response is not a JSON array (${lastError instanceof Error ? lastError.message : "no array found"})`,
-	);
+	if (parsedNonArray) throw new Error("authoring response is not a JSON array");
+	throw new Error("authoring response JSON is unparseable");
 }
 
 /** Durable pointer from an event to the authoring turn its last dispatch started (#187). */

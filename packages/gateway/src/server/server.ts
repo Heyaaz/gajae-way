@@ -1256,18 +1256,22 @@ async function handleRequest(
 			const recentEvents = options.database
 				.monitorEventRows(monitorId, "newest", true)
 				.slice(0, 100)
-				.map((row) => ({
-					eventId: row.event_id,
-					monitorId: row.monitor_id,
-					eventType: row.event_type,
-					firedAt: row.fired_at,
-					stage: row.stage,
-					...(row.procedure_json ? { procedure: JSON.parse(row.procedure_json) } : {}),
-					...(row.skipped_by ? { skippedBy: row.skipped_by } : {}),
-					...(options.database.isBrokerQuarantined("monitor", row.event_id)
-						? { quarantined: true, reason: "broker_authority_quarantined" }
-						: {}),
-				}));
+				.map((row) => {
+					const recovery = options.database.monitorEventRecovery(row.event_id);
+					return {
+						eventId: row.event_id,
+						monitorId: row.monitor_id,
+						eventType: row.event_type,
+						firedAt: row.fired_at,
+						stage: row.stage,
+						...(recovery ? { recovery } : {}),
+						...(row.procedure_json ? { procedure: JSON.parse(row.procedure_json) } : {}),
+						...(row.skipped_by ? { skippedBy: row.skipped_by } : {}),
+						...(options.database.isBrokerQuarantined("monitor", row.event_id)
+							? { quarantined: true, reason: "broker_authority_quarantined" }
+							: {}),
+					};
+				});
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",

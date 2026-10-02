@@ -494,14 +494,10 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new Database(path);
-		// Remove v22-v24 completely before replaying historical DDL; missing objects are fixture errors.
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_immutable_${action}`);
-		raw.exec(
-			"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts",
-		);
 		for (const table of [
 			"broker_authority",
 			"broker_owned_bindings",
@@ -511,6 +507,9 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 			"broker_retired_sessions",
 		])
 			raw.exec(`DROP TABLE ${table}`);
+		raw.exec(
+			"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts",
+		);
 		raw.exec(`
 DROP TABLE lane_reports;
 DROP TABLE work_attempt_runtime;
@@ -534,7 +533,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(28);
+		expect(upgraded.schemaVersion).toBe(29);
 		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
 			[
 				["ride-trigger", "trigger", "bound"],
