@@ -98,7 +98,7 @@ export interface GatewayConfigFile {
 	readonly work?: WorkLaneConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
-	/** Mid-work speech gating (issue #71); maxPerTurn: 0 disables the gate entirely. */
+	/** Mid-work speech limits (issue #71); unset means every non-narration mid-work message ships. */
 	readonly interimSpeech?: InterimSpeechConfig;
 	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
@@ -106,8 +106,8 @@ export interface GatewayConfigFile {
 
 export interface InterimSpeechConfig {
 	/**
-	 * Hard cap on delivered mid-work messages within one turn.
-	 * Set to 0 to disable the gate entirely; messages will be delivered without filtering.
+	 * Hard cap on delivered mid-work messages within one turn; unset means no cap
+	 * beyond the turn's part budget. 0 delivers no mid-work messages at all.
 	 */
 	readonly maxPerTurn?: number;
 	/**

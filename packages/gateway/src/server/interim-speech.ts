@@ -30,9 +30,17 @@ export interface InterimSpeechLimits {
 	readonly minGapMs: number;
 }
 
+/**
+ * No count or pacing limit by default: the gateway delivers every mid-work
+ * message the persona writes (4b3230ca0) and the turn's ten-part budget in the
+ * server already bounds a chatty turn. A cap of 2 / 45 s gap silently dropped
+ * real findings ("two interim findings were not delivered"). Operators who
+ * want pacing set `interimSpeech.maxPerTurn` / `minGapMs` in config.json; the
+ * narration and near-repeat filters always apply.
+ */
 export const DEFAULT_INTERIM_SPEECH_LIMITS: InterimSpeechLimits = {
-	maxPerTurn: 2,
-	minGapMs: 45_000,
+	maxPerTurn: Number.POSITIVE_INFINITY,
+	minGapMs: 0,
 };
 
 export type InterimSuppressionReason =
@@ -150,8 +158,8 @@ export function isNearDuplicate(previous: string, next: string): boolean {
  * and a message already sent to Discord cannot be recalled. So the implemented
  * approximation is consecutive near-duplicate suppression, which removes the
  * repetition that was actually observed. Overlap between a mid-work message and
- * the later final answer is therefore still possible; the turn cap of 2 bounds
- * how bad that can get. See the duplicate tests for the pinned behavior.
+ * the later final answer is therefore still possible; an operator-configured
+ * `maxPerTurn` bounds how bad that can get. See the duplicate tests for the pinned behavior.
  */
 export class InterimSpeechGate {
 	readonly #limits: InterimSpeechLimits;
