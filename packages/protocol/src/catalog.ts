@@ -225,7 +225,13 @@ export interface ChatMessagePayload {
 	readonly origin: OriginRef;
 	readonly role: "assistant";
 	readonly text: string;
-	/** True when this is the final message of the turn. */
+	/**
+	 * True when this is the final message of the turn. Mid-work speech and
+	 * reactions are `false`: the turn is still running, so adapters keep its
+	 * working status (typing, presence) up. A reply that already streamed
+	 * mid-turn is not re-sent, so the final progress tick is the authoritative
+	 * end-of-turn signal.
+	 */
 	readonly final: boolean;
 	/**
 	 * Ledger delivery id when this message requires platform delivery
@@ -320,6 +326,15 @@ export interface SessionListResult {
 	}[];
 }
 
+/**
+ * `/model set` choices (session.modelChoices): preset names from the gjc
+ * profile's `models.yml` `profiles:` map plus the configured gateway selector.
+ * Fails soft: an unreadable catalog yields an empty list, never an error.
+ */
+export interface SessionModelChoicesResult {
+	readonly choices: readonly string[];
+}
+
 export interface SessionBootstrapProjection {
 	readonly epoch: number;
 	readonly pending: boolean;
@@ -380,6 +395,20 @@ export type MonitorServiceTier =
 	| "openai-only"
 	| "claude-only";
 
+/**
+ * Where a monitor's authored output goes. Destination and mentions are typed
+ * fields so they are never encoded into an event type or recovered from
+ * instruction prose (issue #180).
+ */
+export interface MonitorChannelTarget {
+	readonly origin: OriginRef;
+	/**
+	 * Platform user ids pinged at the start of every delivered note, as `<@id>`.
+	 * Discord and Slack targets only.
+	 */
+	readonly mentionUserIds?: readonly string[];
+}
+
 export interface MonitorSpec {
 	readonly name: string;
 	readonly trigger: TriggerSpec;
@@ -388,7 +417,7 @@ export interface MonitorSpec {
 	/** Burst policy; coalesce when unspecified (spec fact 12). */
 	readonly burstPolicy?: BurstPolicyKind;
 	/** Channel target for authored output: at most one (spec fact 7). */
-	readonly channelTarget?: { readonly origin: OriginRef } | null;
+	readonly channelTarget?: MonitorChannelTarget | null;
 	/**
 	 * Per-monitor execution instruction handed to the authoring turn. Without it
 	 * a monitor's session only learns that an event fired, so it can do nothing
@@ -410,6 +439,13 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly enabled: boolean;
 }
 
+export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
+	readonly monitorId: string;
+	/** Replace the trigger spec; use schedule to change only a cron schedule. */
+	readonly trigger?: TriggerSpec;
+	/** Change the schedule while retaining the monitor's existing cron trigger. */
+	readonly schedule?: string;
+}
 export interface MonitorScheduleProjection {
 	readonly effectiveTimezone: string | null;
 	readonly nextFireAt: { readonly local: string; readonly utc: string } | null;
@@ -446,12 +482,12 @@ export interface WorkRunParams {
 	readonly resume?: boolean;
 	/** Startup model: an explicit model id or a model profile preset; applied at session create and on every send. */
 	readonly model?: string | { readonly preset: string };
+	/** Untrusted routing hint linking this request to the calling GJC session. */
+	readonly callerSessionId?: string;
 }
 
-/** Only asynchronous starts snapshot a completion notification target. */
-export interface WorkStartParams extends WorkRunParams {
-	readonly notify?: OriginRef;
-}
+/** Asynchronous starts and synchronous runs share the same caller metadata. */
+export type WorkStartParams = WorkRunParams;
 
 export type WorkStartResult =
 	| {
@@ -513,16 +549,28 @@ export type WorkSteerResult =
 	| { readonly steered: false; readonly reason: string };
 
 export interface WorkRetireParams {
-	readonly name: string;
+	readonly name?: string;
+	readonly force?: boolean;
+	readonly allDead?: boolean;
 }
 
 /**
  * Retirement closes the worker's gjc session and clears the gateway binding,
  * so the next `work.run` for that name creates a fresh session. A lane with an
  * open attempt is never retired from under its turn.
+ *
+ * When `force` is true, skip attempt-state checks and require broker liveness
+ * proving the session dead or disowned; if found dead, close as `host_lost` and
+ * rebind the epoch. `allDead` retires all dead lanes at once (implies force).
  */
 export type WorkRetireResult =
-	| { readonly retired: true; readonly sessionKey: string; readonly sessionId: string; readonly closed: boolean }
+	| {
+			readonly retired: true;
+			readonly sessionKey: string;
+			readonly sessionId: string;
+			readonly closed: boolean;
+			readonly forced?: boolean;
+	  }
 	| { readonly retired: false; readonly sessionKey: string; readonly reason: string };
 
 /** Structured detail carried by a `lane_capacity` error. */
@@ -566,6 +614,18 @@ export interface WorkJobsResult {
 		readonly session_id: string;
 		readonly last_activity_at: string | null;
 		readonly updated_at: string;
+		/** Worktree HEAD (issue #67): progress evidence that survives an op dying; null when unreadable. */
+		readonly last_commit: { readonly sha: string; readonly subject: string; readonly committed_at: string } | null;
+		/** When the job was accepted; absent on a corrupt record. */
+		readonly accepted_at?: string;
+		/** The current attempt, a detail of the job; absent on a corrupt record. */
+		readonly attempt?: { readonly op_ref: string; readonly started_at: string; readonly ended_at?: string } | null;
+		readonly reports?: {
+			readonly pending: number;
+			readonly claimed: number;
+			readonly held: number;
+			readonly undeliverable: number;
+		};
 	}>;
 }
 
@@ -654,8 +714,22 @@ export type CycleGateReason =
 	| "memory_closure_blocked"
 	| "monitor_settlement_failed"
 	| "monitor_settlement_stuck"
+	| "monitor_authoring_lost"
 	| "lane_capacity_exhausted"
-	| "inbound_starved";
+	| "inbound_starved"
+	| "agent_disk_headroom"
+	| "gjc_unverified_version";
+
+/**
+ * Free space on the filesystem holding the broker-bound GJC agent directory.
+ * GJC owns and never reaps that directory (sessions, recovery snapshots), so
+ * the gateway only observes headroom; null bytes mean the probe failed.
+ */
+export interface AgentDiskView {
+	readonly path: string;
+	readonly freeBytes: number | null;
+	readonly totalBytes: number | null;
+}
 
 export interface CycleSessionView {
 	/** Canonical, opaque origin key (protocol originKey; never reparsed). */
@@ -707,6 +781,15 @@ export interface OpsCycleResult {
 	};
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
+	/**
+	 * Event types whose most recent terminal events (last 24h) exhausted retries
+	 * with no authored output: `consecutive` lost slots, newest at `lastFiredAt`.
+	 */
+	readonly monitorAuthoringLost: readonly {
+		readonly eventType: string;
+		readonly consecutive: number;
+		readonly lastFiredAt: string;
+	}[];
 	/** Delivery ledger census across all states. */
 	readonly deliveries: {
 		readonly pending: number;
@@ -723,6 +806,8 @@ export interface OpsCycleResult {
 	readonly contextDiff: ConversationContextDiagnostics;
 	/** Worker-lane census against the configured admission cap. */
 	readonly lanes: { readonly active: number; readonly max: number };
+	/** Agent-directory disk headroom; null when no broker agent directory is bound. */
+	readonly agentDisk: AgentDiskView | null;
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
@@ -736,6 +821,7 @@ export interface VerbCatalogV01 {
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
+	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
 	"memory.autolink": {
 		params: undefined;
@@ -743,6 +829,7 @@ export interface VerbCatalogV01 {
 	};
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
+	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
 	"monitor.list": {
 		params: undefined;
 		result: {
@@ -794,10 +881,12 @@ export const VERBS_V01 = [
 	"delivery.fail",
 	"session.recall",
 	"session.list",
+	"session.modelChoices",
 	"memory.audit",
 	"memory.autolink",
 	"memory.search",
 	"monitor.add",
+	"monitor.update",
 	"monitor.list",
 	"monitor.inspect",
 	"monitor.test",
@@ -839,9 +928,32 @@ export function isSilenceToken(text: string): boolean {
 	return (SILENCE_TOKENS as readonly string[]).some((t) => unbracket(t).toUpperCase() === normalized);
 }
 
-/** Existing embedded marker grammar; inspect original content before clipping. */
+/**
+ * Markdown code: closed fenced blocks, then inline spans of any backtick run
+ * length. Text inside code is quoted, never a directive.
+ */
+const MARKDOWN_CODE = /```[\s\S]*?```|(`+)[^\n]*?\1/g;
+
+/**
+ * Existing embedded marker grammar; inspect original content before clipping.
+ *
+ * A marker inside markdown code is a quoted mention, not a directive: a reply
+ * explaining the protocol ("`[SILENT]`(답하지 않기) 같은 표시를 해석해요") is a
+ * real answer. Counting it silenced two fully written Discord replies whole
+ * (live pilot, 2026-09-29).
+ */
 export function containsSilenceToken(text: string): boolean {
-	return /\[(SILENT|silent)\]/.test(text);
+	return /\[(SILENT|silent)\]/.test(text.replace(MARKDOWN_CODE, ""));
+}
+
+/**
+ * Unified silence check: a note is silent if it is EITHER an exact match to
+ * a silence token OR contains an embedded [SILENT] marker (issue #338).
+ * Use this in all delivery and recovery paths to prevent silent content from
+ * leaking into deliveries while preserving authored notes in records.
+ */
+export function isSilentOutput(text: string): boolean {
+	return isSilenceToken(text) || containsSilenceToken(text);
 }
 
 function unbracket(text: string): string {

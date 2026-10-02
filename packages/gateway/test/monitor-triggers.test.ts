@@ -92,7 +92,7 @@ test("Seoul cron start claims the exact UTC slot for its configured wall-clock t
 			admitted.push(scheduled.toISOString());
 			return true;
 		},
-		{ now: () => slot, timezone: "Asia/Seoul" },
+		{ now: () => slot, since: new Date(slot.getTime() - 60_000), timezone: "Asia/Seoul" },
 	);
 	stop();
 	expect(admitted).toEqual([slot.toISOString()]);

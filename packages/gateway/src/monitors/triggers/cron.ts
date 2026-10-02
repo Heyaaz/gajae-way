@@ -36,7 +36,6 @@ function dateFields(date: Date, timezone?: string): [number, number, number, num
 		throw new Error(`could not read cron time in timezone ${timezone}`);
 	return [minute, hour, day, month, weekday];
 }
-
 export function cronMatches(schedule: string, date: Date, timezone?: string): boolean {
 	const fields = schedule.trim().split(/\s+/);
 	if (fields.length !== 5) throw new Error("cron schedule must have five fields");
@@ -53,28 +52,21 @@ export function cronFieldMatches(field: string, value: number, min: number): boo
 		if (!Number.isInteger(step) || step < 1) return false;
 		if (base === "*") return (value - min) % step === 0;
 		const range = base.split("-").map(Number);
-		if (range.length === 1) return range[0] !== undefined && value === range[0] && step === 1;
-		if (range.length !== 2) return false;
-		const first = range[0];
-		const last = range[1];
+		if (range.length === 1) return value === range[0] && step === 1;
 		return (
-			first !== undefined &&
-			last !== undefined &&
-			Number.isInteger(first) &&
-			Number.isInteger(last) &&
-			value >= first &&
-			value <= last &&
-			(value - first) % step === 0
+			range.length === 2 &&
+			Number.isInteger(range[0]) &&
+			Number.isInteger(range[1]) &&
+			value >= range[0]! &&
+			value <= range[1]! &&
+			(value - range[0]!) % step === 0
 		);
 	});
 }
 
-/** Next cron slot after `from`, or null when the schedule cannot match. */
 export function nextCronFire(schedule: string, from: Date, timezone: string): Date | null {
 	const fields = schedule.trim().split(/\s+/);
 	if (fields.length !== 5) return null;
-	// Scan nearby absolute minutes first so a repeated wall time in a DST fold
-	// remains visible even when the date iterator has already advanced a day.
 	const nearTerm: Date[] = [];
 	cronSlotsBetween(
 		schedule,
@@ -126,8 +118,6 @@ export function nextCronFire(schedule: string, from: Date, timezone: string): Da
 		while (candidates.hasNext()) {
 			const candidate = candidates.next().toDate();
 			if (candidate.getTime() <= from.getTime()) continue;
-			// The parser is used to advance efficiently in the zone; keep the
-			// gateway's established field-match semantics authoritative.
 			if (cronMatches(schedule, candidate, timezone)) return candidate;
 		}
 	} catch {
@@ -143,14 +133,14 @@ export function minuteEpoch(date: Date): number {
 
 /**
  * Exact scheduled slot timestamps for every schedule minute in the half-open
- * window (from, now], oldest first. Each cursor step is one absolute minute;
- * its wall-clock fields are evaluated in the explicit IANA zone or the gateway
- * process's local zone.
+ * window (from, now], oldest first. Each cursor step is an absolute minute;
+ * fields are evaluated in the explicit IANA zone or the process-local zone.
+ * A spring-forward minute does not exist; a repeated fall-back minute has two
+ * distinct UTC slots.
  *
  * `fire` returning false means the slot was NOT newly admitted (already
  * claimed durably by an earlier tick/process). Only NEW admissions count
- * against `budget`: duplicates from previously claimed slots never consume
- * catch-up capacity, so a genuinely missed later slot is still reached.
+ * against `budget`, so duplicates never consume catch-up capacity.
  */
 export function cronSlotsBetween(
 	schedule: string,
@@ -164,7 +154,6 @@ export function cronSlotsBetween(
 	const cursor = new Date((minuteEpoch(from) + 1) * 60_000);
 	while (cursor.getTime() <= now.getTime()) {
 		if (cronMatches(schedule, cursor, timezone)) {
-			// Budget counts only newly admitted slots; duplicates don't consume it.
 			if (fired >= budget) break;
 			if (fire(new Date(cursor.getTime()))) fired++;
 		}
@@ -173,11 +162,41 @@ export function cronSlotsBetween(
 	return fired;
 }
 
-/** Safety valve: a single catch-up sweep never authorizes more than this many slots. */
+/** Every schedule slot in the half-open window (from, now], oldest first. */
+export function cronSlotList(schedule: string, from: Date, now: Date, timezone?: string): Date[] {
+	const slots: Date[] = [];
+	cronSlotsBetween(
+		schedule,
+		from,
+		now,
+		Number.POSITIVE_INFINITY,
+		(slot) => {
+			slots.push(slot);
+			return true;
+		},
+		timezone,
+	);
+	return slots;
+}
+
+/** Safety valve: a single in-process suspension sweep never authorizes more than this many slots. */
 export const DEFAULT_MAX_CATCH_UP_SLOTS = 8;
 
-/** How far back a fresh process looks for missed slots. */
+/** How far back a running process re-scans for slots skipped by a suspended tick. */
 export const CATCH_UP_WINDOW_MS = 60 * 60 * 1000;
+
+/** Oldest missed slot a fresh process may still owe after downtime. */
+export const DEFAULT_MAX_CATCH_UP_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Marks the single coalesced event a fresh process fires for slots missed while it was down. */
+export type CronCatchUp = {
+	readonly cause: "startup";
+	/** Oldest missed slot inside the age bound. */
+	readonly missedFrom: string;
+	/** Newest missed slot — the one fired. */
+	readonly missedTo: string;
+	readonly missedSlots: number;
+};
 
 /**
  * Cron trigger with an absolute-minute cursor (red-team blocker 5).
@@ -189,54 +208,65 @@ export const CATCH_UP_WINDOW_MS = 60 * 60 * 1000;
  *   blocker 3); the caller persists it as the event's scheduled identity.
  * - Dedupe/budget durability lives with the caller (the propagator claims the
  *   slot and admits the event in one transaction); this module only computes
- * WHEN slots are due and always scans the bounded window when ticks were
- *   skipped, keeping catch-up bounded by the caller-side claim + budget.
+ *   WHEN slots are due.
+ * - Startup (issue #162): `since` is the persisted schedule boundary (the
+ *   monitor's last claimed slot, else its creation instant). Every slot missed
+ *   between it and now — bounded by `maxCatchUpAgeMs` — coalesces into ONE
+ *   fire of the newest missed slot, marked with a `CronCatchUp` record. A slot
+ *   due in the current minute fires normally. Replaying every historical
+ *   slot would storm the authoring path after a long outage.
+ * - While running, each tick scans from the last evaluated instant (bounded by
+ *   `CATCH_UP_WINDOW_MS` and the slot budget), so a suspended tick still fires
+ *   the slots it skipped without re-scanning slots already evaluated.
  */
 export function startCron(
 	schedule: string,
-	fire: (slotAt: Date) => boolean,
-	options: { now?: () => Date; maxCatchUpSlots?: number; intervalMs?: number; timezone?: string } = {},
+	fire: (slotAt: Date, catchUp?: CronCatchUp) => boolean,
+	options: {
+		since: Date;
+		now?: () => Date;
+		maxCatchUpSlots?: number;
+		maxCatchUpAgeMs?: number;
+		intervalMs?: number;
+		timezone?: string;
+	},
 ): () => void {
 	const now = options.now ?? (() => new Date());
 	const budget = options.maxCatchUpSlots ?? DEFAULT_MAX_CATCH_UP_SLOTS;
+	const maxAge = options.maxCatchUpAgeMs ?? DEFAULT_MAX_CATCH_UP_AGE_MS;
 	let minute = -1;
+	let started = 0;
 	const tick = () => {
 		const date = now();
 		const epoch = minuteEpoch(date);
 		if (epoch === minute) return;
 		if (minute === -1) {
-			// First tick of a fresh process: catch up bounded missed slots with
-			// exact scheduled timestamps. Without this, a restart spanning a due
-			// minute silently skipped that slot forever (issue #29 restart-window
-			// loss). The scan covers the whole window regardless of whether the
-			// current minute itself matches the schedule; caller-side slot claims
-			// keep it exactly-once per slot.
-			minute = epoch;
-			cronSlotsBetween(
-				schedule,
-				new Date(date.getTime() - CATCH_UP_WINDOW_MS - 60_000),
-				date,
-				budget,
-				fire,
-				options.timezone,
-			);
-			return;
+			const from = Math.max(options.since.getTime(), date.getTime() - maxAge);
+			const due = cronSlotList(schedule, new Date(from), date, options.timezone);
+			const last = due.at(-1);
+			const current = last && minuteEpoch(last) === epoch ? due.pop() : undefined;
+			const oldest = due[0];
+			const newest = due.at(-1);
+			if (oldest && newest)
+				fire(newest, {
+					cause: "startup",
+					missedFrom: oldest.toISOString(),
+					missedTo: newest.toISOString(),
+					missedSlots: due.length,
+				});
+			if (current) fire(current);
+			started = date.getTime();
+		} else {
+			// A suspension can skip due slots even when the current minute also
+			// matches (e.g. */30, prior tick 06:00, resume 07:30 — 06:30 and 07:00
+			// fire alongside 07:30); caller-side slot claims make re-scanned slots
+			// no-ops. The scan never reaches behind startup, whose missed slots were
+			// already coalesced. The extra minute keeps the boundary slot (now-60m
+			// exactly) inside the half-open scan.
+			const from = Math.max(started, date.getTime() - CATCH_UP_WINDOW_MS - 60_000);
+			cronSlotsBetween(schedule, new Date(from), date, budget, fire, options.timezone);
 		}
 		minute = epoch;
-		// Always scan the full bounded window INCLUDING the current minute: a
-		// suspension can skip earlier due slots even when the current minute also
-		// matches (e.g. */30, prior tick 06:00, resume 07:30 — the 06:30 and 07:00
-		// slots must be considered alongside 07:30). Dedupe-first admission makes
-		// re-considered slots cheap no-ops. The extra minute padding keeps the
-		// boundary slot (now-60m exactly) inside the half-open scan.
-		cronSlotsBetween(
-			schedule,
-			new Date(date.getTime() - CATCH_UP_WINDOW_MS - 60_000),
-			date,
-			budget,
-			fire,
-			options.timezone,
-		);
 	};
 	tick();
 	const timer = setInterval(tick, options.intervalMs ?? 30_000);

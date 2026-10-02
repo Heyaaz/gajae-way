@@ -14,13 +14,16 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
   "burstPolicy": "dedupe",
   "instruction": "Read the open review queue, pick the oldest item, and post a one-paragraph verdict.",
   "channelTarget": {
-    "origin": { "platform": "discord", "kind": "dm", "conversationId": "owner", "peerId": "owner" }
+    "origin": { "platform": "discord", "kind": "channel", "conversationId": "1470204268933022023" },
+    "mentionUserIds": ["1468532331001413743"]
   },
   "enabled": true
 }
 ```
 
-`instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note.
+`instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note. Write it as prose sentences, not a tag bundle: it reaches the authoring session verbatim.
+
+Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Keep `eventTypes` short, stable identifiers that are safe to group by.
 
 The four trigger kinds are:
 
@@ -28,7 +31,7 @@ The four trigger kinds are:
 { "kind": "cron", "schedule": "30 5 * * *", "timezone": "Asia/Seoul" }
 ```
 
-Cron schedules use five fields (`minute hour day-of-month month day-of-week`) in the trigger's IANA `timezone`. If omitted, the gateway resolves its host-local timezone when the monitor is added and records that effective zone in the trigger. Set `timezone` explicitly when a schedule must keep the same wall-clock meaning across hosts. Schedule data is a separate RPC projection, not a `MonitorRecord` field. `monitor.list` returns `{ "monitors": [...], "schedules": { "<monitorId>": { "effectiveTimezone": "Asia/Seoul", "nextFireAt": { "local": "2026-08-28 08:30:00", "utc": "2026-08-27T23:30:00.000Z" } } }`; `monitor.inspect` returns `{ "monitor": ..., "schedule": { "effectiveTimezone": "Asia/Seoul", "nextFireAt": { "local": "2026-08-28 08:30:00", "utc": "2026-08-27T23:30:00.000Z" } }, "recentEvents": [...] }`. A schedule with no upcoming cron fire has `nextFireAt: null`; non-cron schedules have `effectiveTimezone: null` and `nextFireAt: null`.
+Cron schedules use five fields (`minute hour day-of-month month day-of-week`) in the trigger's IANA `timezone`. If omitted, the gateway resolves its host-local timezone when the monitor is added and records that effective zone in the trigger. Set `timezone` explicitly when a schedule must keep the same wall-clock meaning across hosts. Schedule data is a separate RPC projection, not a `MonitorRecord` field. `monitor.list` returns `{ "monitors": [...], "schedules": { "<monitorId>": { "effectiveTimezone": "Asia/Seoul", "nextFireAt": { "local": "2026-08-28 08:30:00", "utc": "2026-08-27T23:30:00.000Z" } } } }`; `monitor.inspect` returns `{ "monitor": ..., "schedule": { "effectiveTimezone": "Asia/Seoul", "nextFireAt": { "local": "2026-08-28 08:30:00", "utc": "2026-08-27T23:30:00.000Z" } }, "recentEvents": [...] }`. A schedule with no upcoming cron fire has `nextFireAt: null`; non-cron schedules have `effectiveTimezone: null` and `nextFireAt: null`.
 
 The scheduler evaluates absolute UTC minute slots against local wall-clock fields. A nonexistent spring-forward minute is skipped; a repeated fall-back minute fires once for each distinct UTC instant.
 
@@ -44,21 +47,25 @@ The scheduler evaluates absolute UTC minute slots against local wall-clock field
 { "kind": "script", "command": ["/absolute/path/to/check"], "intervalMs": 60000 }
 ```
 
+Cron slots are claimed durably, once per scheduled minute. On startup the gateway resumes from each cron monitor's newest claimed slot (or its creation instant). Slots missed while the gateway was down coalesce into one event for the newest missed slot. Only slots from the last 24 hours count. The event's payload carries `catchUp: { cause: "startup", missedFrom, missedTo, missedSlots }`. Older slots are never replayed, and a restart that owes no slot creates nothing.
+
 For webhook monitors, the registry replaces the supplied route with a generated route token. The runtime receives it at `/hook/<token>`. Watcher roots must fall under configured `watcherRoots`; script commands must be inside configured `scriptRoot` and are checked by ActionGuard.
 
 ## Event sessions and propagation
 
-Event types are declared at monitor creation; they are never inferred. A declared type uses its own monitor-event-type session (`monitor/eventtype/<event type>`). An undeclared type is deliberately routed to the single `monitor/eventtype/catch-all` session, preventing accidental mixing with a declared workflow.
+Event types are declared at monitor creation; they are never inferred. Every session is owned by one monitor: a declared type uses that monitor's session for the type (`monitor/eventtype/<event type>/parent=<monitor id>`), and an undeclared type is routed to that monitor's catch-all session (`monitor/eventtype/catch-all/parent=<monitor id>`), so it cannot mix with a declared workflow. Two monitors that declare the same event type never share a session, its history, its instruction, or its failure domain: a poisoned session fails only the monitor that owns it. Rows keyed by the old event-type-only origin (`monitor/eventtype/<event type>`) are no longer bound after the upgrade. Their history is left unused, not re-keyed, because it already mixes monitors.
 
 The durable propagation path is:
 
 1. **Admitted** — persist the incoming event before work begins and emit its systematic event record.
 2. **Batched** — apply the monitor burst policy and assign a batch.
-3. **Session selected** — choose the declared-type session or catch-all session.
+3. **Session selected** — choose the monitor's declared-type session or its catch-all session.
 4. **Authored** — ask Gajae for exactly one note per event, then persist each authored output.
 5. **Memory queued** — create a durable `monitor-event` memory intent for the authored note.
 6. **Delivered** — when a `channelTarget` exists, prepare and mark an outbound ledger delivery.
-7. **Reconciled** — startup and periodic reconciliation replays unfinished admitted, dispatched, or failed events, and repairs authored events missing their memory intent.
+7. **Reconciled** — startup and periodic reconciliation replays unfinished admitted, dispatched, or failed events, and repairs authored events missing their memory intent. A `failed` event is reclaimed on a backoff measured from its last failure — immediately, then after 10 minutes, 1 hour, 4 hours and 12 hours — so the five-attempt budget spans ~17 hours and a slot survives a multi-hour dispatch outage. Only after that does it land on the terminal `failed_no_retry`.
+
+A gateway stop waits a bounded 10 seconds for in-flight authoring turns. A turn still running past that is failed as `gateway_shutdown` with the bound session id and stop time in `monitor_failures.detail`, its lease is released, and the event is re-dispatched by the next boot's reconcile rather than retried against a session whose host the stop orphaned.
 
 The admission log occurs before propagation. Systematic state is held in the gateway database (`monitor_event` stages such as `admitted`, `batched`, `dispatched`, `authored`, and `failed`); the authored note is separately persisted and fed to the Markdown-memory closure queue. This dual logging preserves both operational history and human-readable memory.
 
@@ -117,11 +124,16 @@ Webhook binding defaults to loopback. A non-loopback bind requires both `webhook
 
 ```sh
 gajaeway monitors add --json '{"name":"weekday-review","trigger":{"kind":"cron","schedule":"30 8 * * 1-5","timezone":"Asia/Seoul"},"eventTypes":["review.due"],"burstPolicy":"dedupe","enabled":true}'
+gajaeway monitors update <monitor-id> --schedule '0 9 * * 1-5'
+gajaeway monitors update <monitor-id> --enabled false
+gajaeway monitors update <monitor-id> --schedule '0 9 * * 1-5' --enabled true
+gajaeway monitors update <monitor-id> --json '{"instruction":"Review the open queue."}'
 gajaeway monitors list
 gajaeway monitors list --json
 gajaeway monitors list --fields id,name,schedule --limit 20 --offset 20
 gajaeway monitors inspect <monitor-id>
 gajaeway monitors test <monitor-id> --type review.due --payload '{"source":"manual"}'
+gajaeway monitors test <monitor-id> --wait=60
 ```
 
-`list` prints a one-line-per-monitor table including `timezone` and `nextFire`; `--json` emits `{ monitors, schedules }`, with `schedules` keyed by monitor ID. Each schedule projection contains `effectiveTimezone` and nullable `nextFireAt.local` / `nextFireAt.utc`; those fields are not added to the monitor record. `--fields a,b,c` selects columns (an unknown name errors and lists the valid names) and `--limit N` / `--offset N` page the rows; both apply to `--json` as well. `sessions list` accepts the same flags. `inspect` returns `{ monitor, schedule, recentEvents }`, with the effective zone in `schedule.effectiveTimezone` and the next local/UTC times in `schedule.nextFireAt.local` and `schedule.nextFireAt.utc`. `test` submits an event and returns its `eventId`; omit `--type` to use the monitor’s first declared type. See [deployment](deployment.md) for `webhook`, `watcherRoots`, and `scriptRoot` configuration.
+`update` changes the existing monitor in place, preserving its identity and event history. Its `--json` value is a partial `MonitorSpec`: only supplied fields are merged into the current spec. Use either `--json` or the shorthand flags; `--schedule '<cron>'` and `--enabled true|false` may be used together. The enabled flag requires an explicit `true` or `false`. The command prints the resulting monitor ID as JSON. `list` prints a one-line-per-monitor table (`id`, `name`, `schedule`, `timezone`, `nextFire`, `events`, `target`, `enabled`); `--json` emits `{ monitors, schedules }`, with `schedules` keyed by monitor ID. Each schedule projection contains `effectiveTimezone` and nullable `nextFireAt.local` / `nextFireAt.utc`; those fields are not added to the monitor record. `--fields a,b,c` selects columns (an unknown name errors and lists the valid names) and `--limit N` / `--offset N` page the rows; both apply to `--json` as well. `sessions list` accepts the same flags. `inspect` returns `{ monitor, schedule, recentEvents }`, with the effective zone in `schedule.effectiveTimezone` and next local/UTC times in `schedule.nextFireAt.local` and `schedule.nextFireAt.utc`. `test` submits an event and returns its `eventId`; omit `--type` to use the monitor’s first declared type. Add `--wait` to observe stage events without polling (30-second default), or `--wait=SECONDS` to choose a non-negative timeout up to 24 hours. It exits when delivery, no-delivery, or dispatch failure is observed; on timeout it returns the latest observed stage, such as `batched`, `authored`, `delivered`, or `failed`. See [deployment](deployment.md) for `webhook`, `watcherRoots`, and `scriptRoot` configuration.
