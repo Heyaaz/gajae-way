@@ -33,6 +33,7 @@ import {
 	type LaneReportRow,
 	type WorkAttemptAdmission,
 	type WorkAttemptRuntime,
+	type WorkAttemptSettleResult,
 	type WorkAttemptTerminalEvidence,
 	type WorkParent,
 	type WorkReportRoot,
@@ -40,7 +41,7 @@ import {
 	workAttemptReportId,
 } from "../store/db";
 import { readFailedTransportCause } from "./failed-turn-evidence";
-import { type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
+import { type LaneForceRetireReason, type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
 import type { TailHandle } from "./tail-runner";
@@ -86,6 +87,19 @@ const pendingOutput = () => ({
 });
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
+}
+function workAttemptEndState(
+	reason: string,
+): "completed" | "terminal_missing_receipt" | "terminal_uncertain" | "failed" | "attempt_ended" {
+	return reason === "end_turn"
+		? "completed"
+		: reason === "terminal_missing_receipt"
+			? "terminal_missing_receipt"
+			: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
+				? "terminal_uncertain"
+				: ["sdk_failed", "send_rejected"].includes(reason)
+					? "failed"
+					: "attempt_ended";
 }
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
@@ -151,6 +165,9 @@ export class WorkLaneManager {
 		this.#db = options.database;
 		this.#port = options.port;
 		options.lanes.setRecoveryGate(() => this.recover());
+		options.lanes.setForceRetireSettlement((name, opRef, reason, endedAt) =>
+			this.settleForceRetiredAttempt(name, opRef, reason, endedAt),
+		);
 	}
 	#now(): number {
 		return this.#options.now?.() ?? Date.now();
@@ -219,6 +236,121 @@ export class WorkLaneManager {
 			if (error instanceof ProtocolError) throw error;
 			throw new ProtocolError("verb_failed", "work lane state unavailable", { reasonCode: "lane_state_corrupt", name });
 		}
+	}
+	/**
+	 * Closes a dead lane's current attempt through the normal atomic settlement
+	 * path. LaneGovernor calls this while it owns the lane mutation lock.
+	 */
+	settleForceRetiredAttempt(name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string): boolean {
+		const record = this.#job(name, true);
+		if (!record) return false;
+		const attempt = record.attempts.at(-1);
+		if (!attempt || attempt.opRef !== opRef) return false;
+		const runtime = this.#db.workAttemptGet(opRef);
+		if (!runtime) return false;
+		if (runtime.settledAt !== null) return attempt.endedAt === runtime.settledAt;
+		if (attempt.endedAt !== undefined) return false;
+
+		const recordedTerminal = runtime.terminal;
+		const terminal: WorkAttemptTerminalEvidence = recordedTerminal ?? {
+			kind: "local",
+			observedAt: endedAt,
+			reasonCode: reason,
+		};
+		const endState = recordedTerminal ? workAttemptEndState(terminal.reasonCode) : "attempt_ended";
+		const errorCode = recordedTerminal
+			? terminal.reasonCode === "end_turn"
+				? undefined
+				: terminal.reasonCode
+			: "host_lost";
+		const output =
+			runtime.output.disposition === "pending"
+				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
+				: runtime.output;
+		const closed = closeAttempt({
+			record,
+			opRef,
+			endState,
+			errorCode,
+			endedAt,
+		});
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output);
+		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
+		let admission: WorkAttemptAdmission | undefined;
+		if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
+			decision = "wake_unaccepted";
+		} else if (runtime.output.knownSilence !== null) {
+			decision = "suppressed";
+		} else if (runtime.parent === null) {
+			decision = "no_target";
+		} else {
+			decision = "report";
+			if (runtime.parent.kind === "persona") {
+				const fallbackPayload = buildDeliveryPayload(runtime.opRef, runtime.parent.origin, text, runtime.deliveryId);
+				if (!fallbackPayload) return false;
+				const holdReason = this.#options.personaHold?.(runtime.parent.originKey);
+				admission = {
+					kind: "persona",
+					row: {
+						messageId: runtime.reportId,
+						originKey: runtime.parent.originKey,
+						originRefJson: JSON.stringify(runtime.parent.origin),
+						body: text,
+						receivedAt: endedAt,
+					},
+					fallbackPayload,
+					...(holdReason ? { holdReason } : {}),
+				};
+			} else {
+				const root = runtime.parent.root;
+				admission = {
+					kind: "lane",
+					report: {
+						reportId: runtime.reportId,
+						parentName: runtime.parent.name,
+						childName: name,
+						childOpRef: runtime.opRef,
+						body: text,
+						root,
+					},
+					fallbackPayload: root
+						? (buildDeliveryPayload(runtime.opRef, root.origin, text, runtime.deliveryId) ?? null)
+						: null,
+				};
+			}
+		}
+		const settled: WorkAttemptSettleResult | undefined = this.#db.workAttemptSettle(
+			opRef,
+			runtime.version,
+			closed,
+			{ decision, settledAt: endedAt, terminal, ...(output !== runtime.output ? { output } : {}) },
+			admission,
+		);
+		if (!settled) return false;
+		this.#finishWaiters(opRef);
+		for (const payload of [settled.fallbackPayload, settled.childFallback]) {
+			if (!payload) continue;
+			try {
+				this.#options.deliverFallback?.(payload);
+			} catch {
+				console.error(`work_fallback_delivery_failed deliveryId=${payload.deliveryId}`);
+			}
+		}
+		if (settled.runtime.decision === "reported" && settled.runtime.parent?.kind === "persona") {
+			try {
+				this.#options.notifyPersona?.(settled.runtime.parent.originKey);
+			} catch {
+				console.error(`work_persona_nudge_failed origin=${settled.runtime.parent.originKey}`);
+			}
+		}
+		const parents = new Set([name]);
+		if (settled.runtime.parent?.kind === "lane") parents.add(settled.runtime.parent.name);
+		for (const parentName of parents) {
+			void this.#drainLaneReports(parentName).catch(() => {
+				console.error(`lane_report_drain_failed parent=${parentName}`);
+			});
+		}
+		return true;
 	}
 	#assertNotQuarantined(jobId: string, name?: string): void {
 		if (this.#db.isBrokerQuarantined("work", jobId))
@@ -852,16 +984,7 @@ export class WorkLaneManager {
 					console.error(`work_transport_cause_read_error opRef=${runtime.opRef} reason=${failureReason(error)}`);
 				}
 			}
-			const endState =
-				reason === "end_turn"
-					? "completed"
-					: reason === "terminal_missing_receipt"
-						? "terminal_missing_receipt"
-						: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
-							? "terminal_uncertain"
-							: ["sdk_failed", "send_rejected"].includes(reason)
-								? "failed"
-								: "attempt_ended";
+			const endState = workAttemptEndState(reason);
 			let job = closeAttempt({
 				record: this.#job(name, true)!,
 				opRef: runtime.opRef,
@@ -935,7 +1058,7 @@ export class WorkLaneManager {
 				admission,
 			);
 			if (!settled) return undefined;
-			for (const waiter of [...(this.#waiters.get(runtime.opRef) ?? [])]) waiter.finish();
+			this.#finishWaiters(runtime.opRef);
 			return settled;
 		});
 
@@ -994,6 +1117,9 @@ export class WorkLaneManager {
 			await observer.tail?.close();
 			observer.tail = undefined;
 		}
+	}
+	#finishWaiters(opRef: string): void {
+		for (const waiter of [...(this.#waiters.get(opRef) ?? [])]) waiter.finish();
 	}
 	async #drainLaneReports(parentName: string): Promise<void> {
 		if (this.#stopped) return;
@@ -1273,10 +1399,17 @@ export class WorkLaneManager {
 		}
 		let after = "";
 		while (!this.#stopped) {
-			const rows = this.#db.workAttemptOpen(100, after);
-			if (!rows.length) break;
+			let invalidAfter = after;
+			const rows = this.#db.workAttemptOpen(100, after, (error) => {
+				if (error.opRef && error.opRef > invalidAfter) invalidAfter = error.opRef;
+				console.error(
+					`work_recovery_invalid_attempt opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`,
+				);
+			});
+			const lastValid = rows.at(-1)?.opRef ?? after;
+			const nextAfter = invalidAfter > lastValid ? invalidAfter : lastValid;
+			if (!rows.length && nextAfter === after) break;
 			for (const runtime of rows) {
-				after = runtime.opRef;
 				const prior = this.#observers.get(runtime.opRef);
 				if (prior && this.#writeCurrent(prior)) continue;
 				if (prior) {
@@ -1341,6 +1474,7 @@ export class WorkLaneManager {
 					this.#schedule(observer, 0);
 				}
 			}
+			after = nextAfter;
 		}
 		if (this.#stopped) return;
 		const parents = new Set([
