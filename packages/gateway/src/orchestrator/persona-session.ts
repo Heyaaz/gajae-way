@@ -977,11 +977,11 @@ class OriginActor {
 
 	readonly #holdSweeps = new Map<string, number>();
 
-	async #queueIsEmpty(sessionId: string): Promise<boolean> {
+	async #queueIsEmpty(sessionId: string, relay?: TailHandle): Promise<boolean> {
 		const port = this.#manager.port;
 		if (!port.queueEmpty) return false;
 		try {
-			return await port.queueEmpty({ sessionId, repo: this.#manager.repo });
+			return await port.queueEmpty({ sessionId, repo: this.#manager.repo, ...(relay ? { relay } : {}) });
 		} catch {
 			return false;
 		}
@@ -1179,6 +1179,7 @@ class OriginActor {
 							sessionId: binding.sessionId,
 							repo: this.#manager.repo,
 							selection: lifecycle.effectiveModel,
+							relay: tail,
 						})
 					: undefined;
 			if (lifecycle.effectiveModel) this.#appliedModel.set(binding.sessionId, modelKey);
@@ -1190,6 +1191,7 @@ class OriginActor {
 					sessionId: binding.sessionId,
 					repo: this.#manager.repo,
 					tier: lifecycle.effectiveServiceTier,
+					relay: tail,
 				});
 				this.#appliedServiceTier.set(binding.sessionId, lifecycle.effectiveServiceTier);
 			}
@@ -1772,6 +1774,7 @@ class OriginActor {
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
 				notBeforeMs: bound.dispatchedAtMs,
+				...this.#liveRelay(bound),
 			});
 		} catch (error) {
 			this.#manager.log(
@@ -1819,6 +1822,7 @@ class OriginActor {
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
 				notBeforeMs: bound.dispatchedAtMs,
+				...this.#liveRelay(bound),
 			});
 			const text = found?.text?.trim();
 			if (!text) return undefined;
@@ -1992,6 +1996,11 @@ class OriginActor {
 	 * between reopens, or refuses the read. A transport failure on the relay is
 	 * never a verdict about the operation.
 	 */
+	/** The bound turn's relay while it is attached; reads fall back to the CLI on their own when it tears. */
+	#liveRelay(bound: BoundTurn): { relay?: TailHandle } {
+		return bound.tail && !bound.detached ? { relay: bound.tail } : {};
+	}
+
 	async #statusOf(bound: BoundTurn): Promise<StatusReport> {
 		const base = { sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.turn.opRef };
 		if (!bound.tail || bound.detached) return await this.#manager.port.status(base);
@@ -2079,7 +2088,7 @@ class OriginActor {
 					// An indeterminate liveness probe is not release evidence.
 				}
 				const dead = live === false || disowned;
-				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId));
+				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId, this.#liveRelay(bound).relay));
 				if (liveIdle && (await this.#deliverUnobservedAnswer(bound, count))) return;
 				if (dead || liveIdle) {
 					await this.#releaseUnlanded(
@@ -2182,6 +2191,7 @@ class OriginActor {
 							notBeforeMs,
 							terminalIdentity: report.status,
 							isCurrent,
+							...this.#liveRelay(bound),
 						});
 						if (!isCurrent()) return;
 						if (output.status === "proven") text = output.text;
