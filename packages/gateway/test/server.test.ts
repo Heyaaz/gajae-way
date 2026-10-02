@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,7 +11,7 @@ import { MonitorRegistry } from "../src/monitors/registry";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { ACK_TIMEOUT_MS, DeliveryLedger } from "../src/store/ledger";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -145,7 +146,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(23);
+	expect(client.frames[2].result.schemaVersion).toBe(29);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -216,7 +217,13 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	expect(database.deliveryRows().find((row) => row.delivery_id === deliveryId)).toMatchObject({
 		state: "pending",
 		attempts: 1,
+		last_error: "other",
 	});
+	client.send({ v: "0.1", type: "request", id: "status-retry", verb: "gateway.status" });
+	await waitFrame(client.frames, "status-retry");
+	const retrying = client.frames.find((frame) => frame.id === "status-retry").result.delivery.recentPending;
+	expect(retrying).toMatchObject([{ deliveryId, state: "pending", attempts: 1, lastError: "other" }]);
+	expect(Date.parse(retrying[0].nextRetryAt)).toBeGreaterThan(Date.now() - 2_000);
 	const messagesBeforeRetry = client.frames.filter(
 		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
 	).length;
@@ -237,6 +244,57 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	expect(
 		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId),
 	).toHaveLength(2);
+	client.close();
+});
+
+test("inflight rows are not re-broadcast by the timed sweep within ack timeout", async () => {
+	const { client, database } = await startDeliveryServer({ deliverySweepIntervalMs: 50 });
+	const origin = { platform: "discord", kind: "dm", conversationId: "inflight-test", peerId: "owner" };
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "create-inflight",
+		verb: "chat.send",
+		params: { origin, text: "test inflight", engagement: { mentioned: false, group: false, authorId: "owner" } },
+	});
+	await waitFrame(client.frames, "create-inflight");
+	// Wait for the delivery to arrive
+	for (let attempt = 0; attempt < 400 && !client.frames.some((frame) => frame.event === "chat.message"); attempt++)
+		await Bun.sleep(5);
+	const initial = client.frames.find(
+		(frame) => frame.event === "chat.message" && frame.payload?.text === "the single reply body",
+	);
+	expect(initial).toBeDefined();
+	const deliveryId = initial.payload.deliveryId as string;
+
+	// Manually mark the delivery as inflight (simulating an in-flight state)
+	const ledger = new DeliveryLedger(database);
+	ledger.markInflight(deliveryId);
+	const row = ledger.get(deliveryId);
+	const updatedAt = Date.parse(row!.updatedAt);
+
+	// Count chat.message frames with this deliveryId before the sweep
+	const messagesBeforeSweep = client.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
+	).length;
+
+	// Wait for multiple sweep cycles (timed sweep runs every 50ms)
+	await Bun.sleep(250);
+
+	// Verify no duplicate was broadcast during the ack timeout window
+	const messagesAfterWait = client.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
+	).length;
+	expect(messagesAfterWait).toBe(messagesBeforeSweep);
+
+	// Manually advance time to after the ack timeout in the ledger
+	const nowAfterTimeout = updatedAt + ACK_TIMEOUT_MS + 100;
+	const undelivered = ledger.listUndelivered(24 * 60 * 60_000, nowAfterTimeout, false);
+
+	// After ack timeout, the inflight row should be returned
+	expect(undelivered).toHaveLength(1);
+	expect(undelivered[0]).toMatchObject({ deliveryId, state: "inflight" });
+
 	client.close();
 });
 
@@ -387,6 +445,59 @@ test("an expired monitor delivery fails its authored events with evidence; a con
 	await waitFrame(client.frames, "confirm");
 	expect(eventStage()).toBe("delivered");
 	client.close();
+});
+
+test("the sweep expires a stale unsettled row and alerts once even with no adapter connected", async () => {
+	const logs: string[] = [];
+	const originalError = console.error;
+	console.error = (...values: unknown[]) => logs.push(values.map(String).join(" "));
+	try {
+		directory = await mkdtemp(join(tmpdir(), "gajaeway-delivery-ttl-"));
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home: directory,
+			configPath: join(directory, "config.json"),
+			socketPath: join(directory, "gateway.sock"),
+			dbPath: join(directory, "gateway.db"),
+			logVerbosity: "info",
+			dmPolicy: "open",
+		};
+		const database = await GatewayDatabase.open(config.dbPath);
+		const sessionPort = sessionPortFromResponder({
+			bind: (key, epoch) => bindWorkFixture(key, epoch),
+			respond: async () => "unused",
+		});
+		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		const ledger = new DeliveryLedger(database);
+		ledger.createPending({ deliveryId: "orphan", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
+		ledger.fail("orphan", false, "socket hang up");
+		ledger.fail("orphan", false, "socket hang up");
+		const raw = new Database(config.dbPath);
+		raw
+			.query("UPDATE deliveries SET created_at = ? WHERE delivery_id = 'orphan'")
+			.run(new Date(Date.now() - 25 * 60 * 60_000).toISOString());
+		raw.close();
+		server = await startUnixServer({
+			config,
+			database,
+			sessionPort,
+			onStop: () => database.close(),
+			deliverySweepIntervalMs: 20,
+		});
+		for (let attempt = 0; attempt < 400 && ledger.get("orphan")?.state !== "expired"; attempt++) await Bun.sleep(5);
+		expect(ledger.get("orphan")).toMatchObject({
+			state: "expired",
+			attempts: 2,
+			lastError: "network",
+			nextRetryAt: null,
+		});
+		await Bun.sleep(100);
+		expect(logs.filter((line) => line.startsWith("delivery_expired deliveryId=orphan"))).toEqual([
+			"delivery_expired deliveryId=orphan origin=discord/channel/c attempts=2 reason=age",
+		]);
+	} finally {
+		console.error = originalError;
+	}
 });
 
 test("ops.redeliver requeues expired rows by id or since and immediately publishes them", async () => {
@@ -1451,6 +1562,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	expect(jobs.result.jobs).toHaveLength(1);
 	expect(jobs.result.jobs[0].job_id).toBe(jobId);
 	expect(jobs.result.jobs[0].lane_key).toBe("work-Repo.Fix-2");
+	expect(jobs.result.jobs[0].reports).toEqual({ pending: 0, claimed: 0, held: 0, undeliverable: 0 });
 	// The completed ATTEMPT closed; the JOB stays continuable (attempt_ended),
 	// never a terminal work-failure.
 	expect(jobs.result.jobs[0].state).toBe("attempt_ended");
@@ -2090,6 +2202,7 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 });
 async function workSocketFixture() {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-async-socket-"));
+	const target = { platform: "discord" as const, kind: "channel" as const, conversationId: "results" };
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
@@ -2098,6 +2211,7 @@ async function workSocketFixture() {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		work: { maxLanes: 2 },
+		ownerTarget: { origin: target },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
@@ -2128,13 +2242,12 @@ async function workSocketFixture() {
 
 test("socket work.start accepts before terminal, status/steer stay available, one completion notice", async () => {
 	const f = await workSocketFixture();
-	const target = { platform: "discord", kind: "channel", conversationId: "results" };
 	f.client.send({
 		v: "0.1",
 		type: "request",
 		id: "start",
 		verb: "work.start",
-		params: { name: "a", text: "work", cwd: directory, notify: target },
+		params: { name: "a", text: "work", cwd: directory },
 	});
 	await waitFrame(f.client.frames, "start");
 	const receipt = f.client.frames.find((frame) => frame.id === "start").result;
@@ -2167,7 +2280,7 @@ test("socket work.start accepts before terminal, status/steer stay available, on
 	expect(notices).toHaveLength(1);
 	expect(notices[0].payload).toMatchObject({
 		turnId: receipt.opRef,
-		origin: target,
+		origin: { platform: "discord", kind: "channel", conversationId: "results" },
 		text: "[lane a] completed: socket result",
 	});
 	expect(f.port.sends).toHaveLength(1);

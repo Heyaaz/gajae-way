@@ -9,8 +9,10 @@ import {
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import type { GatewayDatabase } from "../store/db";
+import { validateProcedureFiles } from "./procedure";
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
+const OVERLAP_POLICIES = new Set(["queue", "skip"]);
 const SERVICE_TIERS = new Set(["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"]);
 const MONITOR_UPDATE_FIELDS = new Set([
 	"name",
@@ -22,6 +24,7 @@ const MONITOR_UPDATE_FIELDS = new Set([
 	"model",
 	"serviceTier",
 	"enabled",
+	"procedureFiles",
 ]);
 /** Upper bound on a per-monitor authoring instruction, in characters. */
 export const MONITOR_INSTRUCTION_MAX_LENGTH = 4000;
@@ -33,15 +36,23 @@ export class MonitorRegistry {
 	}
 	add(spec: MonitorSpec): MonitorRecord {
 		validateSpec(spec);
-		const trigger = spec.trigger.kind === "webhook" ? { ...spec.trigger, route: crypto.randomUUID() } : spec.trigger;
+		const trigger: TriggerSpec =
+			spec.trigger.kind === "webhook"
+				? { ...spec.trigger, route: crypto.randomUUID() }
+				: spec.trigger.kind === "cron"
+					? { ...spec.trigger, timezone: spec.trigger.timezone ?? localTimezone() }
+					: spec.trigger;
 		const instruction = spec.instruction?.trim() || undefined;
+		const procedureFiles = spec.procedureFiles?.length ? spec.procedureFiles.map((file) => file.trim()) : undefined;
 		const record: MonitorRecord = {
 			...spec,
 			trigger,
 			monitorId: crypto.randomUUID(),
 			burstPolicy: spec.burstPolicy ?? "coalesce",
+			overlap: spec.overlap ?? "queue",
 			enabled: spec.enabled ?? true,
 			instruction,
+			procedureFiles,
 			createdAt: new Date().toISOString(),
 		};
 		this.#database.withTransaction(() =>
@@ -51,11 +62,13 @@ export class MonitorRegistry {
 				triggerJson: JSON.stringify(record.trigger),
 				eventTypesJson: JSON.stringify(record.eventTypes),
 				burstPolicy: record.burstPolicy,
+				overlap: record.overlap,
 				channelTargetJson: record.channelTarget ? JSON.stringify(record.channelTarget) : null,
 				enabled: record.enabled,
 				instruction: instruction ?? null,
 				modelJson: record.model ? JSON.stringify(record.model) : null,
 				serviceTier: record.serviceTier ?? null,
+				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			}),
 		);
 		return record;
@@ -66,7 +79,7 @@ export class MonitorRegistry {
 			try {
 				records.push(rowToRecord(row));
 			} catch {
-				console.error(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
+				console.warn(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
 			}
 		}
 		return records;
@@ -107,7 +120,13 @@ export class MonitorRegistry {
 			const instruction = Object.hasOwn(patch, "instruction")
 				? patch.instruction?.trim() || undefined
 				: current.instruction;
-			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction };
+			if (patch.procedureFiles !== undefined) validateProcedureFiles(patch.procedureFiles);
+			const procedureFiles = Object.hasOwn(patch, "procedureFiles")
+				? patch.procedureFiles?.length
+					? patch.procedureFiles.map((file) => file.trim())
+					: undefined
+				: current.procedureFiles;
+			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
 			validateSpec(updated);
 			const persisted = this.#database.monitorUpdate({
@@ -121,6 +140,7 @@ export class MonitorRegistry {
 				instruction: instruction ?? null,
 				modelJson: updated.model ? JSON.stringify(updated.model) : null,
 				serviceTier: updated.serviceTier ?? null,
+				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			});
 			return persisted ? updated : undefined;
 		});
@@ -131,17 +151,21 @@ export class MonitorRegistry {
 }
 
 function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): MonitorRecord {
+	const trigger = JSON.parse(row.trigger_json) as TriggerSpec;
 	const record: MonitorRecord = {
 		monitorId: row.monitor_id,
 		name: row.name,
-		trigger: JSON.parse(row.trigger_json),
+		trigger:
+			trigger.kind === "cron" && trigger.timezone === undefined ? { ...trigger, timezone: localTimezone() } : trigger,
 		eventTypes: JSON.parse(row.event_types_json),
 		burstPolicy: row.burst_policy as MonitorRecord["burstPolicy"],
+		overlap: row.overlap as MonitorRecord["overlap"],
 		channelTarget: row.channel_target_json ? JSON.parse(row.channel_target_json) : null,
 		enabled: Boolean(row.enabled),
 		instruction: row.instruction ?? undefined,
 		model: row.model_json ? JSON.parse(row.model_json) : undefined,
 		serviceTier: (row.service_tier as MonitorRecord["serviceTier"]) ?? undefined,
+		procedureFiles: row.procedure_files_json ? JSON.parse(row.procedure_files_json) : undefined,
 		createdAt: row.created_at,
 	};
 	validateSpec(record);
@@ -172,6 +196,8 @@ export function validateSpec(spec: MonitorSpec): void {
 		}
 	}
 	if (spec.burstPolicy && !BURST_POLICIES.has(spec.burstPolicy)) throw new Error("invalid monitor burstPolicy");
+	if (spec.overlap !== undefined && !OVERLAP_POLICIES.has(spec.overlap))
+		throw new Error('monitor overlap must be "queue" or "skip"');
 	validateTrigger(spec.trigger);
 	if (spec.channelTarget) {
 		validateOriginRef(spec.channelTarget.origin);
@@ -195,6 +221,7 @@ export function validateSpec(spec: MonitorSpec): void {
 		if (spec.instruction.length > MONITOR_INSTRUCTION_MAX_LENGTH)
 			throw new Error(`monitor instruction must be at most ${MONITOR_INSTRUCTION_MAX_LENGTH} characters`);
 	}
+	if (spec.procedureFiles !== undefined) validateProcedureFiles(spec.procedureFiles);
 }
 /** `<@id>` renders as a ping on Discord (numeric snowflake) and Slack (`U…`/`W…`). */
 const MENTION_ID_BY_PLATFORM: Partial<Record<string, RegExp>> = {
@@ -211,7 +238,18 @@ function validateMentionUserIds(target: MonitorChannelTarget): void {
 }
 function validateTrigger(trigger: TriggerSpec): void {
 	if (!trigger || typeof trigger !== "object") throw new Error("monitor trigger is required");
-	if (trigger.kind === "cron" && typeof trigger.schedule === "string") return;
+	if (trigger.kind === "cron" && typeof trigger.schedule === "string") {
+		if (trigger.timezone !== undefined) {
+			if (typeof trigger.timezone !== "string" || !trigger.timezone.trim())
+				throw new Error("monitor cron timezone must be a non-empty IANA timezone");
+			try {
+				new Intl.DateTimeFormat("en-US", { timeZone: trigger.timezone }).format();
+			} catch {
+				throw new Error(`monitor cron timezone ${JSON.stringify(trigger.timezone)} is not a valid IANA timezone`);
+			}
+		}
+		return;
+	}
 	if (trigger.kind === "webhook" && typeof trigger.route === "string") return;
 	if (trigger.kind === "watcher" && typeof trigger.root === "string") return;
 	if (
@@ -224,4 +262,10 @@ function validateTrigger(trigger: TriggerSpec): void {
 	)
 		return;
 	throw new Error("invalid monitor trigger");
+}
+
+function localTimezone(): string {
+	const timezone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+	if (!timezone) throw new Error("gateway local IANA timezone is unavailable");
+	return timezone;
 }

@@ -2,11 +2,13 @@ import {
 	CATCH_ALL_EVENT_ORIGIN,
 	type ChatMessagePayload,
 	eventTypeOrigin,
-	isSilenceToken,
+	isSilentOutput,
 	type MonitorEventRecord,
 	type MonitorRecord,
+	monitorSessionOrigin,
 	type OriginRef,
 	originKey,
+	type ProtocolFailureReason,
 } from "@gajae-gateway/protocol";
 import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
@@ -37,10 +39,10 @@ import {
 	MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD,
 	type MonitorDigestNote,
 	type NativeCompactionStatus,
-	type ProtocolFailureReason,
 	type SessionRollReason,
 	unavailableCompactionPort,
 } from "./compaction";
+import { readMonitorProcedure } from "./procedure";
 import type { MonitorRegistry } from "./registry";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
@@ -89,16 +91,12 @@ type DispatchFailureCode =
 	| "internal_error";
 
 /**
- * Failures that say nothing about the dispatch path being down, so reconcile
- * reclaims them on the next sweep instead of on the #179 outage backoff: a
- * `gateway_shutdown` interrupt is retried by the next boot (#225), and a
- * `session_busy` refusal is replayed into the session the busy roll just bound
- * (#263). The reclaim budget still bounds both.
+ * Failures that say nothing about the dispatch path, so the #179 retry backoff
+ * does not apply: `session_busy` sent nothing (and the #263 roll moves the next
+ * attempt to a fresh session), `gateway_shutdown` was this process's own stop
+ * (#225: the next boot re-dispatches at once). Both still consume the budget.
  */
-const IMMEDIATE_RETRY_FAILURE_CODES: ReadonlySet<string> = new Set<DispatchFailureCode>([
-	"gateway_shutdown",
-	"session_busy",
-]);
+const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode>(["session_busy", "gateway_shutdown"]);
 
 /**
  * How long shutdown waits for in-flight authoring turns before marking them
@@ -353,15 +351,20 @@ export class MonitorPropagator {
 		if (typeof eventType !== "string" || !eventType) throw new Error("event type is required");
 		const eventId = crypto.randomUUID();
 		const firedAt = new Date().toISOString();
-		this.#database.withTransaction(() =>
+		const skippedBy = this.#database.withTransaction(() =>
 			this.#database.monitorEventCreate({
 				eventId,
 				monitorId,
 				eventType,
 				payloadJson: JSON.stringify(payload ?? null),
 				firedAt,
+				overlap: monitor.overlap,
 			}),
 		);
+		if (skippedBy) {
+			this.#noteSkipped({ eventId, monitorId, eventType, firedAt }, skippedBy);
+			return eventId;
+		}
 		this.#emit({ eventId, monitorId, eventType, firedAt, stage: "admitted" });
 		const key = `${monitorId}\u0000${eventType}`;
 		if (monitor.burstPolicy === "serialize") {
@@ -436,14 +439,19 @@ export class MonitorPropagator {
 		// it existed — catch-up admission is clamped to monitor.createdAt.
 		if (slotAt.getTime() < Date.parse(monitor.createdAt)) return null;
 		const eventId = crypto.randomUUID();
-		const admitted = this.#database.monitorSlotClaimWithEvent({
+		const claim = this.#database.monitorSlotClaimWithEvent({
 			monitorId,
 			slotAt: slotAt.toISOString(),
 			eventId,
 			eventType,
 			payloadJson: JSON.stringify(payload ?? null),
+			overlap: monitor.overlap,
 		});
-		if (!admitted) return null;
+		if (!claim.admitted) return null;
+		if (claim.skippedBy) {
+			this.#noteSkipped({ eventId, monitorId, eventType, firedAt: slotAt.toISOString() }, claim.skippedBy);
+			return eventId;
+		}
 		this.#emit({ eventId, monitorId, eventType, firedAt: slotAt.toISOString(), stage: "admitted" });
 		const key = `${monitorId}\u0000${eventType}`;
 		if (monitor.burstPolicy === "serialize") {
@@ -467,6 +475,21 @@ export class MonitorPropagator {
 		return eventId;
 	}
 	/**
+	 * Overlap policy `skip` (issue #83): the fire lost its slot to a predecessor
+	 * that still owes an authoring turn. It is recorded terminal `skipped` and
+	 * never dispatched. It is a scheduling outcome, not a dispatch failure, so it
+	 * writes no monitor_failures row.
+	 */
+	#noteSkipped(
+		event: { eventId: string; monitorId: string; eventType: string; firedAt: string },
+		skippedBy: string,
+	): void {
+		this.#emit({ ...event, stage: "skipped" });
+		console.error(
+			`monitor event skipped (overlap=skip): event ${event.eventId} of monitor ${event.monitorId}; event ${skippedBy} is still in flight`,
+		);
+	}
+	/**
 	 * Recovery sweep. Oldest-first, at-most-one concurrent sweep per process:
 	 * - `batched` rows not in this process's in-flight set are orphans of a dead
 	 *   dispatch and are reclaimed exactly like `admitted`/`dispatched`/`failed`
@@ -478,7 +501,7 @@ export class MonitorPropagator {
 	 * an event that keeps failing lands on `failed_no_retry` — operator-visible,
 	 * never an infinite dispatch loop. `failed` rows are reclaimed on the
 	 * MONITOR_EVENT_RETRY_BACKOFF_MS schedule, so the budget spans hours rather
-	 * than five consecutive sweeps (#179).
+	 * than five consecutive sweeps (#179); BACKOFF_EXEMPT_FAILURES retry at once.
 	 */
 	async reconcile(): Promise<void> {
 		if (this.#reconciling) {
@@ -523,8 +546,8 @@ export class MonitorPropagator {
 				// A silent note is never delivered, so `authored` would wait forever for a
 				// confirmation that cannot come (#94): settle it as authored_no_delivery.
 				if (output && !hasMemory)
-					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilenceToken(output), row);
-				else if (output && row.stage === "authored" && isSilenceToken(output))
+					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilentOutput(output), row);
+				else if (output && row.stage === "authored" && isSilentOutput(output))
 					this.#database.withTransaction(() => this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery"));
 				else if (!output && this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
@@ -539,6 +562,7 @@ export class MonitorPropagator {
 								.find((candidate) => candidate.event_id === row.event_id);
 							if (!current) return undefined;
 							this.#database.monitorEventUpdate(row.event_id, "failed_no_retry", null);
+							this.#database.metaDelete(authoringTurnKey(row.event_id));
 							return current.stage === "failed_no_retry" ? undefined : current;
 						});
 						if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
@@ -546,8 +570,8 @@ export class MonitorPropagator {
 					}
 					if (
 						row.stage === "failed" &&
-						!IMMEDIATE_RETRY_FAILURE_CODES.has(this.#database.monitorFailure(row.event_id)?.code ?? "") &&
-						this.#now() - Date.parse(row.updated_at) < (MONITOR_EVENT_RETRY_BACKOFF_MS[row.dispatch_attempts] ?? 0)
+						this.#now() - Date.parse(row.updated_at) < (MONITOR_EVENT_RETRY_BACKOFF_MS[row.dispatch_attempts] ?? 0) &&
+						!BACKOFF_EXEMPT_FAILURES.has(this.#database.monitorFailure(row.event_id)?.code ?? "")
 					)
 						continue;
 					this.#database.monitorEventIncrementAttempts(row.event_id);
@@ -645,7 +669,12 @@ export class MonitorPropagator {
 		try {
 			if (!claimedEventType) throw new Error("missing event type");
 			originKey(eventTypeOrigin(claimedEventType));
-			sessionOrigin = declared.has(claimedEventType) ? eventTypeOrigin(claimedEventType) : CATCH_ALL_EVENT_ORIGIN;
+			// The session is owned by THIS monitor (#177): monitors that declare the
+			// same event type must not share history, instruction, or failure domain.
+			sessionOrigin = monitorSessionOrigin(
+				monitor.monitorId,
+				declared.has(claimedEventType) ? claimedEventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
+			);
 			sessionOriginKey = originKey(sessionOrigin);
 		} catch {
 			for (const row of claimed) {
@@ -681,6 +710,8 @@ export class MonitorPropagator {
 		let boundSessionId: string | undefined;
 		let boundSessionEpoch: number | undefined;
 		let dispatchPhase = "bind";
+		let dispatchOperation: string | undefined;
+		let dispatchOperationArgs: Record<string, unknown> | undefined;
 		// Registered before the per-origin queue: an event still waiting for its
 		// turn is just as interrupted by a shutdown as one mid-request.
 		for (const row of claimed)
@@ -702,6 +733,9 @@ export class MonitorPropagator {
 			// old, and the failure may well have been produced against a session that
 			// no longer exists.
 			const replayedBatch = claimed.some((row) => row.dispatch_attempts > 0);
+			let protocolResponseByteLength: number | undefined;
+			let protocolResponseEntryCount: number | null = null;
+			let protocolValidationActive = false;
 			try {
 				// Safety-net roll boundary (issue #68). It sits HERE, after the
 				// per-origin turn chain has been acquired and before this batch's
@@ -714,6 +748,11 @@ export class MonitorPropagator {
 				const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
 				const effectiveModel = (monitor.model as GjcModelSelection | undefined) ?? this.#model;
 				const effectiveServiceTier = (monitor.serviceTier as GjcServiceTier | undefined) ?? this.#serviceTier;
+				dispatchOperation = "bind";
+				dispatchOperationArgs = {
+					epoch: boundEpoch,
+					hasModel: effectiveModel !== undefined,
+				};
 				const binding = await this.#sessionPort.bind({
 					originKey: sessionOriginKey,
 					epoch: boundEpoch,
@@ -730,12 +769,20 @@ export class MonitorPropagator {
 						: `preset:${effectiveModel.preset}`
 					: undefined;
 				if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
+					dispatchOperation = "setModel";
+					dispatchOperationArgs = {
+						model: modelKey,
+					};
 					await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
 					this.#appliedModels.set(sessionId, modelKey!);
 				} else if (effectiveModel && binding.startupModelApplied) {
 					this.#appliedModels.set(sessionId, modelKey!);
 				}
 				if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
+					dispatchOperation = "setServiceTier";
+					dispatchOperationArgs = {
+						tier: effectiveServiceTier,
+					};
 					await this.#sessionPort.setServiceTier({ sessionId, repo: this.#repo, tier: effectiveServiceTier });
 					this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
 				}
@@ -747,9 +794,33 @@ export class MonitorPropagator {
 					.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
 					.filter((entry, index, all) => entry && all.indexOf(entry) === index);
 				const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
-				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
-				const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
+				// Issue #82: the session is long-lived, so declared procedure files are
+				// re-read at every firing and travel with this prompt, and the version
+				// each event was authored under is recorded on the event row.
+				dispatchPhase = "procedure";
+				const procedure = await readMonitorProcedure(this.#repo, monitor.procedureFiles ?? []);
+				if (procedure.versions.length) {
+					const versionsJson = JSON.stringify(procedure.versions);
+					for (const row of claimed)
+						this.#database.monitorEventFencedSetProcedure(row.event_id, leaseId, versionsJson, now());
+				}
+				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${procedure.prompt ? `\n${procedure.prompt}\n` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+				// #187: a request-phase failure does not mean the prompt was refused —
+				// the turn it started may still be running. Reuse its op-ref on retry.
+				const opRef =
+					(await this.#reusableAuthoringTurn(
+						claimed.map((row) => row.event_id),
+						sessionId,
+					)) ?? `gw-m-${batchId.replaceAll("-", "")}`;
+				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: claimed.map((row) => row.event_id) });
+				this.#database.withTransaction(() => {
+					for (const row of claimed) this.#database.metaSet(authoringTurnKey(row.event_id), pendingTurn);
+				});
 				dispatchPhase = "request";
+				dispatchOperation = "request";
+				dispatchOperationArgs = {
+					opRef,
+				};
 				const response = (
 					await this.#sessionPort.request({
 						sessionId,
@@ -759,6 +830,11 @@ export class MonitorPropagator {
 						opRef,
 					})
 				).assistant.text;
+				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
+				// The turn settled: a later retry must author afresh, never re-read it.
+				this.#database.withTransaction(() => {
+					for (const row of claimed) this.#database.metaDelete(authoringTurnKey(row.event_id));
+				});
 				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
@@ -784,8 +860,10 @@ export class MonitorPropagator {
 					this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
 				);
 				if (!fenced.length) return;
+				protocolValidationActive = true;
 				for (const row of fenced) this.#emitStage(row, "dispatched");
 				const authored = parseAuthoredArray(response) as Array<{ eventId?: unknown; note?: unknown }>;
+				protocolResponseEntryCount = authored.length;
 				if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
 				// Strict response contract: exactly one valid entry per claimed event —
 				// a partial/missing/duplicate/extra response is a structured failure.
@@ -808,6 +886,7 @@ export class MonitorPropagator {
 				for (const id of claimedIds) {
 					if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
 				}
+				protocolValidationActive = false;
 				for (const entry of authored)
 					if (
 						typeof entry.eventId === "string" &&
@@ -857,16 +936,32 @@ export class MonitorPropagator {
 				// fenced event still holding its lease (same transaction). A stale
 				// attempt therefore cannot emit a second delivery.
 				const deliveryId = crypto.randomUUID();
-				const deliveryText = authored
+				// Evaluate silence PER NOTE BEFORE joining: a silent note in a batch
+				// must not leak, and a real note must not be swallowed by a neighbour's marker.
+				const nonSilentEntries = authored
 					.filter(
 						(entry): entry is { eventId: string; note: string } =>
 							typeof entry.eventId === "string" &&
 							typeof entry.note === "string" &&
 							fenced.some((row) => row.event_id === entry.eventId),
 					)
-					.map((entry) => entry.note)
-					.join("\n");
-				if (!isSilenceToken(deliveryText)) {
+					.filter((entry) => !isSilentOutput(entry.note));
+				const silentEntries = authored
+					.filter(
+						(entry): entry is { eventId: string; note: string } =>
+							typeof entry.eventId === "string" &&
+							typeof entry.note === "string" &&
+							fenced.some((row) => row.event_id === entry.eventId),
+					)
+					.filter((entry) => isSilentOutput(entry.note));
+				// Mark all silent notes as authored_no_delivery
+				for (const entry of silentEntries) {
+					if (this.#database.authoredOutput(entry.eventId) === undefined) continue;
+					this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId);
+				}
+				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
+				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
+				if (deliveryText.length > 0) {
 					const origin = target.origin;
 					// Typed mentions (issue #180) are added here, in code: the author is
 					// never asked to remember who to ping, and the recipient list never
@@ -894,18 +989,21 @@ export class MonitorPropagator {
 					// until the next adapter reconnect flushed redeliveries (live finding:
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
-				} else {
-					// A silent batch creates no delivery, so nothing would ever confirm it:
-					// settle terminally instead of stranding it at `authored` (#94).
-					for (const row of fenced) {
-						if (this.#database.authoredOutput(row.event_id) === undefined) continue;
-						this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId);
-					}
 				}
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
 				const failureClass = classifyAuthoringFailure(error);
+				const protocolFailure =
+					protocolValidationActive && failureClass === "protocol" && protocolResponseByteLength !== undefined
+						? {
+								protocolFailure: {
+									reason: classifyProtocolFailure(error),
+									responseByteLength: protocolResponseByteLength,
+									responseEntryCount: protocolResponseEntryCount,
+								},
+							}
+						: undefined;
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
 				for (const row of leased) {
 					const failed = this.#database.monitorEventFencedFail(
@@ -914,8 +1012,10 @@ export class MonitorPropagator {
 						batchId,
 						code,
 						// #64: the detail must carry the actual cause (sanitized), not echo the code.
-						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
+						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, operation: dispatchOperation, operation_args: dispatchOperationArgs, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 						now(),
+						false,
+						protocolFailure,
 					);
 					if (failed) this.#emitStage(row, "failed");
 				}
@@ -940,6 +1040,45 @@ export class MonitorPropagator {
 				for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 			}
 		});
+	}
+	/**
+	 * The op-ref of a previous attempt's authoring turn for exactly these events
+	 * on this session, when that turn is still running or finished successfully.
+	 * A failed, unknown or unreadable prior turn is forgotten so the retry sends
+	 * a fresh prompt.
+	 */
+	async #reusableAuthoringTurn(eventIds: readonly string[], sessionId: string): Promise<string | undefined> {
+		const raw = this.#database.metaGet(authoringTurnKey(eventIds[0] ?? ""));
+		if (raw === undefined) return undefined;
+		let prior: { sessionId?: unknown; opRef?: unknown; eventIds?: unknown };
+		try {
+			prior = JSON.parse(raw) as typeof prior;
+		} catch {
+			prior = {};
+		}
+		const priorIds = Array.isArray(prior.eventIds) ? prior.eventIds : [];
+		const forget = () => {
+			for (const id of new Set([...eventIds, ...priorIds.filter((id): id is string => typeof id === "string")]))
+				this.#database.metaDelete(authoringTurnKey(id));
+		};
+		if (
+			prior.sessionId !== sessionId ||
+			typeof prior.opRef !== "string" ||
+			priorIds.length !== eventIds.length ||
+			!eventIds.every((id) => priorIds.includes(id))
+		) {
+			forget();
+			return undefined;
+		}
+		try {
+			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
+			const state = report.status.status;
+			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
+		} catch {
+			// Unreadable status is not evidence of a live turn.
+		}
+		forget();
+		return undefined;
 	}
 	/** Read-only safety-net evidence for one session origin (ops/tests). */
 	sessionSafetyState(sessionOriginKey: string): MonitorSessionSafetyState {
@@ -1060,7 +1199,7 @@ export class MonitorPropagator {
 			// jip-gajae `sns-threads`, 19/19 ticks in one day).
 			if (liveBinding && state.protocolFailures >= this.#protocolFailureRollThreshold) {
 				state.pendingRoll = "protocol_failures_off_contract";
-				console.error(
+				console.warn(
 					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=protocol_failures_off_contract protocol_failures=${state.protocolFailures}/${this.#protocolFailureRollThreshold} last_reason=${protocolReason} turns=${state.turns}`,
 				);
 			}
@@ -1068,7 +1207,7 @@ export class MonitorPropagator {
 		}
 		if (!liveBinding) {
 			state.staleContextFailures += 1;
-			console.error(
+			console.info(
 				`monitor context failure not counted for ${sessionOriginKey} (monitor ${monitor.monitorId}): replayed=${replayed} current_epoch=${currentEpoch}`,
 			);
 			return;
@@ -1085,7 +1224,7 @@ export class MonitorPropagator {
 		// Arm, do not roll here: the roll must happen at the dispatch boundary
 		// where no batch is in flight.
 		state.pendingRoll = reason;
-		console.error(
+		console.warn(
 			`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} context_failures=${state.contextFailures}/${this.#contextFailureRollThreshold} native_compaction=${status} turns=${state.turns}`,
 		);
 	}
@@ -1152,7 +1291,7 @@ export class MonitorPropagator {
 		state.protocolFailures = 0;
 		state.busyFailures = 0;
 		state.turns = 0;
-		console.error(
+		console.info(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
 		);
 		return digest;
@@ -1287,19 +1426,24 @@ export function parseAuthoredArray(response: string): unknown {
 		}
 	}
 	attempts.push(...spans.reverse());
-	let lastError: unknown;
+	let parsedNonArray = false;
 	for (const candidate of attempts) {
 		if (!candidate) continue;
 		try {
 			const parsed = JSON.parse(candidate) as unknown;
 			if (Array.isArray(parsed)) return parsed;
-		} catch (error) {
-			lastError = error;
+			parsedNonArray = true;
+		} catch {
+			// Raw parser errors can echo attacker-controlled response text.
 		}
 	}
-	throw new Error(
-		`authoring response is not a JSON array (${lastError instanceof Error ? lastError.message : "no array found"})`,
-	);
+	if (parsedNonArray) throw new Error("authoring response is not a JSON array");
+	throw new Error("authoring response JSON is unparseable");
+}
+
+/** Durable pointer from an event to the authoring turn its last dispatch started (#187). */
+function authoringTurnKey(eventId: string): string {
+	return `monitor_authoring_turn:${eventId}`;
 }
 
 /** Only explicit diagnostic vocabulary crosses the durable boundary, never raw error text. */

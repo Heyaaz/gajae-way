@@ -23,7 +23,22 @@ Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`
 
 A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It does need the same global-user `gjc` executable and canonical agent directory/broker used by the operator's interactive SDK. Verify `command -v gjc` in that user's normal shell and set the service's `GJC_EXECUTABLE` explicitly to the verified absolute executable path. Run the service as that same user with the same canonical profile environment (`HOME`, and any intentional `GJC_CONFIG_DIR`/`PI_CONFIG_DIR` or `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` selection). Do not introduce gateway-private overrides, copy model/provider configuration, or seed settings. The default profile is `~/.gjc/agent`; using the same executable with a different agent directory is not the same runtime. GJC owns its daemon; the gateway is an SDK client only. Credentials belong in the user's established protected environment, not in copied broker settings.
 
-The gateway requires GJC 0.16.0 or newer. GJC 0.17.6 requires `--json` for machine-readable `sdk session` errors; the gateway adds it to those commands. The `sdk serve --stdio` relay arguments and environment binding are unchanged.
+The gateway requires GJC 0.16.0 or newer. Its error-code handling is verified through the gjc minor named by `VERIFIED_GJC_THROUGH` (`packages/gateway/src/orchestrator/gjc-contract.ts`); a newer minor still runs but raises the `gjc_unverified_version` cycle gate until `GAJAEWAY_E2E_GJC=1 bun test packages/gateway/test/gjc-contract.e2e.test.ts` passes against it and the constant is raised. After upgrading gjc on a host, run that test there; the gateway ends a pre-upgrade `gjc` process that keeps killing the shared broker on its own (see the runbook). GJC 0.17.6 requires `--json` for machine-readable `sdk session` errors; the gateway adds it to those commands. The `sdk serve --stdio` relay arguments and environment binding are unchanged.
+
+## Upgrades
+
+`gajaeway update` upgrades a binary install in place from the project's GitHub releases — the same model `gjc update` uses — so a production host never needs the source checkout it was first installed from:
+
+```sh
+gajaeway update --check                 # report only; touches nothing
+gajaeway update                         # download, replace, and queue the stack restart
+gajaeway update --no-restart            # replace binaries; restart later with ops restart-stack
+gajaeway update --bin-dir /opt/gajaeway # when driving the update from elsewhere
+```
+
+The update resolves the latest `vX.Y.Z` release, downloads this platform's `gajaeway-<platform>-<arch>.tar.gz`, stages and size-checks the binaries, backs the previous ones up into `<bin-dir>/backup-<version>-<timestamp>/`, replaces them in place, records the installed release in `<bin-dir>/.gajaeway-release`, and queues the existing `ops restart-stack` supervisor (gateway first, then adapters). Only binaries the host already installed are replaced, plus the `gajaeway`/`gajaeway-gateway` core pair; a release never installs adapters the operator did not choose. One update runs at a time per bin dir (`.gajaeway-update.lock`; a lock naming a live pid refuses, a stale one is taken over), and `--force` reinstalls the current release.
+
+A source checkout keeps upgrading through `git` + `bun run build` + `services repair`; `update` refuses to guess a bin dir when run under `bun`, so pass `--bin-dir` in that case. `GAJAEWAY_UPDATE_REPO=owner/name` redirects update checks at a fork's releases; the default comes from the package's declared repository.
 
 ## Home and configuration
 
@@ -73,7 +88,7 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
 
 ## Slack adapter
 
@@ -84,7 +99,8 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
   "botTokenFile": "secrets/slack-bot-token",
   "appTokenFile": "secrets/slack-app-token",
   "gatewaySocket": "/Users/me/gajaeway/gateway.sock",
-  "channels": { "C0123456789": { "engagement": "open" } }
+  "channels": { "C0123456789": { "engagement": "open" } },
+  "liveReplies": true
 }
 ```
 
@@ -95,13 +111,14 @@ Create the Slack app from a manifest with:
 - Socket Mode **enabled**, and an app-level token with the `connections:write` scope (`appTokenFile`).
 - Bot token scopes: `app_mentions:read channels:history channels:read chat:write groups:history groups:read im:history im:read im:write mpim:history mpim:read reactions:read reactions:write users:read files:read commands`.
 - Event subscriptions (bot events): `message.channels message.groups message.im message.mpim reaction_added reaction_removed`.
-- Slash commands `/new`, `/reset`, and `/restart` (any request URL; Socket Mode delivers them over the socket).
+- Slash commands `/new`, `/reset`, `/restart`, and `/model` (any request URL; Socket Mode delivers them over the socket). Register `/model` even if you never plan to type it: Slack delivers a slash command to whichever workspace app registered its name, so if this app does not register `/model`, typing `/model` anywhere — including this bot's own DM — reaches whichever other app claimed it instead.
 
 Invite the bot to every channel it should read; Slack delivers no history or events for channels the bot is not a member of.
 
 Origins are `slack/dm/D…/peer=U…` for direct messages, `slack/channel/C…` for public, private, and multi-person channels, and `slack/thread/C…:<thread_ts>/parent=C…` for messages inside a thread. Platform message ids are `channel:ts` pairs because a Slack `ts` is unique only within its channel. Replies default into threads: a channel mention is answered in a thread rooted at the message that triggered it (the room stays readable and the conversation continues in that thread, which is its own session), a reply inside a thread stays in it, and a DM sent inside a thread is answered in that thread. `[REPLY:<channel:ts>]` overrides the target.
 
 Presence is a reaction gradient on the message the persona is answering, not a posted or edited message: on acceptance the message gets ⏳; as the turn moves it becomes 🔧 (running a tool), 💭 (reading a result), ✍️ (writing); a clock face 🕐…🕛 advances once per minute and a digit 1️⃣ 2️⃣ 3️⃣ 5️⃣ 🔟 💯 tracks tool calls (or tokens when the runtime reports none). Each marker is swapped only when its bucket changes and at most once per 15 seconds, and every marker comes off when the reply lands. The tool's name and stated intent are never rendered in chat; they are shown in the admin console's live-work row. Outbound writes are paced per channel (about one per second; replies take priority over status edits), HTTP 429 is retried up to three times honouring `Retry-After` and then left as an ambiguous delivery for the next redelivery pass rather than recorded as a failure, and a reconnect after a blip shorter than five seconds does not repeat a catch-up pass that finished within the last minute. Reactions are mapped by Slack emoji name (`👍` → `+1`, `🦞` → `lobster`); the whole allowlist is deliverable, and the presence markers are disjoint from it so the two never collide. Inbound text is normalised (`<@U…>` mentions, `<#C…|name>`, links, `&amp;`) before it reaches the persona, and outbound Markdown is converted to Slack mrkdwn. Files and images arrive as `[image · name · size · url]` lines; the persona needs the bot token to fetch `url_private`. There is no voice transcription or spoken reply on Slack.
+`liveReplies` (optional, default off) folds a turn's streaming output into one message instead of one message per part: the first mid-turn part posts the reply and every later part — including the terminal reply — is edited into it with `chat.update`, so a working persona reads as one growing answer rather than a burst of separate messages. A single-part turn posts exactly as before, and the feature never changes ledger semantics: each part is still its own delivery row, settled from the same outcomes. The edit is a full-text render of the applied parts, so ledger replays are idempotent — an already-applied part re-confirms without a platform call, an unapplied retry renders in its stored position, and only the fallback post path (entry sealed or lost) carries the `[recovered - may be a duplicate]` prefix. Folding degrades to ordinary posting, never loses content: a render past the message limit, a Slack refusal to edit (message deleted, permissions changed), or a turn that already ended seals the entry for the rest of the turn. It needs no extra scope (`chat.update` uses the same `chat:write` as posting).
 
 After every socket connect and gateway reconnect the adapter backfills missed messages from `conversations.history`, keyed by `channel:ts`, so the gateway's durable dedupe makes overlap with live traffic safe. Coverage is bounded on purpose: only channels listed in `adapter-slack.json` `channels`, the 100 most recently active DMs seen live within 30 days, and threads the persona replied in during the last 7 days are revisited; a channel with no watermark is backfilled 24 hours deep, and an oversized gap drains across passes in bounded slices. Channels the bot cannot read are quarantined after three consecutive failures and probed again on the next connect. A message the gateway refuses three times for its own content is dead-lettered into `adapters/slack/recovery-cursor.json` (with a per-channel digest) rather than pinning the channel; a gateway outage never discards anything.
 
@@ -111,8 +128,8 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, and `dmPolicy`. Verify the next event through the path consuming the changed policy.
-- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, and `work`. They are reported and deliberately NOT applied; restart to pick them up.
+- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]` replies). Verify the next event through the path consuming the changed policy.
+- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `work`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 
@@ -184,7 +201,7 @@ Run the Discord, Telegram, and Slack binaries as separate managed services after
 
 A gateway restart does not kill an adapter. The adapter reconnects and keeps serving the previous generation: nothing dies, nothing is lost, `delivery.pending` stays 0, and the only symptom is replies arriving a beat late. The service definitions therefore bind the stack together instead of relying on an operator following a restart order.
 
-On systemd each adapter and the admin unit carry `BindsTo=`, `After=`, and `PartOf=gajaeway-gateway.service`, so `systemctl --user restart gajaeway-gateway` realigns the whole stack in one command, and `WantedBy=gajaeway-gateway.service` means enabling the gateway enables them. Only the gateway unit carries `KillMode=process`, because GJC daemon and session hosts share its cgroup.
+On systemd each adapter and the admin unit carry `BindsTo=`, `After=`, and `PartOf=gajaeway-gateway.service`, so `systemctl --user restart gajaeway-gateway` realigns the whole stack in one command, and `WantedBy=gajaeway-gateway.service` means enabling the gateway enables them. Only the gateway unit carries `KillMode=mixed` and `TimeoutStopSec=30s`; see below for why that cannot reach the shared GJC broker.
 
 launchd has no `BindsTo`/`PartOf` equivalent, and `WatchPaths` does not restart an already-running job. Use the single entry point instead, on either host:
 
@@ -209,17 +226,23 @@ The gateway daemon is always started and stopped by launchd or systemd; never st
 
 Restart with the host's service manager: on the systemd deployment reached on SSH port 24, use `systemctl --user restart gajaeway-gateway`; on macOS launchd, use `launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway`. These are alternatives, not consecutive steps. Give ordered shutdown at least 30 seconds with systemd `TimeoutStopSec` or launchd `ExitTimeOut`. Two gateways on one home can race over the database and delivery state even though neither owns the user broker.
 
-### systemd: preserve shared GJC hosts across gateway restarts
+### systemd: no gateway child outlives the unit
 
-Where the shared GJC daemon or SDK session hosts share the gateway's systemd cgroup, the gateway unit must use:
+The gateway unit must use:
 
 ```ini
 [Service]
-KillMode=process
+KillMode=mixed
 TimeoutStopSec=30s
 ```
 
-`TimeoutStopSec` must be at least 30 seconds; the installed unit pins it. On SIGTERM/SIGINT the gateway stops admitting work, waits up to 10 seconds for in-flight monitor authoring turns, marks any that are still running as `gateway_shutdown` (failure detail names the session and the stop time; lease released so the next boot's reconcile re-dispatches them at once), and exits by itself within 25 seconds, logging `gateway_shutdown_timeout` if teardown could not settle. A stop that reaches the service manager's SIGKILL is therefore a defect, not the expected path. `KillMode=process` limits service-manager termination to the gateway main process: SDK turns must outlive the gateway. `KillMode=control-group` and `KillMode=mixed` can kill the shared user daemon and session hosts during a restart, destroying in-flight turns even though session files remain durable. Do not restore cgroup-wide killing merely because an authority cutover completed; process-only termination remains required while those hosts share the gateway cgroup.
+`TimeoutStopSec` must be at least 30 seconds; the installed unit pins it. On SIGTERM/SIGINT the gateway stops admitting work, waits up to 10 seconds for in-flight monitor authoring turns, marks any that are still running as `gateway_shutdown` (failure detail names the session and the stop time; lease released so the next boot's reconcile re-dispatches them at once), and exits by itself within 25 seconds, logging `gateway_shutdown_timeout` if teardown could not settle. A stop that reaches the service manager's SIGKILL is therefore a defect, not the expected path.
+
+`KillMode=mixed` sends SIGTERM to the gateway main process for its ordered shutdown, then SIGKILLs everything still left in the unit's cgroup. Without it, every `gjc sdk serve` relay and `gjc sdk session` command the gateway spawned outlived each stop, and the next start re-adopted them (`Found left-over process ... in control group while starting unit. Ignoring.`). Those orphans held gigabytes of memory for days and kept writing into state owned by the new incarnation (#183, #227). `KillMode=process` is what caused this, and it is not supported.
+
+The shared GJC broker is not the gateway's child to kill. GJC autostarts it detached from whichever SDK command first finds it absent. When that command is the gateway's, the broker and every session host it forks would otherwise land in the gateway cgroup. The gateway therefore checks each broker generation it observes. If that broker runs inside the gateway's own unit, the gateway moves it and its descendants into a transient `gajaeway-gjc-broker-<pid>.scope` and logs `broker_scope_released`. A broker started anywhere else is never touched. SDK turns outlive gateway restarts because they run in the broker's scope, not because the unit spares its children.
+
+Upgrading a host that still has `KillMode=process` in the unit or in a drop-in: deploy this gateway first, and confirm `broker_scope_released` in its log (or `systemd-cgls --user-unit gajaeway-gateway.service` no longer listing `broker-internal`). Only then change the drop-in to `KillMode=mixed`, run `systemctl --user daemon-reload`, and restart. Changing the kill mode before the broker has been released stops the broker along with the gateway.
 
 Normal gateway stop/start closes its own SDK calls and relays and reconnects as a client. It never kills the shared user broker, reaps old hosts, deletes discovery files, copies settings, or runs global session GC. A readiness failure is not permission to repair or replace the user's daemon. If the shared broker is unavailable at boot (for example while it clears a stale lock after a host reboot), the gateway does not exit: it retries the preflight and readiness steps with exponential backoff (1s doubling to 30s) for up to 10 minutes, logging one `gateway_boot_waiting_for_broker step=… attempt=… retry_in_ms=…` line per retry, and exits 1 only after that deadline. A wrong gjc version or a rejected relay argv is still fatal immediately. For a database changing broker authority, complete the explicit cutover in the runbook before starting recovery; changing service environment alone does not migrate old work.
 

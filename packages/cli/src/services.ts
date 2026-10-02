@@ -220,11 +220,14 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 		unitEnvironment("PATH", path),
 		"Restart=always",
 		"RestartSec=2",
-		// Only the gateway: GJC daemon and session hosts share the gateway cgroup,
-		// so the default control-group kill would take unrelated sessions with it.
-		// The gateway exits on its own inside 25s (SHUTDOWN_DEADLINE_MS in the
-		// gateway main); the unit's stop window is pinned so that ceiling always fits.
-		...(spec.dependsOnGateway ? [] : ["KillMode=process", "TimeoutStopSec=30s"]),
+		// Only the gateway: SIGTERM its main process for an ordered shutdown, then
+		// kill whatever is left in its cgroup so no child outlives the unit and
+		// gets re-adopted by the next start (#183). The gateway exits on its own
+		// inside 25s (SHUTDOWN_DEADLINE_MS in the gateway main); the unit's stop
+		// window is pinned so that ceiling always fits (#225). The gateway moves a GJC broker
+		// it autostarted into a scope of its own, so this never reaches the shared
+		// broker or its session hosts.
+		...(spec.dependsOnGateway ? [] : ["KillMode=mixed", "TimeoutStopSec=30s"]),
 		"",
 		"[Install]",
 		// Enabling the gateway pulls the whole stack in; a dependent is never
@@ -235,9 +238,19 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 	return unit.join("\n");
 }
 
-function systemdUnitDir(env: NodeJS.ProcessEnv, userHome: string): string {
+export function systemdUnitDir(env: NodeJS.ProcessEnv, userHome: string): string {
 	const base = env.XDG_CONFIG_HOME || join(userHome, ".config");
 	return join(base, "systemd", "user");
+}
+
+/** Gets the path where a service's LaunchAgent plist is stored on darwin. */
+export function launchAgentPlistPath(spec: ServiceSpec, launchAgentsDir: string): string {
+	return join(launchAgentsDir, `dev.gajaeway.${spec.id}.plist`);
+}
+
+/** Gets the path where a service's systemd unit file is stored on linux. */
+export function systemdUnitPath(spec: ServiceSpec, unitDir: string): string {
+	return join(unitDir, systemdUnitName(spec));
 }
 
 /**

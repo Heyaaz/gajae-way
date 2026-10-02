@@ -5,6 +5,7 @@ import {
 	AGENT_DISK_MIN_FREE_BYTES,
 	AGENT_DISK_MIN_FREE_RATIO,
 	INBOUND_STARVATION_MS,
+	MONITOR_TERMINAL_STREAK_THRESHOLD,
 	observeAgentDisk,
 	projectRuntimeCycle,
 	type RuntimeCycleSources,
@@ -42,6 +43,9 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		maxLanes: 8,
 		settledWorkOrigins: new Set(),
 		agentDisk: null,
+		gjcVersion: undefined,
+		monitorTerminalStreak: 0,
+		brokerRespawnChurn: false,
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -64,6 +68,18 @@ const boundSession = {
 };
 
 describe("runtime cycle projection", () => {
+	test("a gjc newer than the verified contract is a gate; verified and unknown versions are not", () => {
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.19.0" }), generatedAt).gates).toContain(
+			"gjc_unverified_version",
+		);
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.18.7" }), generatedAt).gates).not.toContain(
+			"gjc_unverified_version",
+		);
+		expect(projectRuntimeCycle(sources({ gjcVersion: undefined }), generatedAt).gates).not.toContain(
+			"gjc_unverified_version",
+		);
+	});
+
 	// Issue #15: the GJC agent directory grew to 70+ GB with no reaper; the
 	// gateway must surface the disk-full cliff before session creation fails.
 	test("agent-directory disk headroom below the floor or unobservable is a gate", () => {
@@ -128,6 +144,32 @@ describe("runtime cycle projection", () => {
 		);
 		expect(starved.phase).toBe("degraded");
 		expect(starved.gates).toEqual(["inbound_starved"]);
+	});
+
+	test("issue #189: a run of terminal monitor failures degrades the cycle even with no failed/stuck rows", () => {
+		// 26 consecutive failed_no_retry slots projected idle: failed_no_retry is
+		// terminal, so neither monitor_settlement_failed nor _stuck ever fired.
+		const below = projectRuntimeCycle(
+			sources({
+				monitorStages: new Map([["failed_no_retry", 2]]),
+				monitorTerminalStreak: MONITOR_TERMINAL_STREAK_THRESHOLD - 1,
+			}),
+			generatedAt,
+		);
+		expect(below.gates).toEqual([]);
+		expect(below.phase).toBe("idle");
+		const outage = projectRuntimeCycle(
+			sources({ monitorStages: new Map([["failed_no_retry", 26]]), monitorTerminalStreak: 26 }),
+			generatedAt,
+		);
+		expect(outage.gates).toEqual(["monitor_dispatch_failing"]);
+		expect(outage.phase).toBe("degraded");
+	});
+
+	test("issue #189: broker respawn churn is a gate, not a string of healthy verdicts", () => {
+		const churn = projectRuntimeCycle(sources({ brokerRespawnChurn: true }), generatedAt);
+		expect(churn.gates).toEqual(["broker_respawn_churn"]);
+		expect(churn.phase).toBe("degraded");
 	});
 
 	test("empty durable state projects idle with no gates", () => {
