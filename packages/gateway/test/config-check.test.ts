@@ -77,24 +77,6 @@ test("runtime PATH settings are validated and classified as restart-required", (
 	expect(RESTART_REQUIRED_FIELDS).toContain("runtime");
 });
 
-test("invalid runtime PATH settings fail the offline config check", async () => {
-	for (const runtime of [
-		{ path: [] },
-		{ path: ["/ok", ""] },
-		{ path: ["/ok", 1] },
-		{ path: "/not-an-array" },
-		{ inheritLoginPath: "yes" },
-		{ path: ["/ok"], inheritLoginPath: true },
-		{ unexpected: true },
-	]) {
-		const result = await checkConfigFile(
-			await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, runtime })),
-		);
-		expect(result.ok, JSON.stringify(runtime)).toBe(false);
-		if (!result.ok) expect(result.code).toBe("config_invalid");
-	}
-});
-
 test("monitorCatchUp is a bounded, restart-required cron catch-up ceiling", () => {
 	const config = parseConfigFile({
 		schemaVersion: CONFIG_SCHEMA_VERSION,
@@ -114,6 +96,24 @@ test("monitorCatchUp is a bounded, restart-required cron catch-up ceiling", () =
 			() => parseConfigFile({ schemaVersion: CONFIG_SCHEMA_VERSION, monitorCatchUp }),
 			JSON.stringify(monitorCatchUp),
 		).toThrow(/monitorCatchUp/);
+});
+
+test("invalid runtime PATH settings fail the offline config check", async () => {
+	for (const runtime of [
+		{ path: [] },
+		{ path: ["/ok", ""] },
+		{ path: ["/ok", 1] },
+		{ path: "/not-an-array" },
+		{ inheritLoginPath: "yes" },
+		{ path: ["/ok"], inheritLoginPath: true },
+		{ unexpected: true },
+	]) {
+		const result = await checkConfigFile(
+			await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, runtime })),
+		);
+		expect(result.ok, JSON.stringify(runtime)).toBe(false);
+		if (!result.ok) expect(result.code).toBe("config_invalid");
+	}
 });
 
 test("malformed JSON is reported as not_json rather than crashing", async () => {

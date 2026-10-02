@@ -3,13 +3,15 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
+import { MonitorRegistry } from "../src/monitors/registry";
 import { type DatabaseStartupError, GatewayDatabase } from "../src/store/db";
 
 test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
 	try {
 		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		expect(database.schemaVersion).toBe(23);
+		expect(database.schemaVersion).toBe(29);
 		database.memoryIntentCreate({ id: "memory-schema", kind: "daily_capture", payloadJson: "{}" });
 		expect(database.memoryIntentRows()[0]).toMatchObject({
 			state: "queued",
@@ -31,6 +33,51 @@ test("migrates the sessions foundation", async () => {
 	}
 });
 
+test("durable monitor cron cursor combines slot claims and skips, then clears on removal", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-cron-cursor-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "cron-cursor",
+			trigger: { kind: "cron", schedule: "0 * * * *" },
+			eventTypes: ["cron.cursor"],
+			enabled: true,
+		});
+		const claimedAt = new Date(Date.now() + 60_000).toISOString();
+		expect(database.monitorCronCursor(monitor.monitorId)).toBeUndefined();
+		expect(
+			database.monitorSlotClaimWithEvent({
+				monitorId: monitor.monitorId,
+				slotAt: claimedAt,
+				eventId: crypto.randomUUID(),
+				eventType: "cron.cursor",
+				payloadJson: "{}",
+			}).admitted,
+		).toBe(true);
+		expect(database.monitorCronCursor(monitor.monitorId)).toBe(claimedAt);
+
+		const skipped = {
+			count: 2,
+			oldest: new Date(Date.parse(claimedAt) + 60_000).toISOString(),
+			newest: new Date(Date.parse(claimedAt) + 120_000).toISOString(),
+		};
+		const recordedAt = new Date(Date.parse(claimedAt) + 180_000).toISOString();
+		expect(database.monitorCronRecordSkip(monitor.monitorId, skipped, recordedAt)).toEqual({
+			cursor: skipped.newest,
+			skippedTotal: 2,
+			lastSkip: { ...skipped, recordedAt },
+		});
+		expect(database.monitorCronCursor(monitor.monitorId)).toBe(skipped.newest);
+		expect(registry.remove(monitor.monitorId)).toBe(true);
+		expect(database.monitorCronState(monitor.monitorId)).toBeUndefined();
+		expect(database.metaGet(`monitor_cron:${monitor.monitorId}`)).toBeUndefined();
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("adds quarantine diagnostics to existing memory intents", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-migration-"));
 	const path = join(directory, "gateway.db");
@@ -41,17 +88,82 @@ test("adds quarantine diagnostics to existing memory intents", async () => {
 
 		const legacy = new Database(path);
 		legacy.exec(
-			"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts; DELETE FROM schema_migrations WHERE version = 23",
+			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts; ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 23",
 		);
 		legacy.close();
 
 		const migrated = await GatewayDatabase.open(path);
-		expect(migrated.schemaVersion).toBe(23);
+		expect(migrated.schemaVersion).toBe(29);
 		expect(migrated.memoryIntentRows()[0]).toMatchObject({
 			id: "legacy-intent",
 			state: "queued",
 			attempts: 0,
 			quarantine_reason: null,
+		});
+		migrated.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+test("/new discards platform input but preserves internal lane reports", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const key = originKey(LOOPBACK_ORIGIN);
+		database.inboundEnqueue({
+			messageId: "platform-before-new",
+			originKey: key,
+			originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+			body: "platform message",
+			receivedAt: "2026-09-01T00:00:00.000Z",
+		});
+		database.inboundEnqueue({
+			messageId: "lane-report-internal",
+			originKey: key,
+			originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+			body: "internal report",
+			receivedAt: "2026-09-01T00:00:01.000Z",
+			source: "lane_report",
+		});
+		expect(database.inboundDiscardBefore(key, "2026-09-02T00:00:00.000Z")).toEqual(["platform-before-new"]);
+		expect(database.inboundPendingOldest(key)).toMatchObject({
+			message_id: "lane-report-internal",
+			source: "lane_report",
+			engagement_json: null,
+			body: "internal report",
+		});
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("adds last_error to existing deliveries without touching their state (#171)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-migration-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const current = await GatewayDatabase.open(path);
+		current.deliveryCreate({
+			id: "legacy-delivery",
+			turnId: "turn",
+			originKey: "discord/channel/c",
+			payloadJson: "{}",
+		});
+		current.deliveryUpdate("legacy-delivery", "pending", 2);
+		const latest = current.schemaVersion;
+		current.close();
+
+		const legacy = new Database(path);
+		legacy.exec("ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 26");
+		legacy.close();
+
+		const migrated = await GatewayDatabase.open(path);
+		expect(migrated.schemaVersion).toBe(latest);
+		expect(migrated.deliveryRows()[0]).toMatchObject({
+			delivery_id: "legacy-delivery",
+			state: "pending",
+			attempts: 2,
+			last_error: null,
 		});
 		migrated.close();
 	} finally {

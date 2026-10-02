@@ -4,9 +4,14 @@ import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, normalize } from "node:path";
 import {
 	type ChatMessagePayload,
-	isSilenceToken,
+	isSilentOutput,
+	type MonitorEventRecovery,
+	type MonitorProtocolFailureRecord,
 	type OriginRef,
 	originKey,
+	PROTOCOL_FAILURE_REASONS,
+	type ProtocolFailureReason,
+	parseOriginKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import {
@@ -15,6 +20,7 @@ import {
 	type PromptStatusBody,
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
+import { buildDeliveryPayload } from "../delivery/delivery";
 
 export interface BrokerAuthority {
 	readonly canonicalAgentDir: string;
@@ -96,6 +102,7 @@ const BROKER_SNAPSHOT_TABLES = [
 	"conversation_model",
 	"session_tail_cursors",
 	"work_attempt_runtime",
+	"lane_reports",
 	"broker_owned_bindings",
 	"broker_tail_cursors",
 	"broker_retired_sessions",
@@ -108,7 +115,21 @@ const REPLAYABLE_MONITOR =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)";
 
 export type WorkAttemptMode = "start" | "run" | "historical";
-export type WorkAttemptDecision = "undecided" | "enqueued" | "suppressed" | "no_target";
+export type WorkAttemptDecision =
+	| "undecided"
+	| "reported"
+	| "fallback"
+	| "suppressed"
+	| "no_target"
+	| "wake_unaccepted";
+export type WorkAttemptRequestedDecision = "report" | "suppressed" | "no_target" | "wake_unaccepted";
+export interface WorkReportRoot {
+	readonly originKey: string;
+	readonly origin: OriginRef;
+}
+export type WorkParent =
+	| { readonly kind: "persona"; readonly originKey: string; readonly origin: OriginRef }
+	| { readonly kind: "lane"; readonly name: string; readonly root: WorkReportRoot | null };
 export interface WorkAttemptOutputProof {
 	readonly opRef: string;
 	readonly sessionId: string;
@@ -133,6 +154,16 @@ export interface WorkAttemptOutput {
 	readonly proof: WorkAttemptOutputProof | null;
 	/** Proven original attempt-final silence survives output loss and ledger pruning. */
 	readonly knownSilence: WorkAttemptOutputProof | null;
+	/** Transport failure details for failed attempts with terminal_missing_receipt. */
+	readonly transportCause?: {
+		readonly kind: string;
+		readonly nativeErrorCode?: string;
+		readonly http2RstCode?: number;
+		readonly status?: number;
+		readonly requestBytes?: number;
+		readonly retryMaxAttempts?: number;
+		readonly endpointClass?: string;
+	};
 }
 export interface WorkAttemptTerminalEvidence {
 	readonly kind: "broker" | "local";
@@ -154,7 +185,10 @@ export interface WorkAttemptRuntime {
 	readonly sendEvidence: { readonly source: "receipt" | "status"; readonly observedAt: string } | null;
 	readonly terminal: WorkAttemptTerminalEvidence | null;
 	readonly output: WorkAttemptOutput;
-	readonly target: OriginRef | null;
+	readonly parent: WorkParent | null;
+	readonly reportId: string;
+	readonly wakeReportId: string | null;
+	readonly noticeHash: string | null;
 	readonly deliveryId: string;
 	readonly decision: WorkAttemptDecision;
 	readonly settledAt: string | null;
@@ -162,14 +196,90 @@ export interface WorkAttemptRuntime {
 }
 export type WorkAttemptPatch = Partial<Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "terminal" | "output">>;
 export interface WorkAttemptSettlement extends WorkAttemptPatch {
-	readonly decision: Exclude<WorkAttemptDecision, "undecided">;
+	readonly decision: WorkAttemptRequestedDecision;
 	readonly settledAt: string;
 }
+export interface WorkAttemptAdmissionPersona {
+	readonly kind: "persona";
+	readonly row: {
+		readonly messageId: string;
+		readonly originKey: string;
+		readonly originRefJson: string;
+		readonly body: string;
+		readonly receivedAt: string;
+	};
+	readonly fallbackPayload: ChatMessagePayload;
+	readonly holdReason?: string;
+}
+export interface WorkAttemptAdmissionLane {
+	readonly kind: "lane";
+	readonly report: {
+		readonly reportId: string;
+		readonly parentName: string;
+		readonly childName: string;
+		readonly childOpRef: string;
+		readonly body: string;
+		readonly root: WorkReportRoot | null;
+	};
+	readonly fallbackPayload: ChatMessagePayload | null;
+}
+export type WorkAttemptAdmission = WorkAttemptAdmissionPersona | WorkAttemptAdmissionLane;
+export interface WorkAttemptSettleResult {
+	readonly runtime: WorkAttemptRuntime;
+	readonly fallbackPayload?: ChatMessagePayload;
+	readonly childFallback?: ChatMessagePayload;
+	readonly requeuedParent?: string;
+}
+export type LaneReportState = "pending" | "claimed" | "consumed" | "fallback" | "held" | "undeliverable";
+export interface LaneReportRow {
+	readonly report_id: string;
+	readonly parent_name: string;
+	readonly child_name: string;
+	readonly child_op_ref: string;
+	readonly body: string;
+	readonly root_json: string | null;
+	readonly state: LaneReportState;
+	readonly claim_kind: "steer" | "wake" | null;
+	readonly claim_ref: string | null;
+	readonly claim_target_op_ref: string | null;
+	readonly claim_seq: number;
+	readonly hold_reason: string | null;
+	readonly consumed_op_ref: string | null;
+	readonly created_at: string;
+	readonly updated_at: string;
+}
 export class WorkAttemptStateError extends Error {
-	constructor() {
-		super("work lane state unavailable");
+	readonly opRef: string | undefined;
+	readonly assertion: string;
+	constructor(opRef?: string, assertion = "work attempt payload validation") {
+		super(
+			`work lane state unavailable${opRef === undefined ? "" : ` opRef=${JSON.stringify(opRef)}`} assertion=${assertion}`,
+		);
 		this.name = "WorkAttemptStateError";
+		this.opRef = opRef;
+		this.assertion = assertion;
 	}
+}
+
+/**
+ * The only permitted terminal rewrite (#248): broker evidence observed with
+ * receiptState=missing is upgraded to present, in the same write that stores
+ * this op's proven final body. The SDK receipt state is monotonic, so the
+ * rest of the terminal status must be unchanged.
+ */
+function lateReceiptReconciled(current: WorkAttemptRuntime, next: WorkAttemptRuntime): boolean {
+	const before = current.terminal;
+	const after = next.terminal;
+	return (
+		before?.kind === "broker" &&
+		after?.kind === "broker" &&
+		before.observedAt === after.observedAt &&
+		before.status?.receiptState === "missing" &&
+		JSON.stringify({ ...before.status, receiptState: "present" }) === JSON.stringify(after.status) &&
+		current.output.proof === null &&
+		next.output.proof !== null &&
+		(next.output.disposition === "available" || next.output.disposition === "silent")
+	);
 }
 
 /** Length-delimited identity hashing; independent of target, output and recovery time. */
@@ -177,6 +287,21 @@ export function workAttemptDeliveryId(instanceId: string, jobId: string, opRef: 
 	return `work-${createHash("sha256")
 		.update(JSON.stringify([instanceId, jobId, opRef]))
 		.digest("hex")}`;
+}
+
+/** Stable report identity, using length-delimited UTF-8 components. */
+export function workAttemptReportId(instanceId: string, jobId: string, opRef: string): string {
+	const hash = createHash("sha256");
+	for (const value of [instanceId, jobId, opRef]) {
+		const length = Buffer.allocUnsafe(4);
+		length.writeUInt32BE(Buffer.byteLength(value, "utf8"));
+		hash.update(length).update(value, "utf8");
+	}
+	return `lane-report-${hash.digest("hex")}`;
+}
+
+function workAccepted(runtime: WorkAttemptRuntime): boolean {
+	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
 }
 
 const WORK_REASON_CODES = new Set([
@@ -193,11 +318,12 @@ const WORK_REASON_CODES = new Set([
 	"terminal_uncertain",
 	"session_dead",
 	"session_disowned",
+	"host_lost",
 	"recovery_indeterminate",
 	"output_unavailable",
 ]);
-function workAssert(condition: unknown): asserts condition {
-	if (!condition) throw new WorkAttemptStateError();
+function workAssert(condition: unknown, assertion = "work attempt payload validation"): asserts condition {
+	if (!condition) throw new WorkAttemptStateError(undefined, assertion);
 }
 function workTime(value: unknown): boolean {
 	return typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value));
@@ -208,6 +334,24 @@ function workString(value: unknown, max = 512): value is string {
 		if (value.charCodeAt(index) < 32) return false;
 	}
 	return true;
+}
+function validateWorkRoot(root: WorkReportRoot): void {
+	workAssert(root && typeof root === "object");
+	validateOriginRef(root.origin);
+	workAssert(originKey(root.origin) === root.originKey);
+	workAssert(["discord", "slack", "telegram", "loopback"].includes(root.origin.platform));
+}
+
+function validateWorkParent(parent: WorkParent, mode: WorkAttemptMode): void {
+	workAssert(mode === "start");
+	if (parent.kind === "persona") {
+		validateOriginRef(parent.origin);
+		workAssert(originKey(parent.origin) === parent.originKey);
+		workAssert(["discord", "slack", "telegram", "loopback"].includes(parent.origin.platform));
+		return;
+	}
+	workAssert(parent.kind === "lane" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(parent.name));
+	if (parent.root !== null) validateWorkRoot(parent.root);
 }
 function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): void {
 	workAssert(value && typeof value === "object");
@@ -223,10 +367,14 @@ function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): voi
 	workAssert(["prepared", "accepted", "uncertain"].includes(value.sendPhase));
 	workAssert(Number.isSafeInteger(value.version) && value.version >= 0);
 	workAssert(value.deliveryId === workAttemptDeliveryId(instanceId, value.jobId, value.opRef));
-	if (value.target !== null) {
-		workAssert(value.mode === "start");
-		validateOriginRef(value.target);
-	}
+	workAssert(!Object.hasOwn(value, "target"));
+	workAssert(value.parent === null || (value.parent && typeof value.parent === "object"));
+	if (value.parent !== null) validateWorkParent(value.parent, value.mode);
+	workAssert(value.mode !== "run" || value.parent === null);
+	workAssert(value.reportId === workAttemptReportId(instanceId, value.jobId, value.opRef));
+	workAssert(value.wakeReportId === null || /^lane-report-[0-9a-f]{64}$/.test(value.wakeReportId));
+	workAssert(value.wakeReportId === null || value.mode === "start");
+	workAssert(value.noticeHash === null || /^[0-9a-f]{64}$/.test(value.noticeHash));
 	if (value.sendEvidence !== null) {
 		workAssert(["receipt", "status"].includes(value.sendEvidence.source) && workTime(value.sendEvidence.observedAt));
 	}
@@ -281,20 +429,67 @@ function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): voi
 	}
 	workAssert(output.disposition !== "available" || (output.proof !== null && output.excerpt !== null));
 	workAssert(output.disposition !== "silent" || output.knownSilence !== null);
-	workAssert(["undecided", "enqueued", "suppressed", "no_target"].includes(value.decision));
+	workAssert(
+		["undecided", "reported", "fallback", "suppressed", "no_target", "wake_unaccepted"].includes(value.decision),
+	);
 	workAssert(value.decision === "undecided" ? value.settledAt === null : workTime(value.settledAt));
 	if (value.decision !== "undecided") {
 		workAssert(value.terminal !== null && output.disposition !== "pending");
 		workAssert(
-			value.decision !== "enqueued" ||
-				(value.mode === "start" && value.target !== null && output.knownSilence === null),
+			!["reported", "fallback"].includes(value.decision) || (value.parent !== null && output.knownSilence === null),
+		);
+		workAssert(
+			value.decision !== "fallback" ||
+				value.parent?.kind === "persona" ||
+				(value.parent?.kind === "lane" && value.parent.root !== null),
+		);
+		workAssert(
+			value.decision !== "no_target" ||
+				value.parent === null ||
+				(value.parent.kind === "lane" && value.parent.root === null),
 		);
 		workAssert(value.decision !== "suppressed" || output.knownSilence !== null);
-		workAssert(value.decision !== "no_target" || value.target === null);
+		workAssert(
+			value.decision !== "wake_unaccepted" ||
+				(value.wakeReportId !== null && value.mode === "start" && value.terminal !== null && !workAccepted(value)),
+		);
+		workAssert(value.wakeReportId === null || workAccepted(value) || value.decision === "wake_unaccepted");
 	}
 	workAssert(Buffer.byteLength(JSON.stringify(value), "utf8") <= 16384);
 }
 
+function laneJobDatabaseId(name: string): string {
+	return `lanejob-${Buffer.from(name, "utf8").toString("hex")}`;
+}
+
+function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
+	if (row.root_json === null) return null;
+	const root = JSON.parse(row.root_json) as WorkReportRoot;
+	validateWorkRoot(root);
+	return root;
+}
+
+function validateLaneReportRow(row: LaneReportRow): void {
+	workAssert(/^lane-report-[0-9a-f]{64}$/.test(row.report_id));
+	workAssert(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(row.parent_name));
+	workAssert(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(row.child_name));
+	assertValidOpRef(row.child_op_ref);
+	workAssert(typeof row.body === "string" && Buffer.byteLength(row.body, "utf8") <= 2048);
+	workAssert(["pending", "claimed", "consumed", "fallback", "held", "undeliverable"].includes(row.state));
+	workAssert(row.claim_kind === null || ["steer", "wake"].includes(row.claim_kind));
+	workAssert(Number.isSafeInteger(row.claim_seq) && row.claim_seq >= 0);
+	workAssert(row.claim_ref === null || workString(row.claim_ref, 128));
+	workAssert(row.claim_target_op_ref === null || workString(row.claim_target_op_ref, 128));
+	for (const ref of [row.claim_ref, row.claim_target_op_ref, row.consumed_op_ref])
+		if (ref !== null) assertValidOpRef(ref);
+	workAssert((row.state !== "claimed" && row.state !== "held") || (row.claim_kind !== null && row.claim_ref !== null));
+	workAssert(row.claim_kind !== "steer" || row.claim_target_op_ref !== null);
+	workAssert(row.claim_kind !== "wake" || row.claim_target_op_ref === null);
+	workAssert(row.hold_reason === null || workString(row.hold_reason, 128));
+	workAssert(row.state === "consumed" ? workString(row.consumed_op_ref, 128) : row.consumed_op_ref === null);
+	workAssert(workTime(row.created_at) && workTime(row.updated_at));
+	laneReportRoot(row);
+}
 /**
  * A gjc model selection: either an explicit selector string or a model profile
  * preset. Structurally identical to the config type; duplicated as a local
@@ -336,6 +531,7 @@ export type InboundTurnRole = (typeof INBOUND_TURN_ROLES)[number];
  */
 export interface InboundMessageRow {
 	readonly message_id: string;
+	readonly source: "platform" | "lane_report";
 	readonly origin_key: string;
 	readonly origin_ref_json: string;
 	readonly body: string;
@@ -357,8 +553,29 @@ export interface InboundMessageRow {
 	readonly bound_session_id: string | null;
 	/** Stamped at bind, before the send; the earliest wall clock this turn's answer can carry. */
 	readonly dispatched_at: string | null;
-	/** JSON map part -> ledger delivery id that satisfied that terminal reply slot. */
+	/**
+	 * JSON map part -> ledger delivery id that satisfied that terminal reply slot.
+	 * A turn that closed without any delivery carries `{"none": reason}` instead;
+	 * a `done` trigger with NULL here is a ledger defect (see inboundTerminalLinkAudit).
+	 */
 	readonly terminal_delivery_id: string | null;
+}
+
+/** Why a closed turn has no terminal delivery; recorded as `{"none": reason}`. */
+export type TerminalUnlinkedReason = "silent" | "loopback" | "turn_failed" | "retired" | "no_delivery";
+
+/** Delivery ids that answered a turn, from its `terminal_delivery_id` JSON; empty for a sentinel or NULL. */
+export function terminalDeliveryIds(json: string | null): string[] {
+	if (!json) return [];
+	try {
+		const parsed: unknown = JSON.parse(json);
+		if (typeof parsed !== "object" || parsed === null) return [];
+		return Object.entries(parsed)
+			.filter(([part, id]) => /^\d+$/.test(part) && typeof id === "string" && id.length > 0)
+			.map(([, id]) => id as string);
+	} catch {
+		return [];
+	}
 }
 
 /** A trigger row's turn, as the actor tracks it. */
@@ -379,7 +596,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 22;
+const LATEST_SCHEMA_VERSION = 29;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -447,10 +664,17 @@ export interface MonitorFailureRow {
 	readonly code: string;
 	readonly detail: string;
 	readonly failed_at: string;
+	readonly protocol_reason: ProtocolFailureReason | null;
+	readonly response_byte_length: number | null;
+	readonly response_entry_count: number | null;
+}
+
+interface MonitorFailureOptions {
+	readonly protocolFailure?: Pick<MonitorProtocolFailureRecord, "reason" | "responseByteLength" | "responseEntryCount">;
 }
 
 export class DatabaseStartupError extends Error {
-	readonly code: "newer_schema" | "integrity_check_failed";
+	readonly code: "newer_schema" | "integrity_check_failed" | "migration_corrupt";
 	constructor(code: DatabaseStartupError["code"], message: string) {
 		super(message);
 		this.name = "DatabaseStartupError";
@@ -469,12 +693,18 @@ export class DatabaseStartupError extends Error {
  * - dispatched: authoring turn sent, output not yet parsed.
  * - authored: note authored; delivery to the target is pending or settled.
  * - delivered: the batch's ledger delivery was confirmed by the adapter.
- * - authored_no_delivery: terminal — the monitor has no channel target and no
- *   owner target is configured, so nothing will ever be delivered. Explicit
- *   instead of `authored`-forever so the operator sees a finished state.
+ * - authored_no_delivery: terminal — nothing will ever be delivered: the
+ *   monitor has no channel target and no owner target is configured, or the
+ *   authored note is a silence token. Explicit instead of `authored`-forever
+ *   so the operator sees a finished state.
+ * - failed_no_retry also covers an authored note whose delivery expired
+ *   (`monitor_failures` code `delivery_expired`).
  * - failed: the last dispatch attempt failed; reconcile redispatches.
  * - failed_no_retry: dispatch failed and reconcile will not retry it again
  *   (reclaim budget exhausted); operator-visible terminal state.
+ * - skipped: terminal — the monitor's overlap policy is `skip` and an earlier
+ *   event of the same monitor was still awaiting authoring when this one
+ *   fired (`skipped_by` names it). A scheduling outcome, never a failure.
  */
 export const MONITOR_EVENT_STAGES = [
 	"admitted",
@@ -485,15 +715,40 @@ export const MONITOR_EVENT_STAGES = [
 	"authored_no_delivery",
 	"failed",
 	"failed_no_retry",
+	"skipped",
 ] as const;
 export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
 /** Stages whose rows reconcile() may claim and redispatch. */
 export const RECONCILABLE_STAGES: readonly MonitorEventStage[] = ["admitted", "batched", "dispatched", "failed"];
 /** Terminal stages: no further transition will ever happen without operator action. */
-export const TERMINAL_STAGES: readonly MonitorEventStage[] = ["delivered", "authored_no_delivery", "failed_no_retry"];
+export const TERMINAL_STAGES: readonly MonitorEventStage[] = [
+	"delivered",
+	"authored_no_delivery",
+	"failed_no_retry",
+	"skipped",
+];
 
+/**
+ * Stages in which an event still owes an authoring turn: the overlap policy's
+ * definition of "a previous event of the same monitor is still in flight".
+ * `authored` is excluded: its turn is done and only delivery is pending.
+ */
+const IN_FLIGHT_MONITOR_STAGES = "'admitted','batched','dispatched','failed'";
+
+/**
+ * Minimum wait, measured from the last failure (`updated_at`), before reconcile reclaims a
+ * `failed` event for its (index+1)-th time. The schedule spans ~17h so a slot survives a
+ * multi-hour dispatch outage instead of burning its budget on consecutive 60s sweeps (#179).
+ */
+export const MONITOR_EVENT_RETRY_BACKOFF_MS: readonly number[] = [
+	0,
+	10 * 60_000,
+	60 * 60_000,
+	4 * 60 * 60_000,
+	12 * 60 * 60_000,
+];
 /** Upper bound on how often a single event may be reclaimed by reconcile. */
-export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = 5;
+export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = MONITOR_EVENT_RETRY_BACKOFF_MS.length;
 
 export class GatewayDatabase {
 	readonly #database: Database;
@@ -534,6 +789,10 @@ export class GatewayDatabase {
 			const runtime = this.workAttemptGet(row.op_ref)!;
 			if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
 		}
+		openWork +=
+			this.#database
+				.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')")
+				.get()?.n ?? 0;
 		const openInbound = this.#database
 			.query<{ n: number }, []>(
 				`SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND ${REPLAYABLE_INBOUND}`,
@@ -541,7 +800,7 @@ export class GatewayDatabase {
 			.get()!.n;
 		const openMonitors = this.#database
 			.query<{ n: number }, []>(
-				"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+				"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
 			)
 			.get()!.n;
 		return { authority, populated, openInbound, openWork, openMonitors };
@@ -577,6 +836,31 @@ export class GatewayDatabase {
 		const authority = { canonicalAgentDir: value[0], identity: value[1] };
 		if (brokerAuthorityKey(authority) !== stored.authority_key) throw new BrokerAuthorityError("invalid_authority");
 		return authority;
+	}
+
+	/** Resolves an untrusted GJC_SESSION_ID only when it has one unambiguous origin. */
+	originForSessionId(sessionId: string): string | undefined {
+		if (!/^[A-Za-z0-9-]{1,128}$/.test(sessionId)) return undefined;
+		const origins = new Set<string>();
+		const session = this.#database
+			.query<{ origin_key: string }, [string]>("SELECT origin_key FROM sessions WHERE gjc_session_id = ?")
+			.get(sessionId);
+		if (session) origins.add(session.origin_key);
+		let authority: BrokerAuthority | null;
+		try {
+			authority = this.#brokerAuthority();
+		} catch {
+			return undefined;
+		}
+		if (authority) {
+			for (const row of this.#database
+				.query<{ origin_key: string }, [string, string]>(
+					"SELECT origin_key FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ? AND NOT EXISTS (SELECT 1 FROM broker_retired_sessions r WHERE r.session_id = broker_owned_bindings.session_id)",
+				)
+				.all(brokerAuthorityKey(authority), sessionId))
+				origins.add(row.origin_key);
+		}
+		return origins.size === 1 ? origins.values().next().value : undefined;
 	}
 
 	/** Only a successful gateway session.create response may supply this provenance. */
@@ -775,25 +1059,52 @@ export class GatewayDatabase {
 		try {
 			const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
 			validateWorkRuntime(runtime, this.instanceId);
-			workAssert(runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key);
-			workAssert(runtime.sessionId === row.session_id && runtime.version === row.version);
-			workAssert(runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id);
+			workAssert(
+				runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key,
+				"runtime identity matches database columns",
+			);
+			workAssert(
+				runtime.sessionId === row.session_id && runtime.version === row.version,
+				"runtime session and version match database columns",
+			);
+			workAssert(
+				runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id,
+				"runtime settlement and delivery id match database columns",
+			);
 			this.#workHistory(runtime);
 			return runtime;
-		} catch {
-			throw new WorkAttemptStateError();
+		} catch (error) {
+			throw new WorkAttemptStateError(
+				opRef,
+				error instanceof WorkAttemptStateError ? error.assertion : "runtime record parsing",
+			);
 		}
 	}
 
 	/** Keyset pagination: callers can recover arbitrarily many lanes in bounded reads. */
-	workAttemptOpen(limit = 100, afterOpRef = ""): readonly WorkAttemptRuntime[] {
+	workAttemptOpen(
+		limit = 100,
+		afterOpRef = "",
+		onInvalid?: (error: WorkAttemptStateError) => void,
+	): readonly WorkAttemptRuntime[] {
 		workAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000);
-		return this.#database
+		const rows = this.#database
 			.query<{ op_ref: string }, [string, number]>(
 				"SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL AND op_ref > ? AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) ORDER BY op_ref LIMIT ?",
 			)
-			.all(afterOpRef, limit)
-			.map((row) => this.workAttemptGet(row.op_ref)!);
+			.all(afterOpRef, limit);
+		if (!onInvalid) return rows.map((row) => this.workAttemptGet(row.op_ref)!);
+		const attempts: WorkAttemptRuntime[] = [];
+		for (const row of rows) {
+			try {
+				const runtime = this.workAttemptGet(row.op_ref);
+				if (runtime) attempts.push(runtime);
+			} catch (error) {
+				if (!(error instanceof WorkAttemptStateError)) throw error;
+				onInvalid(error);
+			}
+		}
+		return attempts;
 	}
 
 	workAttemptOpenByLane(laneKey: string): WorkAttemptRuntime | undefined {
@@ -803,6 +1114,180 @@ export class GatewayDatabase {
 			)
 			.get(laneKey);
 		return row ? this.workAttemptGet(row.op_ref) : undefined;
+	}
+
+	#laneReportGetInside(reportId: string): LaneReportRow | undefined {
+		const row = this.#database
+			.query<LaneReportRow, [string]>("SELECT * FROM lane_reports WHERE report_id = ?")
+			.get(reportId);
+		if (!row) return undefined;
+		try {
+			validateLaneReportRow(row);
+			return row;
+		} catch {
+			throw new WorkAttemptStateError();
+		}
+	}
+
+	laneReportGet(reportId: string): LaneReportRow | undefined {
+		return this.#laneReportGetInside(reportId);
+	}
+
+	laneReportsByParent(parentName: string): readonly LaneReportRow[] {
+		return this.#database
+			.query<LaneReportRow, [string]>("SELECT * FROM lane_reports WHERE parent_name = ? ORDER BY created_at, rowid")
+			.all(parentName)
+			.map((row) => {
+				try {
+					validateLaneReportRow(row);
+					return row;
+				} catch {
+					throw new WorkAttemptStateError();
+				}
+			});
+	}
+
+	laneReportParentNames(): readonly string[] {
+		return this.#database
+			.query<{ parent_name: string }, []>(
+				"SELECT DISTINCT parent_name FROM lane_reports WHERE state IN ('pending','claimed','held') ORDER BY parent_name",
+			)
+			.all()
+			.map((row) => row.parent_name);
+	}
+
+	laneReportCounts(parentName: string): { pending: number; claimed: number; held: number; undeliverable: number } {
+		const row = this.#database
+			.query<{ pending: number; claimed: number; held: number; undeliverable: number }, [string]>(
+				"SELECT SUM(state = 'pending') AS pending, SUM(state = 'claimed') AS claimed, SUM(state = 'held') AS held, SUM(state = 'undeliverable') AS undeliverable FROM lane_reports WHERE parent_name = ?",
+			)
+			.get(parentName);
+		return {
+			pending: row?.pending ?? 0,
+			claimed: row?.claimed ?? 0,
+			held: row?.held ?? 0,
+			undeliverable: row?.undeliverable ?? 0,
+		};
+	}
+
+	laneReportClaim(
+		reportId: string,
+		kind: "steer" | "wake",
+		ref: string,
+		targetOpRef: string | null,
+	): LaneReportRow | undefined {
+		assertValidOpRef(ref);
+		workAssert(kind === "steer" ? targetOpRef !== null : targetOpRef === null);
+		if (targetOpRef !== null) assertValidOpRef(targetOpRef);
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current || current.state !== "pending") return undefined;
+			const changed = this.#database
+				.query(
+					"UPDATE lane_reports SET state = 'claimed', claim_kind = ?, claim_ref = ?, claim_target_op_ref = ?, claim_seq = claim_seq + 1, hold_reason = NULL, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = 'pending' AND claim_seq = ?",
+				)
+				.run(kind, ref, targetOpRef, new Date().toISOString(), reportId, current.claim_seq).changes;
+			return changed === 1 ? this.#laneReportGetInside(reportId) : undefined;
+		});
+	}
+
+	laneReportConsume(reportId: string, ref: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current) return false;
+			if (current.state === "consumed") return current.consumed_op_ref === ref;
+			if ((current.state !== "claimed" && current.state !== "held") || current.claim_ref !== ref) return false;
+			return (
+				this.#database
+					.query(
+						"UPDATE lane_reports SET state = 'consumed', consumed_op_ref = ?, hold_reason = NULL, updated_at = ? WHERE report_id = ? AND state = ? AND claim_seq = ? AND claim_ref = ?",
+					)
+					.run(ref, new Date().toISOString(), reportId, current.state, current.claim_seq, ref).changes === 1
+			);
+		});
+	}
+
+	laneReportRequeue(reportId: string, ref: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current || (current.state !== "claimed" && current.state !== "held") || current.claim_ref !== ref)
+				return false;
+			return (
+				this.#database
+					.query(
+						"UPDATE lane_reports SET state = 'pending', claim_kind = NULL, claim_ref = NULL, claim_target_op_ref = NULL, hold_reason = NULL, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = ? AND claim_seq = ? AND claim_ref = ?",
+					)
+					.run(new Date().toISOString(), reportId, current.state, current.claim_seq, ref).changes === 1
+			);
+		});
+	}
+
+	laneReportHold(reportId: string, reason: string): boolean {
+		if (!workString(reason, 128)) throw new WorkAttemptStateError();
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current) return false;
+			if (current.state === "held") return current.hold_reason === reason;
+			if (current.state !== "claimed") return false;
+			return (
+				this.#database
+					.query(
+						"UPDATE lane_reports SET state = 'held', hold_reason = ?, updated_at = ? WHERE report_id = ? AND state = 'claimed' AND claim_seq = ?",
+					)
+					.run(reason, new Date().toISOString(), reportId, current.claim_seq).changes === 1
+			);
+		});
+	}
+
+	laneReportFallback(reportId: string, payload: ChatMessagePayload): boolean {
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current || current.state !== "pending") return false;
+			const root = laneReportRoot(current);
+			workAssert(root !== null);
+			const deliveryId = workAttemptDeliveryId(
+				this.instanceId,
+				laneJobDatabaseId(current.child_name),
+				current.child_op_ref,
+			);
+			workAssert(
+				payload.deliveryId === deliveryId &&
+					payload.turnId === current.child_op_ref &&
+					originKey(payload.origin) === root.originKey &&
+					payload.text === current.body &&
+					payload.role === "assistant" &&
+					payload.final === true &&
+					!payload.reaction &&
+					!isSilentOutput(payload.text),
+			);
+			const changed = this.#database
+				.query(
+					"UPDATE lane_reports SET state = 'fallback', updated_at = ? WHERE report_id = ? AND state = 'pending' AND claim_seq = ?",
+				)
+				.run(new Date().toISOString(), reportId, current.claim_seq).changes;
+			if (changed !== 1) return false;
+			this.deliveryCreateInTransaction({
+				id: deliveryId,
+				turnId: current.child_op_ref,
+				originKey: root.originKey,
+				payloadJson: JSON.stringify(payload),
+			});
+			return true;
+		});
+	}
+
+	laneReportUndeliverable(reportId: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current || current.state !== "pending") return false;
+			return (
+				this.#database
+					.query(
+						"UPDATE lane_reports SET state = 'undeliverable', updated_at = ? WHERE report_id = ? AND state = 'pending' AND claim_seq = ?",
+					)
+					.run(new Date().toISOString(), reportId, current.claim_seq).changes === 1
+			);
+		});
 	}
 
 	/** Atomically append history, freeze notification intent and refresh activity before send. */
@@ -821,6 +1306,10 @@ export class GatewayDatabase {
 			workAssert(runtime.sendEvidence === null);
 			workAssert(runtime.sendPhase === (runtime.mode === "historical" ? "uncertain" : "prepared"));
 			this.#workValidateHistory(runtime, record);
+			if (runtime.wakeReportId !== null) {
+				const report = this.#laneReportGetInside(runtime.wakeReportId);
+				workAssert(report?.state === "claimed" && report.claim_kind === "wake" && report.claim_ref === runtime.opRef);
+			}
 			const previousJson = this.laneJobJson(runtime.jobId);
 			const previous = previousJson === undefined ? undefined : parseLaneJobRecord(previousJson);
 			if (runtime.mode === "historical") {
@@ -851,7 +1340,7 @@ export class GatewayDatabase {
 		});
 	}
 
-	/** CAS staging, including output-read claims and proof-before-checkpoint commits. */
+	/** CAS staging, including output-read claims, acceptance proof, and notice receipt. */
 	workAttemptUpdate(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
 		return this.withTransaction(() => {
 			const current = this.workAttemptGet(opRef);
@@ -859,58 +1348,291 @@ export class GatewayDatabase {
 			this.#assertNotQuarantined("work", current.jobId);
 			const next = this.#workPatched(current, patch);
 			workAssert(next.decision === "undecided" && next.settledAt === null);
+			const acceptanceEstablished = !workAccepted(current) && workAccepted(next);
 			if (!this.#workCas(current, next)) return undefined;
+			if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(next);
+			if (acceptanceEstablished && next.noticeHash !== null)
+				this.metaSet(`lane-notice:${next.sessionKey}`, JSON.stringify({ epoch: next.epoch, hash: next.noticeHash }));
 			return next;
 		});
 	}
 
-	/** Winning settlement is the only notification admission; retained runtime is its tombstone. */
+	/**
+	 * Streamed turn activity of an open attempt refreshes its lane's
+	 * `last_activity_at`, fenced to the attempt's own binding. Never moves it back.
+	 */
+	workAttemptActivity(opRef: string, at: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.workAttemptGet(opRef);
+			if (!current || current.settledAt !== null) return false;
+			this.#assertNotQuarantined("work", current.jobId);
+			return (
+				this.#database
+					.query(
+						"UPDATE sessions SET last_activity_at = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
+					)
+					.run(at, current.sessionKey, current.sessionId, current.epoch, at).changes === 1
+			);
+		});
+	}
+
+	/** Atomically settle the attempt and admit its report (or refusal decision). */
 	workAttemptSettle(
 		opRef: string,
 		expectedVersion: number,
 		record: LaneJobRecord,
 		patch: WorkAttemptSettlement,
-		payload?: ChatMessagePayload,
-	): WorkAttemptRuntime | undefined {
+		admission?: WorkAttemptAdmission,
+	): WorkAttemptSettleResult | undefined {
 		return this.withTransaction(() => {
 			const current = this.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 			this.#assertNotQuarantined("work", current.jobId);
-			const next = this.#workPatched(current, patch);
-			workAssert(next.decision !== "undecided" && next.settledAt !== null);
+			const { decision: requested, settledAt, ...attemptPatch } = patch;
+			const staged = this.#workPatched(current, attemptPatch);
+			const draft = { ...staged, settledAt };
+			let decision: WorkAttemptDecision;
+			let fallbackPayload: ChatMessagePayload | undefined;
+			let childFallback: ChatMessagePayload | undefined;
+			let requeuedParent: string | undefined;
+			let linkedReport: LaneReportRow | undefined;
+
+			if (current.wakeReportId !== null && !workAccepted(draft)) {
+				workAssert(requested === "wake_unaccepted" && admission === undefined);
+				decision = "wake_unaccepted";
+				linkedReport = this.#laneReportGetInside(current.wakeReportId);
+				workAssert(
+					linkedReport?.state === "claimed" &&
+						linkedReport.claim_kind === "wake" &&
+						linkedReport.claim_ref === current.opRef,
+				);
+			} else {
+				workAssert(requested !== "wake_unaccepted");
+				if (requested === "report") {
+					workAssert(admission !== undefined && draft.parent !== null && draft.output.knownSilence === null);
+					if (admission.kind === "persona") {
+						workAssert(draft.parent.kind === "persona");
+						workAssert(
+							admission.row.messageId === draft.reportId &&
+								admission.row.originKey === draft.parent.originKey &&
+								originKey(draft.parent.origin) === draft.parent.originKey &&
+								Buffer.byteLength(admission.row.body, "utf8") <= 2048 &&
+								admission.fallbackPayload.turnId === opRef &&
+								admission.fallbackPayload.deliveryId === draft.deliveryId &&
+								originKey(admission.fallbackPayload.origin) === draft.parent.originKey &&
+								admission.fallbackPayload.text === admission.row.body,
+						);
+						const sessionExists = this.#database
+							.query("SELECT 1 FROM sessions WHERE origin_key = ?")
+							.get(draft.parent.originKey);
+						const idExists = this.#database
+							.query("SELECT 1 FROM inbound_messages WHERE message_id = ?")
+							.get(draft.reportId);
+						const refused = Boolean(admission.holdReason) || !sessionExists || Boolean(idExists);
+						decision = refused ? "fallback" : "reported";
+						if (refused) fallbackPayload = admission.fallbackPayload;
+					} else {
+						workAssert(draft.parent.kind === "lane");
+						const report = admission.report;
+						workAssert(
+							report.reportId === draft.reportId &&
+								report.parentName === draft.parent.name &&
+								report.childOpRef === opRef &&
+								report.childName === draft.sessionKey.slice("work/task/".length) &&
+								Buffer.byteLength(report.body, "utf8") <= 2048 &&
+								JSON.stringify(report.root) === JSON.stringify(draft.parent.root),
+						);
+						if (report.root === null) workAssert(admission.fallbackPayload === null);
+						else
+							workAssert(
+								admission.fallbackPayload !== null &&
+									admission.fallbackPayload.turnId === opRef &&
+									admission.fallbackPayload.deliveryId === draft.deliveryId &&
+									originKey(admission.fallbackPayload.origin) === report.root.originKey &&
+									admission.fallbackPayload.text === report.body,
+							);
+						decision = this.#laneParentAvailable(report.parentName)
+							? "reported"
+							: report.root
+								? "fallback"
+								: "no_target";
+						if (decision === "fallback") fallbackPayload = admission.fallbackPayload!;
+					}
+				} else {
+					workAssert(admission === undefined);
+					decision = requested;
+				}
+			}
+
+			const next: WorkAttemptRuntime = { ...draft, decision };
+			validateWorkRuntime(next, this.instanceId);
 			this.#workValidateHistory(next, record);
 			const previous = this.#workHistory(current);
 			workAssert(record.attempts.length === previous.attempts.length);
 			workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous.attempts.slice(0, -1)));
-			if (next.decision === "enqueued") {
-				workAssert(payload && payload.deliveryId === next.deliveryId && payload.turnId === opRef);
-				workAssert(next.target && originKey(payload.origin) === originKey(next.target));
-				workAssert(
-					payload.role === "assistant" && payload.final === true && !payload.reaction && !isSilenceToken(payload.text),
-				);
-			} else workAssert(payload === undefined);
 			if (!this.#workCas(current, next)) return undefined;
 			this.#workPutHistory(next, record);
 			this.#workActivity(next, next.settledAt!);
-			if (payload)
+
+			if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(next);
+			if (next.decision === "reported" && admission?.kind === "persona") {
+				workAssert(
+					this.inboundEnqueueInTransaction({
+						messageId: admission.row.messageId,
+						originKey: admission.row.originKey,
+						originRefJson: admission.row.originRefJson,
+						body: admission.row.body,
+						receivedAt: next.settledAt!,
+						source: "lane_report",
+					}),
+				);
+			}
+			if (next.decision === "reported" && admission?.kind === "lane") {
+				const report = admission.report;
+				const createdAt = next.settledAt!;
+				this.#database
+					.query(
+						"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
+					)
+					.run(
+						report.reportId,
+						report.parentName,
+						report.childName,
+						report.childOpRef,
+						report.body,
+						report.root === null ? null : JSON.stringify(report.root),
+						createdAt,
+						createdAt,
+					);
+			}
+			if (fallbackPayload) {
+				const expectedOrigin =
+					admission?.kind === "persona"
+						? admission.row.originKey
+						: admission?.kind === "lane"
+							? admission.report.root?.originKey
+							: undefined;
+				workAssert(
+					fallbackPayload.deliveryId === next.deliveryId &&
+						fallbackPayload.turnId === opRef &&
+						expectedOrigin !== undefined &&
+						originKey(fallbackPayload.origin) === expectedOrigin &&
+						fallbackPayload.role === "assistant" &&
+						fallbackPayload.final === true &&
+						!fallbackPayload.reaction &&
+						!isSilentOutput(fallbackPayload.text),
+				);
 				this.deliveryCreateInTransaction({
 					id: next.deliveryId,
 					turnId: opRef,
-					originKey: originKey(payload.origin),
-					payloadJson: JSON.stringify(payload),
+					originKey: expectedOrigin!,
+					payloadJson: JSON.stringify(fallbackPayload),
 				});
-			return next;
+			}
+			if (next.decision === "wake_unaccepted") {
+				const row = linkedReport!;
+				const definitiveRefusal = draft.terminal?.reasonCode === "send_rejected";
+				const isHeld = record.state === "awaiting_operator" || record.state === "stalled";
+				let state: LaneReportState;
+				let holdReason: string | null = null;
+				let childDelivery: ChatMessagePayload | undefined;
+				let clearClaim = false;
+				if (!definitiveRefusal) {
+					state = "held";
+					holdReason = "wake_acceptance_uncertain";
+				} else if (!isHeld) {
+					state = "pending";
+					clearClaim = true;
+					requeuedParent = row.parent_name;
+				} else if (row.root_json !== null) {
+					state = "fallback";
+					const root = laneReportRoot(row)!;
+					const deliveryId = workAttemptDeliveryId(
+						this.instanceId,
+						laneJobDatabaseId(row.child_name),
+						row.child_op_ref,
+					);
+					childDelivery = buildDeliveryPayload(row.child_op_ref, root.origin, row.body, deliveryId)!;
+				} else {
+					state = "undeliverable";
+				}
+				const changed = this.#database
+					.query(
+						"UPDATE lane_reports SET state = ?, claim_kind = ?, claim_ref = ?, claim_target_op_ref = ?, hold_reason = ?, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = 'claimed' AND claim_kind = 'wake' AND claim_ref = ? AND claim_seq = ?",
+					)
+					.run(
+						state,
+						clearClaim ? null : row.claim_kind,
+						clearClaim ? null : row.claim_ref,
+						clearClaim ? null : row.claim_target_op_ref,
+						holdReason,
+						next.settledAt,
+						row.report_id,
+						opRef,
+						row.claim_seq,
+					).changes;
+				workAssert(changed === 1);
+				if (childDelivery) {
+					this.deliveryCreateInTransaction({
+						id: childDelivery.deliveryId!,
+						turnId: childDelivery.turnId,
+						originKey: originKey(childDelivery.origin),
+						payloadJson: JSON.stringify(childDelivery),
+					});
+					childFallback = childDelivery;
+				}
+			}
+			return {
+				runtime: next,
+				...(fallbackPayload ? { fallbackPayload } : {}),
+				...(childFallback ? { childFallback } : {}),
+				...(requeuedParent ? { requeuedParent } : {}),
+			};
 		});
 	}
 
-	#workPatched(current: WorkAttemptRuntime, patch: WorkAttemptPatch | WorkAttemptSettlement): WorkAttemptRuntime {
-		const allowed = new Set(["sendPhase", "sendEvidence", "terminal", "output", "decision", "settledAt"]);
+	#laneParentAvailable(name: string): boolean {
+		const jobId = laneJobDatabaseId(name);
+		if (this.isBrokerQuarantined("work", jobId)) return false;
+		const json = this.laneJobJsonByLaneKey(`work-${name}`);
+		if (json === undefined) return false;
+		try {
+			return parseLaneJobRecord(json).jobId === jobId;
+		} catch {
+			return false;
+		}
+	}
+
+	#consumeWakeReport(runtime: WorkAttemptRuntime): void {
+		const reportId = runtime.wakeReportId;
+		if (reportId === null) return;
+		const row = this.#laneReportGetInside(reportId);
+		workAssert(row !== undefined && row.claim_kind === "wake" && row.claim_ref === runtime.opRef);
+		if (row.state === "consumed") {
+			workAssert(row.consumed_op_ref === runtime.opRef);
+			return;
+		}
+		workAssert(row.state === "claimed" || row.state === "held");
+		const changed = this.#database
+			.query(
+				"UPDATE lane_reports SET state = 'consumed', consumed_op_ref = ?, hold_reason = NULL, updated_at = ? WHERE report_id = ? AND state = ? AND claim_kind = 'wake' AND claim_ref = ? AND claim_seq = ?",
+			)
+			.run(runtime.opRef, new Date().toISOString(), reportId, row.state, runtime.opRef, row.claim_seq).changes;
+		workAssert(changed === 1);
+	}
+
+	#workPatched(current: WorkAttemptRuntime, patch: WorkAttemptPatch): WorkAttemptRuntime {
+		const allowed = new Set(["sendPhase", "sendEvidence", "terminal", "output"]);
 		workAssert(Object.keys(patch).every((key) => allowed.has(key)));
 		const next = { ...current, ...patch, version: current.version + 1 };
 		validateWorkRuntime(next, this.instanceId);
 		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
 		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
-		workAssert(current.terminal === null || JSON.stringify(current.terminal) === JSON.stringify(next.terminal));
+		workAssert(
+			current.terminal === null ||
+				JSON.stringify(current.terminal) === JSON.stringify(next.terminal) ||
+				lateReceiptReconciled(current, next),
+		);
 		workAssert(
 			current.output.knownSilence === null ||
 				JSON.stringify(current.output.knownSilence) === JSON.stringify(next.output.knownSilence),
@@ -932,16 +1654,29 @@ export class GatewayDatabase {
 
 	#workValidateHistory(runtime: WorkAttemptRuntime, input: LaneJobRecord): void {
 		const record = parseLaneJobRecord(JSON.stringify(input));
-		workAssert(record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd);
+		workAssert(
+			record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd,
+			"history job identity matches runtime",
+		);
 		const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
-		workAssert(attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt);
-		workAssert(runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt);
-		if (runtime.settledAt === null) workAssert(record.attempts.at(-1)?.opRef === runtime.opRef);
+		workAssert(
+			attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt,
+			"history attempt identity matches runtime",
+		);
+		workAssert(
+			runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt,
+			"attempt.endedAt matches runtime.settledAt",
+		);
+		if (runtime.settledAt === null)
+			workAssert(record.attempts.at(-1)?.opRef === runtime.opRef, "open runtime belongs to latest history attempt");
 	}
 
 	#workHistory(runtime: WorkAttemptRuntime): LaneJobRecord {
 		const json = this.laneJobJson(runtime.jobId);
-		workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+		workAssert(
+			json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json,
+			"lane history rows share one serialized record",
+		);
 		const record = parseLaneJobRecord(json);
 		this.#workValidateHistory(runtime, record);
 		return record;
@@ -1035,6 +1770,8 @@ export class GatewayDatabase {
 		| {
 				epoch: number;
 				lastBootstrappedEpoch: number;
+				agentsMdEpoch: number;
+				agentsMdDigest: string | null;
 				appliedAt: string | null;
 				includedSections: readonly string[];
 				byteCount: number;
@@ -1047,6 +1784,8 @@ export class GatewayDatabase {
 				{
 					epoch: number;
 					last_bootstrapped_epoch: number;
+					agents_md_epoch: number;
+					agents_md_digest: string | null;
 					bootstrap_applied_at: string | null;
 					bootstrap_sections_json: string;
 					bootstrap_byte_count: number;
@@ -1055,19 +1794,32 @@ export class GatewayDatabase {
 				},
 				[string]
 			>(
-				"SELECT epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
+				"SELECT epoch, last_bootstrapped_epoch, agents_md_epoch, agents_md_digest, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
 			)
 			.get(originKey);
 		if (!row) return undefined;
 		return {
 			epoch: row.epoch,
 			lastBootstrappedEpoch: row.last_bootstrapped_epoch,
+			agentsMdEpoch: row.agents_md_epoch,
+			agentsMdDigest: row.agents_md_digest,
 			appliedAt: row.bootstrap_applied_at,
 			includedSections: parseStringList(row.bootstrap_sections_json),
 			byteCount: row.bootstrap_byte_count,
 			truncated: row.bootstrap_truncated === 1,
 			diagnostics: parseStringList(row.bootstrap_diagnostics_json),
 		};
+	}
+
+	/** Records the current AGENTS.md digest for a session epoch when it changes. */
+	recordSessionAgentsBaseline(originKey: string, epoch: number, digest: string): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE sessions SET agents_md_epoch = ?, agents_md_digest = ? WHERE origin_key = ? AND epoch = ? AND (agents_md_epoch < ? OR (agents_md_epoch = ? AND agents_md_digest IS NOT ?))",
+				)
+				.run(epoch, digest, originKey, epoch, epoch, epoch, digest).changes === 1
+		);
 	}
 
 	markSessionBootstrapped(
@@ -1336,6 +2088,52 @@ export class GatewayDatabase {
 		}>;
 	}
 
+	/**
+	 * Cycle projection source: per event type, the run of most recent terminal
+	 * events (fired at or after `sinceIso`) that exhausted retries with no stored
+	 * authored output. Any other terminal outcome ends the run; in-flight events
+	 * are not evidence either way. Types whose latest terminal event is not such a
+	 * loss are omitted.
+	 */
+	monitorAuthoringLossStreaks(
+		sinceIso: string,
+	): Array<{ eventType: string; consecutive: number; lastFiredAt: string }> {
+		const rows = this.#database
+			.query<{ event_type: string; fired_at: string; lost: number }, [string]>(
+				`SELECT event_type, fired_at, (stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)) AS lost FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND fired_at >= ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
+			)
+			.all(sinceIso);
+		const streaks = new Map<string, { consecutive: number; lastFiredAt: string; open: boolean }>();
+		for (const row of rows) {
+			const streak = streaks.get(row.event_type);
+			if (!streak) {
+				streaks.set(row.event_type, { consecutive: row.lost ? 1 : 0, lastFiredAt: row.fired_at, open: !!row.lost });
+			} else if (streak.open) {
+				if (row.lost) streak.consecutive++;
+				else streak.open = false;
+			}
+		}
+		return [...streaks]
+			.filter(([, streak]) => streak.consecutive > 0)
+			.map(([eventType, { consecutive, lastFiredAt }]) => ({ eventType, consecutive, lastFiredAt }))
+			.sort((a, b) => a.eventType.localeCompare(b.eventType));
+	}
+
+	/**
+	 * Cycle projection source: how many of the most recently settled monitor
+	 * events, newest first, ended `failed_no_retry` before the first success.
+	 * Dispatch outcome, not process liveness, is what a monitor outage looks like.
+	 */
+	monitorConsecutiveTerminalFailures(limit = 100): number {
+		const rows = this.#database
+			.query<{ stage: string }, [number]>(
+				`SELECT stage FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND ${REPLAYABLE_MONITOR} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
+			)
+			.all(limit);
+		const streak = rows.findIndex((row) => row.stage !== "failed_no_retry");
+		return streak < 0 ? rows.length : streak;
+	}
+
 	addRecall(originKey: string, originRefJson: string, text: string): void {
 		this.#database
 			.query("INSERT INTO recall_snippets (origin_key, origin_ref_json, text, at) VALUES (?, ?, ?, ?)")
@@ -1363,10 +2161,39 @@ export class GatewayDatabase {
 	}
 
 	/** Insertion-order view (rowid) — preserves admission order within the same millisecond. */
-	memoryIntentRowsByRowid(): Array<{ id: string; kind: string; payload_json: string; state: string }> {
+	memoryIntentRowsByRowid(): Array<{
+		id: string;
+		kind: string;
+		payload_json: string;
+		state: string;
+		attempts: number;
+		quarantine_reason: string | null;
+	}> {
 		return this.#database
-			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY rowid")
-			.all() as Array<{ id: string; kind: string; payload_json: string; state: string }>;
+			.query("SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY rowid")
+			.all() as Array<{
+			id: string;
+			kind: string;
+			payload_json: string;
+			state: string;
+			attempts: number;
+			quarantine_reason: string | null;
+		}>;
+	}
+
+	memoryIntentBeginAttempt(id: string): void {
+		this.#database
+			.query("UPDATE memory_intents SET attempts = attempts + 1, updated_at = ? WHERE id = ?")
+			.run(new Date().toISOString(), id);
+	}
+
+	memoryIntentQuarantine(id: string, reason: string): void {
+		if (!reason.trim()) throw new Error("memory intent quarantine reason is required");
+		this.#database
+			.query(
+				"UPDATE memory_intents SET state = 'quarantined', quarantine_reason = COALESCE(quarantine_reason, ?), updated_at = ? WHERE id = ?",
+			)
+			.run(reason, new Date().toISOString(), id);
 	}
 
 	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
@@ -1380,14 +2207,20 @@ export class GatewayDatabase {
 		kind: string;
 		payload_json: string;
 		state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+		attempts: number;
+		quarantine_reason: string | null;
 	}> {
 		return this.#database
-			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY created_at, id")
+			.query(
+				"SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY created_at, id",
+			)
 			.all() as Array<{
 			id: string;
 			kind: string;
 			payload_json: string;
 			state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+			attempts: number;
+			quarantine_reason: string | null;
 		}>;
 	}
 
@@ -1397,21 +2230,39 @@ export class GatewayDatabase {
 		originKey: string;
 		originRefJson: string;
 		body: string;
-		engagementJson?: string;
+		engagementJson?: string | null;
 		receivedAt?: string;
+		source?: "platform" | "lane_report";
 	}): boolean {
+		const enqueue = () => this.inboundEnqueueInTransaction(row);
+		return this.#inTransaction ? enqueue() : this.withTransaction(enqueue);
+	}
+
+	inboundEnqueueInTransaction(row: {
+		messageId: string;
+		originKey: string;
+		originRefJson: string;
+		body: string;
+		engagementJson?: string | null;
+		receivedAt?: string;
+		source?: "platform" | "lane_report";
+	}): boolean {
+		this.requireTransaction();
 		const receivedAt = row.receivedAt ?? new Date().toISOString();
 		if (!Number.isFinite(Date.parse(receivedAt))) throw new Error("inbound receivedAt must be an ISO timestamp");
+		const source = row.source ?? "platform";
+		if (source === "lane_report" && row.engagementJson !== undefined && row.engagementJson !== null)
+			throw new Error("lane report inbound rows cannot carry engagement metadata");
 		const changes = this.#database
 			.query(
-				"INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at) VALUES (?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
+				"INSERT INTO inbound_messages (message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
 			)
-			.run(row.messageId, row.originKey, row.originRefJson, row.body, row.engagementJson ?? null, receivedAt);
+			.run(row.messageId, source, row.originKey, row.originRefJson, row.body, row.engagementJson ?? null, receivedAt);
 		return changes.changes > 0;
 	}
 
 	inboundColumns(): string {
-		return "message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
+		return "message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
 	}
 
 	/**
@@ -1533,6 +2384,7 @@ export class GatewayDatabase {
 			const key = String(part);
 			const owner = claims[key];
 			if (owner) return owner;
+			delete claims.none;
 			claims[key] = deliveryId;
 			this.#database
 				.query("UPDATE inbound_messages SET terminal_delivery_id = ? WHERE turn_op_ref = ? AND turn_role = 'trigger'")
@@ -1542,20 +2394,46 @@ export class GatewayDatabase {
 	}
 
 	/**
+	 * Records that the turn closed without a delivery, and why. Never overwrites
+	 * a delivery claim or an earlier reason.
+	 */
+	inboundTurnMarkUnlinked(opRef: string, reason: TerminalUnlinkedReason): void {
+		this.#database
+			.query(
+				"UPDATE inbound_messages SET terminal_delivery_id = ? WHERE turn_op_ref = ? AND turn_role = 'trigger' AND terminal_delivery_id IS NULL",
+			)
+			.run(JSON.stringify({ none: reason }), opRef);
+	}
+
+	/**
+	 * Done triggers dispatched at or after `sinceIso`, and how many of them
+	 * carry neither a delivery claim nor a no-delivery reason.
+	 */
+	inboundTerminalLinkAudit(sinceIso: string): { done: number; unlinked: number } {
+		const row = this.#database
+			.query<{ done: number; unlinked: number | null }, [string]>(
+				"SELECT COUNT(*) AS done, SUM(terminal_delivery_id IS NULL) AS unlinked FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state = 'done' AND dispatched_at >= ?",
+			)
+			.get(sinceIso);
+		return { done: row?.done ?? 0, unlinked: row?.unlinked ?? 0 };
+	}
+
+	/**
 	 * Terminal reconciliation: legacy state and turn state become done in one
-	 * statement for the trigger. A steer still `bound` at this point was issued
+	 * statement for the trigger. A trigger no delivery claimed is stamped with
+	 * `unlinkedReason` in the same statement, so `done` never leaves the link NULL. A steer still `bound` at this point was issued
 	 * into the turn but never answered (torn transport): whether the model saw
 	 * it is unknowable now that the turn is over, so it is NOT closed and NOT
 	 * dispatched - it stays attributed to this op-ref as an operator-visible
 	 * hold (`inboundSteersHeld`). Returns how many TRIGGER rows closed, so a
 	 * repeat call is a no-op.
 	 */
-	inboundTurnComplete(opRef: string): number {
+	inboundTurnComplete(opRef: string, unlinkedReason: TerminalUnlinkedReason = "no_delivery"): number {
 		return this.#database
 			.query(
-				"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
+				"UPDATE inbound_messages SET state = 'done', turn_state = 'done', terminal_delivery_id = COALESCE(terminal_delivery_id, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
 			)
-			.run(opRef).changes;
+			.run(JSON.stringify({ none: unlinkedReason }), opRef).changes;
 	}
 
 	/**
@@ -1615,7 +2493,8 @@ export class GatewayDatabase {
 				(cap !== undefined && cap !== "0")
 			)
 				return undefined;
-			if (this.inboundTurnComplete(input.opRef) !== 1) throw new Error("failed turn completion lost its fence");
+			if (this.inboundTurnComplete(input.opRef, "turn_failed") !== 1)
+				throw new Error("failed turn completion lost its fence");
 			this.metaSet(dedupeKey, "1");
 			this.metaSet(capKey, "1");
 			// Do not present the already-failed trigger as new unread work when the
@@ -1633,6 +2512,11 @@ export class GatewayDatabase {
 	clearFailedTurnResetCap(originKey: string): void {
 		this.requireTransaction();
 		this.metaSet(failedTurnResetCapKey(originKey), "0");
+	}
+
+	failedTurnResetCapped(originKey: string): boolean {
+		const cap = this.metaGet(failedTurnResetCapKey(originKey));
+		return cap !== undefined && cap !== "0";
 	}
 
 	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {
@@ -1689,6 +2573,30 @@ export class GatewayDatabase {
 				)
 				.run(messageId, opRef).changes === 1
 		);
+	}
+
+	/**
+	 * A held steer whose turn is over and whose session is gone: whether the model
+	 * saw it is unknowable and nothing will ever answer the clientRef replay. It is
+	 * closed as done input of that turn - never re-dispatched, which could deliver
+	 * a message the model already answered a second time - and, in the SAME
+	 * transaction, its platform message leaves the unread context window, exactly
+	 * like an accepted steer, so the next turn does not present it as unread.
+	 */
+	inboundSteerAbandoned(messageId: string, opRef: string, contextMessageId?: string): boolean {
+		return this.withTransaction(() => {
+			const closed =
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE message_id = ? AND state = 'pending' AND turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?",
+					)
+					.run(messageId, opRef).changes === 1;
+			if (closed && contextMessageId)
+				this.#database
+					.query("UPDATE conversation_context SET consumed_at = ? WHERE message_id = ? AND consumed_at IS NULL")
+					.run(new Date().toISOString(), contextMessageId);
+			return closed;
+		});
 	}
 
 	/** Held steers of this origin whose turn is already terminal: unresolvable by the turn, only by a clientRef replay. */
@@ -1772,6 +2680,16 @@ export class GatewayDatabase {
 			.all()
 			.map((row) => row.origin_key);
 	}
+	/** A nonterminal trigger hidden from execution because its inbound row was quarantined. */
+	inboundHasQuarantinedNonterminalTurn(originKey: string): boolean {
+		return (
+			this.#database
+				.query<{ n: number }, [string]>(
+					"SELECT 1 AS n FROM inbound_messages i JOIN broker_quarantine q ON q.kind = 'inbound' AND q.subject_id = i.message_id WHERE i.origin_key = ? AND i.turn_role = 'trigger' AND i.turn_state IN ('bound','accepted') LIMIT 1",
+				)
+				.get(originKey) !== null
+		);
+	}
 
 	/** Origins with bound/accepted turns that need actor reconstruction after boot. */
 	inboundNonterminalOrigins(): readonly string[] {
@@ -1812,13 +2730,13 @@ export class GatewayDatabase {
 		const discard = () => {
 			const ids = this.#database
 				.query<{ message_id: string }, [string, string]>(
-					`SELECT message_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
+					`SELECT message_id FROM inbound_messages WHERE origin_key = ? AND source = 'platform' AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
 				)
 				.all(originKey, floorAt)
 				.map((row) => row.message_id);
 			this.#database
 				.query(
-					`UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
+					`UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND source = 'platform' AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
 				)
 				.run(originKey, floorAt);
 			return ids;
@@ -2355,6 +3273,23 @@ export class GatewayDatabase {
 			.all();
 	}
 
+	/** Check if this gateway is in broker mode (has an active broker authority). */
+	isBrokerMode(): boolean {
+		return this.#brokerAuthority() !== null;
+	}
+
+	/** Get the repo for a work lane by session ID from the owned binding, or undefined if not found. */
+	workLaneRepoBySessionId(sessionId: string): string | undefined {
+		const authority = this.#brokerAuthority();
+		if (!authority) return undefined;
+		const row = this.#database
+			.query<{ repo: string }, [string, string]>(
+				"SELECT repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?",
+			)
+			.get(brokerAuthorityKey(authority), sessionId);
+		return row?.repo;
+	}
+
 	putSession(originKey: string, sessionId: string): void {
 		if (this.#database.query("SELECT 1 FROM broker_authority").get()) throw new BrokerAuthorityError("unowned_session");
 		this.#database
@@ -2391,10 +3326,12 @@ export class GatewayDatabase {
 		);
 	}
 
-	deliveryUpdate(id: string, state: string, attempts?: number): void {
+	deliveryUpdate(id: string, state: string, attempts?: number, lastError?: string): void {
 		this.#database
-			.query("UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), updated_at = ? WHERE delivery_id = ?")
-			.run(state, attempts ?? null, new Date().toISOString(), id);
+			.query(
+				"UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), last_error = COALESCE(?, last_error), updated_at = ? WHERE delivery_id = ?",
+			)
+			.run(state, attempts ?? null, lastError ?? null, new Date().toISOString(), id);
 	}
 
 	deliveryExpireBefore(
@@ -2405,10 +3342,11 @@ export class GatewayDatabase {
 		origin_key: string;
 		attempts: number;
 		updated_at: string;
+		last_error: string | null;
 	}> {
 		const rows = this.#database
-			.query<{ delivery_id: string; origin_key: string; attempts: number }, [string]>(
-				"SELECT delivery_id, origin_key, attempts FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
+			.query<{ delivery_id: string; origin_key: string; attempts: number; last_error: string | null }, [string]>(
+				"SELECT delivery_id, origin_key, attempts, last_error FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
 			)
 			.all(before);
 		if (rows.length === 0) return [];
@@ -2453,10 +3391,11 @@ export class GatewayDatabase {
 		attempts: number;
 		created_at: string;
 		updated_at: string;
+		last_error: string | null;
 	}> {
 		return this.#database
 			.query(
-				"SELECT delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at FROM deliveries ORDER BY created_at",
+				"SELECT delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error FROM deliveries ORDER BY created_at",
 			)
 			.all() as Array<{
 			delivery_id: string;
@@ -2467,10 +3406,80 @@ export class GatewayDatabase {
 			attempts: number;
 			created_at: string;
 			updated_at: string;
+			last_error: string | null;
 		}>;
 	}
 
 	monitorCreate(row: {
+		id: string;
+		name: string;
+		triggerJson: string;
+		eventTypesJson: string;
+		burstPolicy: string;
+		overlap?: string;
+		channelTargetJson: string | null;
+		enabled: boolean;
+		instruction: string | null;
+		modelJson: string | null;
+		serviceTier: string | null;
+		procedureFilesJson?: string | null;
+	}): void {
+		this.#database
+			.query(
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				row.id,
+				row.name,
+				row.triggerJson,
+				row.eventTypesJson,
+				row.burstPolicy,
+				row.overlap ?? "queue",
+				row.channelTargetJson,
+				row.enabled ? 1 : 0,
+				new Date().toISOString(),
+				row.instruction,
+				row.modelJson,
+				row.serviceTier,
+				row.procedureFilesJson ?? null,
+			);
+	}
+	monitorRows(): Array<{
+		monitor_id: string;
+		name: string;
+		trigger_json: string;
+		event_types_json: string;
+		burst_policy: string;
+		overlap: string;
+		channel_target_json: string | null;
+		enabled: number;
+		created_at: string;
+		instruction: string | null;
+		model_json: string | null;
+		service_tier: string | null;
+		procedure_files_json: string | null;
+	}> {
+		return this.#database
+			.query(
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors ORDER BY created_at",
+			)
+			.all() as Array<{
+			monitor_id: string;
+			name: string;
+			trigger_json: string;
+			event_types_json: string;
+			burst_policy: string;
+			overlap: string;
+			channel_target_json: string | null;
+			enabled: number;
+			created_at: string;
+			instruction: string | null;
+			model_json: string | null;
+			service_tier: string | null;
+			procedure_files_json: string | null;
+		}>;
+	}
+	monitorUpdate(row: {
 		id: string;
 		name: string;
 		triggerJson: string;
@@ -2481,72 +3490,66 @@ export class GatewayDatabase {
 		instruction: string | null;
 		modelJson: string | null;
 		serviceTier: string | null;
-	}): void {
-		this.#database
-			.query(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			)
-			.run(
-				row.id,
-				row.name,
-				row.triggerJson,
-				row.eventTypesJson,
-				row.burstPolicy,
-				row.channelTargetJson,
-				row.enabled ? 1 : 0,
-				new Date().toISOString(),
-				row.instruction,
-				row.modelJson,
-				row.serviceTier,
-			);
-	}
-	monitorRows(): Array<{
-		monitor_id: string;
-		name: string;
-		trigger_json: string;
-		event_types_json: string;
-		burst_policy: string;
-		channel_target_json: string | null;
-		enabled: number;
-		created_at: string;
-		instruction: string | null;
-		model_json: string | null;
-		service_tier: string | null;
-	}> {
-		return this.#database
-			.query(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier FROM monitors ORDER BY created_at",
-			)
-			.all() as Array<{
-			monitor_id: string;
-			name: string;
-			trigger_json: string;
-			event_types_json: string;
-			burst_policy: string;
-			channel_target_json: string | null;
-			enabled: number;
-			created_at: string;
-			instruction: string | null;
-			model_json: string | null;
-			service_tier: string | null;
-		}>;
+		procedureFilesJson: string | null;
+	}): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ? WHERE monitor_id = ?",
+				)
+				.run(
+					row.name,
+					row.triggerJson,
+					row.eventTypesJson,
+					row.burstPolicy,
+					row.channelTargetJson,
+					row.enabled ? 1 : 0,
+					row.instruction,
+					row.modelJson,
+					row.serviceTier,
+					row.procedureFilesJson,
+					row.id,
+				).changes > 0
+		);
 	}
 	monitorDelete(id: string): boolean {
+		const deleted = this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
 		this.metaDelete(monitorCronMetaKey(id));
-		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
+		return deleted;
 	}
+	/**
+	 * Admits one monitor event. Under the `skip` overlap policy the predecessor
+	 * check and the insert share one statement, so two concurrent fires can never
+	 * both see "nothing in flight": the event lands as terminal `skipped` naming
+	 * the oldest same-monitor event still awaiting authoring (issue #83).
+	 * Returns the predecessor's id when skipped, undefined when admitted.
+	 */
 	monitorEventCreate(row: {
 		eventId: string;
 		monitorId: string;
 		eventType: string;
 		payloadJson: string;
 		firedAt: string;
-	}): void {
-		this.#database
-			.query(
-				"INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, updated_at) VALUES (?, ?, ?, ?, ?, 'admitted', NULL, ?)",
+		overlap?: "queue" | "skip";
+	}): string | undefined {
+		const predecessor =
+			row.overlap === "skip"
+				? `(SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid LIMIT 1)`
+				: "NULL";
+		const inserted = this.#database
+			.query<{ skipped_by: string | null }, string[]>(
+				`INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
 			)
-			.run(row.eventId, row.monitorId, row.eventType, row.payloadJson, row.firedAt, new Date().toISOString());
+			.get(
+				row.eventId,
+				row.monitorId,
+				row.eventType,
+				row.payloadJson,
+				row.firedAt,
+				new Date().toISOString(),
+				...(row.overlap === "skip" ? [row.monitorId] : []),
+			);
+		return inserted?.skipped_by ?? undefined;
 	}
 	/**
 	 * Durable dispatch lease (red-team blocker 1): a process claims an event
@@ -2775,6 +3778,7 @@ WHERE event_id = ? AND ${leasePredicate}`,
 		detail: string,
 		now = Date.now(),
 		terminal = false,
+		options?: MonitorFailureOptions,
 	): boolean {
 		return this.withTransaction(() => {
 			const changes = this.#database
@@ -2793,7 +3797,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 					new Date(now).toISOString(),
 				).changes;
 			if (changes === 0) return false;
-			this.monitorFailureRecord(eventId, code, detail);
+			this.monitorFailureRecord(eventId, code, detail, options);
 			return true;
 		});
 	}
@@ -2886,7 +3890,10 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		// delivered may ONLY be reached from authored: an omitted event still in
 		// dispatched/batched can never be promoted by a batch-wide settlement
 		// (terminal-critic blocker 3).
-		if (stage === "delivered" && row.stage === "authored") {
+		if (
+			stage === "delivered" &&
+			(row.stage === "authored" || (row.stage === "failed_no_retry" && this.authoredOutput(eventId) !== undefined))
+		) {
 			this.monitorEventUpdate(eventId, "delivered");
 			return true;
 		}
@@ -2903,6 +3910,33 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			return true;
 		}
 		return false;
+	}
+	/**
+	 * Events left `authored` behind an expired delivery can never reach `delivered` (#94).
+	 * Move the batch's still-authored events to `failed_no_retry` with evidence.
+	 * Runs inside the caller's transaction and returns the failed event ids.
+	 */
+	monitorEventsFailExpiredDelivery(deliveryId: string, reason: string): string[] {
+		const delivery = this.#database
+			.query<{ turn_id: string; attempts: number; state: string }, [string]>(
+				"SELECT turn_id, attempts, state FROM deliveries WHERE delivery_id = ?",
+			)
+			.get(deliveryId);
+		if (delivery?.state !== "expired") return [];
+		const events = this.#database
+			.query<{ event_id: string }, [string]>(
+				`SELECT event_id FROM monitor_events WHERE batch_id = ? AND stage = 'authored' AND ${REPLAYABLE_MONITOR}`,
+			)
+			.all(delivery.turn_id);
+		for (const { event_id } of events) {
+			this.monitorEventUpdate(event_id, "failed_no_retry");
+			this.monitorFailureRecord(
+				event_id,
+				"delivery_expired",
+				`delivery ${deliveryId} expired after ${delivery.attempts} attempts: ${reason}`,
+			);
+		}
+		return events.map((row) => row.event_id);
 	}
 	/**
 	 * Bumps the reclaim counter; returns the new count. Reconcile stops
@@ -2944,7 +3978,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		stage: string;
 		batch_id: string | null;
 		dispatch_attempts: number;
+		skipped_by: string | null;
 		updated_at: string;
+		procedure_json: string | null;
 	}> {
 		const direction = order === "oldest" ? "ASC" : "DESC";
 		return this.#database
@@ -2962,7 +3998,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			stage: string;
 			batch_id: string | null;
 			dispatch_attempts: number;
+			skipped_by: string | null;
 			updated_at: string;
+			procedure_json: string | null;
 		}>;
 	}
 	authoredOutputCreate(eventId: string, outputText: string): void {
@@ -2972,6 +4010,24 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				"INSERT INTO authored_outputs (event_id, output_text, authored_at) VALUES (?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET output_text = excluded.output_text, authored_at = excluded.authored_at",
 			)
 			.run(eventId, outputText, new Date().toISOString());
+	}
+	/**
+	 * Records the procedure versions one event's authoring turn is given (issue
+	 * #82). Lease-fenced like every dispatch write: a stale attempt cannot
+	 * overwrite the version a newer attempt authored with.
+	 */
+	monitorEventFencedSetProcedure(eventId: string, leaseId: string, procedureJson: string, now = Date.now()): boolean {
+		this.#assertNotQuarantined("monitor", eventId);
+		return (
+			this.#database
+				.query(
+					`UPDATE monitor_events SET procedure_json = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+				)
+				.run(procedureJson, eventId, leaseId, new Date(now).toISOString()).changes > 0
+		);
 	}
 	authoredOutput(eventId: string): string | undefined {
 		return this.#database
@@ -2983,7 +4039,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return (
 			this.#database
 				.query<MonitorFailureRow, [string]>(
-					"SELECT event_id, code, detail, failed_at FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
 				)
 				.get(eventId) ?? undefined
 		);
@@ -2994,17 +4050,99 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * Keeps the newest 20 rows per event and deletes stale rows so the table
 	 * cannot grow without bound across retries.
 	 */
-	monitorFailureRecord(eventId: string, code: string, detail: string): void {
+	monitorFailureRecord(eventId: string, code: string, detail: string, options?: MonitorFailureOptions): void {
 		// Runs inside the caller's transaction when one is open (dispatch failure
 		// bookkeeping must be atomic with the stage transition); standalone otherwise.
+		const protocolFailure = options?.protocolFailure;
+		if (protocolFailure) {
+			if (!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(protocolFailure.reason))
+				throw new Error("invalid monitor protocol failure reason");
+			if (!Number.isSafeInteger(protocolFailure.responseByteLength) || protocolFailure.responseByteLength < 0)
+				throw new Error("invalid monitor protocol response byte length");
+			if (
+				protocolFailure.responseEntryCount !== null &&
+				(!Number.isSafeInteger(protocolFailure.responseEntryCount) ||
+					protocolFailure.responseEntryCount < 0 ||
+					protocolFailure.responseEntryCount > protocolFailure.responseByteLength)
+			)
+				throw new Error("invalid monitor protocol response entry count");
+		}
+		const failedAt = new Date().toISOString();
 		this.#database
-			.query("INSERT INTO monitor_failures (event_id, code, detail, failed_at) VALUES (?, ?, ?, ?)")
-			.run(eventId, code, detail.slice(0, 500), new Date().toISOString());
+			.query(
+				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				eventId,
+				code,
+				detail.slice(0, 500),
+				failedAt,
+				protocolFailure?.reason ?? null,
+				protocolFailure?.responseByteLength ?? null,
+				protocolFailure?.responseEntryCount ?? null,
+			);
 		this.#database
 			.query(
 				"DELETE FROM monitor_failures WHERE event_id = ? AND rowid NOT IN (SELECT rowid FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 20)",
 			)
 			.run(eventId, eventId);
+	}
+	/** Public-safe protocol failure history and delivery recovery timing for an event. */
+	monitorEventRecovery(eventId: string): MonitorEventRecovery | undefined {
+		const event = this.#database
+			.query<{ stage: string; updated_at: string; dispatch_attempts: number }, [string]>(
+				"SELECT stage, updated_at, dispatch_attempts FROM monitor_events WHERE event_id = ?",
+			)
+			.get(eventId);
+		if (!event) return undefined;
+		const rows = this.#database
+			.query<
+				{
+					protocol_reason: string | null;
+					failed_at: string;
+					response_byte_length: number | null;
+					response_entry_count: number | null;
+				},
+				[string]
+			>(
+				"SELECT protocol_reason, failed_at, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? AND protocol_reason IS NOT NULL ORDER BY rowid ASC",
+			)
+			.all(eventId);
+		const protocolFailures: MonitorProtocolFailureRecord[] = [];
+		for (const row of rows) {
+			if (
+				!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(row.protocol_reason ?? "") ||
+				!Number.isSafeInteger(row.response_byte_length) ||
+				(row.response_byte_length ?? -1) < 0 ||
+				(row.response_entry_count !== null &&
+					(!Number.isSafeInteger(row.response_entry_count) ||
+						row.response_entry_count < 0 ||
+						row.response_entry_count > (row.response_byte_length ?? -1)))
+			)
+				continue;
+			protocolFailures.push({
+				reason: row.protocol_reason as ProtocolFailureReason,
+				failedAt: row.failed_at,
+				responseByteLength: row.response_byte_length as number,
+				responseEntryCount: row.response_entry_count,
+			});
+		}
+		const first = protocolFailures[0];
+		if (!first) return undefined;
+		const deliveredAt = event.stage === "delivered" ? event.updated_at : null;
+		const failedAtMs = Date.parse(first.failedAt);
+		const deliveredAtMs = deliveredAt === null ? Number.NaN : Date.parse(deliveredAt);
+		const latency = deliveredAtMs - failedAtMs;
+		return {
+			protocolFailures,
+			firstFailedAt: first.failedAt,
+			deliveredAt,
+			recoveryLatencyMs:
+				Number.isFinite(failedAtMs) && Number.isFinite(deliveredAtMs) && Number.isSafeInteger(latency) && latency >= 0
+					? latency
+					: null,
+			dispatchAttempts: event.dispatch_attempts + 1,
+		};
 	}
 	monitorFailures(eventIds: readonly string[]): Map<string, MonitorFailureRow> {
 		const rows = new Map<string, MonitorFailureRow>();
@@ -3020,6 +4158,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * the slot but died before submitting the event — reconcile admits it. A
 	 * crash can therefore strand neither a claimed-but-unadmitted slot (this
 	 * row shape makes it visible) nor a duplicate event (unique slot key).
+	 * A slot skipped by the overlap policy is still claimed: it fired, and its
+	 * `skipped` event row is the record of what happened to it.
 	 */
 	monitorSlotClaimWithEvent(row: {
 		monitorId: string;
@@ -3027,7 +4167,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		eventId: string;
 		eventType: string;
 		payloadJson: string;
-	}): boolean {
+		overlap?: "queue" | "skip";
+	}): { admitted: false } | { admitted: true; skippedBy: string | undefined } {
 		const now = new Date().toISOString();
 		return this.withTransaction(() => {
 			const claim = this.#database
@@ -3035,16 +4176,17 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 					"INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
 				)
 				.run(row.monitorId, row.slotAt, row.eventId, now).changes;
-			if (claim === 0) return false;
-			this.monitorEventCreate({
+			if (claim === 0) return { admitted: false as const };
+			const skippedBy = this.monitorEventCreate({
 				eventId: row.eventId,
 				monitorId: row.monitorId,
 				eventType: row.eventType,
 				payloadJson: row.payloadJson,
 				firedAt: row.slotAt,
+				...(row.overlap ? { overlap: row.overlap } : {}),
 			});
-			return true;
-		}) as boolean;
+			return { admitted: true as const, skippedBy };
+		});
 	}
 	/** Test/recovery seam: move a monitor's creation instant (clamps catch-up). */
 	monitorSetCreatedAt(monitorId: string, createdAt: string): void {
@@ -3058,12 +4200,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.get(monitorId, slotAt);
 		return (row?.n ?? 0) > 0;
 	}
-	/**
-	 * Durable cron cursor (issue #157): the newest slot this monitor has admitted
-	 * (a `monitor_slots` claim) or refused under catch-up policy (recorded by
-	 * `monitorCronRecordSkip`), whichever is later. Undefined for a monitor that
-	 * has neither — the caller starts it from the monitor's creation instant.
-	 */
+	/** Durable boundary from the newest claimed slot or newest policy skip. */
 	monitorCronCursor(monitorId: string): string | undefined {
 		const claimed = this.#database
 			.query<{ slot_at: string | null }, [string]>(
@@ -3075,16 +4212,12 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		if (!skipped) return claimed;
 		return Date.parse(skipped) > Date.parse(claimed) ? skipped : claimed;
 	}
-	/** Catch-up diagnostics for one cron monitor; undefined when it never skipped a slot. */
+	/** Catch-up diagnostics; absent until this monitor has skipped at least one slot. */
 	monitorCronState(monitorId: string): MonitorCronState | undefined {
 		const raw = this.metaGet(monitorCronMetaKey(monitorId));
 		return raw === undefined ? undefined : (JSON.parse(raw) as MonitorCronState);
 	}
-	/**
-	 * Durably records slots a catch-up sweep refused under its age/count policy
-	 * and advances the cursor past them, so a refused slot is counted exactly
-	 * once and never silently dropped.
-	 */
+	/** Records policy refusals durably and advances the cursor so they are counted once. */
 	monitorCronRecordSkip(
 		monitorId: string,
 		skip: { count: number; oldest: string; newest: string },
@@ -3558,6 +4691,203 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(22, new Date().toISOString());
+			});
+		}
+		if (current < 23) {
+			this.withTransaction(() => {
+				this.#database.exec(
+					"ALTER TABLE memory_intents ADD COLUMN quarantine_reason TEXT; ALTER TABLE memory_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0 AND typeof(attempts) = 'integer')",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(23, new Date().toISOString());
+			});
+		}
+		if (current < 24) {
+			this.withTransaction(() => {
+				this.#database.exec(`
+					ALTER TABLE inbound_messages ADD COLUMN source TEXT NOT NULL DEFAULT 'platform' CHECK(source IN ('platform','lane_report'));
+					CREATE TABLE lane_reports (
+						report_id TEXT PRIMARY KEY,
+						parent_name TEXT NOT NULL,
+						child_name TEXT NOT NULL,
+						child_op_ref TEXT NOT NULL UNIQUE,
+						body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 2048),
+						root_json TEXT,
+						state TEXT NOT NULL CHECK(state IN ('pending','claimed','consumed','fallback','held','undeliverable')),
+						claim_kind TEXT CHECK(claim_kind IS NULL OR claim_kind IN ('steer','wake')),
+						claim_ref TEXT,
+						claim_target_op_ref TEXT,
+						claim_seq INTEGER NOT NULL DEFAULT 0 CHECK(claim_seq >= 0),
+						hold_reason TEXT,
+						consumed_op_ref TEXT,
+						created_at TEXT NOT NULL,
+						updated_at TEXT NOT NULL,
+						CHECK(state NOT IN ('claimed','held') OR (claim_kind IS NOT NULL AND claim_ref IS NOT NULL)),
+						CHECK(state <> 'pending' OR (claim_kind IS NULL AND claim_ref IS NULL AND claim_target_op_ref IS NULL)),
+						CHECK(claim_kind IS NULL OR claim_seq > 0),
+						CHECK(claim_kind IS NULL OR claim_kind <> 'steer' OR claim_target_op_ref IS NOT NULL),
+						CHECK(claim_kind IS NULL OR claim_kind <> 'wake' OR claim_target_op_ref IS NULL),
+						CHECK((state = 'consumed' AND consumed_op_ref IS NOT NULL) OR (state <> 'consumed' AND consumed_op_ref IS NULL))
+					);
+					CREATE INDEX lane_reports_parent_state ON lane_reports(parent_name, state, created_at);
+					DROP TRIGGER IF EXISTS work_attempt_runtime_quarantine_update;
+					DROP TRIGGER IF EXISTS work_attempt_runtime_quarantine_delete;
+				`);
+				for (const row of this.#database
+					.query<{ op_ref: string; job_id: string; record_json: string }, []>(
+						"SELECT op_ref, job_id, record_json FROM work_attempt_runtime",
+					)
+					.all()) {
+					try {
+						const legacy = JSON.parse(row.record_json) as Record<string, unknown>;
+						workAssert(legacy && typeof legacy === "object" && !Array.isArray(legacy));
+						const target = legacy.target;
+						let parent: WorkParent | null = null;
+						if (target !== null) {
+							validateOriginRef(target as OriginRef);
+							const origin = structuredClone(target as OriginRef);
+							parent = { kind: "persona", originKey: originKey(origin), origin };
+						}
+						delete legacy.target;
+						legacy.parent = parent;
+						legacy.reportId = workAttemptReportId(this.instanceId, row.job_id, row.op_ref);
+						legacy.wakeReportId = null;
+						legacy.noticeHash = null;
+						if (legacy.decision === "enqueued") legacy.decision = "fallback";
+						const runtime = legacy as unknown as WorkAttemptRuntime;
+						validateWorkRuntime(runtime, this.instanceId);
+						workAssert(runtime.opRef === row.op_ref && runtime.jobId === row.job_id);
+						this.#database
+							.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+							.run(JSON.stringify(runtime), row.op_ref);
+					} catch {
+						throw new DatabaseStartupError(
+							"migration_corrupt",
+							`schema v24 could not migrate work attempt ${row.op_ref}`,
+						);
+					}
+				}
+				this.#database.exec(`
+					CREATE TRIGGER work_attempt_runtime_quarantine_update BEFORE UPDATE ON work_attempt_runtime
+					WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+					BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+					CREATE TRIGGER work_attempt_runtime_quarantine_delete BEFORE DELETE ON work_attempt_runtime
+					WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+					BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+				`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(24, new Date().toISOString());
+			});
+		}
+		if (current < 25) {
+			this.withTransaction(() => {
+				// Track each epoch's AGENTS.md baseline. Only the digest is persisted;
+				// prompt content remains in the workspace and is re-read on each turn.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(sessions)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("agents_md_epoch"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_epoch INTEGER NOT NULL DEFAULT -1");
+				if (!columns.has("agents_md_digest"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_digest TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(25, new Date().toISOString());
+			});
+		}
+		if (current < 26) {
+			this.withTransaction(() => {
+				// Issue #171: the allowlisted classification of the latest failed attempt.
+				const columns = this.#database
+					.query<{ name: string }, []>("PRAGMA table_info(deliveries)")
+					.all()
+					.map((row) => row.name);
+				if (!columns.includes("last_error")) this.#database.exec("ALTER TABLE deliveries ADD COLUMN last_error TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(26, new Date().toISOString());
+			});
+		}
+		if (current < 27) {
+			this.withTransaction(() => {
+				// Issue #82: declared procedure files are re-read per firing and each
+				// authoring event records the procedure version it was given.
+				const columns = (table: string) =>
+					new Set(
+						this.#database
+							.query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+							.all()
+							.map((row) => row.name),
+					);
+				if (!columns("monitors").has("procedure_files_json"))
+					this.#database.exec("ALTER TABLE monitors ADD COLUMN procedure_files_json TEXT");
+				if (!columns("monitor_events").has("procedure_json"))
+					this.#database.exec("ALTER TABLE monitor_events ADD COLUMN procedure_json TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(27, new Date().toISOString());
+			});
+		}
+		if (current < 28) {
+			this.withTransaction(() => {
+				// Issue #83: per-monitor overlap policy and the terminal `skipped` stage.
+				// Rebuild monitor_events because its stage CHECK constraint must widen.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitors)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("overlap"))
+					this.#database.exec(
+						"ALTER TABLE monitors ADD COLUMN overlap TEXT NOT NULL DEFAULT 'queue' CHECK(overlap IN ('queue','skip'))",
+					);
+				this.#database.exec(`CREATE TABLE monitor_events_v28 (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry','skipped')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, skipped_by TEXT, updated_at TEXT NOT NULL, procedure_json TEXT);
+INSERT INTO monitor_events_v28 (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at, procedure_json) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at, procedure_json FROM monitor_events ORDER BY rowid;
+DROP TABLE monitor_events;
+ALTER TABLE monitor_events_v28 RENAME TO monitor_events;
+CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);`);
+				for (const action of ["UPDATE", "DELETE"])
+					this.#database.exec(`CREATE TRIGGER monitor_events_quarantine_${action.toLowerCase()} BEFORE ${action} ON monitor_events
+					WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = OLD.event_id)
+					BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(28, new Date().toISOString());
+			});
+		}
+		if (current < 29) {
+			this.withTransaction(() => {
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitor_failures)")
+						.all()
+						.map((row) => row.name),
+				);
+				const additions = [
+					[
+						"protocol_reason",
+						"TEXT CHECK(protocol_reason IS NULL OR protocol_reason IN ('protocol_response_not_array', 'protocol_entry_missing_field', 'protocol_unknown_event', 'protocol_duplicate_event', 'protocol_omitted_event', 'protocol_unparseable_json', 'protocol_off_contract'))",
+					],
+					[
+						"response_byte_length",
+						"INTEGER CHECK(response_byte_length IS NULL OR (typeof(response_byte_length) = 'integer' AND response_byte_length BETWEEN 0 AND 9007199254740991))",
+					],
+					[
+						"response_entry_count",
+						"INTEGER CHECK(response_entry_count IS NULL OR (typeof(response_entry_count) = 'integer' AND response_entry_count BETWEEN 0 AND 9007199254740991))",
+					],
+				] as const;
+				for (const [name, declaration] of additions)
+					if (!columns.has(name)) this.#database.exec(`ALTER TABLE monitor_failures ADD COLUMN ${name} ${declaration}`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(29, new Date().toISOString());
 			});
 		}
 	}

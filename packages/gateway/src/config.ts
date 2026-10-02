@@ -3,10 +3,12 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
 	type ChannelEngagementPolicy,
+	describeChatPlatforms,
 	ENGAGEMENT_AUDIENCES,
 	ENGAGEMENT_MODES,
 	type EngagementAudience,
 	type EngagementMode,
+	isChatPlatform,
 	type OriginRef,
 	parseRuntimeConfig as parseSharedRuntimeConfig,
 	type RuntimeConfig,
@@ -33,6 +35,7 @@ const WORK_IDLE_RETIRE_MAX_MS = 7 * 24 * 60 * 60_000;
 export interface WorkLaneConfig {
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
+	readonly allowNested?: boolean;
 }
 export type GjcServiceTier =
 	| "none"
@@ -87,12 +90,7 @@ export interface GatewayConfigFile {
 	 * MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD.
 	 */
 	readonly monitorContextFailureRollThreshold?: number;
-	/**
-	 * Cron catch-up ceiling (issue #157). After downtime every slot since a
-	 * monitor's durable cursor is replayed, except slots older than `maxAgeMs`
-	 * and the oldest overflow beyond `maxSlots`; those are recorded as skipped.
-	 * Default DEFAULT_CRON_CATCH_UP (24 slots, 24 hours).
-	 */
+	/** Durable cron slot replay age/count limits; omitted values use runtime defaults. */
 	readonly monitorCatchUp?: MonitorCatchUpConfig;
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
@@ -102,6 +100,10 @@ export interface GatewayConfigFile {
 	readonly work?: WorkLaneConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
+	/** Mid-work speech limits (issue #71); unset means every non-narration mid-work message ships. */
+	readonly interimSpeech?: InterimSpeechConfig;
+	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
+	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
 }
 
 export interface MonitorCatchUpConfig {
@@ -109,9 +111,22 @@ export interface MonitorCatchUpConfig {
 	readonly maxAgeMs?: number;
 }
 
-/** Bounds for `monitorCatchUp`: at least one slot, at most a week of lookback. */
+/** Bounds for monitorCatchUp: 1–1000 slots and 1 minute–7 days of age. */
 export const MONITOR_CATCH_UP_MAX_SLOTS = 1000;
 export const MONITOR_CATCH_UP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface InterimSpeechConfig {
+	/**
+	 * Hard cap on delivered mid-work messages within one turn; unset means no cap
+	 * beyond the turn's part budget. 0 delivers no mid-work messages at all.
+	 */
+	readonly maxPerTurn?: number;
+	/**
+	 * Minimum spacing between delivered mid-work messages in milliseconds.
+	 * The first message is never delayed.
+	 */
+	readonly minGapMs?: number;
+}
 
 export interface BotAudienceConfig {
 	/**
@@ -344,6 +359,27 @@ function parseBotAudience(value: unknown): BotAudienceConfig | undefined {
 	};
 }
 
+function parseNonNegativeInteger(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 0)
+		throw new ConfigError("config_invalid", `${field} must be a non-negative integer`);
+	return value as number;
+}
+
+function parseInterimSpeech(value: unknown): InterimSpeechConfig | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "interimSpeech");
+	for (const key of Object.keys(input))
+		if (key !== "maxPerTurn" && key !== "minGapMs")
+			throw new ConfigError("config_invalid", "interimSpeech contains an unknown field");
+	const maxPerTurn = parseNonNegativeInteger(input.maxPerTurn, "interimSpeech.maxPerTurn");
+	const minGapMs = parseNonNegativeInteger(input.minGapMs, "interimSpeech.minGapMs");
+	return {
+		...(maxPerTurn === undefined ? {} : { maxPerTurn }),
+		...(minGapMs === undefined ? {} : { minGapMs }),
+	};
+}
+
 function parseStallTimeout(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) < 1_000 || (value as number) > 3_600_000)
 		throw new ConfigError("config_invalid", "stallTimeoutMs must be an integer between 1000 and 3600000");
@@ -362,6 +398,27 @@ function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
 			`ownerTarget.origin is invalid: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
+}
+
+function parseHandoffTargets(value: unknown): Readonly<Record<string, OriginRef>> {
+	const input = requireObject(value, "handoffTargets");
+	const targets: Record<string, OriginRef> = {};
+	for (const [alias, origin] of Object.entries(input)) {
+		// An alias with `/` or `:` would be shadowed by the origin-key spellings the resolver also accepts.
+		if (!/^[A-Za-z0-9_.-]{1,64}$/.test(alias))
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be named with letters, digits, _ . or -`);
+		let parsed: OriginRef;
+		try {
+			parsed = validateOriginRef(requireObject(origin, `handoffTargets.${alias}`) as unknown as OriginRef);
+		} catch (error) {
+			if (error instanceof ConfigError) throw error;
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be a valid origin`);
+		}
+		if (!isChatPlatform(parsed.platform))
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be a ${describeChatPlatforms()} origin`);
+		targets[alias] = parsed;
+	}
+	return targets;
 }
 
 function parseStringArray(value: unknown, field: string): readonly string[] {
@@ -432,8 +489,8 @@ function parseMonitorCatchUp(value: unknown): MonitorCatchUpConfig {
 
 function parseWork(value: unknown): WorkLaneConfig {
 	const input = requireObject(value, "work");
-	if (Object.keys(input).some((key) => key !== "maxLanes" && key !== "idleRetireMs"))
-		throw new ConfigError("config_invalid", "work may only contain maxLanes and idleRetireMs");
+	if (Object.keys(input).some((key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested"))
+		throw new ConfigError("config_invalid", "work may only contain maxLanes, idleRetireMs, and allowNested");
 	if (
 		input.maxLanes !== undefined &&
 		(!Number.isInteger(input.maxLanes) || (input.maxLanes as number) < 1 || (input.maxLanes as number) > 256)
@@ -449,9 +506,12 @@ function parseWork(value: unknown): WorkLaneConfig {
 			"config_invalid",
 			`work.idleRetireMs must be an integer between ${WORK_IDLE_RETIRE_MIN_MS} and ${WORK_IDLE_RETIRE_MAX_MS}`,
 		);
+	if (input.allowNested !== undefined && typeof input.allowNested !== "boolean")
+		throw new ConfigError("config_invalid", "work.allowNested must be a boolean");
 	return {
 		...(input.maxLanes === undefined ? {} : { maxLanes: input.maxLanes as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
+		...(input.allowNested === undefined ? {} : { allowNested: input.allowNested as boolean }),
 	};
 }
 
@@ -507,8 +567,8 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
-		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
+		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 		...(input.monitorContextFailureRollThreshold === undefined
 			? {}
 			: {
@@ -516,6 +576,8 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 						input.monitorContextFailureRollThreshold,
 					),
 				}),
+		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
+		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
 	};
 }
 
@@ -616,7 +678,14 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * resolved per inbound message) and `stallTimeoutMs` (tail liveness alarms). Each
  * applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutMs", "dmPolicy", "botAudience"] as const;
+export const RELOADABLE_FIELDS = [
+	"mentionAllowlist",
+	"channels",
+	"stallTimeoutMs",
+	"dmPolicy",
+	"botAudience",
+	"handoffTargets",
+] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [
@@ -633,6 +702,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"monitorContextFailureRollThreshold",
 	"monitorCatchUp",
 	"work",
+	"interimSpeech",
 ] as const;
 
 /**

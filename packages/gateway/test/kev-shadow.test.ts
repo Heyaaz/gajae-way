@@ -160,9 +160,11 @@ test("the log line reports every factor, why it was addressed, and how much thre
 	const savedUrl = process.env.KEV_SHADOW_URL;
 	process.env.KEV_SHADOW_URL = `http://127.0.0.1:${server.port}`;
 	const lines: string[] = [];
-	const error = console.error;
-	console.error = (line: unknown) => {
-		lines.push(String(line));
+	const info = console.info;
+	console.info = (line: unknown) => {
+		// console.info is process-wide: timers left by other test files in this
+		// run can log while the probe awaits. Only the shadow's own lines count.
+		if (String(line).startsWith("kev-shadow ")) lines.push(String(line));
 	};
 	try {
 		await recordKevShadow({
@@ -174,7 +176,7 @@ test("the log line reports every factor, why it was addressed, and how much thre
 		});
 		await recordKevShadow({ originKey: "discord:c1", text: "ㅋㅋㅋ" });
 	} finally {
-		console.error = error;
+		console.info = info;
 		if (savedUrl === undefined) {
 			delete process.env.KEV_SHADOW_URL;
 		} else process.env.KEV_SHADOW_URL = savedUrl;
@@ -211,9 +213,11 @@ test("earlier turns are rendered oldest-first under the context header and count
 	const savedUrl = process.env.KEV_SHADOW_URL;
 	process.env.KEV_SHADOW_URL = `http://127.0.0.1:${server.port}`;
 	const lines: string[] = [];
-	const error = console.error;
-	console.error = (line: unknown) => {
-		lines.push(String(line));
+	const info = console.info;
+	console.info = (line: unknown) => {
+		// console.info is process-wide: timers left by other test files in this
+		// run can log while the probe awaits. Only the shadow's own lines count.
+		if (String(line).startsWith("kev-shadow ")) lines.push(String(line));
 	};
 	try {
 		await recordKevShadow({
@@ -226,7 +230,7 @@ test("earlier turns are rendered oldest-first under the context header and count
 			],
 		});
 	} finally {
-		console.error = error;
+		console.info = info;
 		if (savedUrl === undefined) {
 			delete process.env.KEV_SHADOW_URL;
 		} else process.env.KEV_SHADOW_URL = savedUrl;

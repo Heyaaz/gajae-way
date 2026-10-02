@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROTOCOL_FAILURE_REASONS } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
@@ -17,9 +18,9 @@ import {
 	startCron,
 } from "../src/monitors/triggers/cron";
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
-import { SessionTerminalError } from "../src/orchestrator/session-port";
+import { SessionRequestTimeoutError, SessionTerminalError } from "../src/orchestrator/session-port";
 import { startUnixServer } from "../src/server/server";
-import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/db";
+import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, MONITOR_EVENT_RETRY_BACKOFF_MS } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 import type { SessionPortResponder } from "./session-port.fake";
 import { sessionPortFromScript } from "./session-port.fake";
@@ -42,7 +43,10 @@ function fakeSessionPort(respond: SessionPortResponder) {
 
 async function harness(
 	respond: SessionPortResponder,
-	options: { ownerTarget?: { origin: { platform: "loopback"; kind: "loopback"; conversationId: "loopback" } } } = {},
+	options: {
+		ownerTarget?: { origin: { platform: "loopback"; kind: "loopback"; conversationId: "loopback" } };
+		now?: () => number;
+	} = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -63,6 +67,7 @@ async function harness(
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
+		...(options.now ? { now: options.now } : {}),
 	});
 	propagators.push(propagator);
 	return { propagator, monitor, database, registry, sessionPort };
@@ -107,6 +112,15 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 	// Dispatched is the durable monitor stage for an accepted authoring turn.
 	const accepted = seedEvent(db, monitor.monitorId, "dispatched", "old-accepted-batch");
 	const failed = seedEvent(db, monitor.monitorId, "failed", "old-failed-batch");
+	const recovered = seedEvent(db, monitor.monitorId, "failed", "recovered-batch");
+	db.monitorFailureRecord(recovered, "authoring_response_invalid", "safe protocol failure", {
+		protocolFailure: {
+			reason: "protocol_unparseable_json",
+			responseByteLength: 12,
+			responseEntryCount: null,
+		},
+	});
+	db.monitorEventUpdate(recovered, "delivered");
 	db.cutoverBrokerAuthority({
 		expectedAuthority: null,
 		targetAuthority: { canonicalAgentDir: "/tmp/monitor-inspection-global", identity: "shared-broker" },
@@ -114,7 +128,7 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		disposition: "quarantine",
 	});
 	const history = db.monitorEventRows(monitor.monitorId, "newest", true);
-	expect(history).toHaveLength(2);
+	expect(history).toHaveLength(3);
 	expect(db.monitorEventRows()).toEqual([]);
 	expect(db.monitorEventRows(undefined, "oldest")).toEqual([]);
 	expect(db.monitorEventRows(monitor.monitorId, "oldest")).toEqual([]);
@@ -138,7 +152,7 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 	try {
 		const frames: Array<Record<string, unknown>> = [];
 		let buffered = "";
-		socket = await Bun.connect({
+		const connected = await Bun.connect({
 			unix: socketPath,
 			socket: {
 				data(_socket, data) {
@@ -149,24 +163,71 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 				},
 			},
 		});
-		const inspectResult = async (id: string) => {
-			socket!.write(
-				`${JSON.stringify({ v: "0.1", type: "request", id, verb: "monitor.inspect", params: { monitorId: monitor.monitorId } })}\n`,
+		socket = connected;
+		const request = async (id: string, verb: "monitor.inspect" | "monitor.list") => {
+			connected.write(
+				`${JSON.stringify({
+					v: "0.1",
+					type: "request",
+					id,
+					verb,
+					...(verb === "monitor.inspect" ? { params: { monitorId: monitor.monitorId } } : {}),
+				})}\n`,
 			);
 			for (let attempt = 0; attempt < 400; attempt++) {
 				const frame = frames.find((entry) => entry.id === id);
 				if (frame) {
 					expect(frame.type).toBe("response");
-					return frame.result as { recentEvents: Array<Record<string, unknown>>; catchUp?: unknown };
+					return frame.result as Record<string, unknown>;
 				}
 				await Bun.sleep(5);
 			}
-			throw new Error(`no monitor.inspect response for ${id}`);
+			throw new Error(`no ${verb} response for ${id}`);
 		};
-		const inspect = async (id: string) => (await inspectResult(id)).recentEvents;
-		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
-		const rows = await inspect("history");
-		expect(rows).toHaveLength(2);
+		connected.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		const listResponse = await request("list", "monitor.list");
+		const list = listResponse.monitors as Array<Record<string, unknown>>;
+		const schedules = listResponse.schedules as Record<string, Record<string, unknown>>;
+		expect(list[0]).not.toHaveProperty("nextFireAt");
+		expect(schedules[monitor.monitorId]).toMatchObject({
+			effectiveTimezone: monitor.trigger.kind === "cron" ? monitor.trigger.timezone : null,
+			nextFireAt: {
+				local: expect.stringMatching(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/),
+				utc: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+			},
+		});
+		const inspected = await request("history", "monitor.inspect");
+		const inspectedMonitor = inspected.monitor as Record<string, unknown>;
+		const rows = inspected.recentEvents as Array<Record<string, unknown>>;
+		expect(inspectedMonitor).not.toHaveProperty("nextFireAt");
+		expect(inspected.schedule).toMatchObject({
+			effectiveTimezone: monitor.trigger.kind === "cron" ? monitor.trigger.timezone : null,
+			nextFireAt: {
+				local: expect.stringMatching(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/),
+				utc: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+			},
+		});
+		expect(inspected.catchUp).toBeUndefined();
+		db.monitorCronRecordSkip(
+			monitor.monitorId,
+			{
+				count: 2,
+				oldest: "2026-09-01T00:00:00.000Z",
+				newest: "2026-09-01T00:01:00.000Z",
+			},
+			"2026-09-01T00:02:00.000Z",
+		);
+		const inspectedWithCatchUp = await request("history-skips", "monitor.inspect");
+		expect(inspectedWithCatchUp.catchUp).toEqual({
+			skippedTotal: 2,
+			lastSkip: {
+				count: 2,
+				oldest: "2026-09-01T00:00:00.000Z",
+				newest: "2026-09-01T00:01:00.000Z",
+				recordedAt: "2026-09-01T00:02:00.000Z",
+			},
+		});
+		expect(rows).toHaveLength(3);
 		for (const [eventId, stage] of [
 			[accepted, "dispatched"],
 			[failed, "failed"],
@@ -177,9 +238,26 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 				reason: "broker_authority_quarantined",
 			});
 		}
+		expect(rows.find((row) => row.eventId === recovered)).toMatchObject({
+			stage: "delivered",
+			recovery: {
+				protocolFailures: [
+					{
+						reason: "protocol_unparseable_json",
+						responseByteLength: 12,
+						responseEntryCount: null,
+					},
+				],
+				firstFailedAt: expect.any(String),
+				deliveredAt: expect.any(String),
+				recoveryLatencyMs: expect.any(Number),
+				dispatchAttempts: 1,
+			},
+		});
 		// Terminal current-authority events exercise the existing history bound without dispatch.
 		for (let index = 0; index < 101; index++) seedEvent(db, monitor.monitorId, "authored_no_delivery");
-		const bounded = await inspect("bounded");
+		const boundedResponse = await request("bounded", "monitor.inspect");
+		const bounded = boundedResponse.recentEvents as Array<Record<string, unknown>>;
 		expect(bounded).toHaveLength(100);
 		expect(bounded.map((row) => row.eventId)).toEqual(
 			db
@@ -191,18 +269,12 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 			expect(row.quarantined).toBeUndefined();
 			expect(row.reason).toBeUndefined();
 		}
-		// Issue #157: cron slots refused by catch-up policy are reported, never hidden.
-		expect((await inspectResult("no-skips")).catchUp).toBeUndefined();
-		const skip = { count: 3, oldest: "2026-08-27T01:00:00.000Z", newest: "2026-08-27T03:00:00.000Z" };
-		db.monitorCronRecordSkip(monitor.monitorId, skip, "2026-08-27T09:00:00.000Z");
-		expect((await inspectResult("skips")).catchUp).toEqual({
-			skippedTotal: 3,
-			lastSkip: { ...skip, recordedAt: "2026-08-27T09:00:00.000Z" },
-		});
 		await propagator.reconcile();
 		expect(sends).toBe(0);
 		expect(
-			db.monitorEventRows(monitor.monitorId, "newest", true).filter((row) => [accepted, failed].includes(row.event_id)),
+			db
+				.monitorEventRows(monitor.monitorId, "newest", true)
+				.filter((row) => [accepted, failed, recovered].includes(row.event_id)),
 		).toEqual(history);
 	} finally {
 		await server.stop();
@@ -399,6 +471,52 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, eventId)).toBe("delivered");
 	});
 
+	test("a silent note settles authored_no_delivery, never authored-forever (#94)", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(
+			async (_id, text) => JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "[SILENT]" }))),
+			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
+		);
+		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
+		for (let attempt = 0; attempt < 100 && db.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		await propagator.drain();
+		expect(db.authoredOutput(eventId)).toBe("[SILENT]");
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+		expect(db.deliveryRows()).toHaveLength(0);
+	});
+
+	test("reconcile settles events already stranded at authored (#94)", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async () => {
+			throw new Error("stranded authored events must not be re-authored");
+		});
+		const silent = seedEvent(db, monitor.monitorId, "authored", crypto.randomUUID());
+		db.authoredOutputCreate(silent, "[SILENT]");
+		const expiredBatch = crypto.randomUUID();
+		const expired = seedEvent(db, monitor.monitorId, "authored", expiredBatch);
+		db.authoredOutputCreate(expired, "report");
+		const ledger = new DeliveryLedger(db);
+		ledger.createPending({ deliveryId: "old", turnId: expiredBatch, originKey: "loopback", payloadJson: "{}" });
+		for (let attempt = 0; attempt < 3; attempt++) ledger.fail("old");
+		ledger.expireStale(0, Date.now() + 1);
+		// Memory intents exist, as they do for any event that was authored live.
+		for (const eventId of [silent, expired])
+			db.memoryIntentCreate({ id: `monitor-event-intent:${eventId}`, kind: "monitor-event", payloadJson: eventId });
+		await propagator.reconcile();
+		expect(stage(db, silent)).toBe("authored_no_delivery");
+		expect(stage(db, expired)).toBe("failed_no_retry");
+		expect(db.monitorFailure(expired)).toMatchObject({
+			code: "delivery_expired",
+			detail: "delivery old expired after 3 attempts: expired_before_settlement",
+		});
+	});
+
 	test("no channel target and no owner target settles authored_no_delivery", async () => {
 		const {
 			propagator,
@@ -433,6 +551,55 @@ describe("monitor crash-boundary state machine", () => {
 			} as never),
 			'"terminal":"failed"',
 		],
+		// #178: a relay refusal is a structured envelope, not a process exit. It
+		// must carry the envelope code and never a misleading `exitCode: 0`.
+		[
+			"envelope refusal",
+			new GjcCliError("SECRET_RAW", 0, "", { code: "prompt_failed", message: "SECRET_ENVELOPE" }),
+			'"code":"prompt_failed","transport":"envelope"',
+		],
+		// #178: the SDK terminal code and outcome classifiers were flattened away,
+		// so a deadline kill and a provider overload read identically.
+		[
+			"terminal deadline",
+			new SessionTerminalError({
+				operationRef: "SECRET_OP",
+				status: {
+					status: "failed",
+					error: { code: "prompt_deadline_exceeded", message: "SECRET_TERMINAL" },
+					outcome: { kind: "failed", provenance: "deadline" },
+				},
+			} as never),
+			'"code":"prompt_deadline_exceeded","terminal":"failed","outcome":{"kind":"failed","provenance":"deadline"}',
+		],
+		[
+			"terminal provider overload",
+			new SessionTerminalError({
+				operationRef: "SECRET_OP",
+				status: {
+					status: "failed",
+					outcome: {
+						kind: "failed",
+						code: "prompt_failed",
+						providerCode: "overloaded_error",
+						phase: "post_start",
+						category: "agent_runtime",
+						provenance: "agent_failed",
+						message: "SECRET_OUTCOME",
+						reason: "SECRET REASON with spaces",
+					},
+				},
+			} as never),
+			'"code":"prompt_failed","terminal":"failed","outcome":{"kind":"failed","providerCode":"overloaded_error","phase":"post_start","category":"agent_runtime","provenance":"agent_failed"}',
+		],
+		[
+			"request wait timeout",
+			new SessionRequestTimeoutError("s1", "SECRET_OP", {
+				operationRef: "SECRET_OP",
+				status: { status: "in_flight" },
+			} as never),
+			'"class":"SessionRequestTimeoutError","lastStatus":"in_flight"',
+		],
 		[
 			"untrusted fields",
 			Object.assign(new Error("SECRET_RAW"), {
@@ -456,29 +623,143 @@ describe("monitor crash-boundary state machine", () => {
 			expect(detail).toContain(expected);
 			expect(detail).toContain('"phase":"request"');
 			expect(detail).toContain('"sessionId":"s1"');
-			expect(detail).toContain('"origin":"monitor/eventtype/memory.canonicalize"');
+			expect(detail).toContain(`"origin":"monitor/eventtype/memory.canonicalize/parent=${monitor.monitorId}"`);
 			expect(detail).toContain('"attempt":2');
 			expect(detail).not.toContain("SECRET");
-			if (label === "untrusted fields" || label === "missing fields") {
+			if (label === "untrusted fields" || label === "missing fields" || label === "envelope refusal") {
 				expect(detail).not.toContain('"exitCode"');
 				expect(detail).not.toContain('"signal"');
 			}
 			expect(stage(db, eventId)).toBe("failed");
 		});
 	}
-	test("reconcile reclaim budget: an always-failing event lands on failed_no_retry", async () => {
+	test("protocol failure evidence persists only its allowlisted reason and response shape", async () => {
+		const { monitor, database: db } = await harness(async () => "unused");
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		db.monitorFailureRecord(
+			eventId,
+			"authoring_response_invalid",
+			"dispatch phase failed (authoring_response_invalid)",
+			{
+				protocolFailure: {
+					reason: "protocol_unknown_event",
+					responseByteLength: 57,
+					responseEntryCount: 1,
+				},
+			},
+		);
+
+		expect(db.monitorFailure(eventId)).toMatchObject({
+			protocol_reason: "protocol_unknown_event",
+			response_byte_length: 57,
+			response_entry_count: 1,
+		});
+	});
+	test("database protocol telemetry accepts every allowlisted reason including fallback", async () => {
+		const { monitor, database: db } = await harness(async () => "unused");
+		const storedReasons: string[] = [];
+		for (const reason of PROTOCOL_FAILURE_REASONS) {
+			const eventId = seedEvent(db, monitor.monitorId, "failed");
+			db.monitorFailureRecord(eventId, "authoring_response_invalid", "safe detail", {
+				protocolFailure: {
+					reason,
+					responseByteLength: 0,
+					responseEntryCount: null,
+				},
+			});
+			storedReasons.push(db.monitorFailure(eventId)?.protocol_reason ?? "missing");
+		}
+
+		expect(storedReasons).toEqual([...PROTOCOL_FAILURE_REASONS]);
+		expect(storedReasons).toContain("protocol_off_contract");
+		expect(() =>
+			db.monitorFailureRecord("invalid-reason", "authoring_response_invalid", "safe detail", {
+				protocolFailure: {
+					reason: "ghp_attacker_controlled_reason",
+					responseByteLength: 0,
+					responseEntryCount: null,
+				},
+			} as never),
+		).toThrow();
+	});
+	test("failed protocol response recovery exposes first failure latency and attempts", async () => {
+		const invalidResponse = JSON.stringify([{ eventId: "untrusted-event-id", note: "untrusted response text" }]);
 		let turns = 0;
 		const {
 			propagator,
 			monitor,
 			database: db,
-		} = await harness(async () => {
-			turns++;
-			throw new Error("turn exploded");
+		} = await harness(
+			async (_id, text) => {
+				turns++;
+				if (turns === 1) return invalidResponse;
+				return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" })));
+			},
+			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
+		);
+		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
+		for (let attempt = 0; attempt < 100 && stage(db, eventId) !== "failed"; attempt++) await Bun.sleep(10);
+		expect(stage(db, eventId)).toBe("failed");
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("authored");
+		const event = db.monitorEventRows().find((row) => row.event_id === eventId);
+		const delivery = db.deliveryRows().find((row) => row.turn_id === event?.batch_id);
+		expect(delivery).toBeDefined();
+		if (!delivery) throw new Error("monitor delivery was not prepared");
+		db.deliveryConfirmWithSettle(delivery.delivery_id, "delivered");
+		expect(stage(db, eventId)).toBe("delivered");
+
+		const recovery = db.monitorEventRecovery(eventId);
+		expect(recovery).toMatchObject({
+			protocolFailures: [
+				{
+					reason: "protocol_unknown_event",
+					responseByteLength: Buffer.byteLength(invalidResponse, "utf8"),
+					responseEntryCount: 1,
+				},
+			],
+			dispatchAttempts: 2,
 		});
+		if (!recovery?.deliveredAt) throw new Error("monitor recovery telemetry was not completed");
+		expect(recovery.recoveryLatencyMs).toBe(Date.parse(recovery.deliveredAt) - Date.parse(recovery.firstFailedAt));
+		expect(recovery.recoveryLatencyMs).toBeGreaterThanOrEqual(0);
+		expect(recovery.firstFailedAt).toBe(recovery.protocolFailures[0]?.failedAt);
+	});
+	test("protocol telemetry never persists attacker-controlled response or exception text", async () => {
+		const hostileResponse = '[{"eventId":"ghp_attacker_event_id","note":"https://secret.example/token"}]';
+		const { propagator, monitor, database: db } = await harness(async () => hostileResponse);
+		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
+		for (let attempt = 0; attempt < 100 && stage(db, eventId) !== "failed"; attempt++) await Bun.sleep(10);
+
+		const failure = db.monitorFailure(eventId);
+		const durable = `${failure?.detail ?? ""} ${JSON.stringify(db.monitorEventRecovery(eventId))}`;
+		expect(failure?.protocol_reason).toBe("protocol_unknown_event");
+		expect(durable).not.toContain("ghp_");
+		expect(durable).not.toContain("secret.example");
+		expect(durable).not.toContain("attacker_event_id");
+	});
+	test("reconcile reclaim budget: an always-failing event lands on failed_no_retry", async () => {
+		let turns = 0;
+		let clock = Date.now();
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(
+			async () => {
+				turns++;
+				throw new Error("turn exploded");
+			},
+			{ now: () => clock },
+		);
 		const eventId = seedEvent(db, monitor.monitorId, "failed");
-		for (let sweep = 0; sweep < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS + 2; sweep++) await propagator.reconcile();
+		// Sweep once per (simulated) minute for a day: the backoff schedule is exhausted well inside it.
+		for (let sweep = 0; sweep < 24 * 60 && stage(db, eventId) !== "failed_no_retry"; sweep++) {
+			await propagator.reconcile();
+			clock += 60_000;
+		}
 		expect(stage(db, eventId)).toBe("failed_no_retry");
+		expect(turns).toBe(MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS);
 		// Bounded: no more dispatch attempts after the budget.
 		const attemptsAfter = turns;
 		await propagator.reconcile();
@@ -489,6 +770,109 @@ describe("monitor crash-boundary state machine", () => {
 		expect(failure?.detail).toBeDefined();
 		expect(failure?.detail).not.toContain("turn exploded");
 		expect(failure?.code.length ?? 0).toBeGreaterThan(0);
+	});
+
+	test("issue #179: a failed slot outlives a multi-hour dispatch outage and is authored after recovery", async () => {
+		let turns = 0;
+		let down = true;
+		let clock = Date.now();
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(
+			async (_id, text) => {
+				turns++;
+				if (down) throw new GjcCliError("dispatch path down", 0, "");
+				return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" })));
+			},
+			{ now: () => clock },
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		// The production reconcile timer sweeps every 60s. A 15h outage (measured on the issue host)
+		// used to burn the whole budget in ~5 sweeps and drop the slot.
+		for (let sweep = 0; sweep < 15 * 60; sweep++) {
+			await propagator.reconcile();
+			clock += 60_000;
+		}
+		expect(stage(db, eventId)).toBe("failed");
+		// Backoff, not a retry storm: far fewer turns than sweeps.
+		expect(turns).toBeLessThan(MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS);
+		down = false;
+		for (let sweep = 0; sweep < 5 * 60 && stage(db, eventId) === "failed"; sweep++) {
+			await propagator.reconcile();
+			clock += 60_000;
+		}
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+		expect(db.authoredOutput(eventId)).toBe("note");
+	});
+
+	test("#187 a retry attaches to the still-running authoring turn instead of re-prompting the session", async () => {
+		let skew = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+			sessionPort,
+		} = await harness(() => new Promise<string>(() => {}), { now: () => Date.now() + skew });
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		const request = sessionPort.request.bind(sessionPort);
+		// Attempt 1: the prompt is accepted, but the bounded request wait elapses
+		// while the authoring turn keeps running.
+		sessionPort.request = async (input) => {
+			await sessionPort.send(input);
+			throw new SessionRequestTimeoutError(
+				input.sessionId,
+				input.opRef,
+				await sessionPort.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef }),
+			);
+		};
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("failed");
+		expect(sessionPort.sends).toHaveLength(1);
+		const firstOpRef = sessionPort.sends[0]?.opRef;
+		// Attempt 2 runs once the #179 retry backoff elapses, while that turn is still alive.
+		skew += (MONITOR_EVENT_RETRY_BACKOFF_MS[1] ?? 0) + 60_000;
+		sessionPort.request = request;
+		const retry = propagator.reconcile();
+		await Bun.sleep(50);
+		// The live turn finishes its work; whichever op is newest gets the answer.
+		sessionPort.complete(sessionPort.sends.at(-1)?.opRef ?? "", JSON.stringify([{ eventId, note: "slot done" }]));
+		await retry;
+		// One prompt for one event: the retry observed the original turn.
+		expect(sessionPort.sends).toHaveLength(1);
+		expect(sessionPort.sendAttempts.map((input) => input.opRef)).toEqual([firstOpRef, firstOpRef]);
+		expect(db.authoredOutput(eventId)).toBe("slot done");
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+	});
+
+	test("#187 a retry after the prior turn settled failed sends a fresh prompt", async () => {
+		let skew = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+			sessionPort,
+		} = await harness(
+			async (_session, text) =>
+				JSON.stringify(eventsFromPrompt(text).map((entry) => ({ eventId: entry.eventId, note: "ok" }))),
+			{ now: () => Date.now() + skew },
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		const request = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			sessionPort.seedAcceptedSend(input, "failed");
+			throw new SessionTerminalError(
+				await sessionPort.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef }),
+			);
+		};
+		await propagator.reconcile();
+		skew += (MONITOR_EVENT_RETRY_BACKOFF_MS[1] ?? 0) + 60_000;
+		sessionPort.request = request;
+		await propagator.reconcile();
+		expect(sessionPort.sends).toHaveLength(2);
+		expect(new Set(sessionPort.sends.map((input) => input.opRef)).size).toBe(2);
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
 	});
 
 	test("concurrent reconcile sweeps collapse into one", async () => {
@@ -551,6 +935,82 @@ describe("monitor crash-boundary state machine", () => {
 		);
 	});
 
+	test("a bounded drain interrupts an in-flight authoring turn, names the session, and the next boot re-dispatches it (#225)", async () => {
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let turns = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+			registry,
+		} = await harness(async (_id, text) => {
+			turns++;
+			if (turns === 1) await parked;
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" })));
+		});
+		const eventId = seedEvent(db, monitor.monitorId, "admitted");
+		const reconcile = propagator.reconcile();
+		for (let attempt = 0; attempt < 100 && turns === 0; attempt++) await Bun.sleep(5);
+		expect(turns).toBe(1);
+		// The turn never settles inside the shutdown window: drain must return on
+		// its own instead of waiting for the service manager's SIGKILL.
+		const started = Date.now();
+		await propagator.drain(100);
+		expect(Date.now() - started).toBeLessThan(2_000);
+		expect(stage(db, eventId)).toBe("failed");
+		const failure = db.monitorFailure(eventId);
+		expect(failure?.code).toBe("gateway_shutdown");
+		expect(failure?.detail).toContain("gateway stopped at");
+		expect(failure?.detail).toContain('"sessionId":"s1"');
+		expect(failure?.detail).toContain('"phase":"request"');
+		// The lease is released immediately: the next boot need not wait for the
+		// 10-minute TTL before reclaiming the event.
+		expect(db.monitorEventLiveLeaseOwner(eventId)).toBeUndefined();
+		// The orphaned turn finishing after the stop is fenced out: no authored
+		// output and no stage change from the dead attempt.
+		release?.();
+		await reconcile;
+		expect(stage(db, eventId)).toBe("failed");
+		expect(db.authoredOutput(eventId)).toBeUndefined();
+		// Next boot: a fresh propagator reclaims the event as recoverable state
+		// once its retry backoff has elapsed (#179: the second retry waits 10 minutes).
+		const next = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: fakeSessionPort(async (_id, text) =>
+				JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" }))),
+			),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(db)),
+			emit: () => {},
+			now: () => Date.now() + 10 * 60_000 + 1,
+		});
+		propagators.push(next);
+		await next.reconcile();
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+		expect(db.authoredOutput(eventId)).toBe("recovered");
+	});
+
+	test("a closing propagator starts no new dispatch from reconcile", async () => {
+		let turns = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async (_id, text) => {
+			turns++;
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "n" })));
+		});
+		const eventId = seedEvent(db, monitor.monitorId, "admitted");
+		await propagator.drain();
+		await propagator.reconcile();
+		expect(turns).toBe(0);
+		expect(stage(db, eventId)).toBe("admitted");
+	});
+
 	test("durable failure detail keeps only allowlisted classes causes and frames", async () => {
 		class SecretVendorTokenGhp123 extends Error {}
 		const hostile = new SecretVendorTokenGhp123("ghp_attacker-secret prompt=https://secret.example/token");
@@ -566,11 +1026,14 @@ describe("monitor crash-boundary state machine", () => {
 		});
 		const hostileId = seedEvent(db, monitor.monitorId, "admitted");
 		await propagator.reconcile();
-		const hostileDetail = db.monitorFailure(hostileId)?.detail ?? "";
+		const hostileFailure = db.monitorFailure(hostileId);
+		const hostileDetail = hostileFailure?.detail ?? "";
 		expect(hostileDetail).toContain('"class":"Error"');
 		expect(hostileDetail).toContain('"frame":"#dispatchBatch"');
 		expect(hostileDetail).not.toContain("ghp_");
 		expect(hostileDetail).not.toContain("/Users/");
+		expect(JSON.stringify(hostileFailure)).not.toContain("ghp_");
+		expect(db.monitorEventRecovery(hostileId)).toBeUndefined();
 
 		const closed = new Error("Database has closed: ghp_attacker-secret");
 		closed.stack = "Error: Database has closed\n    at withTransaction (/Users/private/gateway.db:3:4)";
@@ -593,9 +1056,7 @@ describe("monitor crash-boundary state machine", () => {
 	});
 });
 
-describe("cron slot catch-up", () => {
-	// Catch-up tests use synthetic 2026-08-27 clocks; backdate the monitor so its
-	// creation instant precedes the scheduled slots under test.
+describe("durable cron slot catch-up (#157)", () => {
 	const at = (hour: number, minute = 0, day = 27) => new Date(2026, 7, day, hour, minute);
 	const noted = async (_id: string, text: string) =>
 		JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" })));
@@ -613,7 +1074,6 @@ describe("cron slot catch-up", () => {
 		return { ...fixture, monitor };
 	}
 
-	/** One gateway incarnation: start the runtime at `now`, let it sweep once, stop. */
 	async function incarnation(
 		fixture: Awaited<ReturnType<typeof cronMonitor>>,
 		now: Date,
@@ -630,31 +1090,39 @@ describe("cron slot catch-up", () => {
 	const admitted = (db: GatewayDatabase, monitorId: string) =>
 		db.monitorEventRows(monitorId, "oldest").map((row) => row.fired_at);
 
-	test("plan replays every slot since the cursor, splitting age/count overflow into one skip", () => {
+	test("planner retains the newest slots and counts age/count overflow once", () => {
 		const hourly = compileCron("0 * * * *");
 		expect(planCronCatchUp(hourly, at(0), at(13), DEFAULT_CRON_CATCH_UP).admit).toHaveLength(13);
 		const plan = planCronCatchUp(hourly, at(0), at(12), { maxSlots: 3, maxAgeMs: 6 * 60 * 60 * 1000 });
-		// 01..05 are older than the 6h floor (06:00); of 06..12 only the newest 3 fit.
 		expect(plan.admit).toEqual([at(10), at(11), at(12)]);
 		expect(plan.skipped).toEqual({ count: 9, oldest: at(1), newest: at(9) });
 		expect(planCronCatchUp(hourly, at(0), at(0, 59), DEFAULT_CRON_CATCH_UP)).toEqual({ admit: [] });
 	});
 
-	test("compiled matcher agrees with cronMatches", () => {
+	test("compiled matcher keeps timezone and repeated DST slots", () => {
 		const schedule = "*/15 8-17 * 1-6 1-5";
-		const matches = compileCron(schedule);
+		const matches = compileCron(schedule, "Asia/Seoul");
 		for (let minute = 0; minute < 7 * 24 * 60; minute += 5) {
-			const date = new Date(2026, 0, 5, 0, minute);
-			expect(matches(date)).toBe(cronMatches(schedule, date));
+			const date = new Date(Date.UTC(2026, 0, 5, 0, minute));
+			expect(matches(date)).toBe(cronMatches(schedule, date, "Asia/Seoul"));
 		}
+		const repeated = compileCron("30 1 * * *", "America/New_York");
+		const plan = planCronCatchUp(
+			repeated,
+			new Date("2026-11-01T05:00:00.000Z"),
+			new Date("2026-11-01T07:00:00.000Z"),
+			DEFAULT_CRON_CATCH_UP,
+		);
+		expect(plan.admit.map((slot) => slot.toISOString())).toEqual([
+			"2026-11-01T05:30:00.000Z",
+			"2026-11-01T06:30:00.000Z",
+		]);
 	});
 
-	test("#157: a 4-hour schedule recovers every missed report after a >1h outage", async () => {
+	test("a 4-hour schedule replays every missed slot after a greater-than-one-hour outage", async () => {
 		const fixture = await cronMonitor("0 */4 * * *", at(23, 30, 26));
 		await incarnation(fixture, at(0, 1));
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual([at(0).toISOString()]);
-		// Down 00:01 -> 13:00: the fixed one-hour lookback used to reach only
-		// 12:00 and silently lose 04:00 and 08:00.
 		await incarnation(fixture, at(13));
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(
 			[at(0), at(4), at(8), at(12)].map((slot) => slot.toISOString()),
@@ -662,20 +1130,19 @@ describe("cron slot catch-up", () => {
 		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toBeUndefined();
 	});
 
-	test("restarts after 30m, 2h and 13h each recover every due slot inside policy", async () => {
+	test("restarts after 30 minutes, 2 hours, and 13 hours recover every due slot", async () => {
 		const fixture = await cronMonitor("0 * * * *", at(0, 30));
 		await incarnation(fixture, at(1, 5));
-		await incarnation(fixture, at(1, 35)); // 30m outage, nothing new due
-		await incarnation(fixture, at(3, 35)); // 2h outage
-		await incarnation(fixture, at(16, 35)); // 13h outage
+		await incarnation(fixture, at(1, 35));
+		await incarnation(fixture, at(3, 35));
+		await incarnation(fixture, at(16, 35));
 		const expected = Array.from({ length: 16 }, (_, index) => at(index + 1).toISOString());
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(expected);
 		for (const slot of expected) expect(fixture.database.monitorSlotExists(fixture.monitor.monitorId, slot)).toBe(true);
 	});
 
-	test("duplicate startup and tick sweeps admit each slot exactly once", async () => {
+	test("duplicate startup and live sweeps admit each scheduled slot exactly once", async () => {
 		const fixture = await cronMonitor("*/30 * * * *", at(5, 45));
-		// Two incarnations racing the same instant, then a live ticking trigger.
 		await incarnation(fixture, at(7, 30));
 		await incarnation(fixture, at(7, 30));
 		const clock = { value: at(7, 30) };
@@ -701,7 +1168,7 @@ describe("cron slot catch-up", () => {
 			{ now: () => clock.value, intervalMs: 1 },
 		);
 		await Bun.sleep(5);
-		clock.value = at(8, 0);
+		clock.value = at(8);
 		await Bun.sleep(5);
 		stop();
 		expect(fired).toEqual([at(8).toISOString()]);
@@ -710,11 +1177,9 @@ describe("cron slot catch-up", () => {
 		);
 	});
 
-	test("a suspended process sweeps every slot missed since its previous sweep, once", async () => {
+	test("a suspended process scans every due slot since its prior sweep once", async () => {
 		const clock = { value: at(6) };
 		const fired: string[] = [];
-		// The durable cursor never moves here, so only the in-process watermark
-		// keeps later ticks from re-offering 06:00.
 		const stop = startCron(
 			"*/30 * * * *",
 			{
@@ -743,7 +1208,7 @@ describe("cron slot catch-up", () => {
 		expect(fixture.database.monitorSlotExists(fixture.monitor.monitorId, at(10).toISOString())).toBe(false);
 	});
 
-	test("slots beyond the age/count policy leave a durable skipped-count diagnostic", async () => {
+	test("age/count skips advance a durable cursor and are exposed without recounting", async () => {
 		const fixture = await cronMonitor("0 * * * *", at(23, 30, 26));
 		const policy = { maxSlots: 3, maxAgeMs: 6 * 60 * 60 * 1000 };
 		await incarnation(fixture, at(12, 5), policy);
@@ -761,11 +1226,9 @@ describe("cron slot catch-up", () => {
 				recordedAt: at(12, 5).toISOString(),
 			},
 		});
-		// Re-sweeping the same gap neither re-counts nor re-admits it.
 		await incarnation(fixture, at(12, 5), policy);
 		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toEqual(state);
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toHaveLength(3);
-		// A gap where everything is too old still advances the cursor past it.
 		await incarnation(fixture, at(20, 5), { maxSlots: 3, maxAgeMs: 60_000 });
 		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)?.skippedTotal).toBe(18);
 		expect(fixture.database.monitorCronCursor(fixture.monitor.monitorId)).toBe(at(20).toISOString());
@@ -773,7 +1236,7 @@ describe("cron slot catch-up", () => {
 		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toBeUndefined();
 	});
 
-	test("runtime startup catch-up respects monitor.createdAt (integration)", async () => {
+	test("runtime startup respects monitor.createdAt", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-runtime-catchup-"));
 		try {
 			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
@@ -800,14 +1263,12 @@ describe("cron slot catch-up", () => {
 				deliver: () => {},
 				emit: () => {},
 			});
-			// Monitor created at 06:29 (backdated) → startup at 06:31 admits the 06:30 slot...
 			db.monitorSetCreatedAt(monitor.monitorId, at(6, 29).toISOString());
 			const runtimeOld = new MonitorRuntime({} as never, registry, propagator, db, { now: () => at(6, 31) });
 			await runtimeOld.start();
 			await runtimeOld.stop();
 			await closure.drain();
 			expect(db.monitorSlotExists(monitor.monitorId, at(6, 30).toISOString())).toBe(true);
-			// ...while a FRESH monitor (created now, after 06:30) never backfills it.
 			const monitorNew = registry.add({
 				name: "fresh",
 				trigger: { kind: "cron", schedule: "30 6 * * *" },
@@ -828,46 +1289,13 @@ describe("cron slot catch-up", () => {
 		}
 	});
 
-	test("fresh monitor does not backfill pre-creation slots; restarted old monitor does", async () => {
+	test("slot admission is atomic and duplicate claims never double-admit", async () => {
 		const { propagator, monitor, database: db } = await harness(noted);
-		// The monitor was just created (createdAt ≈ now). A slot scheduled 30
-		// minutes BEFORE creation must not be synthesized by catch-up...
-		const beforeCreation = new Date(Date.now() - 30 * 60_000);
-		const id = propagator.submitSlot(
-			monitor.monitorId,
-			"memory.canonicalize",
-			{ at: beforeCreation.toISOString() },
-			beforeCreation,
-		);
-		expect(id).toBeNull();
-		expect(db.monitorSlotExists(monitor.monitorId, beforeCreation.toISOString())).toBe(false);
-		// ...while a slot after creation on a RESTARTED (old) monitor still fires:
-		const afterCreation = new Date(Date.now() + 30 * 60_000);
-		const ok = propagator.submitSlot(
-			monitor.monitorId,
-			"memory.canonicalize",
-			{ at: afterCreation.toISOString() },
-			afterCreation,
-		);
-		expect(ok).not.toBeNull();
-	});
-	test("slot admission is atomic: claim+event commit together, duplicate claims never double-admit", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
-		);
 		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
-		const slotAt = new Date(2026, 7, 27, 6, 30);
-		// The ONLY production admission path is the atomic claim+event transaction:
-		// there is no intermediate "claimed but unadmitted" state a crash can leave.
+		const slotAt = at(6, 30);
 		const first = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slotAt.toISOString() }, slotAt);
 		expect(first).not.toBeNull();
 		expect(db.monitorEventRows(monitor.monitorId)).toHaveLength(1);
-		// A second claim attempt for the same slot (restart catch-up overlap) is a
-		// no-op: no second event, no duplicate firing.
 		const second = propagator.submitSlot(
 			monitor.monitorId,
 			"memory.canonicalize",
@@ -879,26 +1307,16 @@ describe("cron slot catch-up", () => {
 	});
 
 	test("slot payload carries the exact scheduled timestamp", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
-		);
+		const { propagator, monitor, database: db } = await harness(noted);
 		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
-		const slotAt = new Date(2026, 7, 27, 6, 30);
+		const slotAt = at(6, 30);
 		const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slotAt.toISOString() }, slotAt);
 		expect(id).not.toBeNull();
 		const rows = db.monitorEventRows(monitor.monitorId);
-		const payloadJson = rows[0]?.payload_json;
-		expect(payloadJson).toBeDefined();
-		expect(JSON.parse(payloadJson as string).at).toBe(slotAt.toISOString());
-		// fired_at itself is the scheduled slot time (blocker 3), not submit-time now.
+		expect(JSON.parse(rows[0]?.payload_json ?? "null").at).toBe(slotAt.toISOString());
 		expect(rows[0]?.fired_at).toBe(slotAt.toISOString());
 	});
 });
-
 describe("durable dispatch leases (restart-concurrent authoring)", () => {
 	test("lease claim is exclusive; a second claim before expiry fails", async () => {
 		const { monitor, database: db } = await harness(async () => "[]");
@@ -1257,7 +1675,8 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				{ platform: "loopback", kind: "loopback", conversationId: "loopback" },
 				"note",
 			);
-			const deliveryId = payload!.deliveryId as string;
+			if (!payload) throw new Error("outbound delivery was not prepared");
+			const deliveryId = payload.deliveryId as string;
 			delivery.markInflight(deliveryId);
 			// Atomic path: one call transitions ledger AND settles events.
 			const outcome = db.deliveryConfirmWithSettle(deliveryId, "delivered");
@@ -1437,5 +1856,108 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("monitor overlap policy (issue #83)", () => {
+	async function overlapHarness(overlap: "queue" | "skip" | undefined) {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-overlap-"));
+		const db = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = db;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "backlog-watch",
+			trigger: { kind: "cron", schedule: "*/30 * * * *" },
+			eventTypes: ["backlog.watch"],
+			burstPolicy: "serialize",
+			...(overlap ? { overlap } : {}),
+		});
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
+		let release!: () => void;
+		let gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const prompts: string[] = [];
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: fakeSessionPort(async (_id, text) => {
+				prompts.push(text);
+				await gate;
+				return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "no-op" })));
+			}),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(db)),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+		const openGate = () => {
+			release();
+			gate = Promise.resolve();
+		};
+		return { db, monitor, propagator, prompts, openGate, registry };
+	}
+	const slot = (minute: number) => new Date(2026, 7, 27, 10, minute);
+	async function settle(db: GatewayDatabase, eventId: string) {
+		for (let attempt = 0; attempt < 400 && stage(db, eventId) !== "authored_no_delivery"; attempt++) await Bun.sleep(5);
+		return stage(db, eventId);
+	}
+
+	test("skip: a slot that fires while its predecessor is still authoring is recorded skipped, never authored", async () => {
+		const { db, monitor, propagator, prompts, openGate, registry } = await overlapHarness("skip");
+		expect(registry.get(monitor.monitorId)?.overlap).toBe("skip");
+		const first = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(0)) as string;
+		for (let attempt = 0; attempt < 400 && prompts.length === 0; attempt++) await Bun.sleep(5);
+		expect(prompts).toHaveLength(1);
+		// The 10:30 slot fires while the 10:00 authoring turn is still running.
+		const second = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(30)) as string;
+		expect(second).not.toBeNull();
+		const row = db.monitorEventRows(monitor.monitorId).find((candidate) => candidate.event_id === second);
+		expect(row?.stage).toBe("skipped");
+		expect(row?.skipped_by).toBe(first);
+		// A scheduling outcome, not an error: no failure evidence, and recovery
+		// never revives it into a late (stale) authoring turn.
+		expect(db.monitorFailure(second)).toBeUndefined();
+		await propagator.reconcile();
+		expect(stage(db, second)).toBe("skipped");
+		// Webhook/script admission honors the same policy.
+		const manual = propagator.submit(monitor.monitorId, "backlog.watch", {});
+		expect(stage(db, manual)).toBe("skipped");
+		openGate();
+		expect(await settle(db, first)).toBe("authored_no_delivery");
+		// Once the predecessor is done the next slot is admitted and authored normally.
+		const third = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(60)) as string;
+		expect(await settle(db, third)).toBe("authored_no_delivery");
+		expect(prompts).toHaveLength(2);
+		expect(prompts.some((text) => text.includes(second) || text.includes(manual))).toBe(false);
+		// The skipped slot stays claimed: a restart catch-up cannot refire it.
+		expect(propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(30))).toBeNull();
+	});
+
+	test("queue (default): an overlapping slot is admitted behind its predecessor", async () => {
+		const { db, monitor, propagator, prompts, openGate, registry } = await overlapHarness(undefined);
+		expect(registry.get(monitor.monitorId)?.overlap).toBe("queue");
+		const first = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(0)) as string;
+		for (let attempt = 0; attempt < 400 && prompts.length === 0; attempt++) await Bun.sleep(5);
+		const second = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(30)) as string;
+		expect(stage(db, second)).not.toBe("skipped");
+		openGate();
+		expect(await settle(db, first)).toBe("authored_no_delivery");
+		expect(await settle(db, second)).toBe("authored_no_delivery");
+		expect(prompts).toHaveLength(2);
+	});
+
+	test("an invalid overlap policy is rejected at registration", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-overlap-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		expect(() =>
+			registry.add({
+				name: "bad",
+				trigger: { kind: "cron", schedule: "*/30 * * * *" },
+				eventTypes: ["backlog.watch"],
+				overlap: "replace" as never,
+			}),
+		).toThrow('monitor overlap must be "queue" or "skip"');
 	});
 });
