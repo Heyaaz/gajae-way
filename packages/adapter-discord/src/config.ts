@@ -54,12 +54,24 @@ export interface LoadedDiscordVoiceConfig extends DiscordVoiceConfig {
 	readonly apiKey: string;
 }
 
+export type StatusReactionsMode = "gradient" | "static" | "off";
+
 export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly intents?: readonly number[];
 	readonly channels?: Readonly<Record<string, ChannelEngagementPolicy>>;
 	readonly voice?: DiscordVoiceConfig;
+	/**
+	 * Controls WorkingStatus reaction behavior:
+	 * - "gradient": show phase marker + clock + effort gradient
+	 * - "static": show only phase marker (⏳ → 🔧 → 💭 → ✍️)
+	 * - "off": disable reactions entirely, zero calls for all engagement types
+	 * - undefined (default): apply per-engagement defaults
+	 *   * DMs: "gradient"
+	 *   * group/bot-audience channels: "off"
+	 */
+	readonly statusReactions?: StatusReactionsMode;
 }
 
 export interface LoadedDiscordAdapterConfig extends DiscordAdapterConfig {
@@ -108,6 +120,11 @@ export async function loadDiscordAdapterConfig(
 	if (raw.channels !== undefined && !validChannels(raw.channels)) {
 		throw new DiscordAdapterStartupError(
 			`Discord adapter channels entries may only set engagement to ${ENGAGEMENT_MODES.join(", ")} and audience to ${ENGAGEMENT_AUDIENCES.join(", ")}.`,
+		);
+	}
+	if (raw.statusReactions !== undefined && !isStatusReactionsMode(raw.statusReactions)) {
+		throw new DiscordAdapterStartupError(
+			`Discord adapter statusReactions must be "gradient", "static", or "off" when set.`,
 		);
 	}
 	const tokenFile = isAbsolute(raw.tokenFile) ? raw.tokenFile : resolve(dirname(configPath), raw.tokenFile);
@@ -172,6 +189,10 @@ async function loadVoiceConfig(raw: unknown, configPath: string): Promise<Loaded
 	}
 	if (!apiKey) throw new DiscordAdapterStartupError(`Voice API key credential file ${apiKeyFile} is empty.`);
 	return { ...(raw as unknown as DiscordVoiceConfig), apiKeyFile, apiKey };
+}
+
+function isStatusReactionsMode(value: unknown): value is StatusReactionsMode {
+	return value === "gradient" || value === "static" || value === "off";
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

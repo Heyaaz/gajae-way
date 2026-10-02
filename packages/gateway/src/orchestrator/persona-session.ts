@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { LogLevel } from "@gajae-gateway/log";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -216,7 +217,7 @@ export interface PersonaSessionManagerOptions {
 	readonly brokerLiveness?: BrokerLivenessProbe;
 	/** Emits a cause-bearing hold notice while the inbound trigger remains pending. */
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
-	readonly log?: (line: string) => void;
+	readonly log?: (line: string, level?: LogLevel) => void;
 }
 
 /**
@@ -243,7 +244,7 @@ export class PersonaSessionManager {
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
-	readonly #log: (line: string) => void;
+	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
 
@@ -267,7 +268,7 @@ export class PersonaSessionManager {
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
-		this.#log = options.log ?? ((line: string) => console.error(line));
+		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -473,7 +474,7 @@ export class PersonaSessionManager {
 		try {
 			await this.#onBindHold?.(input);
 		} catch (error) {
-			this.#log(`persona_bind_hold_notice_failed origin=${input.originKey} detail=${safeDiagnostic(error)}`);
+			this.#log(`persona_bind_hold_notice_failed origin=${input.originKey} detail=${safeDiagnostic(error)}`, "error");
 		}
 	}
 
@@ -481,8 +482,8 @@ export class PersonaSessionManager {
 		return this.#brokerLiveness;
 	}
 
-	log(line: string): void {
-		this.#log(line);
+	log(line: string, level: LogLevel = "info"): void {
+		this.#log(line, level);
 	}
 }
 
@@ -573,7 +574,7 @@ class OriginActor {
 		this.#queue = task.then(
 			() => undefined,
 			(error) => {
-				this.#manager.log(`persona actor ${this.originKey} failed: ${safeDiagnostic(error)}`);
+				this.#manager.log(`persona actor ${this.originKey} failed: ${safeDiagnostic(error)}`, "error");
 			},
 		);
 		return task;
@@ -626,6 +627,7 @@ class OriginActor {
 			await previous.lifecycle.onRetired?.(previous);
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${previous.epoch} opRef=${previous.turn.opRef} reason=/new`,
+				"warn",
 			);
 			this.#scheduleRetiredReattach(previous);
 		}
@@ -633,6 +635,7 @@ class OriginActor {
 			if (turn.epoch < nextEpoch && !this.#retired.has(`${turn.epoch}:${turn.opRef}`)) {
 				this.#manager.log(
 					`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=/new`,
+					"warn",
 				);
 			}
 		}
@@ -689,6 +692,7 @@ class OriginActor {
 				// One unrecoverable turn must not abort recovery of the others.
 				this.#manager.log(
 					`recovery_turn_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+					"error",
 				);
 			}
 		}
@@ -698,7 +702,10 @@ class OriginActor {
 	#quarantinedTurn(opRef: string): boolean {
 		const row = this.#manager.database.inboundTurnRow(opRef);
 		if (!row || !this.#manager.database.isBrokerQuarantined("inbound", row.message_id)) return false;
-		this.#manager.log(`recovery_hold origin=${this.originKey} opRef=${opRef} reason=broker_authority_quarantined`);
+		this.#manager.log(
+			`recovery_hold origin=${this.originKey} opRef=${opRef} reason=broker_authority_quarantined`,
+			"warn",
+		);
 		return true;
 	}
 
@@ -712,6 +719,7 @@ class OriginActor {
 			// can only be a hand-edited or corrupt row. Hold it for the operator.
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${retired ? "retired_session_binding_unavailable" : "session_binding_unavailable"}`,
+				"warn",
 			);
 			return;
 		}
@@ -844,6 +852,7 @@ class OriginActor {
 					else
 						this.#manager.log(
 							`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=session_resume_failed detail=${safeDiagnostic(error)}`,
+							"warn",
 						);
 				}
 				return;
@@ -877,6 +886,7 @@ class OriginActor {
 				}
 				this.#manager.log(
 					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason} sweeps=${count}`,
+					"warn",
 				);
 				return;
 			}
@@ -912,6 +922,7 @@ class OriginActor {
 			detached = true;
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=tail_capacity`,
+				"warn",
 			);
 		}
 		const dispatchedAtMs = this.#dispatchFloorMs(turn.opRef);
@@ -949,10 +960,12 @@ class OriginActor {
 		const reason = retired ? "resume_impossible" : "tail_terminal_evidence_unavailable";
 		this.#manager.log(
 			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}`,
+			"warn",
 		);
 		if (retired)
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=resume_impossible`,
+				"warn",
 			);
 	}
 
@@ -964,11 +977,11 @@ class OriginActor {
 
 	readonly #holdSweeps = new Map<string, number>();
 
-	async #queueIsEmpty(sessionId: string): Promise<boolean> {
+	async #queueIsEmpty(sessionId: string, relay?: TailHandle): Promise<boolean> {
 		const port = this.#manager.port;
 		if (!port.queueEmpty) return false;
 		try {
-			return await port.queueEmpty({ sessionId, repo: this.#manager.repo });
+			return await port.queueEmpty({ sessionId, repo: this.#manager.repo, ...(relay ? { relay } : {}) });
 		} catch {
 			return false;
 		}
@@ -1013,6 +1026,7 @@ class OriginActor {
 			bound.detached = true;
 			this.#manager.log(
 				`broker_generation_fenced originKey=${this.originKey} epoch=${bound.epoch} oldGeneration=${bound.brokerGeneration} generation=${generation}`,
+				"warn",
 			);
 			await this.#reconcileBound(bound);
 		}
@@ -1047,6 +1061,7 @@ class OriginActor {
 		if (this.#current)
 			this.#manager.log(
 				`shutdown_hold origin=${this.originKey} epoch=${this.#current.epoch} opRef=${this.#current.turn.opRef}`,
+				"warn",
 			);
 	}
 
@@ -1117,6 +1132,7 @@ class OriginActor {
 			const attempts = this.#bindFailures;
 			this.#manager.log(
 				`send_session_disowned action=inline_rebind stage=attach origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${binding.sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
+				"warn",
 			);
 			await this.#terminateRetiredSession(binding.sessionId, "session_gone");
 			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
@@ -1163,6 +1179,7 @@ class OriginActor {
 							sessionId: binding.sessionId,
 							repo: this.#manager.repo,
 							selection: lifecycle.effectiveModel,
+							relay: tail,
 						})
 					: undefined;
 			if (lifecycle.effectiveModel) this.#appliedModel.set(binding.sessionId, modelKey);
@@ -1174,6 +1191,7 @@ class OriginActor {
 					sessionId: binding.sessionId,
 					repo: this.#manager.repo,
 					tier: lifecycle.effectiveServiceTier,
+					relay: tail,
 				});
 				this.#appliedServiceTier.set(binding.sessionId, lifecycle.effectiveServiceTier);
 			}
@@ -1197,6 +1215,7 @@ class OriginActor {
 			const nextEpoch = sessionGone ? this.#manager.database.rebindEpoch(this.originKey) : undefined;
 			this.#manager.log(
 				`persona_model_failed origin=${this.originKey} epoch=${epoch}${nextEpoch === undefined ? "" : ` nextEpoch=${nextEpoch}`} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
+				"error",
 			);
 			if (sessionGone) this.#preSendFailures = 0;
 			this.#scheduleDispatchRetry(
@@ -1243,6 +1262,7 @@ class OriginActor {
 				const attempts = this.#bindFailures;
 				this.#manager.log(
 					`send_session_disowned action=inline_rebind stage=send origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempts}`,
+					"error",
 				);
 				// The broker disowned it, but the host process may still be running
 				// (observed: fc41da9b, disowned yet live for hours). End it.
@@ -1252,6 +1272,7 @@ class OriginActor {
 					if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 						this.#manager.log(
 							`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempts} reason=${sdkStatusErrorCode(error)}`,
+							"error",
 						);
 					this.#scheduleDispatchRetry(
 						Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
@@ -1263,10 +1284,14 @@ class OriginActor {
 			// durable op-ref; an unknown status is an operator hold that the periodic
 			// reconcile keeps sweeping, and it is never resent.
 			if ((error instanceof OpRefRejectedError && error.code === CLIENT_REF_CONFLICT_CODE) || isOpRefRejection(error))
-				this.#manager.log(`recovery_client_ref_conflict origin=${this.originKey} epoch=${epoch} opRef=${opRef}`);
+				this.#manager.log(
+					`recovery_client_ref_conflict origin=${this.originKey} epoch=${epoch} opRef=${opRef}`,
+					"error",
+				);
 			else
 				this.#manager.log(
 					`persona_send_ambiguous origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(error)}`,
+					"error",
 				);
 			await this.#reconcileBound(current);
 			return;
@@ -1357,6 +1382,7 @@ class OriginActor {
 				} else
 					this.#manager.log(
 						`steer_hold origin=${this.originKey} message=${held.message_id} opRef=${opRef} reason=unresolved_after_terminal detail=${safeDiagnostic(error)}`,
+						"warn",
 					);
 			}
 		}
@@ -1421,10 +1447,12 @@ class OriginActor {
 		}
 		this.#manager.log(
 			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${attempts} detail=${detail}`,
+			"error",
 		);
 		if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 			this.#manager.log(
 				`persona_send_unrecoverable origin=${this.originKey} message=${trigger.message_id} attempts=${attempts} reason=bind_failed`,
+				"error",
 			);
 		if (this.#sameDetailBindFailures >= BIND_WEDGE_PROBE_STRIKES && !this.#bindHoldProbed) {
 			const probe = this.#manager.brokerLiveness;
@@ -1436,12 +1464,14 @@ class OriginActor {
 				} catch (probeError) {
 					this.#manager.log(
 						`persona_bind_liveness_failed origin=${this.originKey} detail=${safeDiagnostic(probeError)}`,
+						"error",
 					);
 				}
 				const hold = describeBindHold(verdict, detail, this.#sameDetailBindFailures);
 				this.#bindWedged = verdict?.state === "wedged";
 				this.#manager.log(
 					`persona_bind_hold origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${this.#sameDetailBindFailures} reason=${hold.reason} detail=${detail}`,
+					"warn",
 				);
 				if (hold.reason !== this.#lastBindHoldReason) {
 					this.#lastBindHoldReason = hold.reason;
@@ -1594,12 +1624,14 @@ class OriginActor {
 					if (attempt < STEER_REPLAY_ATTEMPTS)
 						this.#manager.log(
 							`steer_ambiguous origin=${this.originKey} message=${row.message_id} action=replay attempt=${attempt + 1} detail=${safeDiagnostic(error)}`,
+							"error",
 						);
 				}
 			}
 			if (outcome === "ambiguous") {
 				this.#manager.log(
 					`steer_hold origin=${this.originKey} message=${row.message_id} opRef=${current.turn.opRef} reason=transport_torn detail=${safeDiagnostic(failure)}`,
+					"error",
 				);
 				return false;
 			}
@@ -1610,6 +1642,7 @@ class OriginActor {
 				this.#manager.database.inboundSteerRefused(row.message_id, current.turn.opRef);
 				this.#manager.log(
 					`steer_failed origin=${this.originKey} message=${row.message_id} action=recover detail=${safeDiagnostic(failure)}`,
+					"error",
 				);
 				await this.#recoverFromSteerFailure(current);
 				return false;
@@ -1644,6 +1677,7 @@ class OriginActor {
 				} catch (error) {
 					this.#manager.log(
 						`session_resume_failed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} detail=${safeDiagnostic(error)}`,
+						"error",
 					);
 				}
 			}
@@ -1689,7 +1723,10 @@ class OriginActor {
 					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
 					await this.#onRelayLost(sessionId, epoch, generation, retired, false);
 				}).catch((error: unknown) =>
-					this.#manager.log(`persona_relay_lost_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+					this.#manager.log(
+						`persona_relay_lost_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+						"error",
+					),
 				);
 			},
 			onRelayDead: () => {
@@ -1697,7 +1734,10 @@ class OriginActor {
 					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
 					await this.#onRelayLost(sessionId, epoch, generation, retired, true);
 				}).catch((error: unknown) =>
-					this.#manager.log(`persona_relay_dead_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+					this.#manager.log(
+						`persona_relay_dead_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+						"error",
+					),
 				);
 			},
 			onStall: ({ elapsedMs }) => {
@@ -1706,7 +1746,7 @@ class OriginActor {
 					await this.#onStall(sessionId, epoch, generation, retired, elapsedMs);
 				}).catch(() => {});
 			},
-			onDiagnostic: (line) => this.#manager.log(line),
+			onDiagnostic: (line, level) => this.#manager.log(line, level),
 		});
 		self = handle;
 		return handle;
@@ -1734,10 +1774,12 @@ class OriginActor {
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
 				notBeforeMs: bound.dispatchedAtMs,
+				...this.#liveRelay(bound),
 			});
 		} catch (error) {
 			this.#manager.log(
 				`unobserved_answer_probe_failed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+				"error",
 			);
 			return false;
 		}
@@ -1780,6 +1822,7 @@ class OriginActor {
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
 				notBeforeMs: bound.dispatchedAtMs,
+				...this.#liveRelay(bound),
 			});
 			const text = found?.text?.trim();
 			if (!text) return undefined;
@@ -1821,10 +1864,12 @@ class OriginActor {
 			bound.tailEvidenceUnavailable = true;
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=${dead ? "relay_dead" : "relay_lost_mid_turn"}`,
+				"warn",
 			);
 			if (retired || bound.retired)
 				this.#manager.log(
 					`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=relay_lost`,
+					"warn",
 				);
 		}
 		await this.#reconcileBound(bound);
@@ -1840,6 +1885,7 @@ class OriginActor {
 		bound.staleOutput = { count: 1, firstAt: now, lastAt: now };
 		this.#manager.log(
 			`stale_output originKey=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} action=start count=1 first=${new Date(now).toISOString()}`,
+			"warn",
 		);
 	}
 
@@ -1849,6 +1895,7 @@ class OriginActor {
 		bound.staleOutput = undefined;
 		this.#manager.log(
 			`stale_output originKey=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} action=stop count=${staleOutput.count} first=${new Date(staleOutput.firstAt).toISOString()} last=${new Date(staleOutput.lastAt).toISOString()} reason=${reason}`,
+			"warn",
 		);
 	}
 
@@ -1864,6 +1911,7 @@ class OriginActor {
 			if (frame.payload.toolCallStarted === true || frame.assistantText)
 				this.#manager.log(
 					`tail_frame_unbound origin=${this.originKey} epoch=${epoch} session=${sessionId} kind=${frame.rawKind} event=${frame.eventId ?? "unidentified"}`,
+					"warn",
 				);
 			return;
 		}
@@ -1918,7 +1966,7 @@ class OriginActor {
 	): Promise<void> {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
-		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`);
+		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`, "warn");
 		if (!bound.retired && !retired) await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
 		if (retired || bound.retired) {
 			this.#flushStaleOutput(bound, "stall");
@@ -1936,6 +1984,7 @@ class OriginActor {
 			if (!bound.answerWanted) await this.#terminateRetiredSession(sessionId, "stall", bound);
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
+				"warn",
 			);
 			await this.#reconcileBound(bound);
 		}
@@ -1947,6 +1996,11 @@ class OriginActor {
 	 * between reopens, or refuses the read. A transport failure on the relay is
 	 * never a verdict about the operation.
 	 */
+	/** The bound turn's relay while it is attached; reads fall back to the CLI on their own when it tears. */
+	#liveRelay(bound: BoundTurn): { relay?: TailHandle } {
+		return bound.tail && !bound.detached ? { relay: bound.tail } : {};
+	}
+
 	async #statusOf(bound: BoundTurn): Promise<StatusReport> {
 		const base = { sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.turn.opRef };
 		if (!bound.tail || bound.detached) return await this.#manager.port.status(base);
@@ -1956,6 +2010,7 @@ class OriginActor {
 			if (!isRelayTransportFailure(error)) throw error;
 			this.#manager.log(
 				`status_relay_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+				"error",
 			);
 			return await this.#manager.port.status(base);
 		}
@@ -1998,6 +2053,7 @@ class OriginActor {
 			}
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
+				"warn",
 			);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
@@ -2032,7 +2088,7 @@ class OriginActor {
 					// An indeterminate liveness probe is not release evidence.
 				}
 				const dead = live === false || disowned;
-				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId));
+				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId, this.#liveRelay(bound).relay));
 				if (liveIdle && (await this.#deliverUnobservedAnswer(bound, count))) return;
 				if (dead || liveIdle) {
 					await this.#releaseUnlanded(
@@ -2044,6 +2100,7 @@ class OriginActor {
 			}
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
+				"warn",
 			);
 			return;
 		}
@@ -2076,6 +2133,7 @@ class OriginActor {
 			bound.statusTerminalHolds += 1;
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=tail_terminal_evidence_unavailable`,
+				"warn",
 			);
 			const timer = this.#manager.schedule(() => {
 				this.#graceTimers.delete(timer);
@@ -2088,7 +2146,10 @@ class OriginActor {
 					bound.tailEvidenceUnavailable = true;
 					await this.#reconcileBound(bound);
 				}).catch((error: unknown) =>
-					this.#manager.log(`persona_reconcile_grace_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+					this.#manager.log(
+						`persona_reconcile_grace_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+						"error",
+					),
 				);
 			}, STATUS_TERMINAL_GRACE_MS);
 			this.#graceTimers.add(timer);
@@ -2130,23 +2191,27 @@ class OriginActor {
 							notBeforeMs,
 							terminalIdentity: report.status,
 							isCurrent,
+							...this.#liveRelay(bound),
 						});
 						if (!isCurrent()) return;
 						if (output.status === "proven") text = output.text;
 						else
 							this.#manager.log(
 								`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${output.code}`,
+								"warn",
 							);
 					} catch (error) {
 						if (!isCurrent()) return;
 						this.#manager.log(
 							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=original_result_read_failed detail=${safeDiagnostic(error)}`,
+							"error",
 						);
 					}
 				}
 				if (text === undefined) {
 					this.#manager.log(
 						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
+						"warn",
 					);
 					return;
 				}
@@ -2158,6 +2223,7 @@ class OriginActor {
 				};
 				this.#manager.log(
 					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}${openTool ? ` open_tool=${openTool.name} open_tool_elapsed_ms=${openTool.elapsedMs}` : ""}`,
+					"error",
 				);
 				failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
 				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
@@ -2171,6 +2237,7 @@ class OriginActor {
 		} catch (error) {
 			this.#manager.log(
 				`persona_terminal_delivery_failed origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+				"error",
 			);
 			throw error;
 		}
@@ -2236,6 +2303,7 @@ class OriginActor {
 				} else {
 					this.#manager.log(
 						`steer_hold origin=${this.originKey} message=${held.message_id} opRef=${bound.turn.opRef} reason=unresolved_at_terminal detail=${safeDiagnostic(error)}`,
+						"warn",
 					);
 				}
 			}
@@ -2264,6 +2332,7 @@ class OriginActor {
 		} catch (error) {
 			this.#manager.log(
 				`persona_turn_settled_hook_failed origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+				"error",
 			);
 		}
 	}
@@ -2276,7 +2345,7 @@ class OriginActor {
 			await bound.tail?.close();
 		} catch (error) {
 			if (!resetApplied) throw error;
-			this.#manager.log(`failed_turn_tail_close_failed origin=${this.originKey} opRef=${bound.turn.opRef}`);
+			this.#manager.log(`failed_turn_tail_close_failed origin=${this.originKey} opRef=${bound.turn.opRef}`, "error");
 		}
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
@@ -2404,7 +2473,10 @@ class OriginActor {
 		try {
 			await lifecycle.onReleased?.(identity);
 		} catch (error) {
-			this.#manager.log(`persona_release_hook_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`);
+			this.#manager.log(
+				`persona_release_hook_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+				"error",
+			);
 		}
 	}
 
@@ -2454,6 +2526,7 @@ class OriginActor {
 					}
 					this.#manager.log(
 						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
+						"warn",
 					);
 					return;
 				}
@@ -2486,7 +2559,10 @@ class OriginActor {
 				if (this.#current !== bound && this.#retired.get(retiredKey(bound)) !== bound) return;
 				await this.#reconcileBound(bound);
 			}).catch((error: unknown) =>
-				this.#manager.log(`persona_status_recheck_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+				this.#manager.log(
+					`persona_status_recheck_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+					"error",
+				),
 			);
 		}, delay);
 		this.#retiredReattachTimers.set(key, timer);
@@ -2506,6 +2582,16 @@ class OriginActor {
 		if (this.#manager.database.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
 		for (const other of this.#retired.values()) if (other !== except && other.sessionId === sessionId) return;
 		if (except) except.retiredHostTerminationAttempted = true;
+		let jobs: string | undefined;
+		if (port.runningJobs) {
+			try {
+				const running = await port.runningJobs({ sessionId, repo: this.#manager.repo });
+				if (running.length > 0)
+					jobs = `count=${running.length} jobs=${JSON.stringify(running.map((job) => `${job.type}:${job.id}:${job.label}`))}`;
+			} catch (error) {
+				jobs = `count=unknown detail=${safeDiagnostic(error)}`;
+			}
+		}
 		try {
 			const result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
 			this.#manager.log(
@@ -2514,10 +2600,16 @@ class OriginActor {
 				}${result.outcome === "refused" ? ` detail=${result.reason}` : ""}${
 					result.outcome === "not_a_host" ? ` command=${JSON.stringify(result.command)}` : ""
 				}`,
+				result.outcome === "refused" ? "error" : result.outcome === "not_a_host" ? "warn" : "info",
 			);
+			if (jobs && result.outcome === "terminated")
+				this.#manager.log(
+					`retired_session_host_jobs_lost origin=${this.originKey} session=${sessionId} reason=${reason} ${jobs}`,
+				);
 		} catch (error) {
 			this.#manager.log(
 				`retired_session_host origin=${this.originKey} session=${sessionId} reason=${reason} outcome=error detail=${safeDiagnostic(error)}`,
+				"error",
 			);
 		}
 	}
@@ -2577,7 +2669,7 @@ class OriginActor {
 				terminalAtMs: terminalAt,
 			});
 		} catch {
-			this.#manager.log(`failed_turn_evidence_unavailable origin=${this.originKey} opRef=${bound.turn.opRef}`);
+			this.#manager.log(`failed_turn_evidence_unavailable origin=${this.originKey} opRef=${bound.turn.opRef}`, "error");
 			return undefined;
 		}
 	}
