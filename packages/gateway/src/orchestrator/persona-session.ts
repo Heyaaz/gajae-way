@@ -2572,6 +2572,16 @@ class OriginActor {
 		if (this.#manager.database.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
 		for (const other of this.#retired.values()) if (other !== except && other.sessionId === sessionId) return;
 		if (except) except.retiredHostTerminationAttempted = true;
+		let jobs: string | undefined;
+		if (port.runningJobs) {
+			try {
+				const running = await port.runningJobs({ sessionId, repo: this.#manager.repo });
+				if (running.length > 0)
+					jobs = `count=${running.length} jobs=${JSON.stringify(running.map((job) => `${job.type}:${job.id}:${job.label}`))}`;
+			} catch (error) {
+				jobs = `count=unknown detail=${safeDiagnostic(error)}`;
+			}
+		}
 		try {
 			const result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
 			this.#manager.log(
@@ -2582,6 +2592,10 @@ class OriginActor {
 				}`,
 				result.outcome === "refused" ? "error" : result.outcome === "not_a_host" ? "warn" : "info",
 			);
+			if (jobs && result.outcome === "terminated")
+				this.#manager.log(
+					`retired_session_host_jobs_lost origin=${this.originKey} session=${sessionId} reason=${reason} ${jobs}`,
+				);
 		} catch (error) {
 			this.#manager.log(
 				`retired_session_host origin=${this.originKey} session=${sessionId} reason=${reason} outcome=error detail=${safeDiagnostic(error)}`,
