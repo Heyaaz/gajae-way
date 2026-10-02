@@ -5,8 +5,12 @@ import { dirname, isAbsolute, normalize } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
+	type MonitorEventRecovery,
+	type MonitorProtocolFailureRecord,
 	type OriginRef,
 	originKey,
+	PROTOCOL_FAILURE_REASONS,
+	type ProtocolFailureReason,
 	parseOriginKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
@@ -575,7 +579,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 28;
+const LATEST_SCHEMA_VERSION = 29;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -643,6 +647,13 @@ export interface MonitorFailureRow {
 	readonly code: string;
 	readonly detail: string;
 	readonly failed_at: string;
+	readonly protocol_reason: ProtocolFailureReason | null;
+	readonly response_byte_length: number | null;
+	readonly response_entry_count: number | null;
+}
+
+interface MonitorFailureOptions {
+	readonly protocolFailure?: Pick<MonitorProtocolFailureRecord, "reason" | "responseByteLength" | "responseEntryCount">;
 }
 
 export class DatabaseStartupError extends Error {
@@ -2149,7 +2160,7 @@ export class GatewayDatabase {
 			.run(reason, new Date().toISOString(), id);
 	}
 
-	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted"): void {
+	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
 		this.#database
 			.query("UPDATE memory_intents SET state = ?, updated_at = ? WHERE id = ?")
 			.run(state, new Date().toISOString(), id);
@@ -3729,6 +3740,7 @@ WHERE event_id = ? AND ${leasePredicate}`,
 		detail: string,
 		now = Date.now(),
 		terminal = false,
+		options?: MonitorFailureOptions,
 	): boolean {
 		return this.withTransaction(() => {
 			const changes = this.#database
@@ -3747,7 +3759,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 					new Date(now).toISOString(),
 				).changes;
 			if (changes === 0) return false;
-			this.monitorFailureRecord(eventId, code, detail);
+			this.monitorFailureRecord(eventId, code, detail, options);
 			return true;
 		});
 	}
@@ -3840,8 +3852,6 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		// delivered may ONLY be reached from authored: an omitted event still in
 		// dispatched/batched can never be promoted by a batch-wide settlement
 		// (terminal-critic blocker 3).
-		// An expired delivery fails its events terminally (#94); an operator redrive
-		// that the adapter then confirms proves the note did land.
 		if (
 			stage === "delivered" &&
 			(row.stage === "authored" || (row.stage === "failed_no_retry" && this.authoredOutput(eventId) !== undefined))
@@ -3864,11 +3874,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return false;
 	}
 	/**
-	 * An expired delivery is terminal, so the monitor events it carried can never
-	 * reach `delivered` (#94). Moves the batch's still-`authored` events to
-	 * `failed_no_retry` with evidence naming the delivery, its attempt count and
-	 * the last transport error. Runs inside the caller's transaction; returns the
-	 * failed event ids.
+	 * Events left `authored` behind an expired delivery can never reach `delivered` (#94).
+	 * Move the batch's still-authored events to `failed_no_retry` with evidence.
+	 * Runs inside the caller's transaction and returns the failed event ids.
 	 */
 	monitorEventsFailExpiredDelivery(deliveryId: string, reason: string): string[] {
 		const delivery = this.#database
@@ -3993,7 +4001,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return (
 			this.#database
 				.query<MonitorFailureRow, [string]>(
-					"SELECT event_id, code, detail, failed_at FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
 				)
 				.get(eventId) ?? undefined
 		);
@@ -4004,17 +4012,99 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * Keeps the newest 20 rows per event and deletes stale rows so the table
 	 * cannot grow without bound across retries.
 	 */
-	monitorFailureRecord(eventId: string, code: string, detail: string): void {
+	monitorFailureRecord(eventId: string, code: string, detail: string, options?: MonitorFailureOptions): void {
 		// Runs inside the caller's transaction when one is open (dispatch failure
 		// bookkeeping must be atomic with the stage transition); standalone otherwise.
+		const protocolFailure = options?.protocolFailure;
+		if (protocolFailure) {
+			if (!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(protocolFailure.reason))
+				throw new Error("invalid monitor protocol failure reason");
+			if (!Number.isSafeInteger(protocolFailure.responseByteLength) || protocolFailure.responseByteLength < 0)
+				throw new Error("invalid monitor protocol response byte length");
+			if (
+				protocolFailure.responseEntryCount !== null &&
+				(!Number.isSafeInteger(protocolFailure.responseEntryCount) ||
+					protocolFailure.responseEntryCount < 0 ||
+					protocolFailure.responseEntryCount > protocolFailure.responseByteLength)
+			)
+				throw new Error("invalid monitor protocol response entry count");
+		}
+		const failedAt = new Date().toISOString();
 		this.#database
-			.query("INSERT INTO monitor_failures (event_id, code, detail, failed_at) VALUES (?, ?, ?, ?)")
-			.run(eventId, code, detail.slice(0, 500), new Date().toISOString());
+			.query(
+				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				eventId,
+				code,
+				detail.slice(0, 500),
+				failedAt,
+				protocolFailure?.reason ?? null,
+				protocolFailure?.responseByteLength ?? null,
+				protocolFailure?.responseEntryCount ?? null,
+			);
 		this.#database
 			.query(
 				"DELETE FROM monitor_failures WHERE event_id = ? AND rowid NOT IN (SELECT rowid FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 20)",
 			)
 			.run(eventId, eventId);
+	}
+	/** Public-safe protocol failure history and delivery recovery timing for an event. */
+	monitorEventRecovery(eventId: string): MonitorEventRecovery | undefined {
+		const event = this.#database
+			.query<{ stage: string; updated_at: string; dispatch_attempts: number }, [string]>(
+				"SELECT stage, updated_at, dispatch_attempts FROM monitor_events WHERE event_id = ?",
+			)
+			.get(eventId);
+		if (!event) return undefined;
+		const rows = this.#database
+			.query<
+				{
+					protocol_reason: string | null;
+					failed_at: string;
+					response_byte_length: number | null;
+					response_entry_count: number | null;
+				},
+				[string]
+			>(
+				"SELECT protocol_reason, failed_at, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? AND protocol_reason IS NOT NULL ORDER BY rowid ASC",
+			)
+			.all(eventId);
+		const protocolFailures: MonitorProtocolFailureRecord[] = [];
+		for (const row of rows) {
+			if (
+				!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(row.protocol_reason ?? "") ||
+				!Number.isSafeInteger(row.response_byte_length) ||
+				(row.response_byte_length ?? -1) < 0 ||
+				(row.response_entry_count !== null &&
+					(!Number.isSafeInteger(row.response_entry_count) ||
+						row.response_entry_count < 0 ||
+						row.response_entry_count > (row.response_byte_length ?? -1)))
+			)
+				continue;
+			protocolFailures.push({
+				reason: row.protocol_reason as ProtocolFailureReason,
+				failedAt: row.failed_at,
+				responseByteLength: row.response_byte_length as number,
+				responseEntryCount: row.response_entry_count,
+			});
+		}
+		const first = protocolFailures[0];
+		if (!first) return undefined;
+		const deliveredAt = event.stage === "delivered" ? event.updated_at : null;
+		const failedAtMs = Date.parse(first.failedAt);
+		const deliveredAtMs = deliveredAt === null ? Number.NaN : Date.parse(deliveredAt);
+		const latency = deliveredAtMs - failedAtMs;
+		return {
+			protocolFailures,
+			firstFailedAt: first.failedAt,
+			deliveredAt,
+			recoveryLatencyMs:
+				Number.isFinite(failedAtMs) && Number.isFinite(deliveredAtMs) && Number.isSafeInteger(latency) && latency >= 0
+					? latency
+					: null,
+			dispatchAttempts: event.dispatch_attempts + 1,
+		};
 	}
 	monitorFailures(eventIds: readonly string[]): Map<string, MonitorFailureRow> {
 		const rows = new Map<string, MonitorFailureRow>();
@@ -4707,6 +4797,35 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(28, new Date().toISOString());
+			});
+		}
+		if (current < 29) {
+			this.withTransaction(() => {
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitor_failures)")
+						.all()
+						.map((row) => row.name),
+				);
+				const additions = [
+					[
+						"protocol_reason",
+						"TEXT CHECK(protocol_reason IS NULL OR protocol_reason IN ('protocol_response_not_array', 'protocol_entry_missing_field', 'protocol_unknown_event', 'protocol_duplicate_event', 'protocol_omitted_event', 'protocol_unparseable_json', 'protocol_off_contract'))",
+					],
+					[
+						"response_byte_length",
+						"INTEGER CHECK(response_byte_length IS NULL OR (typeof(response_byte_length) = 'integer' AND response_byte_length BETWEEN 0 AND 9007199254740991))",
+					],
+					[
+						"response_entry_count",
+						"INTEGER CHECK(response_entry_count IS NULL OR (typeof(response_entry_count) = 'integer' AND response_entry_count BETWEEN 0 AND 9007199254740991))",
+					],
+				] as const;
+				for (const [name, declaration] of additions)
+					if (!columns.has(name)) this.#database.exec(`ALTER TABLE monitor_failures ADD COLUMN ${name} ${declaration}`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(29, new Date().toISOString());
 			});
 		}
 	}

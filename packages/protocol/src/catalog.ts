@@ -492,6 +492,33 @@ export interface MonitorScheduleProjection {
 	readonly nextFireAt: { readonly local: string; readonly utc: string } | null;
 }
 
+export const PROTOCOL_FAILURE_REASONS = [
+	"protocol_response_not_array",
+	"protocol_entry_missing_field",
+	"protocol_unknown_event",
+	"protocol_duplicate_event",
+	"protocol_omitted_event",
+	"protocol_unparseable_json",
+	"protocol_off_contract",
+] as const;
+export type ProtocolFailureReason = (typeof PROTOCOL_FAILURE_REASONS)[number];
+
+export interface MonitorProtocolFailureRecord {
+	readonly reason: ProtocolFailureReason;
+	readonly failedAt: string;
+	readonly responseByteLength: number;
+	/** Null when the invalid response could not be parsed as an array. */
+	readonly responseEntryCount: number | null;
+}
+
+export interface MonitorEventRecovery {
+	readonly protocolFailures: readonly MonitorProtocolFailureRecord[];
+	readonly firstFailedAt: string;
+	readonly deliveredAt: string | null;
+	readonly recoveryLatencyMs: number | null;
+	readonly dispatchAttempts: number;
+}
+
 export interface MonitorTestParams {
 	readonly monitorId: string;
 	readonly eventType?: string;
@@ -511,6 +538,7 @@ export interface MonitorEventRecord {
 	readonly reason?: string;
 	/** Procedure file versions the authoring turn was given; present once authored with declared procedure files. */
 	readonly procedure?: readonly MonitorProcedureVersion[];
+	readonly recovery?: MonitorEventRecovery;
 }
 
 /** Version of one declared procedure file as read for one firing. */

@@ -235,6 +235,54 @@ describe("monitor rows", () => {
 		expect(row?.fields.outcome).toBe("✓ delivered");
 		expect(row?.tone).toBe("ok");
 	});
+	test("a protocol-recovered delivery is marked eventual and its latency is an impact proxy", async () => {
+		const state = await snapshot({
+			"monitor.inspect": {
+				monitor: MONITOR,
+				schedule: MONITOR_SCHEDULE,
+				recentEvents: [
+					monitorEvent({
+						stage: "delivered",
+						recovery: {
+							protocolFailures: [],
+							firstFailedAt: "2026-08-27T23:00:00.000Z",
+							deliveredAt: "2026-08-27T23:01:00.000Z",
+							recoveryLatencyMs: 60_000,
+							dispatchAttempts: 2,
+						},
+					}),
+				],
+			},
+		});
+		expect(state.monitors.rows[0]?.fields.outcome).toBe(
+			"✓ eventually delivered after protocol failure · recovery latency 60000ms (impact proxy)",
+		);
+		expect(state.monitors.rows[0]?.tone).toBe("warn");
+	});
+
+	test("next-fire text comes from the list schedule projection, not the monitor or inspect result", async () => {
+		const listedSchedule = {
+			effectiveTimezone: "Europe/Paris",
+			nextFireAt: { local: "2026-08-28 09:15:00", utc: "2026-08-28T07:15:00.000Z" },
+		};
+		const inspectedSchedule = {
+			effectiveTimezone: "America/Los_Angeles",
+			nextFireAt: { local: "2026-08-28 01:00:00", utc: "2026-08-28T08:00:00.000Z" },
+		};
+		const state = await snapshot({
+			"monitor.list": { monitors: [MONITOR], schedules: { [MONITOR.monitorId]: listedSchedule } },
+			"monitor.inspect": { monitor: MONITOR, schedule: inspectedSchedule, recentEvents: [monitorEvent()] },
+		});
+		expect(state.monitors.rows[0]?.fields.next).toContain("2026-08-28 09:15:00 Europe/Paris");
+		expect(state.monitors.rows[0]?.fields.next).toContain("2026-08-28T07:15:00.000Z");
+		expect(state.monitors.rows[0]?.fields.next).not.toContain("America/Los_Angeles");
+		expect(MONITOR).not.toHaveProperty("nextFireAt");
+	});
+
+	test("a missing list schedule projection is reported as unavailable", async () => {
+		const state = await snapshot({ "monitor.list": { monitors: [MONITOR], schedules: {} } });
+		expect(state.monitors.rows[0]?.fields.next).toBe("schedule unavailable");
+	});
 
 	test("next-fire text comes from the list schedule projection, not the monitor or inspect result", async () => {
 		const listedSchedule = {
