@@ -9,6 +9,7 @@ import {
 	type PidAliveProbe,
 	readBrokerDiscovery,
 } from "./broker-liveness";
+import { type BrokerRelease, type BrokerReleaser, createBrokerReleaser } from "./broker-scope";
 import { isVerifiedGjcVersion, MIN_GJC_VERSION, VERIFIED_GJC_THROUGH } from "./gjc-contract";
 import { sanitizeDiagnostic } from "./rebind";
 
@@ -22,6 +23,22 @@ export {
 	readBrokerDiscovery,
 } from "./broker-liveness";
 
+/**
+ * Read the pinned GJC version from the gateway package.json.
+ * Throws if the file cannot be read or is malformed.
+ */
+export function readPinnedGjcVersion(): string {
+	try {
+		const pkg = JSON.parse(readFileSync(join(dirname(dirname(dirname(__filename))), "package.json"), "utf-8"));
+		const version = pkg.gjc?.version;
+		if (!version || typeof version !== "string") {
+			throw new Error("gjc.version not found in gateway package.json");
+		}
+		return version;
+	} catch (error) {
+		throw new Error(`Failed to read pinned GJC version: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
 // GJC's authoritative shared session flags are in packages/coding-agent/src/commands/sdk.ts;
@@ -39,6 +56,10 @@ const SESSION_VALUE_OPTIONS = new Set([
 	"--text",
 	"--timeout-ms",
 ]);
+/** Window over which observed broker incarnation changes count as churn. */
+export const BROKER_RESPAWN_WINDOW_MS = 30 * 60_000;
+/** Respawns inside the window that turn silent recovery into one operator alert. */
+export const BROKER_RESPAWN_CHURN_THRESHOLD = 3;
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
 export type BrokerGenerationListener = (generation: number) => void;
@@ -67,6 +88,12 @@ export interface GlobalGjcClientOptions {
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
 	/**
+	 * Exact GJC version required; if set, preflight refuses to start the broker
+	 * if the running version does not match exactly. Used by the gateway to
+	 * enforce version pinning across releases.
+	 */
+	readonly pinnedVersion?: string;
+	/**
 	 * How long a started client may keep failing to reach a broker whose own
 	 * discovery record says it is live before `onLiveOutageExceeded` fires.
 	 */
@@ -78,6 +105,8 @@ export interface GlobalGjcClientOptions {
 	 * never fires this; restarting the gateway would not bring it back.
 	 */
 	readonly onLiveOutageExceeded?: (detail: string) => void;
+	/** Moves a broker found in the gateway's own systemd unit into its own scope; `null` disables. */
+	readonly releaseBrokerScope?: BrokerReleaser | null;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -202,16 +231,30 @@ export async function preflightGjcRuntime(
 	run: GjcCommandRunner,
 	minimumVersion = MIN_GJC_VERSION,
 	sdk?: GjcCommandRunner,
+	options?: { readonly pinnedVersion?: string },
 ): Promise<{ readonly version: string }> {
 	const result = await run(["--version"], { timeoutMs: COMMAND_TIMEOUT_MS });
 	const version = (result.stdout || result.stderr).match(/(?:gjc\/)?(\d+)\.(\d+)\.(\d+)/);
-	const minimum = minimumVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
-	if (result.exitCode !== 0 || !version || !minimum)
-		throw new Error("gjc runtime preflight failed: invalid version response");
-	for (let i = 1; i <= 3; i++) {
-		if (Number(version[i]) < Number(minimum[i]))
-			throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}`);
-		if (Number(version[i]) > Number(minimum[i])) break;
+	if (result.exitCode !== 0 || !version) throw new Error("gjc runtime preflight failed: invalid version response");
+
+	const detectedVersion = version.slice(1, 4).join(".");
+
+	// If a pinned version is required, check for exact match
+	if (options?.pinnedVersion) {
+		if (detectedVersion !== options.pinnedVersion) {
+			throw new Error(
+				`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires ${options.pinnedVersion}). Run 'gajaeway ops upgrade' to update the gateway's gjc.`,
+			);
+		}
+	} else {
+		// Otherwise check minimum version
+		const minimum = minimumVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
+		if (!minimum) throw new Error("gjc runtime preflight failed: invalid minimum version spec");
+		for (let i = 1; i <= 3; i++) {
+			if (Number(version[i]) < Number(minimum[i]))
+				throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}`);
+			if (Number(version[i]) > Number(minimum[i])) break;
+		}
 	}
 	// A failed session list is the broker not answering yet (host reboot, stale
 	// lock being cleared), not a wrong runtime: it is classed as unavailable so
@@ -252,6 +295,7 @@ export class GlobalGjcClient {
 	readonly cli: CliRunner;
 	readonly #options: GlobalGjcClientOptions;
 	readonly #spawn: SpawnFn;
+	readonly #releaseBrokerScope: BrokerReleaser | undefined;
 	readonly #cwd: string;
 	readonly #env: Record<string, string>;
 	readonly #timeout: number;
@@ -285,6 +329,9 @@ export class GlobalGjcClient {
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
+	/** Observation times of incarnation changes after the first; bounded by the churn window. */
+	#respawns: number[] = [];
+	#churnAlerted = false;
 
 	constructor(options: GlobalGjcClientOptions = {}) {
 		this.#options = options;
@@ -315,6 +362,10 @@ export class GlobalGjcClient {
 			GJC_AGENT_DIR: this.agentDir,
 		};
 		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
+		this.#releaseBrokerScope =
+			options.releaseBrokerScope === null
+				? undefined
+				: (options.releaseBrokerScope ?? (process.platform === "linux" ? createBrokerReleaser() : undefined));
 		this.#timeout = integer(options.healthProbeTimeoutMs, COMMAND_TIMEOUT_MS, 1);
 		this.#interval = integer(options.healthIntervalMs, 5_000, 1);
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
@@ -335,6 +386,21 @@ export class GlobalGjcClient {
 		if (this.#outageSince === undefined) return undefined;
 		return `broker_unavailable_for=${Math.max(0, Math.floor((now - this.#outageSince) / 1000))}s reason=${this.#unavailableReason}`;
 	}
+	/**
+	 * Broker incarnation changes observed inside the churn window. A daemon that
+	 * keeps dying and being respawned by its own lifecycle passes every
+	 * liveness probe between deaths; only the repetition names the outage.
+	 */
+	recentRespawns(now = Date.now()): number {
+		const floor = now - BROKER_RESPAWN_WINDOW_MS;
+		const live = this.#respawns.findIndex((at) => at > floor);
+		this.#respawns.splice(0, live < 0 ? this.#respawns.length : live);
+		return this.#respawns.length;
+	}
+	/** True while respawns inside the window reach the churn threshold. */
+	respawnChurn(now = Date.now()): boolean {
+		return this.recentRespawns(now) >= BROKER_RESPAWN_CHURN_THRESHOLD;
+	}
 	/** Judges the daemon from its own discovery file, bypassing SDK transport. */
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
 		return judgeBrokerLiveness(this.discoveryPath, this.#options.isPidAlive ?? defaultPidAlive);
@@ -348,6 +414,7 @@ export class GlobalGjcClient {
 			(args, options) => this.#run(args, options?.timeoutMs),
 			MIN_GJC_VERSION,
 			this.cli,
+			{ pinnedVersion: this.#options.pinnedVersion },
 		);
 		this.#noteVersion(result.version);
 	}
@@ -510,7 +577,9 @@ export class GlobalGjcClient {
 			}
 			const identity = `${discovery.pid}|${discovery.url}|${discovery.token}`;
 			if (identity !== this.#identity) {
+				if (this.#identity !== undefined) this.#noteRespawn(discovery.pid);
 				this.#identity = identity;
+				await this.#releaseBroker(discovery.pid);
 				this.#generation++;
 				for (const listener of this.#listeners) {
 					try {
@@ -529,6 +598,38 @@ export class GlobalGjcClient {
 			}
 			return false;
 		}
+	}
+	/** A broker our own SDK command autostarted must not share the gateway unit's stop (#183). */
+	async #releaseBroker(pid: number): Promise<void> {
+		if (!this.#releaseBrokerScope) return;
+		let result: BrokerRelease;
+		try {
+			result = await this.#releaseBrokerScope(pid);
+		} catch (error) {
+			result = {
+				outcome: "skipped",
+				reason: `scope_failed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+		if (result.outcome === "released")
+			this.#log(`broker_scope_released pid=${pid} scope=${result.scope} processes=${result.pids.length}`);
+		else if (result.reason.startsWith("scope_failed"))
+			this.#log(`broker_scope_release_failed pid=${pid} reason=${result.reason}`);
+	}
+	#noteRespawn(pid: number): void {
+		const now = Date.now();
+		this.#respawns.push(now);
+		if (!this.respawnChurn(now)) {
+			this.#churnAlerted = false;
+			return;
+		}
+		// One loud line per churn episode, not one per respawn: the episode ends
+		// only when the window drains below the threshold.
+		if (this.#churnAlerted) return;
+		this.#churnAlerted = true;
+		this.#log(
+			`broker_respawn_churn respawns=${this.recentRespawns(now)} windowMs=${BROKER_RESPAWN_WINDOW_MS} pid=${pid} generation=${this.#generation + 1}`,
+		);
 	}
 	#schedule(epoch: number): void {
 		// Continue observation after involuntary stops so the #246 guard can trigger.
