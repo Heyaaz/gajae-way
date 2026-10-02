@@ -98,6 +98,21 @@ async function harness(
 	});
 }
 
+async function settleFailedInbound(port: ScriptedSessionPort, messageId: string) {
+	enqueue(messageId, messageId);
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	await activeManager.notifyInbound(KEY);
+	const send = port.sends.at(-1);
+	if (!send) throw new Error(`failed turn ${messageId} was not dispatched`);
+	await eventually(
+		() => activeDatabase.inboundTurnRow(send.opRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
+		`failed turn ${messageId} did not settle`,
+	);
+	return send;
+}
+
 test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
 	const port = new ScriptedSessionPort({
 		onSend: (input, scripted) => scripted.complete(input.opRef, "persona reply"),
@@ -573,6 +588,96 @@ test("provider quota exhaustion gives a safe notice and does not reset or rebind
 	expect(port.sends).toHaveLength(1);
 	expect(activeDatabase.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
 	expect(activeDatabase.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+});
+
+test("two consecutive internal submission failures reset the next inbound to a new epoch", async () => {
+	const port = new ScriptedSessionPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) =>
+			scripted.fail(input.opRef, "Prompt submission failed.", {
+				code: "internal",
+				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+			}),
+	});
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+
+	const first = await settleFailedInbound(port, "submission-1");
+	const second = await settleFailedInbound(port, "submission-2");
+	expect(first.sessionId).toBe("session-e0");
+	expect(second.sessionId).toBe(first.sessionId);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(logs).toContain(
+		`session_reset_after_failed_turn origin=${KEY} epoch=0 nextEpoch=1 opRef=${second.opRef} reason=repeated_submission_failure`,
+	);
+
+	const third = await settleFailedInbound(port, "submission-3");
+	expect(third).toMatchObject({ sessionId: "session-e1", text: "submission-3" });
+});
+
+test("a healthy turn clears consecutive internal submission failures", async () => {
+	const port = new ScriptedSessionPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) => {
+			if (input.text === "healthy") scripted.complete(input.opRef, "healthy reply");
+			else
+				scripted.fail(input.opRef, "Prompt submission failed.", {
+					code: "internal",
+					outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+				});
+		},
+	});
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	const first = await settleFailedInbound(port, "submission-before-healthy");
+	const healthy = "healthy";
+	enqueue(healthy, healthy);
+	await activeManager.notifyInbound(KEY);
+	const successful = port.sends.at(-1);
+	if (!successful) throw new Error("healthy turn was not dispatched");
+	await eventually(
+		() => activeDatabase.inboundTurnRow(successful.opRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
+		"healthy turn did not settle",
+	);
+	const last = await settleFailedInbound(port, "submission-after-healthy");
+
+	expect(successful.sessionId).toBe(first.sessionId);
+	expect(last.sessionId).toBe(first.sessionId);
+	expect(activeDatabase.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
+});
+
+test("repeated submission failures respect the reset cap and log it once per session", async () => {
+	const port = new ScriptedSessionPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) =>
+			scripted.fail(input.opRef, "Prompt submission failed.", {
+				code: "internal",
+				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+			}),
+	});
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+
+	const sends: (typeof port.sends)[number][] = [];
+	for (let index = 0; index < 6; index++) sends.push(await settleFailedInbound(port, `capped-submission-${index + 1}`));
+	const capped = sends[3];
+	if (!capped) throw new Error("reset cap failure was not recorded");
+
+	expect(sends.slice(0, 2).map((send) => send.sessionId)).toEqual(["session-e0", "session-e0"]);
+	expect(sends.slice(2).map((send) => send.sessionId)).toEqual([
+		"session-e1",
+		"session-e1",
+		"session-e1",
+		"session-e1",
+	]);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(logs.filter((line) => line.startsWith("failed_turn_reset_capped "))).toEqual([
+		`failed_turn_reset_capped origin=${KEY} epoch=1 session=session-e1 opRef=${capped.opRef} reason=repeated_submission_failure`,
+	]);
 });
 
 for (const restart of [false, true])
