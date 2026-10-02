@@ -33,6 +33,7 @@ export {
 	type MonitorChannelTarget,
 	type MonitorEventRecord,
 	type MonitorRecord,
+	type MonitorScheduleProjection,
 	type MonitorSpec,
 	type MonitorTestParams,
 	type MonitorUpdateParams,

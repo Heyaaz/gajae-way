@@ -9,6 +9,7 @@ import {
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
 import type { SessionRelayStream } from "../src/orchestrator/broker";
 import type {
+	RunningHostJob,
 	SessionBindInput,
 	SessionBinding,
 	SessionPort,
@@ -210,6 +211,15 @@ export class ScriptedSessionPort implements SessionPort {
 		if (state) this.#sessionStates.set(input.sessionId, { ...state, live: false });
 	}
 
+	/** Background jobs each scripted host reports as running; an Error makes the read fail. */
+	readonly hostJobs = new Map<string, readonly RunningHostJob[] | Error>();
+
+	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
+		const jobs = this.hostJobs.get(input.sessionId) ?? [];
+		if (jobs instanceof Error) throw jobs;
+		return jobs;
+	}
+
 	/** Ends the host of a retired session; a live seeded session is "terminated", anything else "already_gone". */
 	async terminateHost(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome> {
 		const state = this.#sessionStates.get(input.sessionId);
@@ -272,20 +282,33 @@ export class ScriptedSessionPort implements SessionPort {
 		await this.onSteer?.(input, this);
 	}
 
-	async setModel(input: {
+	/** Session controls/queries the caller routed over a live relay handle instead of the CLI (issue #316). */
+	readonly relayedRequests: string[] = [];
+
+	async setModel({
+		relay,
+		...input
+	}: {
 		sessionId: string;
 		repo: string;
 		selection: GjcModelSelection;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }> {
+		if (relay) this.relayedRequests.push("setModel");
 		this.models.push(input);
 		return { changed: true };
 	}
 
-	async setServiceTier(input: {
+	async setServiceTier({
+		relay,
+		...input
+	}: {
 		sessionId: string;
 		repo: string;
 		tier: GjcServiceTier;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }> {
+		if (relay) this.relayedRequests.push("setServiceTier");
 		this.serviceTiers.push(input);
 		return { changed: true };
 	}
@@ -992,9 +1015,10 @@ export type ScriptedRelayRequest = {
 	readonly type: "control_request" | "query_request";
 	readonly operation: string;
 	readonly input: Record<string, unknown>;
+	readonly cursor?: string;
 };
 export type ScriptedRelayReply =
-	| { readonly ok: true; readonly result?: Record<string, unknown> }
+	| { readonly ok: true; readonly result?: unknown; readonly page?: Record<string, unknown> }
 	| { readonly ok: false; readonly error: { readonly code: string; readonly message?: string } };
 
 export function scriptedRelay(
@@ -1008,6 +1032,7 @@ export function scriptedRelay(
 				type: frame.type as ScriptedRelayRequest["type"],
 				operation: String(frame.type === "control_request" ? frame.operation : frame.query),
 				input: (frame.input as Record<string, unknown>) ?? {},
+				...(typeof frame.cursor === "string" ? { cursor: frame.cursor } : {}),
 			};
 			requests.push(request);
 			const reply = await respond(request);
