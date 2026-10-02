@@ -323,7 +323,12 @@ export class GlobalGjcClient {
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
-		this.cli = (args, commandOptions) => this.#run(bindAgentDir(args, this.agentDir), commandOptions?.timeoutMs, commandOptions?.priority ?? "interactive");
+		this.cli = (args, commandOptions) =>
+			this.#run(
+				bindAgentDir(args, this.agentDir),
+				commandOptions?.timeoutMs,
+				commandOptions?.priority ?? "interactive",
+			);
 	}
 	get generation(): number {
 		return this.#generation;
@@ -418,7 +423,7 @@ export class GlobalGjcClient {
 		if (this.#timer) clearTimeout(this.#timer);
 		this.#timer = undefined;
 		for (const close of this.#relays) close();
-		for (const wake of this.#queue.splice(0)) wake();
+		for (const entry of this.#queue.splice(0)) entry.resolve();
 		const results = await Promise.allSettled([...this.#children].map((child) => this.#terminate(child)));
 		if (results.some((result) => result.status === "rejected") || this.#children.size > 0) {
 			throw new GjcCliUnavailableError("shutdown incomplete: owned child exit remains unconfirmed");
@@ -590,7 +595,11 @@ export class GlobalGjcClient {
 	#log(error: unknown): void {
 		(this.#options.log ?? console.error)(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
 	}
-	async #run(args: readonly string[], requestedTimeout?: number, priority: "interactive" | "background" = "interactive"): Promise<CliResult> {
+	async #run(
+		args: readonly string[],
+		requestedTimeout?: number,
+		priority: "interactive" | "background" = "interactive",
+	): Promise<CliResult> {
 		this.#assertAgentDirIdentity();
 		const timeout = integer(requestedTimeout, COMMAND_TIMEOUT_MS, 1);
 		const deadline = Date.now() + timeout;
@@ -629,7 +638,8 @@ export class GlobalGjcClient {
 		if (priority === "background") this.#backgroundInFlight++;
 		try {
 			const remaining = Math.max(1, deadline - Date.now());
-			if (this.#options.command) return await bounded(this.#options.command(args, { timeoutMs: remaining, priority }), remaining);
+			if (this.#options.command)
+				return await bounded(this.#options.command(args, { timeoutMs: remaining, priority }), remaining);
 			const child = this.#spawn({
 				cmd: [this.executable, ...args],
 				cwd: this.#cwd,

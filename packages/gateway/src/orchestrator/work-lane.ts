@@ -110,6 +110,7 @@ interface Observer {
 	attaching?: Promise<void>;
 	task?: Promise<void>;
 	timer?: ReturnType<typeof setTimeout>;
+	wakeRequested?: boolean;
 	text?: string;
 }
 interface Waiter {
@@ -717,7 +718,12 @@ export class WorkLaneManager {
 	}
 	async #query(runtime: { jobId: string; sessionId: string; cwd: string; opRef: string }): Promise<PromptStatusBody> {
 		this.#assertNotQuarantined(runtime.jobId);
-		const report = await this.#port.status({ sessionId: runtime.sessionId, repo: runtime.cwd, opRef: runtime.opRef, priority: "background" });
+		const report = await this.#port.status({
+			sessionId: runtime.sessionId,
+			repo: runtime.cwd,
+			opRef: runtime.opRef,
+			priority: "background",
+		});
 		if (
 			report.operationRef !== runtime.opRef ||
 			!report.status ||
@@ -741,7 +747,16 @@ export class WorkLaneManager {
 		return observer;
 	}
 	#schedule(observer: Observer, delay: number): void {
-		if (!this.#current(observer) || observer.timer || observer.task) return;
+		if (!this.#current(observer)) return;
+		if (observer.task) {
+			if (delay === 0) observer.wakeRequested = true;
+			return;
+		}
+		if (observer.timer) {
+			if (delay !== 0) return;
+			clearTimeout(observer.timer);
+			observer.timer = undefined;
+		}
 		const opRef = observer.runtime.opRef;
 		observer.timer = setTimeout(() => {
 			observer.timer = undefined;
@@ -767,11 +782,18 @@ export class WorkLaneManager {
 					const failures = this.#failures.get(opRef)?.failures ?? 0;
 					if (failures > 0 && failures % FAILURES_PER_READOPTION === 0)
 						return this.#readopt(observer, "reconciliation_unavailable");
+					if (observer.wakeRequested) {
+						observer.wakeRequested = false;
+						return this.#schedule(observer, 0);
+					}
 					const pollMs = this.#options.pollMs ?? 250;
-					// When a tail is attached, frames already wake the observer (#schedule(observer, 0) in onFrame),
-					// so use a slow fallback cadence (5s) instead of the fast 250ms poll.
+					// When a tail is attached, frames wake the observer; use a slow fallback
+					// cadence instead of polling every 250ms.
 					const basePollMs = observer.tail && !this.#options.pollMs ? 5_000 : pollMs;
-					this.#schedule(observer, failures ? Math.min(basePollMs * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_MS) : basePollMs);
+					this.#schedule(
+						observer,
+						failures ? Math.min(basePollMs * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_MS) : basePollMs,
+					);
 				});
 		}, delay);
 	}
