@@ -1096,6 +1096,8 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 	const fixture = await serverFixture({ port, dmPolicy: "open", channels: { "d7-chan": { engagement: "open" } } });
 	try {
 		const channel = { platform: "discord", kind: "channel", conversationId: "d7-chan" } as const;
+		// Follow-ups arrive only after every turn has started: a follow-up that is
+		// already in the trigger prompt's unread context is closed, not steered.
 		fixture.client.sendMany([
 			request("dm-trigger", "chat.send", {
 				origin: DM_ORIGIN,
@@ -1103,17 +1105,21 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 				text: "dm start",
 				engagement: DM_ENGAGEMENT,
 			}),
-			request("dm-steer", "chat.send", {
-				origin: DM_ORIGIN,
-				messageId: "dm-steer",
-				text: "dm follow-up",
-				engagement: { ...DM_ENGAGEMENT, authorName: "bellman" },
-			}),
 			request("ch-trigger", "chat.send", {
 				origin: channel,
 				messageId: "ch-trigger",
 				text: "channel start",
 				engagement: { mentioned: true, group: true, authorId: "u1", authorName: "alice" },
+			}),
+			request("lb-trigger", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback start" }),
+		]);
+		await eventually(() => port.sends.length === 3, "not every trigger started a turn");
+		fixture.client.sendMany([
+			request("dm-steer", "chat.send", {
+				origin: DM_ORIGIN,
+				messageId: "dm-steer",
+				text: "dm follow-up",
+				engagement: { ...DM_ENGAGEMENT, authorName: "bellman" },
 			}),
 			request("ch-steer", "chat.send", {
 				origin: channel,
@@ -1127,7 +1133,6 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 					replyTo: { messageId: "ch-trigger", authorName: "alice", fromSelf: false, excerpt: "channel start" },
 				},
 			}),
-			request("lb-trigger", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback start" }),
 			request("lb-steer", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback follow-up" }),
 		]);
 		await eventually(() => port.steers.length === 3, "not every follow-up was steered");
@@ -1155,7 +1160,7 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new (await import("bun:sqlite")).Database(path);
-		// Remove v22/v23 completely before replaying historical DDL; missing objects are fixture errors.
+		// Remove v22-v24 completely before replaying historical DDL; missing objects are fixture errors.
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -1173,6 +1178,7 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 		])
 			raw.exec(`DROP TABLE ${table}`);
 		raw.exec(`
+DROP TABLE lane_reports;
 DROP TABLE work_attempt_runtime;
 DROP TABLE inbound_messages;
 CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL, batch_key TEXT, batch_role TEXT, batch_epoch INTEGER, batch_state TEXT, attributed_op_ref TEXT, accepted_at TEXT, bound_session_id TEXT, dispatched_at TEXT, terminal_delivery_id TEXT);
@@ -1185,7 +1191,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 `);
 		raw.close();
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(23);
+		expect(upgraded.schemaVersion).toBe(25);
 		const count = new (await import("bun:sqlite")).Database(path, { readonly: true })
 			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages")
 			.get()?.n;
