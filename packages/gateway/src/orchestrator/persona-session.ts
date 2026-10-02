@@ -13,9 +13,16 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
-import { type GatewayDatabase, type InboundMessageRow, type InboundTurn, terminalDeliveryIds } from "../store/db";
+import {
+	BrokerAuthorityError,
+	type GatewayDatabase,
+	type InboundMessageRow,
+	type InboundTurn,
+	terminalDeliveryIds,
+} from "../store/db";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
+import { isSessionGoneCode } from "./gjc-contract";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
 import {
@@ -79,6 +86,11 @@ export interface PersonaTurnLifecycle {
 	readonly effectiveServiceTier?: GjcServiceTier;
 	/** Legacy/send-time fallback only; persistent persona turns leave this unset. */
 	readonly sendModelFallback?: GjcModelSelection;
+	/**
+	 * Message IDs that are included in this turn's unread context.
+	 * Used to prevent double-delivery when a message in context is also steered.
+	 */
+	readonly contextMessageIds?: ReadonlySet<string>;
 	/**
 	 * Renders a message that arrives while this turn runs into the steer text.
 	 * Owns the same speaker/place/reply header as the trigger so the model can
@@ -528,6 +540,10 @@ class OriginActor {
 	readonly #graceTimers = new Set<unknown>();
 	readonly #appliedModel = new Map<string, string>();
 	readonly #appliedServiceTier = new Map<string, GjcServiceTier>();
+	/** Consecutive submission-phase failures for each session still bound to this origin. */
+	readonly #submissionFailures = new Map<string, number>();
+	/** Prevents repeating the capped-reset warning for the same bound session. */
+	readonly #loggedCappedFailedTurnSessions = new Set<string>();
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
@@ -1083,16 +1099,24 @@ class OriginActor {
 		try {
 			tail = await this.#attachTail(binding.sessionId, epoch, false);
 		} catch (error) {
-			// The relay refusing to attach because the broker no longer serves the
-			// session (`endpoint_stale`) is the same proof as a disowning send: the
-			// prompt never landed. Release the bound row and rebind, never hold.
-			if (sdkStatusErrorCode(error) !== "session_unavailable") throw error;
+			// No prompt was sent, so this lifecycle can never reach a terminal: the
+			// trigger is re-dispatched under a new one (below, or by recovery).
+			await this.#releaseLifecycle(lifecycle, {
+				originKey: this.originKey,
+				epoch,
+				sessionId: binding.sessionId,
+				turn,
+			});
+			// No send was attempted. A broker disown code or positive liveness
+			// proof can therefore release this row without replaying accepted work.
+			// A generic failure alone is not authority to replace the session.
+			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
 			this.#manager.database.inboundTurnRequeue(opRef);
 			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 			this.#bindFailures += 1;
 			const attempts = this.#bindFailures;
 			this.#manager.log(
-				`persona_attach_session_gone origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${binding.sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
+				`send_session_disowned action=inline_rebind stage=attach origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${binding.sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
 			);
 			await this.#terminateRetiredSession(binding.sessionId, "session_gone");
 			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
@@ -1198,12 +1222,9 @@ class OriginActor {
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
-			// The Router disowning the session id is NOT ambiguous: it is proof the
-			// send never landed, so there is nothing to protect by holding. gjc is
-			// allowed to be unreliable here - surviving that is this gateway's job.
-			// Holding instead left the conversation dead with one message pending,
-			// an empty gjc_session_id and no retry, until a human restarted the
-			// daemon (live: epoch 41, session_unavailable, 2026-09-03).
+			// Only the established session_unavailable status proves this send did
+			// not land. A session_not_found returned after port.send is ambiguous:
+			// the broker may have accepted the operation before the CLI failed.
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
 				await tail.close();
 				this.#manager.database.inboundTurnRequeue(opRef);
@@ -1221,7 +1242,7 @@ class OriginActor {
 				this.#bindFailures += 1;
 				const attempts = this.#bindFailures;
 				this.#manager.log(
-					`persona_send_session_gone origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempts}`,
+					`send_session_disowned action=inline_rebind stage=send origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempts}`,
 				);
 				// The broker disowned it, but the host process may still be running
 				// (observed: fc41da9b, disowned yet live for hours). End it.
@@ -1230,7 +1251,7 @@ class OriginActor {
 				else {
 					if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 						this.#manager.log(
-							`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempts} reason=session_unavailable`,
+							`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempts} reason=${sdkStatusErrorCode(error)}`,
 						);
 					this.#scheduleDispatchRetry(
 						Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
@@ -1343,17 +1364,19 @@ class OriginActor {
 
 	/**
 	 * Positive evidence that a session can no longer run anything: the SDK
-	 * disowned it (`session_unavailable`, incl. `endpoint_stale`), or the relay
-	 * failed and the broker's own liveness reports it not live / disowned. An
-	 * unanswerable probe is not evidence.
+	 * reported `session_unavailable`, or the relay failed and the broker's own
+	 * liveness reports it not live / disowned. An unanswerable probe is not
+	 * evidence.
 	 */
 	async #sessionProvablyGone(sessionId: string, error: unknown): Promise<boolean> {
+		if (error instanceof BrokerAuthorityError) throw error;
 		if (sdkStatusErrorCode(error) === "session_unavailable") return true;
 		if (!this.#manager.port.liveness) return false;
 		try {
 			const raw = await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo });
 			return raw.live === false || raw.disowned === true;
-		} catch {
+		} catch (probeError) {
+			if (probeError instanceof BrokerAuthorityError) throw probeError;
 			return false;
 		}
 	}
@@ -1505,6 +1528,28 @@ class OriginActor {
 			this.#quarantinedTurn(current.turn.opRef)
 		)
 			return false;
+		// The row's message was already rendered into this turn's unread context
+		// (e.g. the row was requeued by recovery and the next turn's prompt picked
+		// it up). Steering it too would make the model answer it twice. Close it as
+		// done input of this turn WITHOUT sending: leaving it pending would make
+		// the #steerPending loop re-read the same row forever.
+		// Exact id only: an edit row carries new text for an old message and must
+		// still be steered even when the original is in the context window.
+		if (current.lifecycle.contextMessageIds?.has(row.message_id)) {
+			const contextMessageId = current.lifecycle.steerContextMessageId?.(row);
+			const closed = this.#manager.database.inboundSteerAccepted({
+				messageId: row.message_id,
+				epoch: current.epoch,
+				opRef: current.turn.opRef,
+				contextMessageId,
+			});
+			if (!closed) return false;
+			await current.lifecycle.onSteerAccepted?.({ ...current, row });
+			this.#manager.log(
+				`steer_skip origin=${this.originKey} message=${row.message_id} opRef=${current.turn.opRef} reason=already_in_context`,
+			);
+			return true;
+		}
 		{
 			assertControlAllowed("turn.steer", { operatorApproval: true });
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, current.epoch, row.message_id);
@@ -2054,6 +2099,7 @@ class OriginActor {
 				`terminal_status_reconciled origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} tail_evidence=unavailable`,
 			);
 		}
+		let failedTurnEvidence: FailedTurnEvidence | undefined;
 		try {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
 				// The owned relay is the live authority: its last assistant message
@@ -2113,10 +2159,11 @@ class OriginActor {
 				this.#manager.log(
 					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}${openTool ? ` open_tool=${openTool.name} open_tool_elapsed_ms=${openTool.elapsedMs}` : ""}`,
 				);
+				failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
 				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
 				await bound.lifecycle.onFailure?.({
 					...bound,
-					error: terminalError(report, openTool),
+					error: terminalError(report, openTool, failedTurnEvidence?.reason),
 					status: report,
 					...(recoveredText ? { recoveredText } : {}),
 				});
@@ -2130,7 +2177,7 @@ class OriginActor {
 		// Persist the failure notice before settling its trigger. If delivery fails,
 		// recovery can retry the same deterministic notice without losing it. Reset
 		// completion and its budget are then committed atomically below.
-		const resetApplied = await this.#resetFailedTurn(bound, report);
+		const resetApplied = this.#resetFailedTurn(bound, report, failedTurnEvidence);
 		const completed = resetApplied
 			? 1
 			: this.#manager.database.withTransaction(() => {
@@ -2157,8 +2204,10 @@ class OriginActor {
 						report.status.terminalAt >= report.status.startedAt &&
 						report.status.terminalAt <= this.#manager.now() &&
 						this.#manager.database.getSessionRecord(this.originKey)?.sessionId === bound.sessionId
-					)
+					) {
 						this.#manager.database.clearFailedTurnResetCap(this.originKey);
+						this.#submissionFailures.delete(bound.sessionId);
+					}
 					return changed;
 				});
 		// Read the terminal slot from the durable trigger row AFTER completion. A
@@ -2348,8 +2397,12 @@ class OriginActor {
 
 	/** Best-effort: a presentation hook failing must never keep the origin from re-dispatching. */
 	async #notifyReleased(bound: BoundTurn): Promise<void> {
+		await this.#releaseLifecycle(bound.lifecycle, bound);
+	}
+
+	async #releaseLifecycle(lifecycle: PersonaTurnLifecycle, identity: PersonaTurnIdentity): Promise<void> {
 		try {
-			await bound.lifecycle.onReleased?.(bound);
+			await lifecycle.onReleased?.(identity);
 		} catch (error) {
 			this.#manager.log(`persona_release_hook_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`);
 		}
@@ -2492,8 +2545,8 @@ class OriginActor {
 		return this.#manager.database.getSessionRecord(this.originKey)?.epoch ?? 0;
 	}
 
-	/** Exact failure resets only the binding for subsequent input; the failed trigger is completed, never resent. */
-	async #resetFailedTurn(bound: BoundTurn, report: StatusReport): Promise<boolean> {
+	/** Reads only bounded saved-transcript evidence for a current failed turn. */
+	async #classifyFailedTurn(bound: BoundTurn, report: StatusReport): Promise<FailedTurnEvidence | undefined> {
 		const port = this.#manager.port;
 		const startedAt = report.status.startedAt;
 		const terminalAt = report.status.terminalAt;
@@ -2515,10 +2568,9 @@ class OriginActor {
 			bound.dispatchedAtMs === undefined ||
 			startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
-			return false;
-		let evidence: FailedTurnEvidence | undefined;
+			return undefined;
 		try {
-			evidence = await port.failedTurnEvidence({
+			return await port.failedTurnEvidence({
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
 				startedAtMs: startedAt,
@@ -2526,21 +2578,54 @@ class OriginActor {
 			});
 		} catch {
 			this.#manager.log(`failed_turn_evidence_unavailable origin=${this.originKey} opRef=${bound.turn.opRef}`);
-			return false;
+			return undefined;
 		}
-		if (!evidence || !["unsupported_input_status", "context_exhausted"].includes(evidence.reason)) return false;
-		this.#manager.log(
-			`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
-		);
+	}
+
+	/** Exact context/request failures and repeated submission failures reset only the next binding. */
+	#resetFailedTurn(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
+		if (evidence)
+			this.#manager.log(
+				`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
+			);
 		if (
+			report.status.status !== "failed" ||
+			report.operationRef !== bound.turn.opRef ||
 			this.#current !== bound ||
 			bound.retired ||
 			bound.epoch !== this.#epoch() ||
 			bound.brokerGeneration !== this.#manager.brokerGeneration ||
 			this.#stopped ||
-			this.#manager.stopped
+			this.#manager.stopped ||
+			typeof report.status.startedAt !== "number" ||
+			!Number.isFinite(report.status.startedAt) ||
+			report.status.startedAt <= 0 ||
+			typeof report.status.terminalAt !== "number" ||
+			!Number.isFinite(report.status.terminalAt) ||
+			report.status.terminalAt < report.status.startedAt ||
+			report.status.terminalAt > this.#manager.now() ||
+			bound.dispatchedAtMs === undefined ||
+			report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
 			return false;
+		if (evidence?.reason === "provider_quota_exhausted") {
+			this.#submissionFailures.delete(bound.sessionId);
+			return false;
+		}
+		const submissionFailure = report.status.outcome?.phase === "submission";
+		let repeatedSubmissionFailure = false;
+		if (submissionFailure) {
+			const count = Math.min(2, (this.#submissionFailures.get(bound.sessionId) ?? 0) + 1);
+			this.#submissionFailures.set(bound.sessionId, count);
+			repeatedSubmissionFailure = count >= 2;
+		} else this.#submissionFailures.delete(bound.sessionId);
+		const resetReason =
+			evidence?.reason === "unsupported_input_status" || evidence?.reason === "context_exhausted"
+				? evidence.reason
+				: repeatedSubmissionFailure
+					? "repeated_submission_failure"
+					: undefined;
+		if (!resetReason) return false;
 		const nextEpoch = this.#manager.database.inboundFailedTurnReset({
 			originKey: this.originKey,
 			epoch: bound.epoch,
@@ -2548,9 +2633,21 @@ class OriginActor {
 			opRef: bound.turn.opRef,
 			triggerMessageId: bound.turn.triggerMessageId,
 		});
-		if (nextEpoch === undefined) return false;
+		if (nextEpoch === undefined) {
+			if (
+				this.#manager.database.failedTurnResetCapped(this.originKey) &&
+				!this.#loggedCappedFailedTurnSessions.has(bound.sessionId)
+			) {
+				this.#loggedCappedFailedTurnSessions.add(bound.sessionId);
+				this.#manager.log(
+					`failed_turn_reset_capped origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${bound.turn.opRef} reason=${resetReason}`,
+				);
+			}
+			return false;
+		}
+		this.#submissionFailures.delete(bound.sessionId);
 		this.#manager.log(
-			`session_reset_after_failed_turn origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
+			`session_reset_after_failed_turn origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} reason=${resetReason}`,
 		);
 		return true;
 	}
@@ -2567,7 +2664,15 @@ class OriginActor {
 function terminalError(
 	status: StatusReport,
 	openTool?: { readonly name: string; readonly elapsedMs: number },
+	evidenceReason?: FailedTurnEvidence["reason"],
 ): GjcRuntimeError {
+	if (evidenceReason === "provider_quota_exhausted") {
+		const message = "model provider quota/billing is exhausted (HTTP 402); switch the model preset";
+		return new GjcRuntimeError(`provider_quota_exhausted: ${message}`, {
+			code: "provider_quota_exhausted",
+			message,
+		});
+	}
 	const failure = status.status.error;
 	const outcome = status.status.outcome;
 	const code = sanitizeDiagnostic(failure?.code ?? outcome?.code ?? "") || undefined;
@@ -2670,7 +2775,7 @@ function sdkStatusErrorCode(error: unknown): string | undefined {
 			: typeof detailCode === "string" && /^[a-z0-9_.-]{1,64}$/i.test(detailCode)
 				? detailCode
 				: undefined;
-	if (raw === "endpoint_stale" || raw === "not_found") return "session_unavailable";
+	if (isSessionGoneCode(raw)) return "session_unavailable";
 	if (raw) return raw;
 	const message = error instanceof Error ? error.message : "";
 	return /session_unavailable|endpoint_stale/.test(message) ? "session_unavailable" : undefined;

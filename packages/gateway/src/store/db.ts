@@ -4,7 +4,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, normalize } from "node:path";
 import {
 	type ChatMessagePayload,
-	isSilenceToken,
+	isSilentOutput,
 	type OriginRef,
 	originKey,
 	parseOriginKey,
@@ -134,6 +134,16 @@ export interface WorkAttemptOutput {
 	readonly proof: WorkAttemptOutputProof | null;
 	/** Proven original attempt-final silence survives output loss and ledger pruning. */
 	readonly knownSilence: WorkAttemptOutputProof | null;
+	/** Transport failure details for failed attempts with terminal_missing_receipt. */
+	readonly transportCause?: {
+		readonly kind: string;
+		readonly nativeErrorCode?: string;
+		readonly http2RstCode?: number;
+		readonly status?: number;
+		readonly requestBytes?: number;
+		readonly retryMaxAttempts?: number;
+		readonly endpointClass?: string;
+	};
 }
 export interface WorkAttemptTerminalEvidence {
 	readonly kind: "broker" | "local";
@@ -219,9 +229,15 @@ export interface LaneReportRow {
 	readonly updated_at: string;
 }
 export class WorkAttemptStateError extends Error {
-	constructor() {
-		super("work lane state unavailable");
+	readonly opRef: string | undefined;
+	readonly assertion: string;
+	constructor(opRef?: string, assertion = "work attempt payload validation") {
+		super(
+			`work lane state unavailable${opRef === undefined ? "" : ` opRef=${JSON.stringify(opRef)}`} assertion=${assertion}`,
+		);
 		this.name = "WorkAttemptStateError";
+		this.opRef = opRef;
+		this.assertion = assertion;
 	}
 }
 
@@ -285,8 +301,8 @@ const WORK_REASON_CODES = new Set([
 	"recovery_indeterminate",
 	"output_unavailable",
 ]);
-function workAssert(condition: unknown): asserts condition {
-	if (!condition) throw new WorkAttemptStateError();
+function workAssert(condition: unknown, assertion = "work attempt payload validation"): asserts condition {
+	if (!condition) throw new WorkAttemptStateError(undefined, assertion);
 }
 function workTime(value: unknown): boolean {
 	return typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value));
@@ -559,7 +575,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 24;
+const LATEST_SCHEMA_VERSION = 25;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -999,25 +1015,52 @@ export class GatewayDatabase {
 		try {
 			const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
 			validateWorkRuntime(runtime, this.instanceId);
-			workAssert(runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key);
-			workAssert(runtime.sessionId === row.session_id && runtime.version === row.version);
-			workAssert(runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id);
+			workAssert(
+				runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key,
+				"runtime identity matches database columns",
+			);
+			workAssert(
+				runtime.sessionId === row.session_id && runtime.version === row.version,
+				"runtime session and version match database columns",
+			);
+			workAssert(
+				runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id,
+				"runtime settlement and delivery id match database columns",
+			);
 			this.#workHistory(runtime);
 			return runtime;
-		} catch {
-			throw new WorkAttemptStateError();
+		} catch (error) {
+			throw new WorkAttemptStateError(
+				opRef,
+				error instanceof WorkAttemptStateError ? error.assertion : "runtime record parsing",
+			);
 		}
 	}
 
 	/** Keyset pagination: callers can recover arbitrarily many lanes in bounded reads. */
-	workAttemptOpen(limit = 100, afterOpRef = ""): readonly WorkAttemptRuntime[] {
+	workAttemptOpen(
+		limit = 100,
+		afterOpRef = "",
+		onInvalid?: (error: WorkAttemptStateError) => void,
+	): readonly WorkAttemptRuntime[] {
 		workAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000);
-		return this.#database
+		const rows = this.#database
 			.query<{ op_ref: string }, [string, number]>(
 				"SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL AND op_ref > ? AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) ORDER BY op_ref LIMIT ?",
 			)
-			.all(afterOpRef, limit)
-			.map((row) => this.workAttemptGet(row.op_ref)!);
+			.all(afterOpRef, limit);
+		if (!onInvalid) return rows.map((row) => this.workAttemptGet(row.op_ref)!);
+		const attempts: WorkAttemptRuntime[] = [];
+		for (const row of rows) {
+			try {
+				const runtime = this.workAttemptGet(row.op_ref);
+				if (runtime) attempts.push(runtime);
+			} catch (error) {
+				if (!(error instanceof WorkAttemptStateError)) throw error;
+				onInvalid(error);
+			}
+		}
+		return attempts;
 	}
 
 	workAttemptOpenByLane(laneKey: string): WorkAttemptRuntime | undefined {
@@ -1171,7 +1214,7 @@ export class GatewayDatabase {
 					payload.role === "assistant" &&
 					payload.final === true &&
 					!payload.reaction &&
-					!isSilenceToken(payload.text),
+					!isSilentOutput(payload.text),
 			);
 			const changed = this.#database
 				.query(
@@ -1414,7 +1457,7 @@ export class GatewayDatabase {
 						fallbackPayload.role === "assistant" &&
 						fallbackPayload.final === true &&
 						!fallbackPayload.reaction &&
-						!isSilenceToken(fallbackPayload.text),
+						!isSilentOutput(fallbackPayload.text),
 				);
 				this.deliveryCreateInTransaction({
 					id: next.deliveryId,
@@ -1548,16 +1591,29 @@ export class GatewayDatabase {
 
 	#workValidateHistory(runtime: WorkAttemptRuntime, input: LaneJobRecord): void {
 		const record = parseLaneJobRecord(JSON.stringify(input));
-		workAssert(record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd);
+		workAssert(
+			record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd,
+			"history job identity matches runtime",
+		);
 		const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
-		workAssert(attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt);
-		workAssert(runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt);
-		if (runtime.settledAt === null) workAssert(record.attempts.at(-1)?.opRef === runtime.opRef);
+		workAssert(
+			attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt,
+			"history attempt identity matches runtime",
+		);
+		workAssert(
+			runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt,
+			"attempt.endedAt matches runtime.settledAt",
+		);
+		if (runtime.settledAt === null)
+			workAssert(record.attempts.at(-1)?.opRef === runtime.opRef, "open runtime belongs to latest history attempt");
 	}
 
 	#workHistory(runtime: WorkAttemptRuntime): LaneJobRecord {
 		const json = this.laneJobJson(runtime.jobId);
-		workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+		workAssert(
+			json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json,
+			"lane history rows share one serialized record",
+		);
 		const record = parseLaneJobRecord(json);
 		this.#workValidateHistory(runtime, record);
 		return record;
@@ -1651,6 +1707,8 @@ export class GatewayDatabase {
 		| {
 				epoch: number;
 				lastBootstrappedEpoch: number;
+				agentsMdEpoch: number;
+				agentsMdDigest: string | null;
 				appliedAt: string | null;
 				includedSections: readonly string[];
 				byteCount: number;
@@ -1663,6 +1721,8 @@ export class GatewayDatabase {
 				{
 					epoch: number;
 					last_bootstrapped_epoch: number;
+					agents_md_epoch: number;
+					agents_md_digest: string | null;
 					bootstrap_applied_at: string | null;
 					bootstrap_sections_json: string;
 					bootstrap_byte_count: number;
@@ -1671,19 +1731,32 @@ export class GatewayDatabase {
 				},
 				[string]
 			>(
-				"SELECT epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
+				"SELECT epoch, last_bootstrapped_epoch, agents_md_epoch, agents_md_digest, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
 			)
 			.get(originKey);
 		if (!row) return undefined;
 		return {
 			epoch: row.epoch,
 			lastBootstrappedEpoch: row.last_bootstrapped_epoch,
+			agentsMdEpoch: row.agents_md_epoch,
+			agentsMdDigest: row.agents_md_digest,
 			appliedAt: row.bootstrap_applied_at,
 			includedSections: parseStringList(row.bootstrap_sections_json),
 			byteCount: row.bootstrap_byte_count,
 			truncated: row.bootstrap_truncated === 1,
 			diagnostics: parseStringList(row.bootstrap_diagnostics_json),
 		};
+	}
+
+	/** Records the current AGENTS.md digest for a session epoch when it changes. */
+	recordSessionAgentsBaseline(originKey: string, epoch: number, digest: string): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE sessions SET agents_md_epoch = ?, agents_md_digest = ? WHERE origin_key = ? AND epoch = ? AND (agents_md_epoch < ? OR (agents_md_epoch = ? AND agents_md_digest IS NOT ?))",
+				)
+				.run(epoch, digest, originKey, epoch, epoch, epoch, digest).changes === 1
+		);
 	}
 
 	markSessionBootstrapped(
@@ -2361,6 +2434,11 @@ export class GatewayDatabase {
 	clearFailedTurnResetCap(originKey: string): void {
 		this.requireTransaction();
 		this.metaSet(failedTurnResetCapKey(originKey), "0");
+	}
+
+	failedTurnResetCapped(originKey: string): boolean {
+		const cap = this.metaGet(failedTurnResetCapKey(originKey));
+		return cap !== undefined && cap !== "0";
 	}
 
 	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {
@@ -3115,6 +3193,23 @@ export class GatewayDatabase {
 				"SELECT origin_key, gjc_session_id, last_activity_at FROM sessions WHERE origin_key LIKE 'work/task/%' AND gjc_session_id <> '' ORDER BY last_activity_at",
 			)
 			.all();
+	}
+
+	/** Check if this gateway is in broker mode (has an active broker authority). */
+	isBrokerMode(): boolean {
+		return this.#brokerAuthority() !== null;
+	}
+
+	/** Get the repo for a work lane by session ID from the owned binding, or undefined if not found. */
+	workLaneRepoBySessionId(sessionId: string): string | undefined {
+		const authority = this.#brokerAuthority();
+		if (!authority) return undefined;
+		const row = this.#database
+			.query<{ repo: string }, [string, string]>(
+				"SELECT repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?",
+			)
+			.get(brokerAuthorityKey(authority), sessionId);
+		return row?.repo;
 	}
 
 	putSession(originKey: string, sessionId: string): void {
@@ -4439,6 +4534,25 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(24, new Date().toISOString());
+			});
+		}
+		if (current < 25) {
+			this.withTransaction(() => {
+				// Track each epoch's AGENTS.md baseline. Only the digest is persisted;
+				// prompt content remains in the workspace and is re-read on each turn.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(sessions)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("agents_md_epoch"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_epoch INTEGER NOT NULL DEFAULT -1");
+				if (!columns.has("agents_md_digest"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_digest TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(25, new Date().toISOString());
 			});
 		}
 	}

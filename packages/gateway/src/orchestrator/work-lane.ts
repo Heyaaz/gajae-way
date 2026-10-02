@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import {
 	type ChatMessagePayload,
-	containsSilenceToken,
-	isSilenceToken,
+	isSilentOutput,
 	type OriginRef,
 	originKey,
 	type PromptStatusBody,
@@ -34,13 +33,15 @@ import {
 	type LaneReportRow,
 	type WorkAttemptAdmission,
 	type WorkAttemptRuntime,
+	type WorkAttemptSettleResult,
 	type WorkAttemptTerminalEvidence,
 	type WorkParent,
 	type WorkReportRoot,
 	workAttemptDeliveryId,
 	workAttemptReportId,
 } from "../store/db";
-import { type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
+import { readFailedTransportCause } from "./failed-turn-evidence";
+import { type LaneForceRetireReason, type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
 import type { TailHandle } from "./tail-runner";
@@ -86,6 +87,19 @@ const pendingOutput = () => ({
 });
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
+}
+function workAttemptEndState(
+	reason: string,
+): "completed" | "terminal_missing_receipt" | "terminal_uncertain" | "failed" | "attempt_ended" {
+	return reason === "end_turn"
+		? "completed"
+		: reason === "terminal_missing_receipt"
+			? "terminal_missing_receipt"
+			: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
+				? "terminal_uncertain"
+				: ["sdk_failed", "send_rejected"].includes(reason)
+					? "failed"
+					: "attempt_ended";
 }
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
@@ -151,6 +165,9 @@ export class WorkLaneManager {
 		this.#db = options.database;
 		this.#port = options.port;
 		options.lanes.setRecoveryGate(() => this.recover());
+		options.lanes.setForceRetireSettlement((name, opRef, reason, endedAt) =>
+			this.settleForceRetiredAttempt(name, opRef, reason, endedAt),
+		);
 	}
 	#now(): number {
 		return this.#options.now?.() ?? Date.now();
@@ -219,6 +236,121 @@ export class WorkLaneManager {
 			if (error instanceof ProtocolError) throw error;
 			throw new ProtocolError("verb_failed", "work lane state unavailable", { reasonCode: "lane_state_corrupt", name });
 		}
+	}
+	/**
+	 * Closes a dead lane's current attempt through the normal atomic settlement
+	 * path. LaneGovernor calls this while it owns the lane mutation lock.
+	 */
+	settleForceRetiredAttempt(name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string): boolean {
+		const record = this.#job(name, true);
+		if (!record) return false;
+		const attempt = record.attempts.at(-1);
+		if (!attempt || attempt.opRef !== opRef) return false;
+		const runtime = this.#db.workAttemptGet(opRef);
+		if (!runtime) return false;
+		if (runtime.settledAt !== null) return attempt.endedAt === runtime.settledAt;
+		if (attempt.endedAt !== undefined) return false;
+
+		const recordedTerminal = runtime.terminal;
+		const terminal: WorkAttemptTerminalEvidence = recordedTerminal ?? {
+			kind: "local",
+			observedAt: endedAt,
+			reasonCode: reason,
+		};
+		const endState = recordedTerminal ? workAttemptEndState(terminal.reasonCode) : "attempt_ended";
+		const errorCode = recordedTerminal
+			? terminal.reasonCode === "end_turn"
+				? undefined
+				: terminal.reasonCode
+			: "host_lost";
+		const output =
+			runtime.output.disposition === "pending"
+				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
+				: runtime.output;
+		const closed = closeAttempt({
+			record,
+			opRef,
+			endState,
+			errorCode,
+			endedAt,
+		});
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output);
+		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
+		let admission: WorkAttemptAdmission | undefined;
+		if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
+			decision = "wake_unaccepted";
+		} else if (runtime.output.knownSilence !== null) {
+			decision = "suppressed";
+		} else if (runtime.parent === null) {
+			decision = "no_target";
+		} else {
+			decision = "report";
+			if (runtime.parent.kind === "persona") {
+				const fallbackPayload = buildDeliveryPayload(runtime.opRef, runtime.parent.origin, text, runtime.deliveryId);
+				if (!fallbackPayload) return false;
+				const holdReason = this.#options.personaHold?.(runtime.parent.originKey);
+				admission = {
+					kind: "persona",
+					row: {
+						messageId: runtime.reportId,
+						originKey: runtime.parent.originKey,
+						originRefJson: JSON.stringify(runtime.parent.origin),
+						body: text,
+						receivedAt: endedAt,
+					},
+					fallbackPayload,
+					...(holdReason ? { holdReason } : {}),
+				};
+			} else {
+				const root = runtime.parent.root;
+				admission = {
+					kind: "lane",
+					report: {
+						reportId: runtime.reportId,
+						parentName: runtime.parent.name,
+						childName: name,
+						childOpRef: runtime.opRef,
+						body: text,
+						root,
+					},
+					fallbackPayload: root
+						? (buildDeliveryPayload(runtime.opRef, root.origin, text, runtime.deliveryId) ?? null)
+						: null,
+				};
+			}
+		}
+		const settled: WorkAttemptSettleResult | undefined = this.#db.workAttemptSettle(
+			opRef,
+			runtime.version,
+			closed,
+			{ decision, settledAt: endedAt, terminal, ...(output !== runtime.output ? { output } : {}) },
+			admission,
+		);
+		if (!settled) return false;
+		this.#finishWaiters(opRef);
+		for (const payload of [settled.fallbackPayload, settled.childFallback]) {
+			if (!payload) continue;
+			try {
+				this.#options.deliverFallback?.(payload);
+			} catch {
+				console.error(`work_fallback_delivery_failed deliveryId=${payload.deliveryId}`);
+			}
+		}
+		if (settled.runtime.decision === "reported" && settled.runtime.parent?.kind === "persona") {
+			try {
+				this.#options.notifyPersona?.(settled.runtime.parent.originKey);
+			} catch {
+				console.error(`work_persona_nudge_failed origin=${settled.runtime.parent.originKey}`);
+			}
+		}
+		const parents = new Set([name]);
+		if (settled.runtime.parent?.kind === "lane") parents.add(settled.runtime.parent.name);
+		for (const parentName of parents) {
+			void this.#drainLaneReports(parentName).catch(() => {
+				console.error(`lane_report_drain_failed parent=${parentName}`);
+			});
+		}
+		return true;
 	}
 	#assertNotQuarantined(jobId: string, name?: string): void {
 		if (this.#db.isBrokerQuarantined("work", jobId))
@@ -776,7 +908,7 @@ export class WorkLaneManager {
 						observedAtMs: result.observedAtMs,
 						attribution: "operation_ref" as const,
 					};
-					const silent = isSilenceToken(result.text) || containsSilenceToken(result.text);
+					const silent = isSilentOutput(result.text);
 					const terminal = runtime.terminal!;
 					// A terminal first observed with receiptState=missing whose same-op
 					// final body then proves present is a late receipt, not a missing one
@@ -818,16 +950,41 @@ export class WorkLaneManager {
 			const name = runtime.sessionKey.slice("work/task/".length);
 			const at = this.#at();
 			const reason = runtime.terminal!.reasonCode;
-			const endState =
-				reason === "end_turn"
-					? "completed"
-					: reason === "terminal_missing_receipt"
-						? "terminal_missing_receipt"
-						: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
-							? "terminal_uncertain"
-							: ["sdk_failed", "send_rejected"].includes(reason)
-								? "failed"
-								: "attempt_ended";
+			// Extract transport cause for sdk_failed/terminal_missing_receipt failures
+			let output = runtime.output;
+			if (
+				(reason === "sdk_failed" || reason === "terminal_missing_receipt") &&
+				output.disposition === "unavailable" &&
+				!output.transportCause
+			) {
+				try {
+					const terminalAt = runtime.terminal?.status?.terminalAt ?? Date.parse(runtime.terminal?.observedAt ?? "");
+					if (Number.isFinite(terminalAt)) {
+						const input = {
+							sessionId: runtime.sessionId,
+							repo: runtime.cwd,
+							startedAtMs: Date.parse(runtime.startedAt),
+							terminalAtMs: terminalAt,
+						};
+						// Try port method first (for testing), then file-based reader
+						let cause = await this.#port.failedTransportCause?.(input);
+						if (!cause) {
+							cause = await readFailedTransportCause(undefined, input);
+						}
+						if (cause) {
+							output = { ...output, transportCause: cause };
+							const parts = [`kind=${cause.kind}`];
+							if (cause.nativeErrorCode) parts.push(`nativeErrorCode=${cause.nativeErrorCode}`);
+							if (cause.http2RstCode !== undefined) parts.push(`http2RstCode=${cause.http2RstCode}`);
+							if (cause.status !== undefined) parts.push(`status=${cause.status}`);
+							console.error(`work_transport_failure opRef=${runtime.opRef} ${parts.join(" ")}`);
+						}
+					}
+				} catch (error) {
+					console.error(`work_transport_cause_read_error opRef=${runtime.opRef} reason=${failureReason(error)}`);
+				}
+			}
+			const endState = workAttemptEndState(reason);
 			let job = closeAttempt({
 				record: this.#job(name, true)!,
 				opRef: runtime.opRef,
@@ -849,7 +1006,7 @@ export class WorkLaneManager {
 				});
 			}
 
-			const text = reportText(name, endState, reason, runtime.opRef, runtime.output);
+			const text = reportText(name, endState, reason, runtime.opRef, output);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -897,11 +1054,11 @@ export class WorkLaneManager {
 				runtime.opRef,
 				runtime.version,
 				job,
-				{ decision, settledAt: at },
+				{ decision, settledAt: at, ...(output !== runtime.output ? { output } : {}) },
 				admission,
 			);
 			if (!settled) return undefined;
-			for (const waiter of [...(this.#waiters.get(runtime.opRef) ?? [])]) waiter.finish();
+			this.#finishWaiters(runtime.opRef);
 			return settled;
 		});
 
@@ -960,6 +1117,9 @@ export class WorkLaneManager {
 			await observer.tail?.close();
 			observer.tail = undefined;
 		}
+	}
+	#finishWaiters(opRef: string): void {
+		for (const waiter of [...(this.#waiters.get(opRef) ?? [])]) waiter.finish();
 	}
 	async #drainLaneReports(parentName: string): Promise<void> {
 		if (this.#stopped) return;
@@ -1239,10 +1399,17 @@ export class WorkLaneManager {
 		}
 		let after = "";
 		while (!this.#stopped) {
-			const rows = this.#db.workAttemptOpen(100, after);
-			if (!rows.length) break;
+			let invalidAfter = after;
+			const rows = this.#db.workAttemptOpen(100, after, (error) => {
+				if (error.opRef && error.opRef > invalidAfter) invalidAfter = error.opRef;
+				console.error(
+					`work_recovery_invalid_attempt opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`,
+				);
+			});
+			const lastValid = rows.at(-1)?.opRef ?? after;
+			const nextAfter = invalidAfter > lastValid ? invalidAfter : lastValid;
+			if (!rows.length && nextAfter === after) break;
 			for (const runtime of rows) {
-				after = runtime.opRef;
 				const prior = this.#observers.get(runtime.opRef);
 				if (prior && this.#writeCurrent(prior)) continue;
 				if (prior) {
@@ -1307,6 +1474,7 @@ export class WorkLaneManager {
 					this.#schedule(observer, 0);
 				}
 			}
+			after = nextAfter;
 		}
 		if (this.#stopped) return;
 		const parents = new Set([
@@ -1693,12 +1861,24 @@ export function reportText(
 	const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
 	const head = `[lane ${name}] ${label}: ${lead}`;
-	const body =
+	let body =
 		output.disposition === "unavailable"
 			? reason === "terminal_missing_receipt"
 				? `final_response_missing opRef=${opRef}`
 				: "output_unavailable"
 			: (output.excerpt ?? "");
+	// Include transport cause details if present
+	if (reason === "terminal_missing_receipt" && output.transportCause) {
+		const transport = output.transportCause;
+		const parts: string[] = [body, `cause=transport`];
+		if (transport.nativeErrorCode) parts.push(transport.nativeErrorCode);
+		if (transport.http2RstCode !== undefined) parts.push(`http2RstCode=${transport.http2RstCode}`);
+		if (transport.status !== undefined) parts.push(`status=${transport.status}`);
+		if (transport.requestBytes !== undefined) parts.push(`requestBytes=${transport.requestBytes}`);
+		if (transport.retryMaxAttempts !== undefined) parts.push(`retryMaxAttempts=${transport.retryMaxAttempts}`);
+		if (transport.endpointClass !== undefined) parts.push(`endpointClass=${transport.endpointClass}`);
+		body = parts.join(" ");
+	}
 	const content = utf8Prefix(body, 2048 - Buffer.byteLength(head, "utf8"));
 	const text = head + content;
 	if (Buffer.byteLength(text, "utf8") > 2048) throw new Error("lane report exceeded its UTF-8 byte budget");
