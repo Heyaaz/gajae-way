@@ -67,6 +67,22 @@ function brokerAuthorityKey(authority: BrokerAuthority): string {
 	return JSON.stringify([authority.canonicalAgentDir, authority.identity]);
 }
 
+/** Durable cron catch-up diagnostics for one monitor (issue #157), stored in `meta`. */
+export interface MonitorCronState {
+	/** Newest slot refused under policy; the cursor never re-considers it. */
+	readonly cursor: string;
+	/** Slots refused under policy over the monitor's lifetime. */
+	readonly skippedTotal: number;
+	readonly lastSkip: {
+		readonly count: number;
+		readonly oldest: string;
+		readonly newest: string;
+		readonly recordedAt: string;
+	};
+}
+
+const monitorCronMetaKey = (monitorId: string) => `monitor_cron:${monitorId}`;
+
 const BROKER_SNAPSHOT_TABLES = [
 	"sessions",
 	"deliveries",
@@ -3477,7 +3493,9 @@ export class GatewayDatabase {
 		);
 	}
 	monitorDelete(id: string): boolean {
-		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
+		const deleted = this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
+		this.metaDelete(monitorCronMetaKey(id));
+		return deleted;
 	}
 	/**
 	 * Admits one monitor event. Under the `skip` overlap policy the predecessor
@@ -4162,15 +4180,39 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.get(monitorId, slotAt);
 		return (row?.n ?? 0) > 0;
 	}
-	/** The monitor's persisted schedule boundary: its newest claimed slot. */
-	monitorLastSlotAt(monitorId: string): string | undefined {
-		return (
-			this.#database
-				.query<{ slot_at: string | null }, [string]>(
-					"SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?",
-				)
-				.get(monitorId)?.slot_at ?? undefined
-		);
+	/** Durable boundary from the newest claimed slot or newest policy skip. */
+	monitorCronCursor(monitorId: string): string | undefined {
+		const claimed = this.#database
+			.query<{ slot_at: string | null }, [string]>(
+				"SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?",
+			)
+			.get(monitorId)?.slot_at;
+		const skipped = this.monitorCronState(monitorId)?.cursor;
+		if (!claimed) return skipped;
+		if (!skipped) return claimed;
+		return Date.parse(skipped) > Date.parse(claimed) ? skipped : claimed;
+	}
+	/** Catch-up diagnostics; absent until this monitor has skipped at least one slot. */
+	monitorCronState(monitorId: string): MonitorCronState | undefined {
+		const raw = this.metaGet(monitorCronMetaKey(monitorId));
+		return raw === undefined ? undefined : (JSON.parse(raw) as MonitorCronState);
+	}
+	/** Records policy refusals durably and advances the cursor so they are counted once. */
+	monitorCronRecordSkip(
+		monitorId: string,
+		skip: { count: number; oldest: string; newest: string },
+		recordedAt: string,
+	): MonitorCronState {
+		return this.withTransaction(() => {
+			const previous = this.monitorCronState(monitorId);
+			const state: MonitorCronState = {
+				cursor: skip.newest,
+				skippedTotal: (previous?.skippedTotal ?? 0) + skip.count,
+				lastSkip: { ...skip, recordedAt },
+			};
+			this.metaSet(monitorCronMetaKey(monitorId), JSON.stringify(state));
+			return state;
+		});
 	}
 	/** Drops slot ledger entries older than the retention window (bounded table). */
 	monitorSlotPrune(olderThanMs: number, now = Date.now()): number {

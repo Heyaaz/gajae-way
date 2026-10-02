@@ -58,7 +58,7 @@ The scheduler evaluates absolute UTC minute slots against local wall-clock field
 { "kind": "script", "command": ["/absolute/path/to/check"], "intervalMs": 60000 }
 ```
 
-Cron slots are claimed durably, once per scheduled minute. On startup the gateway resumes from each cron monitor's newest claimed slot (or its creation instant). Slots missed while the gateway was down coalesce into one event for the newest missed slot. Only slots from the last 24 hours count. The event's payload carries `catchUp: { cause: "startup", missedFrom, missedTo, missedSlots }`. Older slots are never replayed, and a restart that owes no slot creates nothing.
+Cron slots use the trigger's configured IANA timezone and are claimed exactly once in `monitor_slots` together with their event; `firedAt` is the exact scheduled slot time. On startup and after a suspended tick, the gateway replays every due slot since that monitor's durable cursor (newest claimed or policy-skipped slot, never earlier than creation), not just the last hour and not as one coalesced event. `monitorCatchUp` limits replay to the newest `maxSlots` within `maxAgeMs`; older or over-limit slots are durably counted and logged as `monitor_slots_skipped`, and `gajaeway monitors inspect <id>` reports them under `catchUp`. See [deployment](deployment.md) for bounds and defaults.
 
 For webhook monitors, the registry replaces the supplied route with a generated route token. The runtime receives it at `/hook/<token>`. Watcher roots must fall under configured `watcherRoots`; script commands must be inside configured `scriptRoot` and are checked by ActionGuard.
 

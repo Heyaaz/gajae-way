@@ -525,6 +525,16 @@ export interface MonitorTestParams {
 	readonly payload?: unknown;
 }
 
+/** Cron slots refused by catch-up policy after downtime; never silently dropped (issue #157). */
+export interface MonitorCatchUpDiagnostic {
+	readonly skippedTotal: number;
+	readonly lastSkip: {
+		readonly count: number;
+		readonly oldest: string;
+		readonly newest: string;
+		readonly recordedAt: string;
+	};
+}
 export interface MonitorEventRecord {
 	readonly eventId: string;
 	readonly monitorId: string;
@@ -927,6 +937,8 @@ export interface VerbCatalogV01 {
 			readonly monitor: MonitorRecord;
 			readonly schedule: MonitorScheduleProjection;
 			readonly recentEvents: readonly MonitorEventRecord[];
+			/** Present once a cron catch-up sweep has refused slots under its age/count policy. */
+			readonly catchUp?: MonitorCatchUpDiagnostic;
 		};
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
