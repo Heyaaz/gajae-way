@@ -32,6 +32,7 @@ export {
 	type MemorySearchResult,
 	type MonitorChannelTarget,
 	type MonitorEventRecord,
+	type MonitorProcedureVersion,
 	type MonitorRecord,
 	type MonitorScheduleProjection,
 	type MonitorSpec,
