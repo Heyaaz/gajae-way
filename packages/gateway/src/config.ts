@@ -98,8 +98,23 @@ export interface GatewayConfigFile {
 	readonly work?: WorkLaneConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
+	/** Mid-work speech limits (issue #71); unset means every non-narration mid-work message ships. */
+	readonly interimSpeech?: InterimSpeechConfig;
 	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
+}
+
+export interface InterimSpeechConfig {
+	/**
+	 * Hard cap on delivered mid-work messages within one turn; unset means no cap
+	 * beyond the turn's part budget. 0 delivers no mid-work messages at all.
+	 */
+	readonly maxPerTurn?: number;
+	/**
+	 * Minimum spacing between delivered mid-work messages in milliseconds.
+	 * The first message is never delayed.
+	 */
+	readonly minGapMs?: number;
 }
 
 export interface BotAudienceConfig {
@@ -333,6 +348,27 @@ function parseBotAudience(value: unknown): BotAudienceConfig | undefined {
 	};
 }
 
+function parseNonNegativeInteger(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 0)
+		throw new ConfigError("config_invalid", `${field} must be a non-negative integer`);
+	return value as number;
+}
+
+function parseInterimSpeech(value: unknown): InterimSpeechConfig | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "interimSpeech");
+	for (const key of Object.keys(input))
+		if (key !== "maxPerTurn" && key !== "minGapMs")
+			throw new ConfigError("config_invalid", "interimSpeech contains an unknown field");
+	const maxPerTurn = parseNonNegativeInteger(input.maxPerTurn, "interimSpeech.maxPerTurn");
+	const minGapMs = parseNonNegativeInteger(input.minGapMs, "interimSpeech.minGapMs");
+	return {
+		...(maxPerTurn === undefined ? {} : { maxPerTurn }),
+		...(minGapMs === undefined ? {} : { minGapMs }),
+	};
+}
+
 function parseStallTimeout(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) < 1_000 || (value as number) > 3_600_000)
 		throw new ConfigError("config_invalid", "stallTimeoutMs must be an integer between 1000 and 3600000");
@@ -499,6 +535,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 						input.monitorContextFailureRollThreshold,
 					),
 				}),
+		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
 	};
 }
 
@@ -622,6 +659,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
 	"work",
+	"interimSpeech",
 ] as const;
 
 /**
