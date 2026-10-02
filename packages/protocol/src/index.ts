@@ -30,6 +30,7 @@ export {
 	type MemoryAuditResult,
 	type MemorySearchParams,
 	type MemorySearchResult,
+	type MonitorCatchUpDiagnostic,
 	type MonitorChannelTarget,
 	type MonitorEventRecord,
 	type MonitorEventRecovery,

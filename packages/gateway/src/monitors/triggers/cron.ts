@@ -45,6 +45,19 @@ export function cronMatches(schedule: string, date: Date, timezone?: string): bo
 		return field !== undefined && value !== undefined && cronFieldMatches(field, value, 0);
 	});
 }
+/** Compiles a five-field cron schedule into a reusable, timezone-aware matcher. */
+export function compileCron(schedule: string, timezone?: string): (date: Date) => boolean {
+	const fields = schedule.trim().split(/\s+/);
+	if (fields.length !== 5) throw new Error("cron schedule must have five fields");
+	const values = CRON_FIELD_RANGES.map(([min, max], index) => {
+		const field = fields[index];
+		if (field === undefined) throw new Error("cron schedule must have five fields");
+		const matches = new Set<number>();
+		for (let value = min; value <= max; value++) if (cronFieldMatches(field, value, 0)) matches.add(value);
+		return matches;
+	});
+	return (date) => dateFields(date, timezone).every((value, index) => values[index]?.has(value) ?? false);
+}
 export function cronFieldMatches(field: string, value: number, min: number): boolean {
 	return field.split(",").some((part) => {
 		const [base, stepText] = part.split("/");
@@ -52,14 +65,18 @@ export function cronFieldMatches(field: string, value: number, min: number): boo
 		if (!Number.isInteger(step) || step < 1) return false;
 		if (base === "*") return (value - min) % step === 0;
 		const range = base.split("-").map(Number);
-		if (range.length === 1) return value === range[0] && step === 1;
+		if (range.length === 1) return range[0] !== undefined && value === range[0] && step === 1;
+		const start = range[0];
+		const end = range[1];
 		return (
 			range.length === 2 &&
-			Number.isInteger(range[0]) &&
-			Number.isInteger(range[1]) &&
-			value >= range[0]! &&
-			value <= range[1]! &&
-			(value - range[0]!) % step === 0
+			start !== undefined &&
+			end !== undefined &&
+			Number.isInteger(start) &&
+			Number.isInteger(end) &&
+			value >= start &&
+			value <= end &&
+			(value - start) % step === 0
 		);
 	});
 }
@@ -162,111 +179,98 @@ export function cronSlotsBetween(
 	return fired;
 }
 
-/** Every schedule slot in the half-open window (from, now], oldest first. */
-export function cronSlotList(schedule: string, from: Date, now: Date, timezone?: string): Date[] {
-	const slots: Date[] = [];
-	cronSlotsBetween(
-		schedule,
-		from,
-		now,
-		Number.POSITIVE_INFINITY,
-		(slot) => {
-			slots.push(slot);
-			return true;
-		},
-		timezone,
-	);
-	return slots;
+/** Catch-up policy for slots accumulated since a monitor's durable cursor. */
+export interface CronCatchUpPolicy {
+	readonly maxSlots: number;
+	readonly maxAgeMs: number;
 }
 
-/** Safety valve: a single in-process suspension sweep never authorizes more than this many slots. */
-export const DEFAULT_MAX_CATCH_UP_SLOTS = 8;
+export const DEFAULT_CRON_CATCH_UP: CronCatchUpPolicy = { maxSlots: 24, maxAgeMs: 24 * 60 * 60 * 1000 };
 
-/** How far back a running process re-scans for slots skipped by a suspended tick. */
-export const CATCH_UP_WINDOW_MS = 60 * 60 * 1000;
+/** Due slots refused under the catch-up policy; oldest/newest bound the gap. */
+export interface CronSkip {
+	readonly count: number;
+	readonly oldest: Date;
+	readonly newest: Date;
+}
 
-/** Oldest missed slot a fresh process may still owe after downtime. */
-export const DEFAULT_MAX_CATCH_UP_AGE_MS = 24 * 60 * 60 * 1000;
-
-/** Marks the single coalesced event a fresh process fires for slots missed while it was down. */
-export type CronCatchUp = {
-	readonly cause: "startup";
-	/** Oldest missed slot inside the age bound. */
-	readonly missedFrom: string;
-	/** Newest missed slot — the one fired. */
-	readonly missedTo: string;
-	readonly missedSlots: number;
-};
+export interface CronCatchUpPlan {
+	/** Slots to admit, oldest first. */
+	readonly admit: Date[];
+	readonly skipped?: CronSkip;
+}
 
 /**
- * Cron trigger with an absolute-minute cursor (red-team blocker 5).
- *
- * - `minute` is an absolute minute EPOCH, never minute-of-hour: a suspended
- *   process whose next tick lands +60m later on the same wall-minute does not
- *   return early — the epoch advanced, so the due-window scan still runs.
- * - `fire(slotAt)` receives the EXACT scheduled slot timestamp (red-team
- *   blocker 3); the caller persists it as the event's scheduled identity.
- * - Dedupe/budget durability lives with the caller (the propagator claims the
- *   slot and admits the event in one transaction); this module only computes
- *   WHEN slots are due.
- * - Startup (issue #162): `since` is the persisted schedule boundary (the
- *   monitor's last claimed slot, else its creation instant). Every slot missed
- *   between it and now — bounded by `maxCatchUpAgeMs` — coalesces into ONE
- *   fire of the newest missed slot, marked with a `CronCatchUp` record. A slot
- *   due in the current minute fires normally. Replaying every historical
- *   slot would storm the authoring path after a long outage.
- * - While running, each tick scans from the last evaluated instant (bounded by
- *   `CATCH_UP_WINDOW_MS` and the slot budget), so a suspended tick still fires
- *   the slots it skipped without re-scanning slots already evaluated.
+ * Splits every scheduled minute in (after, now] by the policy. Slots older than
+ * the age floor and the oldest overflow beyond maxSlots are reported as skipped.
+ */
+export function planCronCatchUp(
+	matches: (date: Date) => boolean,
+	after: Date,
+	now: Date,
+	policy: CronCatchUpPolicy,
+): CronCatchUpPlan {
+	const ageFloor = now.getTime() - policy.maxAgeMs;
+	const admit: Date[] = [];
+	let skippedCount = 0;
+	let oldestSkipped: Date | undefined;
+	let newestSkipped: Date | undefined;
+	const skip = (slot: Date) => {
+		skippedCount++;
+		oldestSkipped ??= slot;
+		newestSkipped = slot;
+	};
+	const cursor = new Date((minuteEpoch(after) + 1) * 60_000);
+	while (cursor.getTime() <= now.getTime()) {
+		if (matches(cursor)) {
+			const slot = new Date(cursor.getTime());
+			if (slot.getTime() < ageFloor) skip(slot);
+			else {
+				admit.push(slot);
+				if (admit.length > policy.maxSlots) {
+					const overflow = admit.shift();
+					if (overflow) skip(overflow);
+				}
+			}
+		}
+		cursor.setTime(cursor.getTime() + 60_000);
+	}
+	return oldestSkipped && newestSkipped
+		? { admit, skipped: { count: skippedCount, oldest: oldestSkipped, newest: newestSkipped } }
+		: { admit };
+}
+
+/** Durable operations supplied by one monitor's runtime. */
+export interface CronSink {
+	cursor(): Date;
+	fire(slotAt: Date): boolean;
+	skipped(skip: CronSkip): void;
+}
+
+/**
+ * Cron trigger driven by a durable per-monitor cursor. Every sweep replays all
+ * slots since that cursor, bounded by policy rather than a fixed lookback.
  */
 export function startCron(
 	schedule: string,
-	fire: (slotAt: Date, catchUp?: CronCatchUp) => boolean,
-	options: {
-		since: Date;
-		now?: () => Date;
-		maxCatchUpSlots?: number;
-		maxCatchUpAgeMs?: number;
-		intervalMs?: number;
-		timezone?: string;
-	},
+	sink: CronSink,
+	options: { now?: () => Date; policy?: CronCatchUpPolicy; intervalMs?: number; timezone?: string } = {},
 ): () => void {
 	const now = options.now ?? (() => new Date());
-	const budget = options.maxCatchUpSlots ?? DEFAULT_MAX_CATCH_UP_SLOTS;
-	const maxAge = options.maxCatchUpAgeMs ?? DEFAULT_MAX_CATCH_UP_AGE_MS;
+	const policy = options.policy ?? DEFAULT_CRON_CATCH_UP;
+	const matches = compileCron(schedule, options.timezone);
 	let minute = -1;
-	let started = 0;
+	let swept = Number.NEGATIVE_INFINITY;
 	const tick = () => {
 		const date = now();
 		const epoch = minuteEpoch(date);
 		if (epoch === minute) return;
-		if (minute === -1) {
-			const from = Math.max(options.since.getTime(), date.getTime() - maxAge);
-			const due = cronSlotList(schedule, new Date(from), date, options.timezone);
-			const last = due.at(-1);
-			const current = last && minuteEpoch(last) === epoch ? due.pop() : undefined;
-			const oldest = due[0];
-			const newest = due.at(-1);
-			if (oldest && newest)
-				fire(newest, {
-					cause: "startup",
-					missedFrom: oldest.toISOString(),
-					missedTo: newest.toISOString(),
-					missedSlots: due.length,
-				});
-			if (current) fire(current);
-			started = date.getTime();
-		} else {
-			// A suspension can skip due slots even when the current minute also
-			// matches (e.g. */30, prior tick 06:00, resume 07:30 — 06:30 and 07:00
-			// fire alongside 07:30); caller-side slot claims make re-scanned slots
-			// no-ops. The scan never reaches behind startup, whose missed slots were
-			// already coalesced. The extra minute keeps the boundary slot (now-60m
-			// exactly) inside the half-open scan.
-			const from = Math.max(started, date.getTime() - CATCH_UP_WINDOW_MS - 60_000);
-			cronSlotsBetween(schedule, new Date(from), date, budget, fire, options.timezone);
-		}
 		minute = epoch;
+		const after = new Date(Math.max(sink.cursor().getTime(), swept));
+		const plan = planCronCatchUp(matches, after, date, policy);
+		if (plan.skipped) sink.skipped(plan.skipped);
+		for (const slot of plan.admit) sink.fire(slot);
+		swept = date.getTime();
 	};
 	tick();
 	const timer = setInterval(tick, options.intervalMs ?? 30_000);

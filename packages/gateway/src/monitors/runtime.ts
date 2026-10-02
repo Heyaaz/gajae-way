@@ -1,8 +1,9 @@
 import { readFile } from "node:fs/promises";
 import type { GatewayConfig } from "../config";
+import type { GatewayDatabase } from "../store/db";
 import type { MonitorPropagator } from "./propagate";
 import type { MonitorRegistry } from "./registry";
-import { startCron } from "./triggers/cron";
+import { type CronCatchUpPolicy, startCron } from "./triggers/cron";
 import { startScript } from "./triggers/script";
 import { startWatcher } from "./triggers/watcher";
 import { startWebhook, type WebhookMonitor } from "./triggers/webhook";
@@ -17,18 +18,23 @@ export class MonitorRuntime {
 	readonly #config: GatewayConfig;
 	readonly #registry: MonitorRegistry;
 	readonly #propagator: MonitorPropagator;
+	readonly #database: GatewayDatabase;
 	#stops: Stop[] = [];
 	readonly #clock?: () => Date;
+	readonly #catchUp?: CronCatchUpPolicy;
 	constructor(
 		config: GatewayConfig,
 		registry: MonitorRegistry,
 		propagator: MonitorPropagator,
-		options: { now?: () => Date } = {},
+		database: GatewayDatabase,
+		options: { now?: () => Date; catchUp?: CronCatchUpPolicy } = {},
 	) {
 		this.#config = config;
 		this.#registry = registry;
 		this.#propagator = propagator;
+		this.#database = database;
 		this.#clock = options.now;
+		this.#catchUp = options.catchUp;
 	}
 	async start(): Promise<void> {
 		await this.stop();
@@ -36,23 +42,39 @@ export class MonitorRuntime {
 		const webhooks = monitors.filter((monitor) => monitor.trigger.kind === "webhook");
 		if (webhooks.length) await this.#startWebhook(webhooks);
 		for (const monitor of monitors) {
+			const eventType = monitor.eventTypes[0];
+			if (eventType === undefined) throw new MonitorRuntimeError("monitor must declare at least one event type");
 			if (monitor.trigger.kind === "cron")
 				this.#stops.push(
 					startCron(
 						monitor.trigger.schedule,
-						// Atomic slot-claim + event admission inside the propagator.
-						// Returns whether the slot was NEWLY admitted (false for
-						// restart-overlap duplicates) so the catch-up budget counts
-						// only real admissions. A startup catch-up event carries its
-						// missed window in the payload.
-						(slotAt, catchUp) =>
-							this.#propagator.submitSlot(
-								monitor.monitorId,
-								monitor.eventTypes[0]!,
-								{ at: slotAt.toISOString(), ...(catchUp ? { catchUp } : {}) },
-								slotAt,
-							) !== null,
-						{ now: this.#clock, since: this.#propagator.slotBoundary(monitor), timezone: monitor.trigger.timezone },
+						{
+							// The cursor cannot precede monitor creation, even if skip state or
+							// an old slot-ledger row somehow does.
+							cursor: () => {
+								const created = Date.parse(monitor.createdAt);
+								const stored = this.#database.monitorCronCursor(monitor.monitorId);
+								return new Date(stored === undefined ? created : Math.max(created, Date.parse(stored)));
+							},
+							// submitSlot returns an id for both admitted and overlap-skipped
+							// outcomes; only an already-claimed slot returns null.
+							fire: (slotAt) =>
+								this.#propagator.submitSlot(monitor.monitorId, eventType, { at: slotAt.toISOString() }, slotAt) !==
+								null,
+							skipped: (skip) => {
+								const oldest = skip.oldest.toISOString();
+								const newest = skip.newest.toISOString();
+								this.#database.monitorCronRecordSkip(
+									monitor.monitorId,
+									{ count: skip.count, oldest, newest },
+									(this.#clock?.() ?? new Date()).toISOString(),
+								);
+								console.error(
+									`monitor_slots_skipped monitor=${monitor.monitorId} count=${skip.count} oldest=${oldest} newest=${newest}`,
+								);
+							},
+						},
+						{ now: this.#clock, policy: this.#catchUp, timezone: monitor.trigger.timezone },
 					),
 				);
 			if (monitor.trigger.kind === "watcher") {
@@ -61,7 +83,7 @@ export class MonitorRuntime {
 					await startWatcher(
 						monitor.trigger.root,
 						this.#config.watcherRoots,
-						(path) => this.#propagator.submit(monitor.monitorId, monitor.eventTypes[0]!, { path }),
+						(path) => this.#propagator.submit(monitor.monitorId, eventType, { path }),
 						monitor.trigger.debounceMs,
 					),
 				);
@@ -70,7 +92,7 @@ export class MonitorRuntime {
 				if (!this.#config.scriptRoot) throw new MonitorRuntimeError("scriptRoot must be configured");
 				this.#stops.push(
 					await startScript(monitor.trigger.command, monitor.trigger.intervalMs, this.#config.scriptRoot, (stdout) =>
-						this.#propagator.submit(monitor.monitorId, monitor.eventTypes[0]!, { stdout }),
+						this.#propagator.submit(monitor.monitorId, eventType, { stdout }),
 					),
 				);
 			}
@@ -90,6 +112,8 @@ export class MonitorRuntime {
 		const records: WebhookMonitor[] = [];
 		for (const monitor of monitors) {
 			const trigger = monitor.trigger as WebhookTrigger;
+			const eventType = monitor.eventTypes[0];
+			if (eventType === undefined) throw new MonitorRuntimeError("monitor must declare at least one event type");
 			if (nonLoopback && (!config.exposeNonLoopback || !trigger.auth))
 				throw new MonitorRuntimeError(
 					"non-loopback webhook binding requires exposeNonLoopback and auth on every webhook monitor",
@@ -98,7 +122,7 @@ export class MonitorRuntime {
 			records.push({
 				monitorId: monitor.monitorId,
 				route: trigger.route,
-				eventType: monitor.eventTypes[0]!,
+				eventType,
 				...(trigger.auth && secret ? { auth: { kind: trigger.auth.kind, secret } } : {}),
 			});
 		}

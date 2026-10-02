@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
+import { MonitorRegistry } from "../src/monitors/registry";
 import { type DatabaseStartupError, GatewayDatabase } from "../src/store/db";
 
 test("migrates the sessions foundation", async () => {
@@ -26,6 +27,51 @@ test("migrates the sessions foundation", async () => {
 		});
 		database.withTransaction(() => database.putSession("loopback/loopback/loopback", "session-1"));
 		expect(database.getSession("loopback/loopback/loopback")).toBe("session-1");
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("durable monitor cron cursor combines slot claims and skips, then clears on removal", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-cron-cursor-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "cron-cursor",
+			trigger: { kind: "cron", schedule: "0 * * * *" },
+			eventTypes: ["cron.cursor"],
+			enabled: true,
+		});
+		const claimedAt = new Date(Date.now() + 60_000).toISOString();
+		expect(database.monitorCronCursor(monitor.monitorId)).toBeUndefined();
+		expect(
+			database.monitorSlotClaimWithEvent({
+				monitorId: monitor.monitorId,
+				slotAt: claimedAt,
+				eventId: crypto.randomUUID(),
+				eventType: "cron.cursor",
+				payloadJson: "{}",
+			}).admitted,
+		).toBe(true);
+		expect(database.monitorCronCursor(monitor.monitorId)).toBe(claimedAt);
+
+		const skipped = {
+			count: 2,
+			oldest: new Date(Date.parse(claimedAt) + 60_000).toISOString(),
+			newest: new Date(Date.parse(claimedAt) + 120_000).toISOString(),
+		};
+		const recordedAt = new Date(Date.parse(claimedAt) + 180_000).toISOString();
+		expect(database.monitorCronRecordSkip(monitor.monitorId, skipped, recordedAt)).toEqual({
+			cursor: skipped.newest,
+			skippedTotal: 2,
+			lastSkip: { ...skipped, recordedAt },
+		});
+		expect(database.monitorCronCursor(monitor.monitorId)).toBe(skipped.newest);
+		expect(registry.remove(monitor.monitorId)).toBe(true);
+		expect(database.monitorCronState(monitor.monitorId)).toBeUndefined();
+		expect(database.metaGet(`monitor_cron:${monitor.monitorId}`)).toBeUndefined();
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

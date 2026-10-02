@@ -57,7 +57,7 @@ import { validateMemory } from "../memory/validator";
 import { MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
-import { nextCronFire } from "../monitors/triggers/cron";
+import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
@@ -616,7 +616,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 		},
 	});
-	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
+	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors, options.database, {
+		catchUp: { ...DEFAULT_CRON_CATCH_UP, ...options.config.monitorCatchUp },
+	});
 	const lanes = new LaneGovernor({
 		database: options.database,
 		sessionPort,
@@ -1272,11 +1274,17 @@ async function handleRequest(
 							: {}),
 					};
 				});
+			const catchUp = options.database.monitorCronState(monitorId);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { monitor, schedule: scheduleProjection(monitor, new Date()), recentEvents },
+				result: {
+					monitor,
+					schedule: scheduleProjection(monitor, new Date()),
+					recentEvents,
+					...(catchUp ? { catchUp: { skippedTotal: catchUp.skippedTotal, lastSkip: catchUp.lastSkip } } : {}),
+				},
 			});
 			return;
 		}

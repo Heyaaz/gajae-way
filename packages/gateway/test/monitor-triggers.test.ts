@@ -18,11 +18,15 @@ test("cron supports steps, lists, ranges, dow and injected clock", () => {
 	let fired = 0;
 	const stop = startCron(
 		"15 10 * * 1",
-		() => {
-			fired++;
-			return true;
+		{
+			cursor: () => new Date(2026, 0, 5, 10, 0),
+			fire: () => {
+				fired++;
+				return true;
+			},
+			skipped: () => {},
 		},
-		{ now: () => monday, since: new Date(2026, 0, 5, 10, 0) },
+		{ now: () => monday },
 	);
 	stop();
 	expect(fired).toBe(1);
@@ -88,11 +92,15 @@ test("Seoul cron start claims the exact UTC slot for its configured wall-clock t
 	const admitted: string[] = [];
 	const stop = startCron(
 		"0 21 * * *",
-		(scheduled) => {
-			admitted.push(scheduled.toISOString());
-			return true;
+		{
+			cursor: () => new Date(slot.getTime() - 60_000),
+			fire: (scheduled) => {
+				admitted.push(scheduled.toISOString());
+				return true;
+			},
+			skipped: () => {},
 		},
-		{ now: () => slot, since: new Date(slot.getTime() - 60_000), timezone: "Asia/Seoul" },
+		{ now: () => slot, timezone: "Asia/Seoul" },
 	);
 	stop();
 	expect(admitted).toEqual([slot.toISOString()]);
