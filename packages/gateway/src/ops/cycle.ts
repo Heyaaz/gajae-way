@@ -56,6 +56,12 @@ export const MONITOR_AUTHORING_LOSS_WINDOW_MS = 24 * 60 * 60_000;
 export const MONITOR_AUTHORING_LOSS_TYPES = 2;
 export const MONITOR_AUTHORING_LOSS_CONSECUTIVE = 2;
 /**
+ * Consecutive most-recent monitor events settled `failed_no_retry` that mark
+ * monitor dispatch as failing. Issue #189: 26 terminal slots in a row over 19h
+ * while every liveness signal stayed green; three in a row is already an outage.
+ */
+export const MONITOR_TERMINAL_STREAK_THRESHOLD = 3;
+/**
  * Agent-directory headroom floor (issue #15). GJC keeps sessions, blobs and
  * recovery snapshots under its agent directory with no retention or reaper
  * (measured 8.9 GB of `.gjc-recovery`, later 70+ GB total), and the gateway may
@@ -130,6 +136,10 @@ export interface RuntimeCycleSources {
 	readonly agentDisk: AgentDiskView | null;
 	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
 	readonly gjcVersion: string | undefined;
+	/** Newest settled monitor events that ended `failed_no_retry` before any success. */
+	readonly monitorTerminalStreak: number;
+	/** True while the shared broker's incarnation keeps changing (die/respawn churn). */
+	readonly brokerRespawnChurn: boolean;
 }
 
 export class RuntimeCycleProjector {
@@ -138,6 +148,7 @@ export class RuntimeCycleProjector {
 	readonly #maxLanes: number;
 	readonly #agentDir: string | undefined;
 	readonly #gjcVersion: () => string | undefined;
+	readonly #brokerRespawnChurn: () => boolean;
 
 	constructor(
 		database: GatewayDatabase,
@@ -146,6 +157,7 @@ export class RuntimeCycleProjector {
 			readonly maxLanes?: number;
 			readonly agentDir?: string;
 			readonly gjcVersion?: () => string | undefined;
+			readonly brokerRespawnChurn?: () => boolean;
 		} = {},
 	) {
 		this.#database = database;
@@ -153,6 +165,7 @@ export class RuntimeCycleProjector {
 		this.#maxLanes = options.maxLanes ?? DEFAULT_WORK_MAX_LANES;
 		this.#agentDir = options.agentDir;
 		this.#gjcVersion = options.gjcVersion ?? (() => undefined);
+		this.#brokerRespawnChurn = options.brokerRespawnChurn ?? (() => false);
 	}
 
 	/** Snapshots durable state and projects the runtime cycle. Read-only; no writes. */
@@ -215,6 +228,8 @@ export class RuntimeCycleProjector {
 			),
 			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
 			gjcVersion: this.#gjcVersion(),
+			monitorTerminalStreak: this.#database.monitorConsecutiveTerminalFailures(),
+			brokerRespawnChurn: this.#brokerRespawnChurn(),
 		};
 	}
 }
@@ -301,6 +316,10 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// against; a newer minor may have renamed the codes recovery depends on.
 	if (sources.gjcVersion !== undefined && !isVerifiedGjcVersion(sources.gjcVersion))
 		gates.add("gjc_unverified_version");
+	// Issue #189: pid/lock liveness stayed green through a 19h monitor outage.
+	// Dispatch outcome and incarnation churn are the health signals that moved.
+	if (sources.monitorTerminalStreak >= MONITOR_TERMINAL_STREAK_THRESHOLD) gates.add("monitor_dispatch_failing");
+	if (sources.brokerRespawnChurn) gates.add("broker_respawn_churn");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);

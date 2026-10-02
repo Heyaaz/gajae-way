@@ -729,6 +729,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			maxLanes: lanes.maxLanes,
 			agentDir: options.broker?.agentDir,
 			gjcVersion: () => options.broker?.gjcVersion,
+			brokerRespawnChurn: () =>
+				typeof options.broker?.respawnChurn === "function" ? options.broker.respawnChurn() : false,
 		}),
 		lanes,
 		work,
