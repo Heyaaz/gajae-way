@@ -575,7 +575,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 27;
+const LATEST_SCHEMA_VERSION = 28;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -674,6 +674,9 @@ export class DatabaseStartupError extends Error {
  * - failed: the last dispatch attempt failed; reconcile redispatches.
  * - failed_no_retry: dispatch failed and reconcile will not retry it again
  *   (reclaim budget exhausted); operator-visible terminal state.
+ * - skipped: terminal — the monitor's overlap policy is `skip` and an earlier
+ *   event of the same monitor was still awaiting authoring when this one
+ *   fired (`skipped_by` names it). A scheduling outcome, never a failure.
  */
 export const MONITOR_EVENT_STAGES = [
 	"admitted",
@@ -684,12 +687,25 @@ export const MONITOR_EVENT_STAGES = [
 	"authored_no_delivery",
 	"failed",
 	"failed_no_retry",
+	"skipped",
 ] as const;
 export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
 /** Stages whose rows reconcile() may claim and redispatch. */
 export const RECONCILABLE_STAGES: readonly MonitorEventStage[] = ["admitted", "batched", "dispatched", "failed"];
 /** Terminal stages: no further transition will ever happen without operator action. */
-export const TERMINAL_STAGES: readonly MonitorEventStage[] = ["delivered", "authored_no_delivery", "failed_no_retry"];
+export const TERMINAL_STAGES: readonly MonitorEventStage[] = [
+	"delivered",
+	"authored_no_delivery",
+	"failed_no_retry",
+	"skipped",
+];
+
+/**
+ * Stages in which an event still owes an authoring turn: the overlap policy's
+ * definition of "a previous event of the same monitor is still in flight".
+ * `authored` is excluded: its turn is done and only delivery is pending.
+ */
+const IN_FLIGHT_MONITOR_STAGES = "'admitted','batched','dispatched','failed'";
 
 /**
  * Minimum wait, measured from the last failure (`updated_at`), before reconcile reclaims a
@@ -756,7 +772,7 @@ export class GatewayDatabase {
 			.get()!.n;
 		const openMonitors = this.#database
 			.query<{ n: number }, []>(
-				"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+				"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
 			)
 			.get()!.n;
 		return { authority, populated, openInbound, openWork, openMonitors };
@@ -3353,6 +3369,7 @@ export class GatewayDatabase {
 		triggerJson: string;
 		eventTypesJson: string;
 		burstPolicy: string;
+		overlap?: string;
 		channelTargetJson: string | null;
 		enabled: boolean;
 		instruction: string | null;
@@ -3362,7 +3379,7 @@ export class GatewayDatabase {
 	}): void {
 		this.#database
 			.query(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				row.id,
@@ -3370,6 +3387,7 @@ export class GatewayDatabase {
 				row.triggerJson,
 				row.eventTypesJson,
 				row.burstPolicy,
+				row.overlap ?? "queue",
 				row.channelTargetJson,
 				row.enabled ? 1 : 0,
 				new Date().toISOString(),
@@ -3385,6 +3403,7 @@ export class GatewayDatabase {
 		trigger_json: string;
 		event_types_json: string;
 		burst_policy: string;
+		overlap: string;
 		channel_target_json: string | null;
 		enabled: number;
 		created_at: string;
@@ -3395,7 +3414,7 @@ export class GatewayDatabase {
 	}> {
 		return this.#database
 			.query(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors ORDER BY created_at",
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors ORDER BY created_at",
 			)
 			.all() as Array<{
 			monitor_id: string;
@@ -3403,6 +3422,7 @@ export class GatewayDatabase {
 			trigger_json: string;
 			event_types_json: string;
 			burst_policy: string;
+			overlap: string;
 			channel_target_json: string | null;
 			enabled: number;
 			created_at: string;
@@ -3448,18 +3468,39 @@ export class GatewayDatabase {
 	monitorDelete(id: string): boolean {
 		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
 	}
+	/**
+	 * Admits one monitor event. Under the `skip` overlap policy the predecessor
+	 * check and the insert share one statement, so two concurrent fires can never
+	 * both see "nothing in flight": the event lands as terminal `skipped` naming
+	 * the oldest same-monitor event still awaiting authoring (issue #83).
+	 * Returns the predecessor's id when skipped, undefined when admitted.
+	 */
 	monitorEventCreate(row: {
 		eventId: string;
 		monitorId: string;
 		eventType: string;
 		payloadJson: string;
 		firedAt: string;
-	}): void {
-		this.#database
-			.query(
-				"INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, updated_at) VALUES (?, ?, ?, ?, ?, 'admitted', NULL, ?)",
+		overlap?: "queue" | "skip";
+	}): string | undefined {
+		const predecessor =
+			row.overlap === "skip"
+				? `(SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid LIMIT 1)`
+				: "NULL";
+		const inserted = this.#database
+			.query<{ skipped_by: string | null }, string[]>(
+				`INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
 			)
-			.run(row.eventId, row.monitorId, row.eventType, row.payloadJson, row.firedAt, new Date().toISOString());
+			.get(
+				row.eventId,
+				row.monitorId,
+				row.eventType,
+				row.payloadJson,
+				row.firedAt,
+				new Date().toISOString(),
+				...(row.overlap === "skip" ? [row.monitorId] : []),
+			);
+		return inserted?.skipped_by ?? undefined;
 	}
 	/**
 	 * Durable dispatch lease (red-team blocker 1): a process claims an event
@@ -3891,6 +3932,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		stage: string;
 		batch_id: string | null;
 		dispatch_attempts: number;
+		skipped_by: string | null;
 		updated_at: string;
 		procedure_json: string | null;
 	}> {
@@ -3910,6 +3952,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			stage: string;
 			batch_id: string | null;
 			dispatch_attempts: number;
+			skipped_by: string | null;
 			updated_at: string;
 			procedure_json: string | null;
 		}>;
@@ -3987,6 +4030,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * the slot but died before submitting the event — reconcile admits it. A
 	 * crash can therefore strand neither a claimed-but-unadmitted slot (this
 	 * row shape makes it visible) nor a duplicate event (unique slot key).
+	 * A slot skipped by the overlap policy is still claimed: it fired, and its
+	 * `skipped` event row is the record of what happened to it.
 	 */
 	monitorSlotClaimWithEvent(row: {
 		monitorId: string;
@@ -3994,7 +4039,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		eventId: string;
 		eventType: string;
 		payloadJson: string;
-	}): boolean {
+		overlap?: "queue" | "skip";
+	}): { admitted: false } | { admitted: true; skippedBy: string | undefined } {
 		const now = new Date().toISOString();
 		return this.withTransaction(() => {
 			const claim = this.#database
@@ -4002,16 +4048,17 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 					"INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
 				)
 				.run(row.monitorId, row.slotAt, row.eventId, now).changes;
-			if (claim === 0) return false;
-			this.monitorEventCreate({
+			if (claim === 0) return { admitted: false as const };
+			const skippedBy = this.monitorEventCreate({
 				eventId: row.eventId,
 				monitorId: row.monitorId,
 				eventType: row.eventType,
 				payloadJson: row.payloadJson,
 				firedAt: row.slotAt,
+				...(row.overlap ? { overlap: row.overlap } : {}),
 			});
-			return true;
-		}) as boolean;
+			return { admitted: true as const, skippedBy };
+		});
 	}
 	/** Test/recovery seam: move a monitor's creation instant (clamps catch-up). */
 	monitorSetCreatedAt(monitorId: string, createdAt: string): void {
@@ -4632,6 +4679,34 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(27, new Date().toISOString());
+			});
+		}
+		if (current < 28) {
+			this.withTransaction(() => {
+				// Issue #83: per-monitor overlap policy and the terminal `skipped` stage.
+				// Rebuild monitor_events because its stage CHECK constraint must widen.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitors)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("overlap"))
+					this.#database.exec(
+						"ALTER TABLE monitors ADD COLUMN overlap TEXT NOT NULL DEFAULT 'queue' CHECK(overlap IN ('queue','skip'))",
+					);
+				this.#database.exec(`CREATE TABLE monitor_events_v28 (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry','skipped')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, skipped_by TEXT, updated_at TEXT NOT NULL, procedure_json TEXT);
+INSERT INTO monitor_events_v28 (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at, procedure_json) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at, procedure_json FROM monitor_events ORDER BY rowid;
+DROP TABLE monitor_events;
+ALTER TABLE monitor_events_v28 RENAME TO monitor_events;
+CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);`);
+				for (const action of ["UPDATE", "DELETE"])
+					this.#database.exec(`CREATE TRIGGER monitor_events_quarantine_${action.toLowerCase()} BEFORE ${action} ON monitor_events
+					WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = OLD.event_id)
+					BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(28, new Date().toISOString());
 			});
 		}
 	}
