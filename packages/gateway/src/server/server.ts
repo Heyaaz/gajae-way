@@ -101,6 +101,7 @@ import {
 	renderHandoffTurn,
 	resolveHandoffTarget,
 } from "./handoff";
+import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -233,7 +234,8 @@ export interface GatewayServerOptions {
 	readonly stallCheckIntervalMs?: number;
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
 	readonly deliverySweepIntervalMs?: number;
-	/** Mid-work speech pacing (issue #71). */
+	/** Mid-work speech gating configuration (issue #71). */
+	readonly interimSpeech?: { readonly maxPerTurn?: number; readonly minGapMs?: number };
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -1992,6 +1994,9 @@ async function createInboundTurnLifecycle(
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
+	// Mid-work speech gate (issue #71): suppress procedural narration and rate-limit interim messages.
+	// maxPerTurn: 0 means no interim messages are delivered; maxPerTurn >= 1 is the cap.
+	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	/**
 	 * Raw messages whose reaction tokens have already been claimed this turn. The
 	 * terminal path re-runs over text the tail already shipped as interim (to
@@ -2299,7 +2304,12 @@ async function createInboundTurnLifecycle(
 				outputTokens: lastKnown.outputTokens + Math.ceil(frame.assistantText.length / 4),
 			};
 			try {
-				await deliverAssistantText(frame.assistantText, "interim");
+				const decision = interimSpeech.admit(frame.assistantText, Date.now());
+				if (!decision.deliver) {
+					console.error(`gateway mid-work speech suppressed (${turnId}, ${(decision as any).reason}).`);
+				} else {
+					await deliverAssistantText(frame.assistantText, "interim");
+				}
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
