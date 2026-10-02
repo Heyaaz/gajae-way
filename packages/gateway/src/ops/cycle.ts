@@ -9,6 +9,7 @@ import {
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import { DEFAULT_WORK_MAX_LANES } from "../config";
+import { isVerifiedGjcVersion } from "../orchestrator/gjc-contract";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
 import type { GatewayDatabase } from "../store/db";
 
@@ -133,6 +134,8 @@ export interface RuntimeCycleSources {
 	readonly settledWorkOrigins: ReadonlySet<string>;
 	/** Headroom of the broker-bound GJC agent directory; null when none is bound. */
 	readonly agentDisk: AgentDiskView | null;
+	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
+	readonly gjcVersion: string | undefined;
 	/** Newest settled monitor events that ended `failed_no_retry` before any success. */
 	readonly monitorTerminalStreak: number;
 	/** True while the shared broker's incarnation keeps changing (die/respawn churn). */
@@ -144,6 +147,7 @@ export class RuntimeCycleProjector {
 	readonly #memory: { readonly queueDepth: number };
 	readonly #maxLanes: number;
 	readonly #agentDir: string | undefined;
+	readonly #gjcVersion: () => string | undefined;
 	readonly #brokerRespawnChurn: () => boolean;
 
 	constructor(
@@ -152,6 +156,7 @@ export class RuntimeCycleProjector {
 		options: {
 			readonly maxLanes?: number;
 			readonly agentDir?: string;
+			readonly gjcVersion?: () => string | undefined;
 			readonly brokerRespawnChurn?: () => boolean;
 		} = {},
 	) {
@@ -159,6 +164,7 @@ export class RuntimeCycleProjector {
 		this.#memory = memory;
 		this.#maxLanes = options.maxLanes ?? DEFAULT_WORK_MAX_LANES;
 		this.#agentDir = options.agentDir;
+		this.#gjcVersion = options.gjcVersion ?? (() => undefined);
 		this.#brokerRespawnChurn = options.brokerRespawnChurn ?? (() => false);
 	}
 
@@ -221,6 +227,7 @@ export class RuntimeCycleProjector {
 					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
 			),
 			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
+			gjcVersion: this.#gjcVersion(),
 			monitorTerminalStreak: this.#database.monitorConsecutiveTerminalFailures(),
 			brokerRespawnChurn: this.#brokerRespawnChurn(),
 		};
@@ -305,6 +312,10 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	if (sources.oldestStarvedPendingMs !== null && sources.oldestStarvedPendingMs >= INBOUND_STARVATION_MS)
 		gates.add("inbound_starved");
 	if (sources.agentDisk && agentDiskLow(sources.agentDisk)) gates.add("agent_disk_headroom");
+	// The gateway classifies gjc envelopes by the contract of the gjc it was verified
+	// against; a newer minor may have renamed the codes recovery depends on.
+	if (sources.gjcVersion !== undefined && !isVerifiedGjcVersion(sources.gjcVersion))
+		gates.add("gjc_unverified_version");
 	// Issue #189: pid/lock liveness stayed green through a 19h monitor outage.
 	// Dispatch outcome and incarnation churn are the health signals that moved.
 	if (sources.monitorTerminalStreak >= MONITOR_TERMINAL_STREAK_THRESHOLD) gates.add("monitor_dispatch_failing");
