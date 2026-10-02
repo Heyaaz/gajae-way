@@ -302,6 +302,7 @@ const WORK_REASON_CODES = new Set([
 	"terminal_uncertain",
 	"session_dead",
 	"session_disowned",
+	"host_lost",
 	"recovery_indeterminate",
 	"output_unavailable",
 ]);
@@ -1337,6 +1338,25 @@ export class GatewayDatabase {
 			if (acceptanceEstablished && next.noticeHash !== null)
 				this.metaSet(`lane-notice:${next.sessionKey}`, JSON.stringify({ epoch: next.epoch, hash: next.noticeHash }));
 			return next;
+		});
+	}
+
+	/**
+	 * Streamed turn activity of an open attempt refreshes its lane's
+	 * `last_activity_at`, fenced to the attempt's own binding. Never moves it back.
+	 */
+	workAttemptActivity(opRef: string, at: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.workAttemptGet(opRef);
+			if (!current || current.settledAt !== null) return false;
+			this.#assertNotQuarantined("work", current.jobId);
+			return (
+				this.#database
+					.query(
+						"UPDATE sessions SET last_activity_at = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
+					)
+					.run(at, current.sessionKey, current.sessionId, current.epoch, at).changes === 1
+			);
 		});
 	}
 

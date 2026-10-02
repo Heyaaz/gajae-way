@@ -1520,6 +1520,16 @@ async function processCommand(pid: number): Promise<string | undefined> {
 	}
 }
 
+/**
+ * The SDK router's own verdict that it serves no host for the session, in any
+ * code the supported GJC versions use for it. Broker transport failures
+ * (`broker_unavailable`, timeouts, unparsable output) carry no envelope code
+ * and never match.
+ */
+export function isSessionUnavailable(error: unknown): boolean {
+	return isSessionGoneCode(sdkErrorCode(error));
+}
+
 function sdkErrorCode(error: unknown): string | undefined {
 	if (error instanceof OpRefRejectedError) return stableErrorCode(error.code);
 	if (error instanceof GjcCliError) return stableErrorCode(envelopeErrorCode(error.details));
