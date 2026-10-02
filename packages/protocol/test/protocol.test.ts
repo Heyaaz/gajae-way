@@ -11,6 +11,7 @@ import {
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	MAX_FRAME_BYTES,
+	monitorSessionOrigin,
 	negotiate,
 	originKey,
 	PROFILE_VERSION,
@@ -117,6 +118,14 @@ describe("origin normalization", () => {
 				peerId: "p1",
 			}),
 		).toThrow();
+	});
+
+	test("monitor session origins are scoped by monitor id and round-trip", () => {
+		const key = originKey(monitorSessionOrigin("m-1", "backlog.watch"));
+		expect(key).toBe("monitor/eventtype/backlog.watch/parent=m-1");
+		expect(key).not.toBe(originKey(monitorSessionOrigin("m-2", "backlog.watch")));
+		expect(parseOriginKey(key)).toEqual(monitorSessionOrigin("m-1", "backlog.watch"));
+		expect(() => originKey(monitorSessionOrigin("bad/id", "backlog.watch"))).toThrow();
 	});
 
 	test("thread requires parentId", () => {
