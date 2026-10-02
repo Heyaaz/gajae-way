@@ -1,4 +1,5 @@
 export {
+	type AgentDiskView,
 	type BurstPolicyKind,
 	type ChatMessagePayload,
 	type ChatProgressActivity,
@@ -23,6 +24,7 @@ export {
 	type EventName,
 	type GatewayStatusResult,
 	isSilenceToken,
+	isSilentOutput,
 	type LaneCapacityDetail,
 	type MemoryAuditResult,
 	type MemorySearchParams,
@@ -99,6 +101,7 @@ export {
 	eventTypeOrigin,
 	isChatPlatform,
 	LOOPBACK_ORIGIN,
+	monitorSessionOrigin,
 	ORIGIN_KINDS,
 	ORIGIN_PLATFORMS,
 	type OriginKind,
