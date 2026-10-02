@@ -162,7 +162,9 @@ test("the log line reports every factor, why it was addressed, and how much thre
 	const lines: string[] = [];
 	const info = console.info;
 	console.info = (line: unknown) => {
-		lines.push(String(line));
+		// console.info is process-wide: timers left by other test files in this
+		// run can log while the probe awaits. Only the shadow's own lines count.
+		if (String(line).startsWith("kev-shadow ")) lines.push(String(line));
 	};
 	try {
 		await recordKevShadow({
@@ -213,7 +215,9 @@ test("earlier turns are rendered oldest-first under the context header and count
 	const lines: string[] = [];
 	const info = console.info;
 	console.info = (line: unknown) => {
-		lines.push(String(line));
+		// console.info is process-wide: timers left by other test files in this
+		// run can log while the probe awaits. Only the shadow's own lines count.
+		if (String(line).startsWith("kev-shadow ")) lines.push(String(line));
 	};
 	try {
 		await recordKevShadow({
