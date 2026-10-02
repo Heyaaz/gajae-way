@@ -378,7 +378,7 @@ export interface MemorySearchResult {
  * at creation, never inferred; unknown types route to the catch-all session.
  */
 export type TriggerSpec =
-	| { readonly kind: "cron"; readonly schedule: string }
+	| { readonly kind: "cron"; readonly schedule: string; readonly timezone?: string }
 	| { readonly kind: "webhook"; readonly route: string }
 	| { readonly kind: "watcher"; readonly root: string; readonly debounceMs?: number }
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
@@ -445,6 +445,10 @@ export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger"
 	readonly trigger?: TriggerSpec;
 	/** Change the schedule while retaining the monitor's existing cron trigger. */
 	readonly schedule?: string;
+}
+export interface MonitorScheduleProjection {
+	readonly effectiveTimezone: string | null;
+	readonly nextFireAt: { readonly local: string; readonly utc: string } | null;
 }
 
 export interface MonitorTestParams {
@@ -828,10 +832,20 @@ export interface VerbCatalogV01 {
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
-	"monitor.list": { params: undefined; result: { readonly monitors: readonly MonitorRecord[] } };
+	"monitor.list": {
+		params: undefined;
+		result: {
+			readonly monitors: readonly MonitorRecord[];
+			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
+		};
+	};
 	"monitor.inspect": {
 		params: { readonly monitorId: string };
-		result: { readonly monitor: MonitorRecord; readonly recentEvents: readonly MonitorEventRecord[] };
+		result: {
+			readonly monitor: MonitorRecord;
+			readonly schedule: MonitorScheduleProjection;
+			readonly recentEvents: readonly MonitorEventRecord[];
+		};
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };

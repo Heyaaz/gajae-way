@@ -18,6 +18,8 @@ import {
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	type MonitorEventRecord,
+	type MonitorRecord,
+	type MonitorScheduleProjection,
 	negotiate,
 	type OriginRef,
 	originKey,
@@ -55,6 +57,7 @@ import { validateMemory } from "../memory/validator";
 import { MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
+import { nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
@@ -815,6 +818,37 @@ async function handleFrame(
 		writeError(connection, error, frame.type === "request" ? frame.id : undefined);
 	}
 }
+
+function localCronFireTime(at: Date, timezone: string): string {
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone: timezone,
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+		hourCycle: "h23",
+	}).formatToParts(at);
+	const part = (type: Intl.DateTimeFormatPartTypes): string => {
+		const value = parts.find((entry) => entry.type === type)?.value;
+		if (!value) throw new Error(`missing ${type} in cron timestamp`);
+		return value;
+	};
+	return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+}
+
+function scheduleProjection(monitor: MonitorRecord, now: Date): MonitorScheduleProjection {
+	if (monitor.trigger.kind !== "cron") return { effectiveTimezone: null, nextFireAt: null };
+	const timezone = monitor.trigger.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+	if (!monitor.enabled) return { effectiveTimezone: timezone, nextFireAt: null };
+	const next = nextCronFire(monitor.trigger.schedule, now, timezone);
+	return {
+		effectiveTimezone: timezone,
+		nextFireAt: next ? { local: localCronFireTime(next, timezone), utc: next.toISOString() } : null,
+	};
+}
+
 async function handleRequest(
 	connection: Connection,
 	request: RequestFrame,
@@ -1198,14 +1232,20 @@ async function handleRequest(
 			}
 			return;
 		}
-		case "monitor.list":
+		case "monitor.list": {
+			const now = new Date();
+			const monitors = runtime.registry.list();
+			const schedules = Object.fromEntries(
+				monitors.map((monitor) => [monitor.monitorId, scheduleProjection(monitor, now)] as const),
+			);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { monitors: runtime.registry.list() },
+				result: { monitors, schedules },
 			});
 			return;
+		}
 		case "monitor.inspect": {
 			const monitorId = (request.params as { monitorId?: unknown } | undefined)?.monitorId;
 			if (typeof monitorId !== "string") throw new ProtocolError("invalid_params", "unknown monitorId");
@@ -1224,7 +1264,12 @@ async function handleRequest(
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
 				}));
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { monitor, recentEvents } });
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { monitor, schedule: scheduleProjection(monitor, new Date()), recentEvents },
+			});
 			return;
 		}
 		case "monitor.test": {

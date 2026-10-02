@@ -5,6 +5,7 @@ import { isAbsolute, join } from "node:path";
 import type {
 	MonitorEventRecord,
 	MonitorRecord,
+	MonitorScheduleProjection,
 	MonitorSpec,
 	OpsCycleResult,
 	WorkJobsResult,
@@ -21,6 +22,7 @@ import {
 	columnNames,
 	type ListOptions,
 	MONITOR_COLUMNS,
+	type MonitorListRow,
 	parseListOptions,
 	renderList,
 	SESSION_COLUMNS,
@@ -68,7 +70,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -727,10 +729,18 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(JSON.stringify(await client.request<{ monitorId: string }>("monitor.update", update.params)));
 					else if (command === "list") {
 						const options = listOptions as ListOptions;
-						const result = await client.request<{ monitors: MonitorRecord[] }>("monitor.list");
-						for (const line of renderList(MONITOR_COLUMNS, result.monitors, options, {
+						const result = await client.request<{
+							monitors: MonitorRecord[];
+							schedules: Record<string, MonitorScheduleProjection>;
+						}>("monitor.list");
+						const rows: MonitorListRow[] = result.monitors.map((monitor) => ({
+							monitor,
+							schedule: result.schedules[monitor.monitorId] ?? null,
+						}));
+						for (const line of renderList(MONITOR_COLUMNS, rows, options, {
 							key: "monitors",
 							result,
+							serializeRow: (row) => row.monitor,
 						}))
 							console.log(line);
 					} else if (command === "inspect" && args[0])
