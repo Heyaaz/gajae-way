@@ -2,11 +2,12 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { GatewayConfig } from "../src/config";
+import { InterimSpeechGate, isNearDuplicate, isProceduralNarration } from "../src/server/interim-speech";
+import type { GatewayServer } from "../src/server/server";
 import { startUnixServer } from "../src/server/server";
-import type { GatewayConfig, GatewayServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
-import { InterimSpeechGate, isNearDuplicate, isProceduralNarration } from "../src/server/interim-speech";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -196,18 +197,14 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 
 	// Wait for messages to reach the client
 	for (let attempt = 0; attempt < 200; attempt++) {
-		const messages = frames.filter(
-			(f: any) => f.type === "event" && f.event === "chat.message",
-		);
+		const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 		if (messages.length >= 3) break; // 2 interim + 1 terminal
 		await Bun.sleep(10);
 	}
 
 	socket.end();
 
-	const messages = frames.filter(
-		(f: any) => f.type === "event" && f.event === "chat.message",
-	);
+	const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 
 	// Should have exactly 2 interim deliveries + 1 terminal = 3 messages
 	expect(messages.length).toBe(3);
@@ -300,18 +297,14 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 
 	// Wait for messages to reach the client
 	for (let attempt = 0; attempt < 200; attempt++) {
-		const messages = frames.filter(
-			(f: any) => f.type === "event" && f.event === "chat.message",
-		);
+		const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 		if (messages.length >= 1) break; // 1 terminal only
 		await Bun.sleep(10);
 	}
 
 	socket.end();
 
-	const messages = frames.filter(
-		(f: any) => f.type === "event" && f.event === "chat.message",
-	);
+	const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 
 	// With maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
 	expect(messages.length).toBe(1);
@@ -409,18 +402,14 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 
 	// Wait for messages to reach the client
 	for (let attempt = 0; attempt < 200; attempt++) {
-		const messages = frames.filter(
-			(f: any) => f.type === "event" && f.event === "chat.message",
-		);
+		const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 		if (messages.length >= 1) break; // 1 terminal only
 		await Bun.sleep(10);
 	}
 
 	socket.end();
 
-	const messages = frames.filter(
-		(f: any) => f.type === "event" && f.event === "chat.message",
-	);
+	const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 
 	// With config-based maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
 	expect(messages.length).toBe(1);
