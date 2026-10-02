@@ -4,7 +4,6 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajae-gateway/protocol";
-import { originKey, parseOriginKey } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	CLI_USAGE,
@@ -97,6 +96,111 @@ describe("cli arguments", () => {
 			console.log = originalLog;
 			listener.stop(true);
 			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("monitors test --wait returns streamed terminal and timeout stages without polling", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-monitor-wait-"));
+		const path = join(home, "fake.sock");
+		const received: string[] = [];
+		const output: string[] = [];
+		const originalLog = console.log;
+		console.log = (line: unknown) => output.push(String(line));
+		const listener = Bun.listen<{ buffer: string }>({
+			unix: path,
+			socket: {
+				open(socket) {
+					socket.data = { buffer: "" };
+				},
+				data(socket, data) {
+					socket.data.buffer += Buffer.from(data).toString("utf8");
+					let newline = socket.data.buffer.indexOf("\n");
+					while (newline >= 0) {
+						const line = socket.data.buffer.slice(0, newline);
+						socket.data.buffer = socket.data.buffer.slice(newline + 1);
+						const frame = JSON.parse(line) as { type: string; id?: string; verb?: string };
+						if (frame.type === "hello")
+							socket.write(
+								`${JSON.stringify({ v: "0.1", type: "negotiated", payload: { profileVersion: "v0.1" } })}\n`,
+							);
+						else if (frame.type === "request") {
+							received.push(frame.verb as string);
+							const eventId = `event-${41 + received.length}`;
+							const stage = received.length === 1 ? "delivered" : "authored";
+							const event = {
+								v: "0.1",
+								type: "event",
+								event: "monitor.event",
+								payload: {
+									eventId,
+									monitorId: "monitor-1",
+									eventType: "test.event",
+									firedAt: "2026-09-25T10:00:00.000Z",
+									stage,
+								},
+							};
+							const response = {
+								v: "0.1",
+								type: "response",
+								id: frame.id,
+								result: { eventId },
+							};
+							// Exercise the event-before-response race: delivery may settle before
+							// the caller has learned the event id from monitor.test.
+							socket.write(`${JSON.stringify(event)}\n${JSON.stringify(response)}\n`);
+						}
+						newline = socket.data.buffer.indexOf("\n");
+					}
+				},
+			},
+		});
+		try {
+			await main(["--socket", path, "monitors", "test", "monitor-1", "--wait=1"]);
+			await main(["--socket", path, "monitors", "test", "monitor-1", "--wait=0"]);
+			expect(received).toEqual(["monitor.test", "monitor.test"]);
+			expect(output).toEqual([
+				'{"eventId":"event-42","stage":"delivered"}',
+				'{"eventId":"event-43","stage":"authored"}',
+			]);
+		} finally {
+			console.log = originalLog;
+			listener.stop(true);
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("monitors test rejects invalid wait options before connecting", async () => {
+		const errors: string[] = [];
+		const originalError = console.error;
+		const previousExitCode = process.exitCode ?? 0;
+		console.error = (line: unknown) => errors.push(String(line));
+		try {
+			const cases = [
+				["--wait=-1"],
+				["--wait=1.5"],
+				["--wait=86401"],
+				["--wait=invalid"],
+				["--wait="],
+				["--wait=1", "--wait=2"],
+			];
+			for (const options of cases) {
+				await main([
+					"--socket",
+					"/nonexistent/gajaeway-monitor-wait.sock",
+					"monitors",
+					"test",
+					"monitor-1",
+					...options,
+				]);
+			}
+			expect(errors).toHaveLength(6);
+			expect(errors.slice(0, 5).every((error) => error.includes("--wait expects a finite non-negative integer"))).toBe(
+				true,
+			);
+			expect(errors[5]).toContain("duplicate --wait");
+		} finally {
+			console.error = originalError;
+			process.exitCode = previousExitCode;
 		}
 	});
 });
@@ -627,6 +731,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 			floorAt: null,
 		},
 		lanes: { active: 0, max: 8 },
+		agentDisk: null,
 		...overrides,
 	};
 }
@@ -714,6 +819,24 @@ describe("cycle rendering", () => {
 		);
 	});
 
+	test("agent-directory headroom renders free/total, or unobservable when the probe failed", () => {
+		const path = "/home/operator/.gjc/agent";
+		const low = renderCycle(
+			cycleResult({
+				phase: "degraded",
+				gates: ["agent_disk_headroom"],
+				agentDisk: { path, freeBytes: 3 * 1024 ** 3, totalBytes: 456 * 1024 ** 3 },
+			}),
+		);
+		expect(low).toContain("gates: agent_disk_headroom");
+		expect(low).toContain(`agent_disk: ${path} free=3.0GiB total=456.0GiB`);
+		expect(renderCycle(cycleResult({ agentDisk: { path, freeBytes: null, totalBytes: null } }))).toContain(
+			`agent_disk: ${path} unobservable`,
+		);
+		expect(renderCycle(cycleResult()).join("\n")).not.toContain("agent_disk:");
+		expect(cycleExitCode(cycleResult({ gates: ["agent_disk_headroom"] }))).toBe(1);
+	});
+
 	test("exit-code contract: gates force exit 1, healthy is exit 0", () => {
 		expect(cycleExitCode(cycleResult())).toBe(0);
 		for (const gate of [
@@ -776,7 +899,10 @@ describe("usage exits the process instead of blocking", () => {
 });
 
 describe("work operator commands", () => {
-	async function run(args: string[], result: unknown) {
+	async function run(args: string[], result: unknown, sessionId?: string) {
+		const previousSessionId = process.env.GJC_SESSION_ID;
+		if (sessionId === undefined) delete process.env.GJC_SESSION_ID;
+		else process.env.GJC_SESSION_ID = sessionId;
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const lines: string[] = [];
 		const errors: string[] = [];
@@ -813,7 +939,9 @@ describe("work operator commands", () => {
 			connect.mockRestore();
 			log.mockRestore();
 			error.mockRestore();
-			process.exitCode = previousExit;
+			process.exitCode = previousExit ?? 0;
+			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = previousSessionId;
 		}
 	}
 
@@ -842,40 +970,18 @@ describe("work operator commands", () => {
 		["--preset", "reliable", { preset: "reliable" }],
 		["--model", "openai/gpt-5.2", "openai/gpt-5.2"],
 	] as const) {
-		test(`work start forwards ${flag} and canonical notification target`, async () => {
-			const output = await run(
-				[
-					"start",
-					"fix",
-					"--cwd",
-					"/repo",
-					"--resume",
-					flag,
-					value,
-					"--notify",
-					"telegram/topic/-100/parent=-200",
-					"fix",
-					"tests",
-				],
-				{
-					started: true,
-					jobId: "job-1",
-					opRef: "op-1",
-					sessionKey: "work/task/fix",
-					sessionId: "session-1",
-				},
-			);
+		test(`work start forwards ${flag} with cwd and resume`, async () => {
+			const output = await run(["start", "fix", "--cwd", "/repo", "--resume", flag, value, "fix", "tests"], {
+				started: true,
+				jobId: "job-1",
+				opRef: "op-1",
+				sessionKey: "work/task/fix",
+				sessionId: "session-1",
+			});
 			expect(output.requests).toEqual([
 				{
 					verb: "work.start",
-					params: {
-						name: "fix",
-						cwd: "/repo",
-						resume: true,
-						model,
-						text: "fix tests",
-						notify: { platform: "telegram", kind: "topic", conversationId: "-100", parentId: "-200" },
-					},
+					params: { name: "fix", cwd: "/repo", resume: true, model, text: "fix tests" },
 				},
 			]);
 			expect(output.lines).toEqual(["started: work/task/fix session=session-1 job=job-1 op=op-1"]);
@@ -884,28 +990,32 @@ describe("work operator commands", () => {
 		});
 	}
 
-	for (const key of [
-		"loopback/loopback/loopback",
-		"discord/channel/123",
-		"discord/dm/123/peer=456",
-		"discord/thread/123/parent=456",
-		"monitor/eventtype/build.done",
-	]) {
-		test(`work start accepts canonical origin ${key}`, async () => {
-			expect(originKey(parseOriginKey(key))).toBe(key);
-			const output = await run(["start", "fix", "--notify", key, "task"], {
-				started: true,
-				jobId: "job-1",
-				opRef: "op-1",
-				sessionKey: "work/task/fix",
-				sessionId: "session-1",
-			});
-			expect(output.errors).toEqual([]);
-			expect(output.requests).toHaveLength(1);
+	for (const command of ["run", "start"] as const) {
+		test(`work ${command} forwards GJC_SESSION_ID as callerSessionId`, async () => {
+			const result =
+				command === "start"
+					? { started: true, jobId: "job-1", opRef: "op-1", sessionKey: "work/task/fix", sessionId: "session-1" }
+					: { held: false, text: "answer" };
+			const output = await run([command, "fix", "task"], result, "caller-session-1");
+			expect(output.requests).toEqual([
+				{
+					verb: `work.${command}`,
+					params: { name: "fix", text: "task", callerSessionId: "caller-session-1" },
+				},
+			]);
+		});
+
+		test(`work ${command} omits blank GJC_SESSION_ID`, async () => {
+			const result =
+				command === "start"
+					? { started: true, jobId: "job-1", opRef: "op-1", sessionKey: "work/task/fix", sessionId: "session-1" }
+					: { held: false, text: "answer" };
+			const output = await run([command, "fix", "task"], result, " \t ");
+			expect(output.requests).toEqual([{ verb: `work.${command}`, params: { name: "fix", text: "task" } }]);
 		});
 	}
 
-	test("work start without notify leaves target selection to the gateway", async () => {
+	test("work start leaves parent selection to the gateway", async () => {
 		const output = await run(["start", "fix", "task"], {
 			started: true,
 			jobId: "j",
@@ -1015,13 +1125,21 @@ describe("work operator commands", () => {
 					session_id: "session-1",
 					last_activity_at: "2026-09-07T00:00:00Z",
 					worktree_path: "/repo/fix",
+					reports: { pending: 2, claimed: 1, held: 3, undeliverable: 4 },
 				},
-				{ lane_key: "done", state: "done", session_id: "", last_activity_at: null, worktree_path: "/repo/done" },
+				{
+					lane_key: "done",
+					state: "done",
+					session_id: "",
+					last_activity_at: null,
+					worktree_path: "/repo/done",
+					reports: { pending: 0, claimed: 0, held: 0, undeliverable: 0 },
+				},
 			],
 		});
 		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
 		expect(output.lines).toEqual([
-			"fix running session=session-1 accepted=- op=- last=2026-09-07T00:00:00Z head=- /repo/fix",
+			"fix running session=session-1 accepted=- op=- last=2026-09-07T00:00:00Z head=- /repo/fix reports=p:2 c:1 h:3 u:4",
 			"done done session=- accepted=- op=- last=- head=- /repo/done",
 		]);
 		expect(output.closed).toBe(true);
@@ -1081,29 +1199,16 @@ describe("work operator commands", () => {
 		expect(output.errors).toEqual([]);
 		expect(output.closed).toBe(true);
 	});
+	test("--notify is a usage error on start and run", async () => {
+		for (const command of ["start", "run"] as const) {
+			const output = await run([command, "fix", "--notify", "discord/channel/c", "task"], {});
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.errors[0]).toContain("usage: gajaeway work");
+		}
+	});
 
 	for (const args of [
-		...[
-			"discord/dm/c",
-			"discord/channel/c/peer=p",
-			"discord/thread/t",
-			"discord/thread/t/peer=p",
-			"discord/dm/c/peer=p/peer=q",
-			"discord/dm/c/peer=",
-			"discord/channel/c/",
-			"discord/channel/c/extra",
-			"discord/channel/a%2Fb",
-			" discord/channel/c",
-			"discord/channel/c ",
-			"unknown/channel/c",
-			"discord/channel/c//",
-			"loopback/channel/c",
-			"monitor/channel/c",
-			"discord/dm/c/peer=p=extra",
-		].map((key) => ["start", "fix", "--notify", key, "task"]),
-		["run", "fix", "--notify", "discord/channel/c", "task"],
-		["start", "fix", "--notify"],
-		["start", "fix", "--notify", "discord/channel/c", "--notify", "discord/channel/d", "task"],
 		["start", "fix", "--model", "model", "--preset", "preset", "task"],
 		["start", "fix", "--preset", "preset", "--model", "model", "task"],
 		["start", "fix", "--model"],

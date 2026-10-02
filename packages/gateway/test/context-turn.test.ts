@@ -205,29 +205,75 @@ test("a chatty turn past the mid-work part budget still delivers its final answe
 	client.close();
 });
 
-test("a turn that wrote its answer and then failed on a hung tool delivers that answer, not a bare failure (#210)", async () => {
+test("#247: every done trigger names the delivery that closed it or why none did", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
-		respond: async () => {
-			throw new Error("Agent run failed after execution started.");
+		respond: async (_session, text, _preamble, _progress, options) => {
+			if (text.includes("interim then silent")) {
+				options?.onAssistantText?.("visible interim answer");
+				return "[SILENT]";
+			}
+			if (text.includes("react only")) return "[REACT:👍]";
+			if (text.includes("stay quiet")) return "[SILENT]";
+			throw new Error("runtime failed before reply");
 		},
 	});
-	// The reply sits in the transcript; the tail never showed it.
-	sessionPort.fetchAssistantSince = async () => ({
-		text: "written before the tool timed out",
-		pages: 1,
-		complete: true,
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	const settle = async (id: string, text: string) => {
+		const turn = sessionPort.sends.length;
+		send(client, id, text);
+		await waitUntil(() => sessionPort.sends.length > turn);
+		const opRef = sessionPort.sends[turn]?.opRef ?? "";
+		await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
+		return database.inboundTurnRow(opRef)?.terminal_delivery_id ?? null;
+	};
+	const deliveryIdOf = (body: string) =>
+		client.frames.find((frame) => frame.event === "chat.message" && frame.payload.text === body)?.payload.deliveryId;
+
+	const interim = await settle("interim-silent", "interim then silent");
+	expect(JSON.parse(interim ?? "null")).toEqual({ 0: deliveryIdOf("visible interim answer") });
+	const reaction = await settle("react-only", "react only");
+	expect(JSON.parse(reaction ?? "null")).toEqual({ 0: deliveryIdOf("👍") });
+	expect(JSON.parse((await settle("silent", "stay quiet")) ?? "null")).toEqual({ none: "silent" });
+	expect(JSON.parse((await settle("failed", "fail please")) ?? "null")).toEqual({ none: "turn_failed" });
+	expect(database.inboundTerminalLinkAudit(new Date(0).toISOString())).toEqual({ done: 4, unlinked: 0 });
+	client.close();
+});
+
+test("an answer that quotes [SILENT] in markdown code is delivered, not settled as silent", async () => {
+	// Live pilot 2026-09-29: two written answers explaining the gateway listed
+	// "`[SILENT]`(답하지 않기)" as a protocol marker; the embedded-marker check
+	// dropped the whole reply and the trigger closed as {"none":"silent"}.
+	const answer = [
+		"게이트웨이는 디스코드와 저 사이의 중계 서버예요.",
+		"```\n디스코드 ⇄ adapter-discord ⇄ 게이트웨이 ⇄ [SILENT] ⇄ 제 세션\n```",
+		"- **답장 표시**: 👀 리액션, 답글 지정, `[SILENT]`(답하지 않기) 같은 표시를 해석해요.",
+	].join("\n");
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => (text.includes("quoted marker") ? answer : "answer then [SILENT]"),
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
-	send(client, "hung-tool-trigger", "owner request");
-	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
-	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
-	// A visible answer consumes the context it was written from.
-	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
-	const texts = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
-	expect(texts).toEqual(["written before the tool timed out"]);
+	send(client, "quoted-silent", "quoted marker please");
+	await waitUntil(() => sessionPort.sends.length === 1);
+	const opRef = sessionPort.sends[0]?.opRef ?? "";
+	await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
+	const delivered = client.frames.filter((frame) => frame.event === "chat.message");
+	expect(delivered.map((frame) => frame.payload.text)).toEqual([answer]);
+	expect(JSON.parse(database.inboundTurnRow(opRef)?.terminal_delivery_id ?? "null")).toEqual({
+		0: delivered[0]?.payload.deliveryId,
+	});
+	// A bare marker outside code still silences the part.
+	send(client, "bare-silent", "bare marker");
+	await waitUntil(() => sessionPort.sends.length === 2);
+	const bareOpRef = sessionPort.sends[1]?.opRef ?? "";
+	await waitUntil(() => database.inboundTurnRow(bareOpRef)?.turn_state === "done");
+	expect(JSON.parse(database.inboundTurnRow(bareOpRef)?.terminal_delivery_id ?? "null")).toEqual({ none: "silent" });
+	expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(1);
 	client.close();
 });
 
