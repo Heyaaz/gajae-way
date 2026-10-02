@@ -37,6 +37,7 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
 import { performUpgrade } from "./upgrade";
 
@@ -63,10 +64,11 @@ export const COMMANDS = [
 	"services",
 	"migrate",
 	"update",
+	"setup",
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -92,6 +94,8 @@ function gatewayHome(): string {
 
 export interface MainOptions {
 	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
+	/** Test seams for `setup`: the platform fetch and the prompter. */
+	readonly setup?: Pick<RunSetupOptions, "fetch" | "prompter" | "env">;
 	/** Test seams for `ops restart-stack`; the real path spawns the service manager. */
 	readonly restartStack?: {
 		readonly launch?: Omit<LaunchRestartOptions, "home">;
@@ -939,6 +943,11 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					...(options.update === undefined ? {} : { deps: options.update }),
 				});
 				for (const line of renderUpdate(result)) console.log(line);
+				break;
+			}
+			case "setup": {
+				// Socket-free: setup runs before any gateway exists.
+				await runSetup(parsed.rest, { home: gatewayHome(), ...options.setup });
 				break;
 			}
 			default:
