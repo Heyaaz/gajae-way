@@ -64,16 +64,16 @@ test("accepts exact engagement modes and audiences while preserving omitted audi
 		expect(config.channels?.collab).toEqual({ engagement: "mention-open", audience: "all" });
 		expect(config.channels?.locked).toEqual({ engagement: "closed", audience: "bot-only" });
 
-	for (const channels of [
-		{ c: { engagement: "open-mention-only" } },
-		{ c: { engagement: "open", audience: "sometimes" } },
-		{ c: { engagement: "open", extra: true } },
-	]) {
-		await writeFile(join(home, "adapter-discord.json"), JSON.stringify({ tokenFile: "token", channels }));
-		await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
-			DiscordAdapterStartupError,
-		);
-	}
+		for (const channels of [
+			{ c: { engagement: "open-mention-only" } },
+			{ c: { engagement: "open", audience: "sometimes" } },
+			{ c: { engagement: "open", extra: true } },
+		]) {
+			await writeFile(join(home, "adapter-discord.json"), JSON.stringify({ tokenFile: "token", channels }));
+			await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
+				DiscordAdapterStartupError,
+			);
+		}
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -544,7 +544,8 @@ test("an interim delivery keeps the working status and re-pulses typing; only th
 	};
 	const typing = new TypingIndicator(typingDiscord, 10_000, 60_000, { error: () => {} });
 	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
-	status.arm("channel-1", "m-1");
+	const engagement = { group: false, mentioned: false };
+	status.arm("channel-1", "m-1", engagement);
 	typing.begin("channel-1");
 	await Bun.sleep(5);
 	const beforeInterim = typingCount;
@@ -845,7 +846,7 @@ test("statusReactions 'off' mode produces zero reactions on bot-audience channel
 		Date.now,
 		"off", // off mode
 	);
-	const botAudience = { group: true, mentioned: false, audience: "bot" }; // Bot-only audience
+	const botAudience = { group: true, mentioned: false }; // Bot-only audience
 	status.arm("bot-channel", "m-1", botAudience);
 	await Bun.sleep(1);
 	expect(reacted).toEqual([]); // No reactions shown on bot-audience channels
@@ -903,9 +904,11 @@ test("statusReactions defaults to 'off' for bot-audience channels when unset", a
 		{ error: () => {} },
 		() => ({ id: "bot-1" }),
 		Date.now,
+		undefined,
+		{ "bot-channel": { audience: "bot-only" } },
 		// statusReactions unset (undefined)
 	);
-	const botAudience = { group: true, mentioned: false, audience: "bot" }; // Bot-audience channel
+	const botAudience = { group: true, mentioned: true }; // Bot-only audience
 	status.arm("bot-channel", "m-1", botAudience);
 	await Bun.sleep(1);
 	expect(reacted).toEqual([]); // No reactions shown with default off behavior

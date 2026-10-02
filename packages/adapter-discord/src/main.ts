@@ -7,7 +7,6 @@ import {
 	type EngagementContext,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
-	type PresenceMarker,
 	type PresenceState,
 	presenceInitial,
 	presenceMarkersFor,
@@ -22,13 +21,11 @@ import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
 import {
 	adapterHome,
-	adapterHome,
 	type LoadedDiscordAdapterConfig,
 	type LoadedDiscordVoiceConfig,
 	loadDiscordAdapterConfig,
 	type StatusReactionsMode,
-	type StatusReactionsMode,
-	} from "./config";
+} from "./config";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
@@ -535,8 +532,6 @@ type PresenceEntry = {
 	reconciling: boolean;
 	/** A change arrived while a pass was running; the loop re-diffs before it exits. */
 	pending: boolean;
-	/** Channel engagement policy for this turn (group vs DM, bot-audience vs user-addressed). */
-	engagement?: Pick<EngagementContext, "group" | "mentioned" | "audience">;
 };
 
 /** Bound on re-diff passes in one reconcile run; retirement cleanup runs regardless. */
@@ -584,21 +579,12 @@ export class WorkingStatus {
 		this.#channels = channels;
 	}
 
-	#shouldShowReactions(engagement?: Pick<EngagementContext, "group" | "mentioned" | "audience">): boolean {
-		if (this.#statusReactionsMode === "off") {
-			// In "off" mode: zero reactions for all engagement types
-			return false;
-		}
-		if (this.#statusReactionsMode === undefined) {
-			// Default behavior when unset: off for group/bot-audience, gradient for DMs only
-			// When engagement is not provided, fail quiet (no reactions)
-			if (!engagement) return false;
-			if (engagement.audience === "bot") return false; // Bot-audience channel
-			if (engagement.group) return false; // ANY group channel (mentioned or not) gets off
-			return true; // DMs only show gradient
-		}
-		// "gradient" and "static" modes both show reactions
-		return true;
+	#shouldShowReactions(conversationId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): boolean {
+		if (this.#statusReactionsMode === "off") return false;
+		if (this.#statusReactionsMode !== undefined) return true;
+		if (!engagement) return false;
+		if (this.#channels[conversationId]?.audience === "bot-only") return false;
+		return !engagement.group;
 	}
 
 	/**
@@ -606,13 +592,12 @@ export class WorkingStatus {
 	 * queued marker goes on immediately; it is the room's only sign the message
 	 * was seen until the first progress tick. Best-effort, never awaited.
 	 */
-	arm(conversationId: string, messageId: string, engagement?: Pick<EngagementContext, "group" | "mentioned" | "audience">): void {
+	arm(conversationId: string, messageId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): void {
 		const prior = this.#entries.get(conversationId);
 		if (prior && prior.messageId === messageId) {
 			// Same message re-armed (an accepted edit): the markers on it are still
 			// ours; restart the gradient from queued without losing ownership.
-			prior.engagement = engagement;
-			prior.wanted = this.#shouldShowReactions(engagement);
+			prior.wanted = this.#shouldShowReactions(conversationId, engagement);
 			prior.state = presenceInitial(this.#now());
 			this.#armStale(conversationId);
 			void this.#reconcile(prior);
@@ -624,10 +609,9 @@ export class WorkingStatus {
 			messageId,
 			state: presenceInitial(this.#now()),
 			shown: new Set(),
-			wanted: this.#shouldShowReactions(engagement),
+			wanted: this.#shouldShowReactions(conversationId, engagement),
 			reconciling: false,
 			pending: false,
-			engagement,
 		};
 		this.#entries.set(conversationId, entry);
 		this.#armStale(conversationId);
@@ -648,7 +632,7 @@ export class WorkingStatus {
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "discord") return;
 		const entry = this.#entries.get(progress.origin.conversationId);
-		if (!entry || !entry.wanted) return;
+		if (!entry?.wanted) return;
 		this.#armStale(progress.origin.conversationId);
 		const swap = presenceTransition(entry.state, progress, this.#now());
 		if (!swap) return;
@@ -704,8 +688,8 @@ export class WorkingStatus {
 							? ["⏳"] // Static mode: show only queued phase marker, never transition
 							: []
 						: entry.wanted
-						? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode)
-						: [],
+							? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode)
+							: [],
 				);
 				const remove = [...entry.shown].filter((unicode) => !desired.has(unicode));
 				const add = [...desired].filter((unicode) => !entry.shown.has(unicode));
@@ -1037,7 +1021,14 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		partials: REQUIRED_PARTIALS,
 	});
 	const typing = new TypingIndicator(discord);
-	const status = new WorkingStatus(discord, console, () => discord.user, Date.now, config.statusReactions, config.channels);
+	const status = new WorkingStatus(
+		discord,
+		console,
+		() => discord.user,
+		Date.now,
+		config.statusReactions,
+		config.channels,
+	);
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? defaultGatewaySocket(),
 		discord,

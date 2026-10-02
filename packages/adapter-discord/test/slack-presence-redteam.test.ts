@@ -116,7 +116,9 @@ test("RT-SLACK-55 Discord gradient coalesces buckets and removes variation-selec
 	await flush();
 	expect(active.has("⏳")).toBe(true);
 	expect(stale).toBeDefined();
-	stale!();
+	const expire = stale;
+	if (!expire) throw new Error("Expected the stale-status timer to be registered");
+	expire();
 	await flush();
 	expect(active.size).toBe(0);
 	expect([...added].sort()).toEqual([...removed].sort());
@@ -138,13 +140,13 @@ test("RT-SLACK-55 Discord own presence event filtered but human presence emoji i
 	};
 	const gateway = new ReconnectingGateway(
 		"/tmp/absent-presence.sock",
-		{} as DiscordClientLike,
-		{} as any,
+		{ channels: { fetch: async () => undefined } },
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: {} },
 		undefined,
 		undefined,
 		"/tmp/no-presence-cursors",
 		() => ({ id: "BOT" }),
-		client as any,
+		client as never,
 	);
 	const reaction = { emoji: { name: "✍️" }, message: { id: "123", channel: { id: "C1", type: 0, name: "test" } } };
 	gateway.sendReaction(reaction, { id: "BOT", bot: true }, "add", { id: "BOT" });
