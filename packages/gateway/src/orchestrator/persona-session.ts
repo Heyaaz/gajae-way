@@ -234,6 +234,12 @@ type PersonaPreambleState = {
 
 /** A session's context right before a send: its usage when readable, and whether the actor just compacted it. */
 type PreparedContext = { readonly usage?: SessionContextUsage; readonly compacted: boolean };
+/** Maximum number of retries for retryable agent errors (transient provider failures). */
+const MAX_AGENT_ERROR_RETRY_ATTEMPTS = 2;
+/** Initial delay before retrying a failed agent error, backs off exponentially. */
+const AGENT_ERROR_RETRY_INITIAL_MS = 1_000;
+/** Maximum delay before retrying a failed agent error. */
+const AGENT_ERROR_RETRY_MAX_MS = 10_000;
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -824,6 +830,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	openTool?: { readonly name: string; readonly startedAtMs: number };
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
+	/** Number of times this turn has been retried due to transient agent errors. */
+	retryAttempt: number;
 };
 
 class OriginActor {
@@ -1380,6 +1388,8 @@ class OriginActor {
 			);
 		}
 		const dispatchedAtMs = this.#dispatchFloorMs(turn.opRef);
+		// Retrieve the actual retry attempt number from the database
+		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, turn.epoch, turn.triggerMessageId);
 		const bound: BoundTurn = {
 			originKey: this.originKey,
 			epoch: turn.epoch,
@@ -1396,6 +1406,7 @@ class OriginActor {
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
+			retryAttempt,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 		};
 		tail?.beginTurn(turn.opRef);
@@ -1656,6 +1667,7 @@ class OriginActor {
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
+			retryAttempt, // Already computed from freshTurnAttempt above
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 		};
 		tail.beginTurn(opRef);
@@ -2036,6 +2048,43 @@ class OriginActor {
 		}, delayMs);
 		this.#graceTimers.add(timer);
 		this.#dispatchRetry = timer;
+	}
+
+	/**
+	 * Schedules a retry of a failed turn due to a transient agent error.
+	 * Increments the retry attempt counter and re-dispatches the turn with a new opRef.
+	 */
+	#scheduleAgentErrorRetry(bound: BoundTurn, delayMs: number): void {
+		const timer = this.#manager.schedule(() => {
+			this.#graceTimers.delete(timer);
+			if (this.#stopped || this.#manager.stopped) return;
+			if (this.#current !== bound) return; // Turn has been replaced
+			void this.enqueue(async () => {
+				const oldOpRef = bound.turn.opRef;
+				const oldSessionId = bound.sessionId;
+				try {
+					// Mark the turn as pending again and increment the attempt counter
+					const nextAttempt = this.#manager.database.inboundTurnRequeue(oldOpRef);
+					this.#manager.log(
+						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} oldOpRef=${oldOpRef} attempt=${nextAttempt}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS}`,
+						"warn",
+					);
+					// Close the tail and clear current turn
+					await bound.tail?.close();
+					this.#current = undefined;
+					this.#state = "idle";
+					await this.#notifyReleased(bound);
+					// Dispatch the turn again with a new opRef
+					await this.#dispatchNext();
+				} catch (error) {
+					this.#manager.log(
+						`agent_error_retry_failed origin=${this.originKey} opRef=${oldOpRef} detail=${safeDiagnostic(error)}`,
+						"error",
+					);
+				}
+			}).catch(() => {});
+		}, delayMs);
+		this.#graceTimers.add(timer);
 	}
 
 	/**
@@ -3007,6 +3056,27 @@ class OriginActor {
 					name: toolLabel(bound.openTool.name),
 					elapsedMs: Math.max(0, this.#manager.now() - bound.openTool.startedAtMs),
 				};
+				// Check if the error is retryable (transient provider failure or post_start agent_runtime)
+				if (
+					isRetryableError(report, !!bound.openTool) &&
+					bound.retryAttempt < MAX_AGENT_ERROR_RETRY_ATTEMPTS &&
+					!bound.retired &&
+					this.#current === bound
+				) {
+					const retryDelayMs = Math.min(
+						AGENT_ERROR_RETRY_MAX_MS,
+						AGENT_ERROR_RETRY_INITIAL_MS * Math.pow(2, bound.retryAttempt),
+					);
+					this.#manager.log(
+						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} attempt=${bound.retryAttempt + 1}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} delayMs=${retryDelayMs} type=${isAgentRuntimeError ? "continuation" : "requeue"} error=${terminalFailureDiagnosis(report)}`,
+						"warn",
+					);
+					// Both provider_transport and agent_runtime post_start errors use the same requeue logic
+					// The SDK handles tool caching/deduplication to avoid re-running tools
+					this.#scheduleAgentErrorRetry(bound, retryDelayMs);
+					return;
+				}
+				// Not retryable or retries exhausted: deliver the failure
 				this.#manager.log(
 					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}${openTool ? ` open_tool=${openTool.name} open_tool_elapsed_ms=${openTool.elapsedMs}` : ""}`,
 					"error",
@@ -3812,6 +3882,37 @@ function toolLabel(name: string): string {
 
 function safeDiagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error";
+}
+
+/**
+ * Whether the error code indicates a retryable transient failure.
+ * Retryable:
+ * 1. provider_transport errors (provider_down, provider_unavailable, etc.)
+ * 2. post_start agent_runtime errors with specific codes (agent_error, prompt_failed)
+ *
+ * NOT retryable if a tool hung (bash call running for Ns).
+ */
+function isRetryableError(status: StatusReport, openTool?: boolean): boolean {
+	const outcome = status.status.outcome;
+	const category = outcome?.category;
+	const code = outcome?.code ?? status.status.error?.code;
+
+	// Don't retry if a hung tool was detected
+	if (openTool) return false;
+
+	// Retry provider_transport errors
+	if (category === "provider_transport") return true;
+
+	// Retry post_start agent_runtime failures with specific codes
+	if (
+		category === "agent_runtime" &&
+		outcome?.phase === "post_start" &&
+		(code === "agent_error" || code === "prompt_failed")
+	) {
+		return true;
+	}
+
+	return false;
 }
 
 /**
