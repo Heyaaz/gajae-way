@@ -604,6 +604,16 @@ export class BindingsGroup {
 		)?.snapshot_json;
 	}
 
+	latestBrokerCutoverAt(): string | null {
+		return (
+			(
+				this.#db.prepare("SELECT MAX(created_at) AS created_at FROM broker_cutovers").get() as {
+					created_at: string | null;
+				} | null
+			)?.created_at ?? null
+		);
+	}
+
 	cutoverBrokerAuthority(
 		tx: WriteTx,
 		input: {

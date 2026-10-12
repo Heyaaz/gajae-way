@@ -116,6 +116,40 @@ test("projector reads durable rows through the database and stays fail-closed", 
 	}
 });
 
+test("origins unbound by a broker cutover stay ungated until a later rebind touches them", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-cutover-"));
+	const database = await Store.open(join(directory, "gateway.db"));
+	try {
+		const key = "discord/dm/c1/peer=p1";
+		database.transaction((tx) => {
+			database.bindings.rotateEpoch(tx, key, JSON.stringify(discordDm));
+			database.bindings.bind(tx, key, "sess-pre-cutover-0000");
+		});
+		expect(database.bindings.latestBrokerCutoverAt()).toBeNull();
+		database.transaction((tx) =>
+			database.bindings.cutoverBrokerAuthority(tx, {
+				expectedAuthority: null,
+				targetAuthority: { canonicalAgentDir: "/srv/gateway/agent", identity: "gateway-private" },
+				evidence: "cycle projection test",
+				disposition: "quarantine",
+			}),
+		);
+		expect(database.bindings.latestBrokerCutoverAt()).toBeString();
+
+		const afterCutover = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		expect(afterCutover.sessions[0]).toMatchObject({ originKey: key, sessionId: "" });
+		expect(afterCutover.gates).not.toContain("stale_session_identity");
+
+		// The next rebind stamps activity past the cutover: mid-rebind is gated again.
+		await Bun.sleep(5);
+		database.transaction((tx) => database.bindings.rotateEpoch(tx, key, JSON.stringify(discordDm)));
+		const rebinding = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		expect(rebinding.gates).toContain("stale_session_identity");
+	} finally {
+		database.close();
+	}
+});
+
 test("starvation is judged per origin from turn_state: an old accepted trigger is busy, an old unbound row alone is starved", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-starve-"));
 	const database = await Store.open(join(directory, "gateway.db"));
