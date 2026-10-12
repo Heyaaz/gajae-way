@@ -147,6 +147,14 @@ export class MonitorsGroup {
 		}>;
 	}
 
+	unquarantinedEventTypes(): Array<{ monitor_id: string; event_type: string; event_types_json: string | null }> {
+		return this.#db
+			.prepare(
+				"SELECT DISTINCT e.monitor_id, e.event_type, m.event_types_json FROM monitor_events e LEFT JOIN monitors m ON m.monitor_id = e.monitor_id WHERE NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = e.event_id)",
+			)
+			.all() as Array<{ monitor_id: string; event_type: string; event_types_json: string | null }>;
+	}
+
 	authoringLossStreaks(sinceIso: string): Array<{ eventType: string; consecutive: number; lastFiredAt: string }> {
 		const rows = this.#db
 			.prepare(
