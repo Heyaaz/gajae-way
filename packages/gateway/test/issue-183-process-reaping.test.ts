@@ -217,17 +217,19 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	const spacedPrefix = "/home/user/gajae way/.gajaeway/gjc";
 	const spacedCurrentGjc = `${spacedPrefix}/0.18.11/bin/gjc`;
 	const spacedPreviousGjc = `${spacedPrefix}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
+	const attachOnlyEnv = "GJC_SDK_BROKER_AUTOSTART=0";
 	const output = [
 		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
-		`300 401 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} SHELL=/bin/zsh`,
-		`300 402 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir}2 SHELL=/bin/zsh`,
-		`300 403 Mon Oct 13 03:20:00 2026 bun ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} SHELL=/bin/zsh`,
-		`300 404 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} --extra HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
-		`300 405 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} other SHELL=/bin/zsh`,
+		`300 401 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
+		`300 402 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir}2 ${attachOnlyEnv}`,
+		`300 403 Mon Oct 13 03:20:00 2026 bun ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
+		`300 404 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} --extra HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
+		`300 405 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} other ${attachOnlyEnv}`,
+		`300 406 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} OTHER=value ${attachOnlyEnv}`,
 	].join("\n");
 	const table = parseUnixProcessTable(output, spacedAgentDir);
 
-	expect(table).toHaveLength(6);
+	expect(table).toHaveLength(7);
 	expect(table[1]).toEqual({
 		pid: 401,
 		ppid: 300,
@@ -238,6 +240,7 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	expect(table[3]?.argv).toEqual(["bun", spacedPreviousGjc, "sdk", "serve", "--stdio", "--session", SESSION]);
 	expect(table[4]?.argv).toEqual([spacedCurrentGjc, "sdk", "serve", "--stdio", "--session", SESSION, "--extra"]);
 	expect(table[5]?.agentDir).toBeUndefined();
+	expect(table[6]?.agentDir).toBeUndefined();
 	expect(
 		select(table, {
 			gjcPath: spacedCurrentGjc,
@@ -255,13 +258,14 @@ test("Unix ps parser preserves spaced gateway and Bun launcher paths", () => {
 	const spacedBun = "/home/user/gajae way/.bun/bin/bun";
 	const spacedSource = "/home/user/gajae way/packages/gateway/src/main.ts";
 	const spacedGateway = "/home/user/gajae way/.gajaeway/bin/gajaeway-gateway";
+	const attachOnlyEnv = "GJC_SDK_BROKER_AUTOSTART=0";
 	const output = [
 		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
 		`300 501 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedSource} daemon`,
-		`501 601 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`501 601 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
 		`300 502 Mon Oct 13 03:20:00 2026 ${spacedGateway} daemon`,
-		`502 602 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
-		`300 603 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`502 602 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
+		`300 603 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
 	].join("\n");
 	const table = parseUnixProcessTable(output, spacedAgentDir, { gjcPath: spacedGjc, gjcPrefix: spacedPrefix });
 

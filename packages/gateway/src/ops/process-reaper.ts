@@ -389,6 +389,7 @@ function findUnixAgentDir(
 	}
 
 	const token = `GJC_CODING_AGENT_DIR=${expectedAgentDir}`;
+	const expectedSuffix = " GJC_SDK_BROKER_AUTOSTART=0";
 	for (
 		let index = commandAndEnvironment.indexOf(token);
 		index >= 0;
@@ -397,7 +398,10 @@ function findUnixAgentDir(
 		const before = index === 0 || /\s/.test(commandAndEnvironment[index - 1] ?? "");
 		const end = index + token.length;
 		const followingEnvironment = commandAndEnvironment.slice(end);
-		const after = end === commandAndEnvironment.length || /^\s+[A-Za-z_][A-Za-z0-9_]*=/.test(followingEnvironment);
+		// broker.ts appends this fixed final variable after the configured agent directory.
+		// Any other suffix is ambiguous in flattened ps output: it may still be part of a
+		// different agent directory whose name extends the configured path with spaces.
+		const after = followingEnvironment === "" || followingEnvironment === expectedSuffix;
 		if (before && after) return { index, value: expectedAgentDir };
 	}
 	return undefined;
