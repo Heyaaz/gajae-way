@@ -44,6 +44,7 @@ import {
 	classifyRecoveryFailure,
 	clearAttempt,
 	recoveryCursorPath as defaultRecoveryCursorPath,
+	isPermanentDiscordUnreadable,
 	loadRecoveryCursors,
 	pruneKnownDms,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
@@ -1703,7 +1704,6 @@ export class ReconnectingGateway {
 				threadIds: [],
 			};
 		}
-		this.clearUnreadableRecoveryTarget(channelId);
 		const threadIds = discoverThreads ? await discoverRecoveryThreadIds(fetched, channelId, Date.now()) : [];
 
 		const cursors = this.#cursors;
@@ -1779,6 +1779,11 @@ export class ReconnectingGateway {
 		// id, so the replay cannot double-count a discard.
 		this.advanceRecovered(channelId, outcome.advancedTo);
 		if (outcome.fetchError) {
+			// A conversation the bot cannot read must not drive the 60s pass loop forever:
+			// quarantine it under the same bound the channel-fetch path uses, so healthy
+			// conversations can complete and the dead one is probed again on reconnect.
+			if (outcome.fetchErrorPermanent)
+				return { incomplete: this.noteUnreadableRecoveryTarget(channelId, outcome.fetchError), threadIds };
 			console.error(
 				`Discord recovery could not read history for channel ${channelId}: ${outcome.fetchError}; other channels continue, retrying with backoff.`,
 			);
@@ -1809,6 +1814,10 @@ export class ReconnectingGateway {
 				`Discord recovery backfilled ${outcome.delivered} fresh message(s), found ${outcome.duplicates} duplicate(s), skipped ${outcome.skipped}, and discarded ${outcome.discarded} for channel ${channelId}.`,
 			);
 		}
+		// A conversation is re-admitted only once a pass read it end to end: the counter that
+		// quarantines an unreadable conversation has to survive a pass whose fetch or history
+		// read failed, or the bound would never be reached.
+		this.clearUnreadableRecoveryTarget(channelId);
 		return { incomplete: false, threadIds };
 	}
 
@@ -2230,19 +2239,6 @@ function isRecoverableChannel(value: unknown): value is RecoverableChannel {
 		value !== null &&
 		"messages" in value &&
 		typeof (value as { messages?: { fetch?: unknown } }).messages?.fetch === "function"
-	);
-}
-
-function isPermanentDiscordUnreadable(error: unknown): boolean {
-	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
-	return (
-		candidate?.code === 10_003 ||
-		candidate?.code === 50_001 ||
-		candidate?.code === 50_013 ||
-		candidate?.status === 403 ||
-		candidate?.status === 404 ||
-		candidate?.httpStatus === 403 ||
-		candidate?.httpStatus === 404
 	);
 }
 
