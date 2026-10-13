@@ -299,6 +299,19 @@ export class WorkLaneManager {
 			this.#refreshWorkSession(tx, runtime, runtime.startedAt);
 		});
 	}
+	#rollbackUnpersistedWorktree(
+		name: string,
+		worktree: { readonly repository: string; readonly path: string; readonly branch: string },
+	): void {
+		try {
+			removeCreatedWorktree(worktree.repository, worktree.path, worktree.branch);
+		} catch (error) {
+			const reason = sanitizeDiagnostic(error instanceof Error ? error.message : String(error))
+				.replace(/\s+/gu, " ")
+				.slice(0, 200);
+			console.error(`work_setup_rollback_failed name=${name} reason=${reason || "unknown"}`);
+		}
+	}
 
 	#updateAttempt(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
 		return this.#db.transaction((tx) => {
@@ -736,66 +749,93 @@ export class WorkLaneManager {
 				};
 			job = acknowledgeHold({ record: job, note: "operator resumed the work lane", at: this.#at() });
 		}
+		let createdWorktree: { readonly repository: string; readonly path: string; readonly branch: string } | undefined;
 		if (!job) {
 			// If repo binding is provided, create a worktree from that repo
 			let worktreePath = input.cwd;
 			if (input.repo !== undefined) {
 				const laneRoot = this.#options.laneRoot ?? this.#options.gajaewayHome;
 				worktreePath = await createWorktreeFromRepo(laneRoot, input.name, input.repo, input.base);
-				assertOutsideServiceDirectory(this.#options.serviceDirectory, worktreePath, input.name);
+				createdWorktree = {
+					repository: input.repo,
+					path: worktreePath,
+					branch: `work/${input.name.toLowerCase()}`,
+				};
 			}
-			const facts = await collectRepoFacts(worktreePath);
-			job = createLaneJobRecord({
-				jobId,
-				branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
-				worktreePath,
-				baselineSha: facts?.headSha,
-				...(input.repo !== undefined ? { repository: input.repo } : {}),
-			});
-		}
-		// The session and the attempt share one path: the lane's recorded worktree (issue #480).
-		input = { ...input, cwd: job.lane.worktreePath };
-		const binding = await this.#port.runExclusive("work/admission", async () => {
-			this.#live();
-			this.#options.lanes.assertAdmission(input.name);
 			try {
-				return await this.#port.bind({
-					originKey: sessionKey,
-					epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
-					repo: input.cwd,
-					codingRegister: true,
-					...(input.model ? { model: input.model } : {}),
+				assertOutsideServiceDirectory(this.#options.serviceDirectory, worktreePath, input.name);
+				const facts = await collectRepoFacts(worktreePath);
+				job = createLaneJobRecord({
+					jobId,
+					branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
+					worktreePath,
+					baselineSha: facts?.headSha,
+					...(input.repo !== undefined ? { repository: input.repo } : {}),
 				});
 			} catch (error) {
-				const cause = workBindFailureCause(error);
-				console.error(
-					`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${input.cwd} cause=${cause} error=${workBindFailureMessage(error)}`,
-				);
-				throw new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
-					reasonCode: "bind_failed",
-					cause,
-					name: input.name,
-				});
+				if (createdWorktree) this.#rollbackUnpersistedWorktree(input.name, createdWorktree);
+				throw error;
 			}
-		});
-		this.#live();
-		const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
-		const notice = mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch) : undefined;
-		const runtime = makeRuntime(
-			this.#db,
-			input.name,
-			binding.sessionId,
-			binding.epoch,
-			input.cwd,
-			this.#at(),
-			opRef,
-			mode,
-			mode === "start" ? context.parent : null,
-			context.wakeReportId ?? null,
-			notice?.hash ?? null,
-		);
-		job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
-		this.#prepareAttempt(runtime, job);
+		}
+		if (!job) throw new Error("work lane job was not initialized");
+		const initialJob = job;
+		// The session and the attempt share one path: the lane's recorded worktree (issue #480).
+		input = { ...input, cwd: job.lane.worktreePath };
+		const initialized = await (async () => {
+			try {
+				const binding = await this.#port.runExclusive("work/admission", async () => {
+					this.#live();
+					this.#options.lanes.assertAdmission(input.name);
+					try {
+						return await this.#port.bind({
+							originKey: sessionKey,
+							epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
+							repo: input.cwd,
+							codingRegister: true,
+							...(input.model ? { model: input.model } : {}),
+						});
+					} catch (error) {
+						const cause = workBindFailureCause(error);
+						console.error(
+							`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${input.cwd} cause=${cause} error=${workBindFailureMessage(error)}`,
+						);
+						throw new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
+							reasonCode: "bind_failed",
+							cause,
+							name: input.name,
+						});
+					}
+				});
+				this.#live();
+				const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+				const notice = mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch) : undefined;
+				const runtime = makeRuntime(
+					this.#db,
+					input.name,
+					binding.sessionId,
+					binding.epoch,
+					input.cwd,
+					this.#at(),
+					opRef,
+					mode,
+					mode === "start" ? context.parent : null,
+					context.wakeReportId ?? null,
+					notice?.hash ?? null,
+				);
+				const attemptJob = appendAttempt(initialJob, {
+					opRef,
+					sessionId: binding.sessionId,
+					startedAt: runtime.startedAt,
+				});
+				this.#prepareAttempt(runtime, attemptJob);
+				return { binding, notice, opRef, runtime };
+			} catch (error) {
+				if (createdWorktree && this.#db.work.laneJobJson(jobId) === undefined)
+					this.#rollbackUnpersistedWorktree(input.name, createdWorktree);
+				throw error;
+			}
+		})();
+		const { binding, notice, opRef, runtime } = initialized;
 
 		const observer = this.#register(runtime);
 		this.#attach(observer);
@@ -2568,4 +2608,26 @@ async function createWorktreeFromRepo(
 			repo,
 		});
 	}
+}
+
+function removeCreatedWorktree(repository: string, worktreePath: string, branch: string): void {
+	const remove = Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
+		stdout: "pipe",
+		stderr: "pipe",
+		cwd: repository,
+	});
+	const deleteBranch = Bun.spawnSync(["git", "branch", "-D", branch], {
+		stdout: "pipe",
+		stderr: "pipe",
+		cwd: repository,
+	});
+	const failures = [
+		remove.exitCode === 0
+			? undefined
+			: `git worktree remove failed: ${remove.stderr?.toString().trim() || "unknown error"}`,
+		deleteBranch.exitCode === 0
+			? undefined
+			: `git branch delete failed: ${deleteBranch.stderr?.toString().trim() || "unknown error"}`,
+	].filter((failure): failure is string => failure !== undefined);
+	if (failures.length > 0) throw new Error(failures.join("; "));
 }

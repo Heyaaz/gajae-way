@@ -148,7 +148,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 		await assertNoRestoreJournal(config.home);
 		// Reap orphaned worker processes from previous boot epochs before accepting new work.
 		// This prevents stale relay processes from accumulating and blocking resources.
-		const reapResult = await reapLeftoverWorkers(config.home);
+		const reapResult = await reapLeftoverWorkers(config.home, { agentDir: config.gjc.agentDir });
 		if (reapResult.found > 0) {
 			console.info(`process_reaper found=${reapResult.found} killed=${reapResult.killed} failed=${reapResult.failed}`);
 		}

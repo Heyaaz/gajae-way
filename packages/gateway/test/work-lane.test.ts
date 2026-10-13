@@ -2425,6 +2425,63 @@ test("work.start with invalid repo throws invalid_params with git stderr", async
 	expect(job).toBeUndefined();
 });
 
+test("repo-bound work.start removes a newly created worktree after bind failure so retry can create it", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-bind-retry-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-bind-retry-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial commit");
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], { stdout: "ignore", stderr: "ignore" });
+
+		const f = await fixture();
+		const bind = f.port.bind.bind(f.port);
+		let failFirstBind = true;
+		f.port.bind = async (input) => {
+			if (failFirstBind) {
+				failFirstBind = false;
+				throw new GjcCliUnavailableError("broker unavailable");
+			}
+			return await bind(input);
+		};
+		const input = { name: "bind-retry", text: "work", cwd: f.directory, repo: bareRepo };
+
+		await expect(f.manager.start(input)).rejects.toMatchObject({
+			code: "verb_failed",
+			detail: { reasonCode: "bind_failed", cause: "broker_unavailable" },
+		});
+		const worktreePath = join(f.gajaewayHome, "lanes", "bind-retry");
+		const branch = Bun.spawnSync(
+			["git", "-C", bareRepo, "show-ref", "--verify", "--quiet", "refs/heads/work/bind-retry"],
+			{ stdout: "ignore", stderr: "ignore" },
+		);
+		const worktrees = Bun.spawnSync(["git", "-C", bareRepo, "worktree", "list", "--porcelain"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(branch.exitCode).not.toBe(0);
+		expect(worktrees.stdout?.toString()).not.toContain(worktreePath);
+
+		const retried = await f.manager.start(input);
+		expect(retried.started).toBe(true);
+		expect(f.job("bind-retry").lane.worktreePath).toBe(worktreePath);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
 test("work.start with repo and base parameter creates worktree from specified base", async () => {
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-base-"));
 	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-base-"));

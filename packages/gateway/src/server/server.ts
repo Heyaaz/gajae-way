@@ -395,6 +395,8 @@ function startMemoryOperation(runtime: Runtime, opRef: string, work: () => Promi
 interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
+	/** Canonical persona workspace shared by session binding and outbound file checks. */
+	readonly workspace: string;
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
 	readonly sessionPort: SessionPort;
@@ -918,6 +920,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			: undefined;
 	runtime = {
 		config: options.config,
+		workspace,
 		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		sessionPort,
@@ -2706,7 +2709,7 @@ async function createInboundTurnLifecycle(
 			}
 			const checked = await checkOutboundFile(requested, {
 				home: runtime.config.home,
-				workspace: join(runtime.config.home, "workspace"),
+				workspace: runtime.workspace,
 				...(runtime.config.outboundFileRoots ? { roots: runtime.config.outboundFileRoots } : {}),
 			});
 			if (!checked.ok) {

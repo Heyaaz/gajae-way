@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ProcessTableEntry, reapLeftoverWorkers, selectOrphanedWorkers } from "../src/ops/process-reaper";
@@ -134,7 +134,7 @@ test("fixture: SKIP unrelated orphaned bun process (different command)", async (
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -159,7 +159,7 @@ test("fixture: SKIP worker with different agent directory", async () => {
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -184,7 +184,7 @@ test("fixture: SKIP prefix-colliding agent directory", async () => {
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -208,7 +208,7 @@ test("fixture: SKIP worker whose ppid === selfPid (child of current gateway)", a
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -232,7 +232,7 @@ test("fixture: SKIP argv superset/prefix match (extra token)", async () => {
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -256,7 +256,7 @@ test("fixture: SKIP argv variant (serve-x instead of serve)", async () => {
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -280,7 +280,7 @@ test("fixture: POSITIVE reap worker with dead parent (ppid=9999 not in table)", 
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -305,7 +305,7 @@ test("fixture: POSITIVE reap worker with ppid=1", async () => {
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -337,7 +337,7 @@ test("fixture: POSITIVE reap worker with systemd --user subreaper (live non-gate
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -362,7 +362,7 @@ test("fixture: POSITIVE reap worker spawned as bun gjcPath (argv[0] = bun)", asy
 	];
 
 	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
+		gjcPaths: new Set([gjcPath]),
 		brokerAgentDir,
 		selfPid,
 	});
@@ -415,6 +415,93 @@ test("integration: reapLeftoverWorkers with injected process table", async () =>
 		expect(killCalled[0]).toEqual({ pid: 2008, signal: "SIGTERM" });
 		expect(killCalled[1]).toEqual({ pid: 2009, signal: "SIGTERM" });
 	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("integration: reaps workers using retained GJC paths and the configured agent directory", async () => {
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-retained-reaper-")));
+	const oldExecutable = join(home, "gjc", "0.18.10", "bin", "gjc");
+	const currentExecutable = join(home, "gjc", "0.18.11", "bin", "gjc");
+	const customAgentDir = join(home, "custom-agent");
+	try {
+		await mkdir(join(home, "gjc", "0.18.10", "bin"), { recursive: true });
+		await mkdir(join(home, "gjc", "0.18.11", "bin"), { recursive: true });
+		await writeFile(oldExecutable, "old gjc");
+		await writeFile(currentExecutable, "current gjc");
+		await symlink("0.18.11", join(home, "gjc", "current"));
+		await mkdir(customAgentDir, { recursive: true });
+
+		const result = await reapLeftoverWorkers(home, {
+			agentDir: customAgentDir,
+			log: () => {},
+			processTable: [
+				{
+					pid: 2012,
+					ppid: 1,
+					argv: [oldExecutable, "sdk", "serve", "--stdio", "--session", "old-session"],
+					agentDir: await realpath(customAgentDir),
+				},
+			],
+			kill: async () => {},
+		});
+
+		expect(result).toEqual({ found: 1, killed: 1, failed: 0 });
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("integration: escalates to SIGKILL when a worker ignores SIGTERM", async () => {
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-reaper-escalation-")));
+	const gjcPath = join(home, "gjc", "current", "bin", "gjc");
+	const brokerAgentDir = join(home, "broker", "agent");
+	let child: ReturnType<typeof Bun.spawn> | undefined;
+	try {
+		await mkdir(join(home, "gjc", "current", "bin"), { recursive: true });
+		await writeFile(gjcPath, "");
+		await mkdir(brokerAgentDir, { recursive: true });
+		child = Bun.spawn(
+			["bun", "-e", 'process.on("SIGTERM", () => {}); console.log("ready"); setInterval(() => {}, 1000);'],
+			{ stdout: "pipe", stderr: "ignore" },
+		);
+		const stdout = child.stdout;
+		if (!stdout || typeof stdout === "number") throw new Error("worker stdout was not captured");
+		const reader = stdout.getReader();
+		const ready = await reader.read();
+		reader.releaseLock();
+		expect(new TextDecoder().decode(ready.value)).toContain("ready");
+
+		const signals: string[] = [];
+		const result = await reapLeftoverWorkers(home, {
+			log: () => {},
+			processTable: [
+				{
+					pid: child.pid,
+					ppid: 1,
+					argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "stubborn-session"],
+					agentDir: brokerAgentDir,
+				},
+			],
+			kill: async (pid, signal) => {
+				signals.push(signal);
+				process.kill(pid, signal as NodeJS.Signals);
+				if (signal === "SIGKILL") await child?.exited;
+			},
+			timeoutMs: 50,
+		});
+
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(result).toEqual({ found: 1, killed: 1, failed: 0 });
+	} finally {
+		if (child) {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				/* already exited */
+			}
+			await child.exited;
+		}
 		await rm(home, { recursive: true, force: true });
 	}
 });

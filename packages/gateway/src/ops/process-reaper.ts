@@ -1,10 +1,12 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readdir, readFile, realpath } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 
 export interface ProcessReaperOptions {
-	/** Optional timeout for the reaper itself (ms). */
+	/** Optional wait after each termination signal before escalating (ms). */
 	readonly timeoutMs?: number;
+	/** Configured broker agent directory; defaults to the bundled directory. */
+	readonly agentDir?: string;
 	/** Log function for diagnostics. */
 	readonly log?: (line: string) => void;
 	/** Optional injected process table for testing. */
@@ -32,7 +34,7 @@ export interface ReapResult {
  * Identifies and kills leftover child processes from the previous gateway epoch.
  *
  * Only reaps processes that are:
- * 1. Spawned with exactly argv = [gjcPath (or bun gjcPath), "sdk", "serve", "--stdio", "--session", <id>]
+ * 1. Spawned with exactly argv = [a current or retained gjcPath (or bun gjcPath), "sdk", "serve", "--stdio", "--session", <id>]
  * 2. With agentDir exactly matching our broker agent directory
  * 3. With ppid !== current process.pid (orphaned from this gateway instance)
  *
@@ -47,8 +49,8 @@ export async function reapLeftoverWorkers(home: string, options: ProcessReaperOp
 	try {
 		const resolvedHome = resolve(home);
 		const layout = homeLayout(resolvedHome);
-		const gjcExecutable = await resolvePath(layout.gjcExecutable());
-		const brokerAgentDir = layout.brokerAgentDir;
+		const gjcPaths = new Set(await retainedGjcPaths(layout.gjcPrefix, layout.gjcExecutable()));
+		const brokerAgentDir = await resolvePath(options.agentDir ?? layout.brokerAgentDir);
 
 		// Get current process's PID; orphaned workers will have ppid !== this
 		const selfPid = process.pid;
@@ -58,7 +60,7 @@ export async function reapLeftoverWorkers(home: string, options: ProcessReaperOp
 
 		// Classify which processes are orphaned workers we should reap
 		const foundPids = selectOrphanedWorkers(processTable, {
-			gjcPath: gjcExecutable,
+			gjcPaths,
 			brokerAgentDir,
 			selfPid,
 		});
@@ -71,7 +73,7 @@ export async function reapLeftoverWorkers(home: string, options: ProcessReaperOp
 		// Kill each found process with SIGTERM then SIGKILL
 		for (const pid of foundPids) {
 			try {
-				await killProcess(pid, options.kill);
+				await killProcess(pid, options.kill, options.timeoutMs);
 				killed++;
 				log(`process-reaper: reaped leftover worker pid=${pid}`);
 			} catch (error) {
@@ -86,35 +88,52 @@ export async function reapLeftoverWorkers(home: string, options: ProcessReaperOp
 	return { found, killed, failed };
 }
 
-/** Resolve a path through symlinks; return undefined if it doesn't exist. */
+/** Resolve a path through symlinks, canonicalizing its existing ancestors when the leaf is missing. */
 async function resolvePath(path: string): Promise<string> {
 	try {
-		const { realpath } = await import("node:fs/promises");
 		return await realpath(path);
-	} catch {
-		// Path doesn't exist; return as-is so matching will fail gracefully
-		return path;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return path;
+		const parent = dirname(path);
+		if (parent === path) return path;
+		return join(await resolvePath(parent), basename(path));
 	}
+}
+
+/** The current GJC plus retained version-specific binaries that old relays may still name in argv. */
+async function retainedGjcPaths(prefix: string, currentExecutable: string): Promise<string[]> {
+	const paths = new Set([await resolvePath(currentExecutable)]);
+	const entries = await readdir(prefix, { withFileTypes: true }).catch(() => undefined);
+	if (!entries) return [...paths];
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		try {
+			paths.add(await realpath(join(prefix, entry.name, "bin", "gjc")));
+		} catch {
+			// An incomplete or removed version directory is not a retained executable.
+		}
+	}
+	return [...paths];
 }
 
 /**
  * Pure classifier: identifies orphaned workers from a process table.
  *
  * A worker is selected for reaping if:
- * 1. Its argv matches [gjcPath or "bun" + gjcPath, "sdk", "serve", "--stdio", "--session", <id>]
+ * 1. Its argv matches a current or retained GJC path, optionally preceded by "bun".
  *    (argv is an exact token match, not substring or prefix)
  * 2. Its agentDir === brokerAgentDir (exact equality)
  * 3. Its ppid !== selfPid (not a child of the current gateway instance)
  */
 export function selectOrphanedWorkers(
 	table: ProcessTableEntry[],
-	options: { readonly gjcPath: string; readonly brokerAgentDir: string; readonly selfPid: number },
+	options: { readonly gjcPaths: ReadonlySet<string>; readonly brokerAgentDir: string; readonly selfPid: number },
 ): number[] {
 	const result: number[] = [];
 
 	for (const entry of table) {
 		// Check argv token match: [gjcPath or bun+gjcPath, "sdk", "serve", "--stdio", "--session", id]
-		if (!isWorkerArgv(entry.argv, options.gjcPath)) continue;
+		if (!isWorkerArgv(entry.argv, options.gjcPaths)) continue;
 
 		// Check agentDir exact equality
 		if (entry.agentDir !== options.brokerAgentDir) continue;
@@ -130,19 +149,19 @@ export function selectOrphanedWorkers(
 
 /**
  * Checks if argv matches the exact pattern for a spawned worker.
- * Pattern: [gjcPath or "bun" + gjcPath, "sdk", "serve", "--stdio", "--session", <id>]
+ * Pattern: [a current or retained GJC path, or "bun" plus that path, then the exact SDK serve arguments]
  */
-function isWorkerArgv(argv: string[], gjcPath: string): boolean {
+function isWorkerArgv(argv: string[], gjcPaths: ReadonlySet<string>): boolean {
 	if (argv.length < 6) return false;
 
 	let idx = 0;
 
-	// Check first token: either gjcPath directly or "bun" followed by gjcPath
+	// Check first token: either a retained GJC executable or "bun" followed by one.
 	if (argv[0] === "bun") {
-		if (argv[1] !== gjcPath) return false;
+		if (!gjcPaths.has(argv[1] ?? "")) return false;
 		idx = 2;
 	} else {
-		if (argv[0] !== gjcPath) return false;
+		if (!gjcPaths.has(argv[0] ?? "")) return false;
 		idx = 1;
 	}
 
@@ -311,17 +330,26 @@ async function killProcess(
 				stdout: "ignore",
 				stderr: "ignore",
 			});
-			const exitPromise = checkProc.exited;
-			const timeoutPromise = new Promise<boolean>((resolve) => {
-				setTimeout(() => resolve(false), timeoutMs);
-			});
-
-			const stillAlive = await Promise.race([exitPromise.then(() => false), timeoutPromise]).catch(() => true);
-
-			if (!stillAlive) return; // Process is dead
-		} catch {
-			// Assume process is dead if we can't check
-			return;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const probe = await Promise.race([
+				checkProc.exited.then((exitCode) => ({ kind: "exit" as const, exitCode })),
+				new Promise<{ kind: "timeout" }>((resolve) => {
+					timer = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
+				}),
+			]);
+			if (timer) clearTimeout(timer);
+			if (probe.kind === "timeout") {
+				try {
+					checkProc.kill();
+				} catch {
+					// The probe may have exited just after the timeout.
+				}
+				continue;
+			}
+			if (probe.exitCode === 0) continue; // kill -0 succeeded; the worker is still alive.
+			return; // A nonzero exit means the worker is gone.
+		} catch (error) {
+			throw new Error(`Could not verify whether process ${pid} is alive`, { cause: error });
 		}
 	}
 
