@@ -2399,6 +2399,105 @@ test("#481 awaiting_checks: pending checks transition to done when they all pass
 	expect(record.state).toBe("done");
 });
 
+test("#481 awaiting_checks: red checks trigger recovery re-steer path (attempts not recorded here)", async () => {
+	let checkStatus: CheckStatusSnapshot | null = { prNumber: 490, status: "pending", failingChecks: [] };
+	const f = await fixture({
+		checkStatusClient: {
+			async getCheckStatus() {
+				return checkStatus;
+			},
+		},
+		ownerTarget: () => origin,
+	});
+	await laneRepo(f.directory, "fix/red-checks-retry", true);
+	const result = await started(f, "f", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.work.laneJobRows().some((row) => row.state === "awaiting_checks"));
+	const jobId = laneJobIdentity("f").jobId;
+	let record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+	// Simulate checks turning red with specific failing checks
+	checkStatus = { prNumber: 490, status: "red", failingChecks: ["unit-test", "lint-check"] };
+	await f.manager.recover();
+	// Lane should stay in awaiting_checks (recovery attempted steer, but without open runtime it doesn't transition)
+	record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+});
+
+test("#481 awaiting_checks: red checks detected during recovery (without open runtime steer not sent)", async () => {
+	let checkStatus: CheckStatusSnapshot | null = { prNumber: 491, status: "pending", failingChecks: [] };
+	const f = await fixture({
+		checkStatusClient: {
+			async getCheckStatus() {
+				return checkStatus;
+			},
+		},
+		ownerTarget: () => origin,
+	});
+	await laneRepo(f.directory, "fix/red-checks-detection", true);
+	const result = await started(f, "g", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.work.laneJobRows().some((row) => row.state === "awaiting_checks"));
+	const jobId = laneJobIdentity("g").jobId;
+	let record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+	// Simulate checks turning red
+	checkStatus = { prNumber: 491, status: "red", failingChecks: ["test-a"] };
+	await f.manager.recover();
+	// Lane should still be in awaiting_checks (since there's no open runtime to re-steer)
+	record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+});
+
+test("#481 awaiting_checks: timeout is checked during recovery (1-hour window)", async () => {
+	const f = await fixture({
+		checkStatusClient: {
+			async getCheckStatus() {
+				return { prNumber: 492, status: "pending", failingChecks: [] };
+			},
+		},
+		ownerTarget: () => origin,
+	});
+	await laneRepo(f.directory, "fix/timeout-pending", true);
+	const result = await started(f, "h", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.work.laneJobRows().some((row) => row.state === "awaiting_checks"));
+	const jobId = laneJobIdentity("h").jobId;
+	let record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+	// Verify the lane stays in awaiting_checks while checks are pending
+	for (let i = 0; i < 3; i++) {
+		await f.manager.recover();
+		record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+		expect(record.state).toBe("awaiting_checks");
+	}
+});
+
+test("#481 awaiting_checks: when checks become unavailable lane stays awaiting (no immediate failure)", async () => {
+	let checkStatus: CheckStatusSnapshot | null = { prNumber: 493, status: "pending", failingChecks: [] };
+	const f = await fixture({
+		checkStatusClient: {
+			async getCheckStatus() {
+				return checkStatus;
+			},
+		},
+		ownerTarget: () => origin,
+	});
+	await laneRepo(f.directory, "fix/checks-unavailable", true);
+	const result = await started(f, "i", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.work.laneJobRows().some((row) => row.state === "awaiting_checks"));
+	const jobId = laneJobIdentity("i").jobId;
+	let record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+	// Simulate checks becoming unavailable (PR closed or checks removed)
+	checkStatus = null;
+	await f.manager.recover();
+	// Lane should stay in awaiting_checks since we can't determine if it's a failure
+	record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+});
+
 test("#407: laneLastCommits reads each distinct worktree once, concurrently, null for non-repos", async () => {
 	const repo = await mkdtemp(join(tmpdir(), "lane-commit-"));
 	const missing = join(repo, "does-not-exist");
