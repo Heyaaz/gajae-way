@@ -980,6 +980,7 @@ test("a throwing history fetch is contained in the outcome instead of thrown", a
 	const outcome = await recoverConversation(channel, { cursor: "10", nowMs: 0, deliver: async () => "acked" });
 	expect(outcome.failed).toBe(true);
 	expect(outcome.fetchError).toBe("discord history 500");
+	expect(outcome.fetchErrorPermanent).toBe(false);
 	expect(outcome.advancedTo).toBe("10");
 });
 
