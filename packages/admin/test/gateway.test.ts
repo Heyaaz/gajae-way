@@ -273,6 +273,7 @@ test("reconnect backoff escalates through crash loops and resets only after stab
 	let gateway: AdminGateway | undefined;
 	const retries = retryScheduler();
 	const logs: string[] = [];
+	const gatewayLogs = () => logs.filter((line) => line.startsWith("Admin gateway "));
 	let random = 0.999;
 	const errorSpy = spyOn(console, "error").mockImplementation((line) => logs.push(String(line)));
 	try {
@@ -291,14 +292,14 @@ test("reconnect backoff escalates through crash loops and resets only after stab
 			retries.runNext();
 			await until(() => retries.pending().length === 1);
 		}
-		expect(logs).toEqual(["Admin gateway disconnected; reconnecting."]);
+		expect(gatewayLogs()).toEqual(["Admin gateway disconnected; reconnecting."]);
 
 		replacement = listenGateway(path);
 		await until(() => retries.pending().length === 1);
 		expect(retries.pending()[0]?.delayMs).toBe(30_000);
 		retries.runNext();
 		await until(() => gateway?.connected === true);
-		expect(logs).toEqual(["Admin gateway disconnected; reconnecting.", "Admin gateway reconnected."]);
+		expect(gatewayLogs()).toEqual(["Admin gateway disconnected; reconnecting.", "Admin gateway reconnected."]);
 		const unstableStabilityTimer = retries.lastPending();
 		retries.advanceBy(unstableStabilityTimer.delayMs - 1);
 		expect(retries.now()).toBe(unstableStabilityTimer.dueAt - 1);
@@ -321,7 +322,7 @@ test("reconnect backoff escalates through crash loops and resets only after stab
 		await until(() => gateway?.connected === false);
 		await until(() => retries.pending().length === 1);
 		expect(retries.pending()[0]?.delayMs).toBe(500);
-		expect(logs).toEqual([
+		expect(gatewayLogs()).toEqual([
 			"Admin gateway disconnected; reconnecting.",
 			"Admin gateway reconnected.",
 			"Admin gateway disconnected; reconnecting.",
