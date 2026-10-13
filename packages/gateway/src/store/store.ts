@@ -69,6 +69,28 @@ export class Store {
 		return this.core.transaction(fn);
 	}
 
+	reconcileWorkAttempts(log: (line: string) => void = console.error): number {
+		return this.transaction((tx) =>
+			this.work.workAttemptReconcile(
+				tx,
+				(runtime, at) =>
+					this.bindings.touchWorkSession(
+						tx,
+						runtime.sessionKey,
+						runtime.sessionId,
+						runtime.epoch,
+						at,
+						JSON.stringify({
+							platform: "work",
+							kind: "task",
+							conversationId: runtime.sessionKey.slice("work/task/".length),
+						}),
+					),
+				log,
+			),
+		);
+	}
+
 	inspectBrokerAuthority(): BrokerAuthorityCensus {
 		let populated = false;
 		for (const table of Object.keys(TABLE_OWNER) as OwnedTable[]) {

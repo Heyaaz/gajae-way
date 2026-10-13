@@ -247,7 +247,7 @@ describe("work attempt boot reconciliation", () => {
 		const deliveries = f.database.outbox.rows();
 		f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?").run(f.runtime.opRef);
 
-		const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx, () => {}));
+		const reconciled = f.database.reconcileWorkAttempts(() => {});
 		expect(reconciled).toBe(1);
 		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(END);
 		expect(f.database.outbox.rows()).toEqual(deliveries);
@@ -258,7 +258,7 @@ describe("work attempt boot reconciliation", () => {
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
 		f.raw.query("UPDATE work_attempt_runtime SET settled_at = ? WHERE op_ref = ?").run(END, f.runtime.opRef);
 
-		const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx));
+		const reconciled = f.database.reconcileWorkAttempts();
 		expect(reconciled).toBe(1);
 		expect(f.database.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
 			decision: "recovery_indeterminate",
@@ -335,7 +335,7 @@ describe("work attempt boot reconciliation", () => {
 					JSON.stringify(runtime),
 				);
 
-		const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx, () => {}));
+		const reconciled = f.database.reconcileWorkAttempts(() => {});
 		expect(reconciled).toBe(2);
 		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(firstReconciledAt);
 		expect(f.database.work.workAttemptGet(secondOpRef)?.settledAt).toBe(secondReconciledAt);
@@ -346,6 +346,7 @@ describe("work attempt boot reconciliation", () => {
 			firstReconciledAt,
 			secondReconciledAt,
 		]);
+		expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(secondReconciledAt);
 	});
 
 	test("boot heals a torn work-history settlement before normal recovery starts", async () => {
@@ -397,6 +398,7 @@ describe("work attempt boot reconciliation", () => {
 				terminal: { reasonCode: "recovery_indeterminate" },
 			});
 			expect(f.database.work.workAttemptOpen()).toEqual([]);
+			expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(END);
 		} finally {
 			await server.stop("test shutdown");
 		}
@@ -419,9 +421,7 @@ describe("work attempt boot reconciliation", () => {
 		);
 
 		const lines: string[] = [];
-		const reconciled = f.database.transaction((tx) =>
-			f.database.work.workAttemptReconcile(tx, (line) => lines.push(line)),
-		);
+		const reconciled = f.database.reconcileWorkAttempts((line) => lines.push(line));
 		expect(reconciled).toBe(1);
 		expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({
 			decision: "wake_unaccepted",
@@ -466,7 +466,7 @@ describe("work attempt boot reconciliation", () => {
 			expect(f.database.work.laneReportGet(wakeReportId)?.state).toBe(scenario.state);
 
 			f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?").run(runtime.opRef);
-			const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx, () => {}));
+			const reconciled = f.database.reconcileWorkAttempts(() => {});
 
 			expect(reconciled).toBe(1);
 			expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({

@@ -522,8 +522,12 @@ export class WorkGroup {
 		}
 	}
 
-	/** Repair torn settlement timestamps before normal recovery starts. */
-	workAttemptReconcile(tx: WriteTx, log: (line: string) => void = console.error): number {
+	/** Repair torn settlement state and refresh lane activity before normal recovery starts. */
+	workAttemptReconcile(
+		tx: WriteTx,
+		refreshWorkSession: (runtime: WorkAttemptRuntime, at: string) => void,
+		log: (line: string) => void = console.error,
+	): number {
 		const rows = this.#db
 			.prepare(
 				"SELECT op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json FROM work_attempt_runtime WHERE settled_at IS NULL OR CASE WHEN json_valid(record_json) THEN settled_at IS NOT json_extract(record_json, '$.settledAt') ELSE 0 END",
@@ -668,6 +672,7 @@ export class WorkGroup {
 						workAssert(this.laneReportHold(tx, next.wakeReportId, "wake_acceptance_uncertain"));
 				}
 			}
+			refreshWorkSession(next, settledAt);
 			reconciled++;
 		}
 
