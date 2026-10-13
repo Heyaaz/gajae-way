@@ -3451,7 +3451,7 @@ export function renderSteer(body: string): string {
 
 function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {
 	if (row.source === "lane_report")
-		return `[Internal lane report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n${row.body}`;
+		return `[Internal report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n${row.body}`;
 	return renderSteer(lifecycle?.renderSteer?.(row) ?? row.body);
 }
 

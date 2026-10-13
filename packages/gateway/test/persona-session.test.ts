@@ -2628,7 +2628,7 @@ test("lane_report steer uses lane framing, not user framing", async () => {
 	await manager!.notifyInbound(KEY);
 	await eventually(() => port.steers.length === 1, "lane report was not steered into the running turn");
 	expect(port.steers[0]?.text).toBe(
-		"[Internal lane report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n[lane child] completed: result",
+		"[Internal report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n[lane child] completed: result",
 	);
 	expect(port.steers[0]?.text).not.toContain("Additional message from the user");
 	expect(database!.inbox.turnRows(latestOpRef)).toEqual(
