@@ -171,12 +171,15 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
   "stallTimeoutMs": 120000,
+  "sessions": { "idleResetMs": 86400000 },
   "monitorCatchUp": { "maxSlots": 24, "maxAgeMs": 86400000 },
   "sqlite": { "journalMode": "WAL" }
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, `stallTimeoutMs`, and `sqlite` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, `stallTimeoutMs`, `sessions`, and `sqlite` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`.
+
+`sessions.idleResetMs` is an optional 60000–2592000000 ms idle window. When set, the 60-second sweep rotates a quiet non-loopback, non-monitor persona session like `/new`; it skips running turns and sessions already unbound after a previous rotation. Unlike `sessions.idleRetireMs`, which ends an idle host but preserves its session history, this deliberately starts the conversation's next turn with fresh context. The `sessions` object is reloadable.
 
 `sqlite.journalMode` accepts `DELETE`, `TRUNCATE`, `PERSIST`, or `WAL` (default `WAL`); `MEMORY` and `OFF` are rejected to preserve database durability. Use `DELETE` or `TRUNCATE` for a single gateway instance on an NFS volume, and change this setting only while the gateway is stopped.
 
