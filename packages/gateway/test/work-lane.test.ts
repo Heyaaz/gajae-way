@@ -3060,7 +3060,6 @@ test("issue #480: cleanup failure on operator retire fails the retirement", asyn
 	}
 });
 
-
 test("issue #480: session binding uses worktree path, not input cwd", async () => {
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-session-bind-"));
 	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-session-bind-"));
@@ -3116,9 +3115,6 @@ test("issue #480: session binding uses worktree path, not input cwd", async () =
 		await rm(bareRepo, { recursive: true, force: true });
 	}
 });
-
-
-
 
 test("issue #480: a lane cwd inside the service checkout is refused", async () => {
 	const f = await fixture();

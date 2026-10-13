@@ -745,8 +745,7 @@ export class WorkLaneManager {
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
-		if (input.cwd !== undefined)
-			assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
+		if (input.cwd !== undefined) assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);
@@ -2639,8 +2638,6 @@ function canonicalPathIncludingMissing(target: string): string {
 		}
 	}
 }
-
-
 
 async function pathExists(path: string): Promise<boolean> {
 	const { lstat } = await import("node:fs/promises");
