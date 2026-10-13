@@ -530,7 +530,28 @@ export class WorkGroup {
 	): number {
 		const rows = this.#db
 			.prepare(
-				"SELECT op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json FROM work_attempt_runtime WHERE settled_at IS NULL OR CASE WHEN json_valid(record_json) THEN settled_at IS NOT json_extract(record_json, '$.settledAt') ELSE 0 END",
+				`SELECT op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json
+				FROM work_attempt_runtime
+				WHERE settled_at IS NULL
+					OR CASE WHEN json_valid(work_attempt_runtime.record_json)
+						THEN settled_at IS NOT json_extract(work_attempt_runtime.record_json, '$.settledAt')
+						ELSE 0
+					END
+					OR EXISTS (
+						SELECT 1
+						FROM lane_jobs AS history,
+							json_each(
+								CASE WHEN json_valid(history.record_json) THEN history.record_json ELSE '{}' END,
+								'$.attempts'
+							) AS history_attempt
+						WHERE history.job_id = work_attempt_runtime.job_id
+							AND CASE
+								WHEN history_attempt.type = 'object' AND json_valid(work_attempt_runtime.record_json)
+									THEN json_extract(history_attempt.value, '$.opRef') = work_attempt_runtime.op_ref
+										AND json_extract(history_attempt.value, '$.endedAt') IS NOT json_extract(work_attempt_runtime.record_json, '$.settledAt')
+								ELSE 0
+							END
+					)`,
 			)
 			.all() as Array<{
 			op_ref: string;

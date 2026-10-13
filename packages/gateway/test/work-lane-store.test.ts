@@ -272,6 +272,34 @@ describe("work attempt boot reconciliation", () => {
 		expect(f.database.work.workAttemptOpen()).toEqual([]);
 	});
 
+	test("reconciliation repairs a settled runtime whose lane history is still open", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		const runtime: WorkAttemptRuntime = {
+			...f.runtime,
+			terminal: { kind: "local", observedAt: END, reasonCode: "recovery_indeterminate" },
+			output: { ...f.runtime.output, disposition: "unavailable" },
+			decision: "recovery_indeterminate",
+			settledAt: END,
+		};
+		f.raw
+			.query("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ? WHERE op_ref = ?")
+			.run(JSON.stringify(runtime), END, runtime.opRef);
+
+		expect(() => f.database.work.workAttemptGet(runtime.opRef)).toThrow(WorkAttemptStateError);
+		const reconciled = f.database.reconcileWorkAttempts(() => {});
+
+		expect(reconciled).toBe(1);
+		expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({
+			decision: "recovery_indeterminate",
+			settledAt: END,
+		});
+		const historyJson = f.database.work.laneJobJson(runtime.jobId);
+		expect(historyJson).toBeDefined();
+		if (historyJson === undefined) throw new Error("reconciled lane history is missing");
+		expect(parseLaneJobRecord(historyJson).attempts[0]?.endedAt).toBe(END);
+	});
+
 	test("reconciliation preserves every repaired attempt in a shared lane history", async () => {
 		const f = await fixture();
 		const secondOpRef = "gw-work-store-b";
