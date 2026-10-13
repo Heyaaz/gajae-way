@@ -11,7 +11,7 @@ import {
 	stat,
 	writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import pkg from "../package.json";
@@ -20,9 +20,12 @@ import { launchRestartStack } from "./restart-stack";
 import {
 	type InstallServicesOptions,
 	installServices,
+	launchAgentPlistPath,
 	type ServicePlatform,
 	serviceSpecs,
+	systemdUnitDir,
 	systemdUnitName,
+	systemdUnitPath,
 } from "./services";
 
 /**
@@ -212,7 +215,10 @@ export type ReleaseFetcher = (repo: string) => Promise<ReleaseInfo>;
 export type AssetDownloader = (asset: ReleaseAsset) => Promise<Uint8Array>;
 export type TarballExtractor = (tarball: Uint8Array, intoDir: string) => Promise<void>;
 export type RestartQueuer = (home: string, binDir: string, trigger: "update") => Promise<RestartQueueReceipt>;
-export type UpdateCommandRunner = (command: readonly string[]) => Promise<number>;
+export interface UpdateCommandOptions {
+	readonly allowFailure?: boolean;
+}
+export type UpdateCommandRunner = (command: readonly string[], options?: UpdateCommandOptions) => Promise<number>;
 
 type UpdateServiceOptions = Pick<
 	InstallServicesOptions,
@@ -260,10 +266,10 @@ async function readPinnedGjcVersion(path: string): Promise<string> {
 	return version;
 }
 
-async function defaultUpdateCommandRunner(command: readonly string[]): Promise<number> {
+async function defaultUpdateCommandRunner(command: readonly string[], options?: UpdateCommandOptions): Promise<number> {
 	const child = Bun.spawn([...command], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
 	const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
-	if (exitCode !== 0) {
+	if (exitCode !== 0 && !options?.allowFailure) {
 		const detail = stderr.trim();
 		throw new Error(`${command.join(" ")} exited with status ${exitCode}${detail.length === 0 ? "" : `: ${detail}`}`);
 	}
@@ -279,7 +285,38 @@ async function installUpdatedServices(options: {
 }): Promise<boolean> {
 	const { home, binDir, platform, noRestart, deps } = options;
 	const brokerProvisioned = await exists(homeLayout(home).brokerProvisionManifest);
-	const env = { ...(deps.env ?? process.env), GAJAEWAY_HOME: home };
+	const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env), GAJAEWAY_HOME: home };
+	const run = deps.serviceRunner ?? defaultUpdateCommandRunner;
+	const execute = async (command: readonly string[]): Promise<void> => {
+		const exitCode = await run(command);
+		if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
+	};
+	const userHome = env.HOME || homedir();
+	const definitionDir =
+		platform === "darwin"
+			? (deps.serviceOptions?.launchAgentsDir ?? join(userHome, "Library", "LaunchAgents"))
+			: (deps.serviceOptions?.unitDir ?? systemdUnitDir(env, userHome));
+	const expandedDefinitionDir = definitionDir.startsWith("~/") ? join(userHome, definitionDir.slice(2)) : definitionDir;
+	const staleDefinitions: Array<{ readonly label: string; readonly path: string; readonly unitName: string }> = [];
+	for (const spec of serviceSpecs()) {
+		if (await exists(join(binDir, spec.binary))) continue;
+		const path =
+			platform === "darwin"
+				? launchAgentPlistPath(spec, expandedDefinitionDir)
+				: systemdUnitPath(spec, expandedDefinitionDir);
+		if (await exists(path)) staleDefinitions.push({ label: spec.label, path, unitName: systemdUnitName(spec) });
+	}
+	if (platform === "linux" && staleDefinitions.length > 0) {
+		await execute(["systemctl", "--user", "disable", "--now", ...staleDefinitions.map(({ unitName }) => unitName)]);
+	} else if (platform === "darwin") {
+		const target = `gui/${process.getuid?.() ?? 0}`;
+		for (const { label } of staleDefinitions) {
+			const serviceTarget = `${target}/${label}`;
+			if ((await run(["launchctl", "print", serviceTarget], { allowFailure: true })) === 0)
+				await execute(["launchctl", "bootout", serviceTarget]);
+		}
+	}
+	for (const { path } of staleDefinitions) await rm(path, { force: true });
 	await installServices({
 		binDir,
 		platform,
@@ -289,11 +326,6 @@ async function installUpdatedServices(options: {
 		...deps.serviceOptions,
 	});
 	if (platform === "linux") {
-		const run = deps.serviceRunner ?? defaultUpdateCommandRunner;
-		const execute = async (command: readonly string[]): Promise<void> => {
-			const exitCode = await run(command);
-			if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
-		};
 		await execute(["systemctl", "--user", "daemon-reload"]);
 		if (!noRestart) {
 			const enableUnits: string[] = [];
