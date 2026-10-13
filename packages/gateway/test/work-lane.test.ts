@@ -1,7 +1,9 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
 import {
 	appendAttempt,
@@ -12,7 +14,14 @@ import {
 } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { classifyCheckRollup } from "../src/orchestrator/gh-checks";
-import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
+import {
+	LaneGovernor,
+	laneJobIdentity,
+	managedLaneBranchName,
+	managedLaneRepositoryPath,
+	managedLaneWorktreePath,
+	workSessionKey,
+} from "../src/orchestrator/lane-governor";
 import {
 	parseWorkerOutputResponse,
 	type SessionBindInput,
@@ -39,6 +48,15 @@ afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 const origin: OriginRef = { platform: "discord", kind: "channel", conversationId: "work-results" };
+
+test("managed repository and worktree paths preserve exact lane-name identity", () => {
+	const root = "/tmp/gajaeway";
+	expect(managedLaneRepositoryPath(root, "Foo")).not.toBe(managedLaneRepositoryPath(root, "foo"));
+	expect(managedLaneRepositoryPath(root, "Foo")).toBe(join(root, "repositories", Buffer.from("Foo").toString("hex")));
+	expect(managedLaneWorktreePath(root, "Foo")).not.toBe(managedLaneWorktreePath(root, "foo"));
+	expect(managedLaneWorktreePath(root, "Foo")).toBe(join(root, "lanes", Buffer.from("Foo").toString("hex")));
+});
+
 async function until(predicate: () => boolean): Promise<void> {
 	for (let i = 0; i < 600 && !predicate(); i++) await Bun.sleep(5);
 	expect(predicate()).toBe(true);
@@ -54,7 +72,9 @@ async function fixture(
 	options: Partial<WorkLaneManagerOptions> = {},
 	portOptions: ConstructorParameters<typeof ScriptedSessionPort>[0] = {},
 ) {
-	const directory = await mkdtemp(join(tmpdir(), "gajaeway-work-lane-"));
+	let directory = await mkdtemp(join(tmpdir(), "gajaeway-work-lane-"));
+	// Normalize path to resolve macOS /var -> /private/var symlink
+	directory = await realpath(directory);
 	const gajaewayHome = join(directory, "gajaeway");
 	// Create gajaewayHome directory for service directory validation tests
 	await mkdir(gajaewayHome, { recursive: true });
@@ -71,7 +91,7 @@ async function fixture(
 		},
 	});
 	const notices: ChatMessagePayload[] = [];
-	const lanes = new LaneGovernor({ database: db, sessionPort: port, maxLanes: 2 });
+	const lanes = new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome, maxLanes: 2 });
 	let implicitOwner: OriginRef | undefined;
 	const ownerTarget = options.ownerTarget ?? (() => implicitOwner);
 	let manager = new WorkLaneManager({
@@ -1107,9 +1127,64 @@ test("nested starts refuse self and ancestor cycles before binding", async () =>
 	expect(f.port.sendAttempts).toHaveLength(sends);
 });
 
-test("issue #480: repository binding is stored in job record", async () => {
-	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-binding-"));
-	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-binding-"));
+test("issue #480: a new lane requires either cwd or repo", async () => {
+	const f = await fixture();
+	await expect(f.manager.start({ name: "missing-location", text: "work" })).rejects.toMatchObject({
+		code: "invalid_params",
+		detail: { reasonCode: "repo_or_cwd_required" },
+	});
+	expect(f.port.binds).toHaveLength(0);
+	expect(f.db.work.laneJobJson(laneJobIdentity("missing-location").jobId)).toBeUndefined();
+});
+
+test("issue #480: base cannot be selected without a repository binding", async () => {
+	const f = await fixture();
+	await expect(
+		f.manager.start({ name: "base-without-repo", text: "work", cwd: f.directory, base: "dev" }),
+	).rejects.toMatchObject({
+		code: "invalid_params",
+		detail: { reasonCode: "base_requires_repo" },
+	});
+	expect(f.port.binds).toHaveLength(0);
+});
+
+test("issue #480: repository URLs with embedded credentials are rejected", async () => {
+	const f = await fixture();
+	for (const repo of ["https://user:password@example.test/project.git", "https://user@example.test/project.git"]) {
+		await expect(f.manager.start({ name: "credentials", text: "work", repo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "invalid_work_params", field: "repo" },
+		});
+	}
+	expect(f.port.binds).toHaveLength(0);
+});
+
+test("issue #480: an existing managed repository path is not removed on collision", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("repository-path-collision");
+	try {
+		const f = await fixture();
+		const repositoryPath = managedLaneRepositoryPath(f.gajaewayHome, "occupied");
+		await mkdir(repositoryPath, { recursive: true });
+		const sentinelPath = join(repositoryPath, "keep.txt");
+		await Bun.write(sentinelPath, "preserve");
+
+		await expect(f.manager.start({ name: "occupied", text: "work", repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "lane_repository_path_exists" },
+		});
+		expect(await Bun.file(sentinelPath).text()).toBe("preserve");
+		expect(f.port.binds).toHaveLength(0);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: repo URL creates a cwd-independent worktree with the bound push remote", async () => {
+	let repoDir = await mkdtemp(join(tmpdir(), "test-repo-binding-"));
+	let bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-binding-"));
+	// Normalize paths to resolve macOS /var -> /private/var symlink
+	repoDir = await realpath(repoDir);
+	bareRepo = await realpath(bareRepo);
 	try {
 		const git = (...args: string[]) =>
 			Bun.spawnSync(["git", "-C", repoDir, ...args], {
@@ -1130,22 +1205,66 @@ test("issue #480: repository binding is stored in job record", async () => {
 			stderr: "ignore",
 		});
 
-		const f = await fixture();
+		const repositoryUrl = pathToFileURL(bareRepo).href;
+		const f = await fixture({ serviceDirectory: process.cwd() });
 		const result = await f.manager.start({
-			name: "a",
+			name: "remote-binding",
 			text: "work",
-			cwd: f.directory,
-			repo: bareRepo,
+			repo: repositoryUrl,
 		});
 		if (!result.started) throw new Error("work did not start");
-		const job = f.job();
-		expect(job.lane.repository).toBe(bareRepo);
+		const job = f.job("remote-binding");
+		expect(job.lane.worktreePath).toBe(managedLaneWorktreePath(f.gajaewayHome, "remote-binding"));
+		expect(job.lane.repository).toBe(repositoryUrl);
+		expect(job.lane.repositoryPath).toBe(managedLaneRepositoryPath(f.gajaewayHome, "remote-binding"));
+		expect(job.baselineSha).toMatch(/^[0-9a-f]{40}$/);
+		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(originUrl.exitCode).toBe(0);
+		expect(originUrl.stdout?.toString().trim()).toBe(repositoryUrl);
+		expect(f.port.binds.at(-1)?.repo).toBe(job.lane.worktreePath);
+		expect(await f.manager.status({ name: "remote-binding" })).toMatchObject({
+			repository: { url: repositoryUrl, branch: managedLaneBranchName("remote-binding"), base: job.baselineSha },
+		});
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
 	}
 });
 
+test("remote clones are asynchronous, preserve repo_clone_failed, and clean up managed paths", async () => {
+	const requestReceived = deferred<void>();
+	const server = createServer((socket) => {
+		socket.once("data", () => {
+			requestReceived.resolve(undefined);
+			setTimeout(() => socket.end("0014ERR unavailable\n"), 50);
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	try {
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("local git server did not bind a TCP port");
+		const f = await fixture();
+		const name = "missing-remote-clone";
+		const remoteUrl = `git://127.0.0.1:${address.port}/missing.git`;
+		const clone = f.manager.start({ name, text: "work", repo: remoteUrl });
+		await requestReceived.promise;
+		await Bun.sleep(10);
+		await expect(clone).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "repo_clone_failed", repo: remoteUrl },
+		});
+		await expect(lstat(managedLaneWorktreePath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(lstat(managedLaneRepositoryPath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
+});
 test("run of the caller's own open lane is attempt_open, not a cycle", async () => {
 	const f = await fixture({ allowNested: () => true });
 	const parent = await f.manager.start({ name: "same", text: "parent task", cwd: f.directory });
@@ -1417,7 +1536,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 	let manager = new WorkLaneManager({
 		database: db,
 		port,
-		lanes: new LaneGovernor({ database: db, sessionPort: port }),
+		lanes: new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome }),
 		gajaewayHome,
 		serviceDirectory: gajaewayHome,
 		ownerTarget: () => origin,
@@ -1437,7 +1556,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 	manager = new WorkLaneManager({
 		database: db,
 		port,
-		lanes: new LaneGovernor({ database: db, sessionPort: port }),
+		lanes: new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome }),
 		gajaewayHome,
 		serviceDirectory: gajaewayHome,
 		pollMs: 5,
@@ -2287,6 +2406,217 @@ test("#481 settled report of a pushed lane without an open PR says pushed=true a
 	expect(calls).toEqual([{ branch: "fix/no-pr", cwd: f.directory }]);
 });
 
+test("#481 repo-backed bare clones detect pushed branches without remote-tracking refs", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("bare-clone-push-check");
+	const { calls, client } = recordingCheckClient({ prNumber: 484, status: "green", failingChecks: [] });
+	try {
+		const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+		const name = "bare-push";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const branch = managedLaneBranchName(name);
+		const trackingRef = Bun.spawnSync(
+			["git", "-C", job.lane.repositoryPath!, "show-ref", "--verify", `refs/remotes/origin/${branch}`],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(trackingRef.exitCode).not.toBe(0);
+
+		const push = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "push", "-u", "origin", branch], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(push.exitCode).toBe(0);
+
+		f.port.complete(result.opRef, "pushed");
+		await until(() => f.notices.some((notice) => notice.text.includes("[lane bare-push] completed")));
+		const report = f.notices.find((notice) => notice.text.includes("[lane bare-push] completed"))?.text ?? "";
+		expect(report).toContain("pushed=true");
+		expect(report).toContain("pr=484");
+		expect(report).toContain("checks=green");
+		expect(calls).toEqual([{ branch, cwd: job.lane.worktreePath }]);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("#481 a local checkout lane pushes to its configured origin push URL", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("checkout-push-target");
+	const { calls, client } = recordingCheckClient({ prNumber: 485, status: "green", failingChecks: [] });
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const fetchUrl = "https://github.com/example/project.git";
+		git(repoDir, "remote", "add", "origin", fetchUrl);
+		git(repoDir, "remote", "set-url", "--push", "origin", bareRepo);
+
+		const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+		const name = "checkout-push";
+		const result = await f.manager.start({ name, text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const branch = managedLaneBranchName(name);
+		expect(git(job.lane.worktreePath, "remote", "get-url", "origin")).toBe(fetchUrl);
+		expect(git(job.lane.worktreePath, "remote", "get-url", "--push", "origin")).toBe(bareRepo);
+		git(job.lane.worktreePath, "push", "-u", "origin", branch);
+		git(bareRepo, "show-ref", "--verify", `refs/heads/${branch}`);
+		const accidentalLocalPush = Bun.spawnSync(["git", "-C", repoDir, "show-ref", "--verify", `refs/heads/${branch}`], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(accidentalLocalPush.exitCode).not.toBe(0);
+
+		f.port.complete(result.opRef, "pushed upstream");
+		await until(() => f.notices.some((notice) => notice.text.includes("[lane checkout-push] completed")));
+		const report = f.notices.find((notice) => notice.text.includes("[lane checkout-push] completed"))?.text ?? "";
+		expect(report).toContain("pushed=true");
+		expect(report).toContain("pr=485");
+		expect(report).toContain("checks=green");
+		expect(calls).toEqual([{ branch, cwd: job.lane.worktreePath }]);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("#550 local checkout lanes resolve relative origin fetch and push URLs against the source repository", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("relative-origin-url");
+	let pushRepo = await mkdtemp(join(tmpdir(), "relative-origin-push-"));
+	// Normalize path to resolve macOS /var -> /private/var symlink
+	pushRepo = await realpath(pushRepo);
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		Bun.spawnSync(["git", "init", "--bare", "-q", pushRepo], { env });
+		git(repoDir, "remote", "add", "origin", relative(repoDir, bareRepo));
+		git(repoDir, "remote", "set-url", "--push", "origin", relative(repoDir, pushRepo));
+		git(repoDir, "fetch", "origin");
+		const defaultBranch = git(repoDir, "branch", "--show-current");
+		const initialRemoteSha = git(repoDir, "rev-parse", `refs/remotes/origin/${defaultBranch}`);
+
+		const f = await fixture();
+		const name = "relative-remote";
+		const result = await f.manager.start({ name, text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const worktreePath = f.job(name).lane.worktreePath;
+		const branch = managedLaneBranchName(name);
+		expect(git(worktreePath, "remote", "get-url", "origin")).toBe(bareRepo);
+		expect(git(worktreePath, "remote", "get-url", "--push", "origin")).toBe(pushRepo);
+		expect(git(worktreePath, "config", "--get", "remote.origin.fetch")).toBe("+refs/heads/*:refs/remotes/origin/*");
+		expect(git(worktreePath, "rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(initialRemoteSha);
+		git(repoDir, "commit", "--allow-empty", "-m", "advance upstream");
+		const advancedSha = git(repoDir, "rev-parse", "HEAD");
+		git(repoDir, "push", bareRepo, `HEAD:refs/heads/${defaultBranch}`);
+		git(worktreePath, "fetch", "origin");
+		expect(git(worktreePath, "rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(advancedSha);
+		git(worktreePath, "push", "-u", "origin", branch);
+		git(pushRepo, "show-ref", "--verify", `refs/heads/${branch}`);
+	} finally {
+		await cleanup();
+		await rm(pushRepo, { recursive: true, force: true });
+	}
+});
+
+test("#550 local checkout lanes preserve scp-like origin URLs", async () => {
+	const { repoDir, cleanup } = await bareRepoFixture("scp-origin-url");
+	const env = { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "test@test" };
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const fetchUrl = "git@github.com:example/project.git";
+		const pushUrl = "git@example.net:mirror/project.git";
+		git(repoDir, "remote", "add", "origin", fetchUrl);
+		git(repoDir, "remote", "set-url", "--push", "origin", pushUrl);
+
+		const f = await fixture();
+		const result = await f.manager.start({ name: "scp-origin", text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const worktreePath = f.job("scp-origin").lane.worktreePath;
+		expect(git(worktreePath, "remote", "get-url", "origin")).toBe(fetchUrl);
+		expect(git(worktreePath, "remote", "get-url", "--push", "origin")).toBe(pushUrl);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("#481 remote push probes are asynchronous and bounded", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("bounded-remote-probe");
+	const f = await fixture({ ownerTarget: () => origin });
+	let remoteRequests = 0;
+	const slowRemote = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch() {
+			remoteRequests++;
+			await Bun.sleep(250);
+			return new Response("remote unavailable", { status: 503 });
+		},
+	});
+	try {
+		const name = "slow-remote";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const setPushUrl = Bun.spawnSync(
+			[
+				"git",
+				"-C",
+				f.job(name).lane.worktreePath,
+				"remote",
+				"set-url",
+				"--push",
+				"origin",
+				`http://127.0.0.1:${slowRemote.port}/repo.git`,
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(setPushUrl.exitCode).toBe(0);
+		let timerFired = false;
+		const timer = setTimeout(() => {
+			timerFired = true;
+		}, 50);
+		const start = Date.now();
+		f.port.complete(result.opRef, "remote probe");
+		const completionCallMs = Date.now() - start;
+		await Bun.sleep(100);
+		clearTimeout(timer);
+		expect(completionCallMs).toBeLessThan(100);
+		expect(timerFired).toBe(true);
+		await until(() => remoteRequests > 0);
+
+		let report: string | undefined;
+		for (let attempt = 0; attempt < 1_400 && report === undefined; attempt++) {
+			report = f.notices.find((notice) => notice.text.includes("[lane slow-remote] completed"))?.text;
+			if (report === undefined) await Bun.sleep(5);
+		}
+		expect(report).toContain("pushed=false");
+	} finally {
+		await slowRemote.stop(true);
+		await cleanup();
+	}
+});
+
 test("#481 settled report of a pushed lane with a red PR names the PR and failing checks", async () => {
 	const { client } = recordingCheckClient({ prNumber: 484, status: "red", failingChecks: ["lint", "test"] });
 	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
@@ -2347,7 +2677,7 @@ test("#407: laneLastCommits reads each distinct worktree once, concurrently, nul
 	}
 });
 
-test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a bare git repo", async () => {
+test("work.start with repo creates an encoded worktree path from a bare git repo", async () => {
 	// Create a bare git repo to test against
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-"));
 	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-"));
@@ -2386,9 +2716,10 @@ test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a 
 
 		expect(result.started).toBe(true);
 		const job = f.job("worktree-test");
-		expect(job.lane.worktreePath).toContain("lanes/worktree-test");
+		expect(job.lane.worktreePath).toBe(managedLaneWorktreePath(laneRoot, "worktree-test"));
 		expect(job.lane.worktreePath.startsWith(join(laneRoot, "lanes"))).toBe(true);
 		expect(job.lane.repository).toBe(bareRepo);
+		expect(job.lane.repositoryPath).toBe(managedLaneRepositoryPath(laneRoot, "worktree-test"));
 
 		// Verify worktree was created with proper branch
 		const branchResult = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
@@ -2396,10 +2727,56 @@ test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a 
 		});
 		expect(branchResult.exitCode).toBe(0);
 		const branch = branchResult.stdout?.toString().trim();
-		expect(branch).toBe("work/worktree-test");
+		expect(branch).toBe(managedLaneBranchName("worktree-test"));
+		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
+			stdout: "pipe",
+		});
+		expect(originUrl.stdout?.toString().trim()).toBe(repoDir);
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("case-distinct lane names create distinct encoded worktree directories", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("case-distinct-worktrees");
+	try {
+		const f = await fixture();
+		for (const name of ["Foo", "foo"]) {
+			const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+			if (!result.started) throw new Error(`lane ${name} did not start`);
+			expect(f.job(name).lane.worktreePath).toBe(managedLaneWorktreePath(f.gajaewayHome, name));
+		}
+		expect(f.job("Foo").lane.worktreePath).not.toBe(f.job("foo").lane.worktreePath);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("work.start normalizes a nested local repository path to its checkout root", async () => {
+	const { repoDir, cleanup } = await bareRepoFixture("nested-repo-path");
+	try {
+		const nestedPath = join(repoDir, "src");
+		await mkdir(nestedPath);
+		const f = await fixture();
+		const name = "nested-repo-path";
+		const result = await f.manager.start({ name, text: "work", repo: nestedPath });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const sourceHead = Bun.spawnSync(["git", "-C", repoDir, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(sourceHead.exitCode).toBe(0);
+		expect(job.baselineSha).toBe(sourceHead.stdout?.toString().trim());
+		expect(job.lane.repository).toBe(nestedPath);
+		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(originUrl.stdout?.toString().trim()).toBe(repoDir);
+	} finally {
+		await cleanup();
 	}
 });
 
@@ -2424,6 +2801,24 @@ test("work.start with invalid repo throws invalid_params with git stderr", async
 	// Verify no worktree was created
 	const job = f.db.work.laneJobJson(laneJobIdentity("bad-repo").jobId);
 	expect(job).toBeUndefined();
+});
+
+test("work.start with special characters in lane name uses hex-encoded branch name", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("special-char-lane-name");
+	try {
+		const f = await fixture();
+		const name = "bad..name";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const branchResult = Bun.spawnSync(
+			["git", "-C", job.lane.repositoryPath!, "show-ref", "--verify", `refs/heads/${managedLaneBranchName(name)}`],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(branchResult.exitCode).toBe(0);
+	} finally {
+		await cleanup();
+	}
 });
 
 test("repo-bound work.start removes a newly created worktree after bind failure so retry can create it", async () => {
@@ -2462,7 +2857,7 @@ test("repo-bound work.start removes a newly created worktree after bind failure 
 			code: "verb_failed",
 			detail: { reasonCode: "bind_failed", cause: "broker_unavailable" },
 		});
-		const worktreePath = join(f.gajaewayHome, "lanes", "bind-retry");
+		const worktreePath = join(f.gajaewayHome, "lanes", Buffer.from("bind-retry", "utf8").toString("hex"));
 		const branch = Bun.spawnSync(
 			["git", "-C", bareRepo, "show-ref", "--verify", "--quiet", "refs/heads/work/bind-retry"],
 			{ stdout: "ignore", stderr: "ignore" },
@@ -2642,16 +3037,14 @@ test("issue #480: cleanup failure on operator retire fails the retirement", asyn
 
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job("cleanup-fail");
-		const repository = job.lane.repository;
+		const repository = job.lane.repositoryPath;
 
 		// Complete the work
 		f.port.complete(result.opRef, "test complete");
 		await until(() => f.db.work.workAttemptOpen().length === 0);
 
-		// Corrupt the repository to cause cleanup to fail
-		if (repository) {
-			await rm(join(repository, "objects"), { recursive: true, force: true });
-		}
+		// Remove the managed bare repository so git cannot unlink its registered worktree.
+		if (repository) await rm(repository, { recursive: true, force: true });
 
 		// Attempt to retire should fail due to cleanup failure
 		const retireOutcome = await f.lanes.retire("cleanup-fail", "operator");
@@ -2659,73 +3052,6 @@ test("issue #480: cleanup failure on operator retire fails the retirement", asyn
 		if (!retireOutcome.retired) {
 			expect(retireOutcome.reason).toContain("worktree cleanup failed");
 		}
-	} finally {
-		await rm(repoDir, { recursive: true, force: true });
-		await rm(bareRepo, { recursive: true, force: true });
-	}
-});
-
-test("issue #480: force retire cleans up worktree and branch", async () => {
-	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-force-retire-"));
-	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-force-retire-"));
-	try {
-		const git = (...args: string[]) =>
-			Bun.spawnSync(["git", "-C", repoDir, ...args], {
-				env: {
-					...process.env,
-					GIT_AUTHOR_NAME: "test",
-					GIT_AUTHOR_EMAIL: "test@test",
-					GIT_COMMITTER_NAME: "test",
-					GIT_COMMITTER_EMAIL: "test@test",
-				},
-			});
-
-		git("init", "-q");
-		git("config", "user.name", "test");
-		git("config", "user.email", "test@test");
-		git("commit", "-q", "--allow-empty", "-m", "initial");
-
-		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-
-		const f = await fixture({ hostLostGraceMs: 20 });
-		const result = await f.manager.start({
-			name: "force-retire-test",
-			text: "work",
-			cwd: f.directory,
-			repo: bareRepo,
-		});
-		expect(result.started).toBe(true);
-
-		if (!result.started) throw new Error("work did not start");
-		const job = f.job("force-retire-test");
-		const worktreePath = job.lane.worktreePath;
-
-		// Simulate host loss by making session unavailable and marking as dead
-		f.port.status = async () => {
-			throw new Error("Session unavailable");
-		};
-		f.port.setSessionState(result.sessionId, { live: false });
-
-		// Force retire should clean up worktree
-		const retireOutcome = await f.lanes.forceRetire("force-retire-test");
-		expect(retireOutcome.retired).toBe(true);
-
-		// Verify worktree was deleted
-		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(exitsAfter.exitCode).not.toBe(0);
-
-		// Verify branch was deleted
-		const branchCheck = Bun.spawnSync(["git", "-C", bareRepo, "show-ref", "work/force-retire-test"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(branchCheck.exitCode).not.toBe(0);
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
@@ -2788,91 +3114,6 @@ test("issue #480: session binding uses worktree path, not input cwd", async () =
 	}
 });
 
-test("issue #480: all-dead retirement cleans up worktree", async () => {
-	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-all-dead-"));
-	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-all-dead-"));
-	try {
-		const git = (...args: string[]) =>
-			Bun.spawnSync(["git", "-C", repoDir, ...args], {
-				env: {
-					...process.env,
-					GIT_AUTHOR_NAME: "test",
-					GIT_AUTHOR_EMAIL: "test@test",
-					GIT_COMMITTER_NAME: "test",
-					GIT_COMMITTER_EMAIL: "test@test",
-				},
-			});
-
-		git("init", "-q");
-		git("config", "user.name", "test");
-		git("config", "user.email", "test@test");
-		git("commit", "-q", "--allow-empty", "-m", "initial");
-
-		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-
-		const f = await fixture();
-		const result = await f.manager.start({
-			name: "all-dead-test",
-			text: "work",
-			cwd: f.directory,
-			repo: bareRepo,
-		});
-
-		if (!result.started) throw new Error("work did not start");
-		const job = f.job("all-dead-test");
-		const worktreePath = job.lane.worktreePath;
-
-		// Verify worktree exists before force retire
-		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(existsBefore.exitCode).toBe(0);
-
-		// Make the session dead so it qualifies for all-dead retirement
-		f.port.setSessionState(result.sessionId, { live: false });
-
-		// Force retire should clean up worktree (all-dead retirement path)
-		const retireOutcome = await f.lanes.forceRetire("all-dead-test");
-		expect(retireOutcome.retired).toBe(true);
-
-		// Verify worktree was deleted by all-dead retirement
-		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(exitsAfter.exitCode).not.toBe(0); // Should fail because worktree is gone
-	} finally {
-		await rm(repoDir, { recursive: true, force: true });
-		await rm(bareRepo, { recursive: true, force: true });
-	}
-});
-
-async function bareRepoFixture(prefix: string): Promise<{ bareRepo: string; cleanup: () => Promise<void> }> {
-	const repoDir = await mkdtemp(join(tmpdir(), `${prefix}-src-`));
-	const bareRepo = await mkdtemp(join(tmpdir(), `${prefix}-bare-`));
-	const env = {
-		...process.env,
-		GIT_AUTHOR_NAME: "test",
-		GIT_AUTHOR_EMAIL: "test@test",
-		GIT_COMMITTER_NAME: "test",
-		GIT_COMMITTER_EMAIL: "test@test",
-	};
-	Bun.spawnSync(["git", "-C", repoDir, "init", "-q"], { env });
-	Bun.spawnSync(["git", "-C", repoDir, "commit", "-q", "--allow-empty", "-m", "initial"], { env });
-	Bun.spawnSync(["git", "clone", "-q", "--bare", repoDir, bareRepo], { env });
-	return {
-		bareRepo,
-		cleanup: async () => {
-			await rm(repoDir, { recursive: true, force: true });
-			await rm(bareRepo, { recursive: true, force: true });
-		},
-	};
-}
-
 test("issue #480: a lane cwd inside the service checkout is refused", async () => {
 	const f = await fixture();
 	const inside = join(f.serviceDirectory, "packages", "gateway");
@@ -2915,7 +3156,7 @@ test("issue #480: re-starting a repo-bound lane is matched by repository, not by
 		// A different repository for the same lane name is a mismatch.
 		await expect(
 			f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: `${bareRepo}-other` }),
-		).rejects.toMatchObject({ detail: { reasonCode: "lane_cwd_mismatch" } });
+		).rejects.toMatchObject({ detail: { reasonCode: "lane_repository_mismatch" } });
 	} finally {
 		await cleanup();
 	}
@@ -3011,4 +3252,636 @@ test("#439 relay non-transport failure is not caught as transport failure", asyn
 	expect(relayErrorThrown).toBe(true);
 	expect(fallbackCalled).toBe(false);
 	expect(f.port.statusReads.filter((read) => read.opRef === result.opRef).every((read) => read.relayUsed)).toBe(true);
+});
+
+test("work.start resolves origin bases from local remote-tracking refs", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("remote-tracking-base");
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repoDir, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const defaultBranch = git("branch", "--show-current");
+		git("remote", "add", "origin", bareRepo);
+		git("push", "-q", "-u", "origin", defaultBranch);
+		git("checkout", "-q", "-b", "dev");
+		git("commit", "-q", "--allow-empty", "-m", "remote-only dev commit");
+		git("push", "-q", "-u", "origin", "dev");
+		const remoteDevSha = git("rev-parse", "refs/remotes/origin/dev");
+		git("checkout", "-q", defaultBranch);
+		git("branch", "-D", "dev");
+		const localDevBranch = Bun.spawnSync(["git", "-C", repoDir, "show-ref", "--verify", "refs/heads/dev"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(localDevBranch.exitCode).not.toBe(0);
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "remote-tracking-base",
+			text: "work",
+			repo: repoDir,
+			base: "origin/dev",
+		});
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("remote-tracking-base");
+		expect(job.baselineSha).toBe(remoteDevSha);
+		expect(git("rev-parse", "refs/remotes/origin/dev")).toBe(remoteDevSha);
+		const worktreeHead = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(worktreeHead.stdout?.toString().trim()).toBe(remoteDevSha);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("work.start defaults to origin/HEAD when its branch exists only as a remote-tracking ref", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("remote-default-base");
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repoDir, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const defaultBranch = git("branch", "--show-current");
+		git("remote", "add", "origin", bareRepo);
+		git("push", "-q", "-u", "origin", defaultBranch);
+		git("remote", "set-head", "origin", defaultBranch);
+		expect(git("symbolic-ref", "refs/remotes/origin/HEAD")).toBe(`refs/remotes/origin/${defaultBranch}`);
+		const remoteDefaultSha = git("rev-parse", `refs/remotes/origin/${defaultBranch}`);
+		const currentBranch = `${defaultBranch}-current`;
+		git("checkout", "-q", "-b", currentBranch);
+		git("commit", "-q", "--allow-empty", "-m", "current local branch");
+		git("branch", "-D", defaultBranch);
+		const deletedLocalDefault = Bun.spawnSync(
+			["git", "-C", repoDir, "show-ref", "--verify", `refs/heads/${defaultBranch}`],
+			{ env, stdout: "pipe", stderr: "pipe" },
+		);
+		expect(deletedLocalDefault.exitCode).not.toBe(0);
+
+		const f = await fixture();
+		const result = await f.manager.start({ name: "remote-default-base", text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("remote-default-base");
+		expect(job.baselineSha).toBe(remoteDefaultSha);
+		expect(git("rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(remoteDefaultSha);
+		const managedDefaultSha = Bun.spawnSync(["git", "rev-parse", "--verify", `refs/heads/${defaultBranch}^{commit}`], {
+			cwd: job.lane.repositoryPath,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(managedDefaultSha.exitCode).toBe(0);
+		expect(managedDefaultSha.stdout?.toString().trim()).toBe(remoteDefaultSha);
+		const worktreeHead = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(worktreeHead.stdout?.toString().trim()).toBe(remoteDefaultSha);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: operator retire cleans up worktree and branch", async () => {
+	// Create a bare git repo to test against
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-retire-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-retire-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "retire-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		if (!result.started) throw new Error("work did not start");
+
+		const job = f.job("retire-test");
+		const worktreePath = job.lane.worktreePath;
+		const repositoryPath = job.lane.repositoryPath!;
+		expect(worktreePath).toBeDefined();
+		const branchBefore = Bun.spawnSync(
+			["git", "-C", repositoryPath, "show-ref", "--verify", `refs/heads/${managedLaneBranchName("retire-test")}`],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(branchBefore.exitCode).toBe(0);
+
+		// Verify worktree exists
+		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+		});
+		expect(existsBefore.exitCode).toBe(0);
+
+		// Complete the work and retire the lane
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		const retireOutcome = await f.lanes.retire("retire-test", "operator");
+		expect(retireOutcome.retired).toBe(true);
+
+		// Verify worktree was deleted
+		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(exitsAfter.exitCode).not.toBe(0);
+
+		// The per-lane bare repository is removed with the worktree and branch.
+		expect(await Bun.file(join(repositoryPath, "HEAD")).exists()).toBe(false);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: cleanup failure on operator retire fails the retirement", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-cleanup-fail-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-cleanup-fail-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "cleanup-fail",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		expect(result.started).toBe(true);
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("cleanup-fail");
+		const repository = job.lane.repositoryPath;
+
+		// Complete the work
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		// Remove the managed bare repository so git cannot unlink its registered worktree.
+		if (repository) await rm(repository, { recursive: true, force: true });
+
+		// Attempt to retire should fail due to cleanup failure
+		const retireOutcome = await f.lanes.retire("cleanup-fail", "operator");
+		expect(retireOutcome.retired).toBe(false);
+		if (!retireOutcome.retired) {
+			expect(retireOutcome.reason).toContain("worktree cleanup failed");
+		}
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: operator retire refuses a persisted repository path outside its managed lane directory", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("repository-path-corruption");
+	try {
+		const f = await fixture();
+		const name = "corrupt-repository-path";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const managedRepositoryPath = f.job(name).lane.repositoryPath!;
+		const unrelatedDirectory = join(f.directory, "unrelated-repository");
+		await mkdir(unrelatedDirectory);
+		const sentinelPath = join(unrelatedDirectory, "keep.txt");
+		await Bun.write(sentinelPath, "preserve");
+
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		const job = f.job(name);
+		const corrupted = { ...job, lane: { ...job.lane, repositoryPath: unrelatedDirectory } };
+		f.db.transaction((tx) =>
+			f.db.work.putLaneJob(tx, {
+				jobId: corrupted.jobId,
+				laneKey: `work-${name}`,
+				state: corrupted.state,
+				createdAt: corrupted.createdAt,
+				updatedAt: corrupted.updatedAt,
+				lane: { branch: corrupted.lane.branch, worktreePath: corrupted.lane.worktreePath },
+				json: JSON.stringify(corrupted),
+			}),
+		);
+
+		const retired = await f.lanes.retire(name, "operator");
+		expect(retired.retired).toBe(false);
+		if (!retired.retired) expect(retired.reason).toContain("worktree cleanup failed");
+		expect(await Bun.file(sentinelPath).text()).toBe("preserve");
+		expect(await Bun.file(join(managedRepositoryPath, "HEAD")).exists()).toBe(true);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: operator retire tolerates an externally removed worktree", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("external-worktree-removal");
+	try {
+		const f = await fixture();
+		const name = "external-removal";
+		const result = await f.manager.start({ name, text: "work", cwd: f.directory, repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const repositoryPath = job.lane.repositoryPath!;
+
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		// Simulate an external rm -rf: the worktree directory disappears but Git
+		// still has its administrative entry until `worktree prune` runs.
+		await rm(job.lane.worktreePath, { recursive: true, force: true });
+		const staleRegistration = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+			cwd: repositoryPath,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(staleRegistration.exitCode).toBe(0);
+		const registeredPaths = staleRegistration.stdout
+			?.toString()
+			.split(/\r?\n/)
+			.filter((line) => line.startsWith("worktree "))
+			.map((line) => line.slice("worktree ".length).replace(/\\/g, "/"));
+		expect(registeredPaths?.includes(managedLaneWorktreePath(f.gajaewayHome, name).replace(/\\/g, "/"))).toBe(true);
+
+		const retired = await f.lanes.retire(name, "operator");
+		expect(retired.retired).toBe(true);
+		expect(await Bun.file(join(repositoryPath, "HEAD")).exists()).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: force retire preserves worktree and branch for resume", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-force-retire-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-force-retire-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture({ hostLostGraceMs: 20 });
+		const result = await f.manager.start({
+			name: "force-retire-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		expect(result.started).toBe(true);
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("force-retire-test");
+		const worktreePath = job.lane.worktreePath;
+		const repositoryPath = job.lane.repositoryPath!;
+		const unpushedCommit = Bun.spawnSync(
+			[
+				"git",
+				"-C",
+				worktreePath,
+				"-c",
+				"user.name=test",
+				"-c",
+				"user.email=test@test",
+				"commit",
+				"--allow-empty",
+				"-m",
+				"unpushed work",
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(unpushedCommit.exitCode).toBe(0);
+
+		// Simulate host loss by making session unavailable and marking as dead
+		const originalStatus = f.port.status;
+		f.port.status = async () => {
+			throw new Error("Session unavailable");
+		};
+		f.port.setSessionState(result.sessionId, { live: false });
+
+		// Force retire must preserve the managed worktree and branch.
+		const retireOutcome = await f.lanes.forceRetire("force-retire-test");
+		expect(retireOutcome.retired).toBe(true);
+		f.port.status = originalStatus;
+
+		// The durable job record still points to this worktree; forced retirement
+		// must not discard its unpushed branch or make the lane unusable.
+		const existsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(existsAfter.exitCode).toBe(0);
+		const headSubject = Bun.spawnSync(["git", "-C", worktreePath, "log", "-1", "--format=%s"], { stdout: "pipe" });
+		expect(headSubject.stdout?.toString().trim()).toBe("unpushed work");
+
+		const branchCheck = Bun.spawnSync(
+			["git", "-C", repositoryPath, "show-ref", "--verify", `refs/heads/${managedLaneBranchName("force-retire-test")}`],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		expect(branchCheck.exitCode).toBe(0);
+
+		const resumed = await f.manager.start({ name: "force-retire-test", text: "continue", resume: true });
+		expect(resumed).toMatchObject({ started: true });
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: session binding uses worktree path, not input cwd", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-session-bind-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-session-bind-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		// Create fixture first, then set up bind tracking
+		const f = await fixture();
+		const bindCalls: SessionBindInput[] = [];
+		// Spy on port.bind to capture the input
+		const originalBind = f.port.bind.bind(f.port);
+		f.port.bind = async (input: SessionBindInput) => {
+			bindCalls.push(input);
+			return originalBind(input);
+		};
+
+		const result = await f.manager.start({
+			name: "session-bind-test",
+			text: "work",
+			cwd: f.directory, // This is the input cwd
+			repo: bareRepo,
+		});
+
+		expect(result.started).toBe(true);
+		const job = f.job("session-bind-test");
+		const worktreePath = job.lane.worktreePath;
+
+		// Verify that the bind call received the worktree path, not the input cwd
+		const bindCall = bindCalls[bindCalls.length - 1]; // Last bind call should be for our lane
+		expect(bindCall?.repo).toBe(worktreePath);
+		expect(bindCall?.repo).not.toBe(f.directory);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: all-dead retirement preserves the worktree", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-all-dead-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-all-dead-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "all-dead-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("all-dead-test");
+		const worktreePath = job.lane.worktreePath;
+		const repositoryPath = job.lane.repositoryPath!;
+
+		// Verify worktree exists before force retire
+		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(existsBefore.exitCode).toBe(0);
+
+		// Make the session dead so it qualifies for all-dead retirement
+		f.port.setSessionState(result.sessionId, { live: false });
+
+		// Unattended all-dead retirement preserves the durable worktree.
+		const retireOutcome = await f.lanes.forceRetire("all-dead-test");
+		expect(retireOutcome.retired).toBe(true);
+
+		const existsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(existsAfter.exitCode).toBe(0);
+		expect(await Bun.file(join(repositoryPath, "HEAD")).exists()).toBe(true);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+async function bareRepoFixture(
+	prefix: string,
+): Promise<{ repoDir: string; bareRepo: string; cleanup: () => Promise<void> }> {
+	let repoDir = await mkdtemp(join(tmpdir(), `${prefix}-src-`));
+	let bareRepo = await mkdtemp(join(tmpdir(), `${prefix}-bare-`));
+	// Normalize paths to resolve macOS /var -> /private/var symlink
+	repoDir = await realpath(repoDir);
+	bareRepo = await realpath(bareRepo);
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	Bun.spawnSync(["git", "-C", repoDir, "init", "-q"], { env });
+	Bun.spawnSync(["git", "-C", repoDir, "commit", "-q", "--allow-empty", "-m", "initial"], { env });
+	Bun.spawnSync(["git", "clone", "-q", "--bare", repoDir, bareRepo], { env });
+	return {
+		repoDir,
+		bareRepo,
+		cleanup: async () => {
+			await rm(repoDir, { recursive: true, force: true });
+			await rm(bareRepo, { recursive: true, force: true });
+		},
+	};
+}
+
+test("issue #480: a lane cwd inside the service checkout is refused", async () => {
+	const f = await fixture();
+	const inside = join(f.serviceDirectory, "packages", "gateway");
+	await mkdir(inside, { recursive: true });
+	for (const cwd of [f.serviceDirectory, inside, join(f.serviceDirectory, "not-yet-created")]) {
+		await expect(f.manager.start({ name: "a", text: "work", cwd })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir", name: "a" },
+		});
+	}
+	expect(f.port.binds).toHaveLength(0);
+	expect(f.port.sends).toHaveLength(0);
+});
+
+test("issue #480: a generated worktree inside the service checkout is refused", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("svc-worktree");
+	try {
+		const f = await fixture();
+		const manager = await f.restart({ laneRoot: join(f.serviceDirectory, "lanes-root") });
+		await expect(manager.start({ name: "a", text: "work", cwd: f.directory, repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir" },
+		});
+		expect(await Bun.file(managedLaneRepositoryPath(join(f.serviceDirectory, "lanes-root"), "a")).exists()).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: a managed repository symlink into the service checkout is refused", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("svc-repository");
+	try {
+		const f = await fixture();
+		const laneRoot = join(f.gajaewayHome, "lanes-root");
+		await mkdir(laneRoot, { recursive: true });
+		await symlink(f.serviceDirectory, join(laneRoot, "repositories"));
+		const manager = await f.restart({ laneRoot });
+		await expect(manager.start({ name: "a", text: "work", repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir" },
+		});
+		expect(f.port.binds).toHaveLength(0);
+		expect(await Bun.file(join(f.serviceDirectory, "a")).exists()).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: re-starting a repo-bound lane is matched by repository, not by the caller cwd", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("rebind");
+	try {
+		const f = await fixture();
+		const first = await f.manager.start({ name: "a", text: "work", cwd: f.directory, repo: bareRepo });
+		expect(first.started).toBe(true);
+		// Same repository from the same caller cwd: the lane is recognized (its attempt is still
+		// open), not rejected as a cwd mismatch against the generated worktree path.
+		await expect(f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: bareRepo })).rejects.toMatchObject(
+			{ detail: { reasonCode: "attempt_open" } },
+		);
+		// A different repository for the same lane name is a mismatch.
+		await expect(
+			f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: `${bareRepo}-other` }),
+		).rejects.toMatchObject({ detail: { reasonCode: "lane_repository_mismatch" } });
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: the production service directory is this source checkout, not the bun runtime", () => {
+	const root = Bun.spawnSync(["git", "-C", import.meta.dir, "rev-parse", "--show-toplevel"])
+		.stdout.toString()
+		.trim();
+	expect(getServiceDirectory()).toBe(root);
+	expect(getServiceDirectory()).not.toBe(dirname(process.execPath));
 });
