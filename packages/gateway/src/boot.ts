@@ -8,6 +8,7 @@ import { DeliveryService } from "./delivery/delivery";
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
 import { assertNoRestoreJournal } from "./offline";
+import { reapLeftoverWorkers } from "./ops/process-reaper";
 import { SloRecorder } from "./ops/slo";
 import {
 	GjcCliUnavailableError,
@@ -146,7 +147,6 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 	};
 	try {
 		await assertNoRestoreJournal(config.home);
-		const personaWorkspace = await resolvePersonaWorkspace(config.home);
 		const layout = homeLayout(config.home);
 		let executable = options.broker?.executable;
 		if (executable === undefined) {
@@ -157,6 +157,17 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 				throw new Error(`Pinned gjc executable cannot be resolved at ${path}: ${diagnostic(error)}`, { cause: error });
 			}
 		}
+		// Reap orphaned worker processes from previous boot epochs before accepting new work.
+		// This prevents stale relay processes from accumulating and blocking resources.
+		const reapResult = await reapLeftoverWorkers(config.home, {
+			gjcExecutable: executable,
+			gjcPrefix: options.broker?.executable === undefined ? layout.gjcPrefix : undefined,
+			brokerAgentDir: config.gjc.agentDir,
+		});
+		if (reapResult.found > 0) {
+			console.info(`process_reaper found=${reapResult.found} killed=${reapResult.killed} failed=${reapResult.failed}`);
+		}
+		const personaWorkspace = await resolvePersonaWorkspace(config.home);
 		const pinnedVersion = readPinnedGjcVersion();
 		let sloRecorder: SloRecorder | undefined;
 		const broker = new GlobalGjcClient({
