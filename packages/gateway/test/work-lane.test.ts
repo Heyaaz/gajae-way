@@ -2502,6 +2502,9 @@ test("#550 local checkout lanes resolve relative origin fetch and push URLs agai
 		Bun.spawnSync(["git", "init", "--bare", "-q", pushRepo], { env });
 		git(repoDir, "remote", "add", "origin", relative(repoDir, bareRepo));
 		git(repoDir, "remote", "set-url", "--push", "origin", relative(repoDir, pushRepo));
+		git(repoDir, "fetch", "origin");
+		const defaultBranch = git(repoDir, "branch", "--show-current");
+		const initialRemoteSha = git(repoDir, "rev-parse", `refs/remotes/origin/${defaultBranch}`);
 
 		const f = await fixture();
 		const name = "relative-remote";
@@ -2511,7 +2514,13 @@ test("#550 local checkout lanes resolve relative origin fetch and push URLs agai
 		const branch = `work/${name}`;
 		expect(git(worktreePath, "remote", "get-url", "origin")).toBe(bareRepo);
 		expect(git(worktreePath, "remote", "get-url", "--push", "origin")).toBe(pushRepo);
+		expect(git(worktreePath, "config", "--get", "remote.origin.fetch")).toBe("+refs/heads/*:refs/remotes/origin/*");
+		expect(git(worktreePath, "rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(initialRemoteSha);
+		git(repoDir, "commit", "--allow-empty", "-m", "advance upstream");
+		const advancedSha = git(repoDir, "rev-parse", "HEAD");
+		git(repoDir, "push", bareRepo, `HEAD:refs/heads/${defaultBranch}`);
 		git(worktreePath, "fetch", "origin");
+		expect(git(worktreePath, "rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(advancedSha);
 		git(worktreePath, "push", "-u", "origin", branch);
 		git(pushRepo, "show-ref", "--verify", `refs/heads/${branch}`);
 	} finally {

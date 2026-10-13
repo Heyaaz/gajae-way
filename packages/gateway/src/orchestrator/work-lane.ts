@@ -2631,6 +2631,7 @@ async function createWorktreeFromRepo(
 	const worktreePath = managedLaneWorktreePath(absoluteLaneRoot, laneName);
 	const isRemote = isGitRemoteUrl(repo);
 	let sourceRepository = repo;
+	let sourceHasOrigin = false;
 	const repositoryPath = managedLaneRepositoryPath(absoluteLaneRoot, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, worktreePath, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, repositoryPath, laneName);
@@ -2754,6 +2755,7 @@ async function createWorktreeFromRepo(
 					.map((url) => url.trim())
 					.filter(Boolean)
 					.map((url) => resolveLocalRemoteUrl(sourceRepository, url));
+				sourceHasOrigin = fetchUrls.length > 0;
 				for (const [index, fetchUrl] of fetchUrls.entries()) {
 					const setFetchUrl = Bun.spawnSync(
 						index === 0
@@ -2792,6 +2794,58 @@ async function createWorktreeFromRepo(
 						});
 					}
 				}
+			}
+		}
+		const fetchRefspec = "+refs/heads/*:refs/remotes/origin/*";
+		const configureFetch = Bun.spawnSync(["git", "config", "--replace-all", "remote.origin.fetch", fetchRefspec], {
+			stdout: "pipe",
+			stderr: "pipe",
+			cwd: repositoryPath,
+		});
+		if (configureFetch.exitCode !== 0) {
+			throw new ProtocolError("invalid_params", "failed to configure lane repository fetch refspec", {
+				reasonCode: "repo_fetch_refspec_failed",
+				repo,
+			});
+		}
+
+		const copySourceTrackingRefs = !isRemote && sourceHasOrigin;
+		const refSource = copySourceTrackingRefs ? sourceRepository : repositoryPath;
+		const sourceRefPrefix = copySourceTrackingRefs ? "refs/remotes/origin" : "refs/heads";
+		const availableRefs = Bun.spawnSync(
+			["git", "-C", refSource, "for-each-ref", "--format=%(refname)", sourceRefPrefix],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		if (availableRefs.exitCode !== 0) {
+			throw new ProtocolError("invalid_params", "failed to inspect lane repository refs", {
+				reasonCode: "repo_fetch_refs_failed",
+				repo,
+			});
+		}
+		const refspecs = availableRefs.stdout
+			.toString()
+			.split(/\r?\n/)
+			.map((ref) => ref.trim())
+			.filter(
+				(ref) =>
+					ref.startsWith(`${sourceRefPrefix}/`) && !(copySourceTrackingRefs && ref === "refs/remotes/origin/HEAD"),
+			)
+			.map((ref) => {
+				const branch = ref.slice(sourceRefPrefix.length + 1);
+				return `+${ref}:refs/remotes/origin/${branch}`;
+			});
+		if (refspecs.length > 0) {
+			const fetchSource = copySourceTrackingRefs ? sourceRepository : ".";
+			const populateTrackingRefs = Bun.spawnSync(["git", "fetch", "--no-tags", "--", fetchSource, ...refspecs], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: repositoryPath,
+			});
+			if (populateTrackingRefs.exitCode !== 0) {
+				throw new ProtocolError("invalid_params", "failed to populate lane repository remote-tracking refs", {
+					reasonCode: "repo_fetch_refs_failed",
+					repo,
+				});
 			}
 		}
 		if (!isRemote && base === undefined && defaultRef) {
