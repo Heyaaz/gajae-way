@@ -151,11 +151,16 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
   "stallTimeoutMs": 120000,
-  "monitorCatchUp": { "maxSlots": 24, "maxAgeMs": 86400000 }
+  "monitorCatchUp": { "maxSlots": 24, "maxAgeMs": 86400000 },
+  "sqlite": { "journalMode": "WAL" }
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, `stallTimeoutMs`, and `sqlite` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`.
+
+`sqlite.journalMode` accepts `DELETE`, `TRUNCATE`, `PERSIST`, or `WAL` (default `WAL`); `MEMORY` and `OFF` are rejected to preserve database durability. Use `DELETE` or `TRUNCATE` for a single gateway instance on an NFS volume, and change this setting only while the gateway is stopped.
+
+`interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
 
 `monitorCatchUp` bounds cron replay after downtime: `maxSlots` is the newest due slots to admit (1–1000, default 24), and `maxAgeMs` excludes slots older than the lookback (60000–604800000 ms, default 86400000 / 24 hours). Refused slots advance the durable monitor cursor, are counted and logged, and appear in `gajaeway monitors inspect <id>` as `catchUp`; the setting is restart-required.
 
@@ -408,7 +413,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 The reload is fail-safe and reports exactly what it did:
 
 - `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]` replies). Verify the next event through the path consuming the changed policy.
-- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `monitorCatchUp`, `work`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
+- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `monitorCatchUp`, `work`, `gjc`, `sqlite`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 
