@@ -3055,6 +3055,8 @@ test("#481 force-retiring a dead red-check retry clears its old checks cycle", a
 	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
 	expect(f.job().state).toBe("attempt_ended");
 	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] completed")).toBeUndefined();
+	expect(checksNotice(f, "[lane a] attempt_ended")).toContain("pr=498 checks=pending");
 });
 
 test("#481 awaiting_checks: the third red result settles the lane failed with the red checks in its report", async () => {

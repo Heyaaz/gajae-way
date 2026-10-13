@@ -513,6 +513,7 @@ export class WorkLaneManager {
 			runtime.output.disposition === "pending"
 				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
 				: runtime.output;
+		const awaitingChecks = record.awaitingChecks;
 		const closed = closeAttempt({
 			record,
 			opRef,
@@ -521,7 +522,24 @@ export class WorkLaneManager {
 			endedAt,
 		});
 		const settledRecord = clearAwaitingChecks(closed);
-		const text = reportText(name, endState, terminal.reasonCode, opRef, output);
+		const reportFacts = awaitingChecks
+			? {
+					headSha: awaitingChecks.headSha,
+					dirtyFiles: 0,
+					pushed: null,
+					...(awaitingChecks.prNumber !== null
+						? {
+								checkStatus: {
+									prNumber: awaitingChecks.prNumber,
+									headSha: awaitingChecks.headSha,
+									status: "pending" as const,
+									failingChecks: [],
+								},
+							}
+						: {}),
+				}
+			: undefined;
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
@@ -2789,7 +2807,6 @@ export function reportText(
 	const checksVerified =
 		!facts ||
 		checks === null ||
-		(facts.pushed === false && checks === undefined) ||
 		(checks?.status === "green" &&
 			facts.pushed === true &&
 			facts.remoteHeadSha === facts.headSha &&
