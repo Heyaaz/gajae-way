@@ -16,13 +16,13 @@ import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { isSessionBusy, type SessionPort } from "../orchestrator/session-port";
 import type { Store } from "../store";
-import type { WriteTx } from "../store/tx";
 import {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
 	RECONCILABLE_STAGES,
 	TERMINAL_STAGES,
 } from "../store/groups/monitors";
+import type { WriteTx } from "../store/tx";
 import {
 	type AuthoringFailureClass,
 	buildMonitorCompactionDigest,
