@@ -47,6 +47,8 @@ import {
 import { readMonitorProcedure } from "./procedure";
 import type { MonitorRegistry } from "./registry";
 
+export const MONITOR_REPORT_MESSAGE_ID_PREFIX = "monitor-report:";
+
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
 const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 	"memory.canonicalize":
@@ -1454,7 +1456,7 @@ export class MonitorPropagator {
 		const target = monitor.reportTo;
 		if (!target) return;
 		this.#database.inbox.enqueue(tx, {
-			messageId: `monitor-report:${event.event_id}`,
+			messageId: `${MONITOR_REPORT_MESSAGE_ID_PREFIX}${event.event_id}`,
 			originKey: originKey(target),
 			originRefJson: JSON.stringify(target),
 			body: `Monitor ${JSON.stringify(monitor.name)} result for ${event.event_type} (${event.event_id}):\n\n${note}`,

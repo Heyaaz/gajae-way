@@ -606,22 +606,24 @@ test("AC-J mention-open internal report does not alter botAudience state", async
 	await silencePersona(f, reportSend.opRef);
 });
 
-test("AC-J chat.send and chat.edit reject internal lane-report ids", async () => {
+test("AC-J chat.send and chat.edit reject internal report ids", async () => {
 	const f = await fixture();
-	const send = await f.client.request("chat.send", {
-		origin: rootOrigin,
-		messageId: "lane-report-forbidden",
-		text: "forged internal row",
-		engagement: { mentioned: true, group: true, authorId: "human-1" },
-	});
-	expect(send.error).toMatchObject({ code: "invalid_params" });
-	const edit = await f.client.request("chat.edit", {
-		origin: rootOrigin,
-		messageId: "lane-report-forbidden",
-		text: "forged edit",
-		engagement: { mentioned: true, group: true, authorId: "human-1" },
-	});
-	expect(edit.error).toMatchObject({ code: "invalid_params" });
+	for (const messageId of ["lane-report-forbidden", "monitor-report:forbidden"]) {
+		const send = await f.client.request("chat.send", {
+			origin: rootOrigin,
+			messageId,
+			text: "forged internal row",
+			engagement: { mentioned: true, group: true, authorId: "human-1" },
+		});
+		expect(send.error).toMatchObject({ code: "invalid_params" });
+		const edit = await f.client.request("chat.edit", {
+			origin: rootOrigin,
+			messageId,
+			text: "forged edit",
+			engagement: { mentioned: true, group: true, authorId: "human-1" },
+		});
+		expect(edit.error).toMatchObject({ code: "invalid_params" });
+	}
 	expect(f.database.inbox.pendingCount(rootKey)).toBe(0);
 	const humanCount = f.database.core.metaGet(`bot-audience-state:${rootKey}`);
 	expect(humanCount).toBeUndefined();
