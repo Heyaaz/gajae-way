@@ -101,7 +101,7 @@ gajaeway ops restart-stack --status
 
 Before census, stop the gateway service and disable managed startup for the entire cutover window; follow [Explicit broker-authority cutover](runbooks/gajaeway-v1.md#explicit-broker-authority-cutover) and retain its census and cutover evidence. The final restart loads a missing macOS LaunchAgent from its plist, including `dev.gajaeway.broker` once its provision manifest exists.
 
-Check `schemaVersion` in the census report before cutover. This procedure requires schema 32; cutover refuses older databases. Gateway startup migrates older schemas only after confirming that configured `gjc.agentDir` matches the authority recorded in the database. If census reports an older version, stop here, migrate under the recorded authority, stop the gateway again, and repeat census. Do not start it against the new private directory or manually alter the recorded authority.
+Check `schemaVersion` in the census report before cutover. This procedure requires the current schema 34; cutover refuses older databases. Gateway startup migrates older schemas only after confirming that configured `gjc.agentDir` matches the authority recorded in the database. If census reports an older version, stop here, migrate under the recorded authority, stop the gateway again, and repeat census. Do not start it against the new private directory or manually alter the recorded authority.
 
 ## Home and configuration
 
@@ -440,7 +440,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]` replies). Verify the next event through the path consuming the changed policy.
+- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]`, `[WAKE:<alias>]`, and `[WATCH:<alias>]`). Verify the next event through the path consuming the changed policy.
 - `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `monitorCatchUp`, `work`, `gjc`, `sqlite`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
@@ -487,7 +487,7 @@ The command returns after a detached supervisor is queued. The supervisor restar
 
 An update-triggered restart stops the broker, runs journaled `broker-agent provision --mode update` under the broker lease, then starts the broker. If provisioning is unrecoverable, the restart receipt says to run `gajaeway setup --broker-agent`; inspect the provision status before restarting. On Linux, the service manager names the broker unit `gajaeway-broker.service`; on macOS the supervisor uses `dev.gajaeway.broker`.
 
-`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply. Migration 33 (L4h), which removes `broker_quarantine` and `broker_cutovers`, remains pending.
+`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply. The current schema is 34; `broker_quarantine` and `broker_cutovers` remain part of the broker-authority evidence.
 
 ## Speech gate
 

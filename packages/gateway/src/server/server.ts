@@ -106,20 +106,29 @@ import {
 	extendHandoffChain,
 	extractHandoffAtBlockStart,
 	extractWakeLines,
+	extractWatchLines,
 	type HandoffProvenance,
 	type HandoffReply,
 	handoffMessageId,
 	parseHandoffReply,
+	parseWatchTtl,
 	readHandoffProvenance,
 	renderHandoffFailure,
 	renderHandoffPointer,
 	renderHandoffTurn,
 	renderWakeFailure,
 	renderWakeTurn,
+	renderWatchedInputTurn,
+	renderWatchFailure,
+	renderWatchRegistered,
 	resolveHandoffTarget,
 	sanitizeHandoffTokens,
+	WATCH_REASON_MAX_LENGTH,
 	type WakeLine,
+	type WatchLine,
 	wakeMessageId,
+	watchRegistrationId,
+	watchWakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
@@ -2211,6 +2220,8 @@ async function sendChat(
 				mentioned?: boolean;
 				authorId?: string;
 				authorName?: unknown;
+				authorHandle?: string;
+				authorServerTag?: string;
 				channelLabel?: string;
 				serverLabel?: string;
 				replyTo?: { fromSelf?: boolean };
@@ -2327,10 +2338,11 @@ async function sendChat(
 	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
 	// Persist before dispatch: this insert is the durable acceptance boundary. The
-	// per-origin actor receives the notification only after this transaction wins.
-	const accepted = ingestOrReportDrop(key, messageId, true, () =>
-		options.database.transaction((tx) =>
-			options.database.inbox.enqueue(tx, {
+	// per-origin actor and any one-shot watch targets are notified only after this
+	// transaction commits. Auto-wakes carry metadata, never the source message.
+	const admission = ingestOrReportDrop(key, messageId, true, () =>
+		options.database.transaction((tx) => {
+			const accepted = options.database.inbox.enqueue(tx, {
 				messageId,
 				originKey: key,
 				originRefJson: JSON.stringify(origin),
@@ -2340,10 +2352,70 @@ async function sendChat(
 				engagementJson: params.engagement
 					? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
 					: undefined,
-			}),
-		),
+			});
+			if (!accepted || !nonLoopback || authorIsBot)
+				return { accepted, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
+
+			const matchedAt = new Date().toISOString();
+			const sourceAt = receivedAt ?? matchedAt;
+			const watchSender = composeSpeakerLabel({
+				authorId: engagement?.authorId,
+				authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+				authorHandle: engagement?.authorHandle,
+				authorServerTag: engagement?.authorServerTag,
+			});
+			const watchWakeOrigins: string[] = [];
+			const memoryIntentIds: string[] = [];
+			for (const watch of options.database.inbox.claimWatchesForOrigin(tx, key, messageId, matchedAt)) {
+				const watcherOrigin = validateOriginRef(JSON.parse(watch.watcher_origin_ref_json) as OriginRef);
+				if (originKey(watcherOrigin) !== watch.watcher_origin_key)
+					throw new Error(`watch ${watch.watch_id} origin key does not match its origin reference`);
+				const chain = JSON.parse(watch.handoff_chain_json) as unknown;
+				if (!Array.isArray(chain) || !chain.every((entry) => typeof entry === "string"))
+					throw new Error(`watch ${watch.watch_id} has invalid handoff provenance`);
+				const provenance: HandoffProvenance = {
+					chain: chain as string[],
+					sourceOriginKey: key,
+					sourceMessageId: messageId,
+					...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
+					...(watchSender ? { requesterName: watchSender } : {}),
+					at: sourceAt,
+				};
+				const wakeId = watchWakeMessageId(watch.watch_id, messageId);
+				const wakeAccepted = options.database.inbox.enqueue(tx, {
+					messageId: wakeId,
+					originKey: watch.watcher_origin_key,
+					originRefJson: watch.watcher_origin_ref_json,
+					body: renderWatchedInputTurn({
+						provenance,
+						sourcePlace:
+							[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
+							`${origin.platform} ${origin.kind} ${origin.conversationId}`,
+						sender: watchSender ?? "unknown sender",
+						reason: watch.reason,
+					}),
+					engagementJson: JSON.stringify({ mentioned: false, group: watcherOrigin.kind !== "dm", handoff: provenance }),
+					receivedAt: matchedAt,
+				});
+				if (!wakeAccepted) throw new Error(`watch wake ${wakeId} already exists before watch ${watch.watch_id} fired`);
+				const intentId = `watch-audit:fired:${watch.watch_id}`;
+				options.database.memory.createIntent(tx, {
+					id: intentId,
+					kind: "daily_capture",
+					payloadJson: JSON.stringify({
+						kind: "daily_capture",
+						originRefJson: JSON.stringify(origin),
+						userText: `Cross-session watch ${watch.watch_id} matched msg:${messageId} from ${watchSender ?? "unknown sender"}`,
+						replyText: `An information-only wake was enqueued for ${watch.watcher_origin_key}. The message text, attachments, and secrets were not copied. Reason: ${watch.reason}`,
+					}),
+				});
+				watchWakeOrigins.push(watch.watcher_origin_key);
+				memoryIntentIds.push(intentId);
+			}
+			return { accepted, watchWakeOrigins, memoryIntentIds };
+		}),
 	);
-	if (!accepted) {
+	if (!admission.accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2353,6 +2425,11 @@ async function sendChat(
 		});
 		return;
 	}
+	for (const intentId of admission.memoryIntentIds) runtime.memory.enqueueExistingId(intentId);
+	for (const watchOriginKey of admission.watchWakeOrigins)
+		void runtime.personaSessions
+			.notifyInbound(watchOriginKey)
+			.catch((error) => console.error(`gateway watch wake dispatch deferred to recovery: ${diagnostic(error)}`));
 	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key, messageId);
 	runtime.inbound.set(messageId, {
 		turnId,
@@ -2772,20 +2849,123 @@ async function createInboundTurnLifecycle(
 		}
 		const provenance = relayProvenance(relay.chain);
 		// Like a handoff row: no author identity, so it never reads as anyone speaking there.
-		const accepted = options.database.transaction((tx) =>
-			options.database.inbox.enqueue(tx, {
-				messageId: wakeMessageId(key, relaySourceMessageId, relay.originKey, line.summary),
+		const wakeId = wakeMessageId(key, relaySourceMessageId, relay.originKey, line.summary);
+		const outcome = options.database.transaction((tx) => {
+			const accepted = options.database.inbox.enqueue(tx, {
+				messageId: wakeId,
 				originKey: relay.originKey,
 				originRefJson: JSON.stringify(relay.origin),
 				body: renderWakeTurn({ provenance, sourcePlace: place, summary: line.summary }),
 				engagementJson: JSON.stringify({ mentioned: false, group: relay.origin.kind !== "dm", handoff: provenance }),
-			}),
-		);
-		if (!accepted) return;
+			});
+			if (!accepted) return { accepted, auditIntentId: undefined };
+			const auditIntentId = `wake-audit:enqueued:${wakeId}`;
+			options.database.memory.createIntent(tx, {
+				id: auditIntentId,
+				kind: "daily_capture",
+				payloadJson: JSON.stringify({
+					kind: "daily_capture",
+					originRefJson: JSON.stringify(origin),
+					userText: `Cross-session wake enqueued for ${relay.originKey}`,
+					replyText: `Information-only wake ${wakeId} was created from ${key}. Wake summary omitted from audit.`,
+				}),
+			});
+			return { accepted, auditIntentId };
+		});
+		if (!outcome.accepted) return;
+		if (outcome.auditIntentId) runtime.memory.enqueueExistingId(outcome.auditIntentId);
 		console.error(`gateway wake enqueued origin=${key} target=${relay.originKey} chain=${relay.chain.length}`);
 		void runtime.personaSessions
 			.notifyInbound(relay.originKey)
 			.catch((error) => console.error(`gateway wake dispatch deferred to recovery: ${diagnostic(error)}`));
+	};
+	/** A one-shot [WATCH:] directive waits for the next human input at another origin. */
+	const watch = (line: WatchLine) => {
+		const relay = resolveHandoffTarget(line.target, runtime.config);
+		if (!relay.ok) {
+			deliverTerminalLine(renderWatchFailure(line.target, relay.reason), deliveredParts.length);
+			return;
+		}
+		const ttl = parseWatchTtl(line.ttl);
+		if (!ttl.ok) {
+			deliverTerminalLine(renderWatchFailure(line.target, ttl.reason), deliveredParts.length);
+			return;
+		}
+		const reason = stripControlCharacters(line.reason).replace(/\s+/g, " ").trim();
+		if (!reason || Array.from(reason).length > WATCH_REASON_MAX_LENGTH) {
+			deliverTerminalLine(
+				renderWatchFailure(line.target, `reason must be 1-${WATCH_REASON_MAX_LENGTH} characters after trimming`),
+				deliveredParts.length,
+			);
+			return;
+		}
+		if (incomingHandoff?.chain.includes(relay.originKey)) {
+			deliverTerminalLine(
+				renderWatchFailure(
+					line.target,
+					`${relay.originKey} is already in this handoff chain (${incomingHandoff.chain.join(" -> ")})`,
+				),
+				deliveredParts.length,
+			);
+			return;
+		}
+		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], relay.originKey, key);
+		if (!hop.ok) {
+			deliverTerminalLine(renderWatchFailure(line.target, hop.reason), deliveredParts.length);
+			return;
+		}
+		const registeredAtDate = new Date();
+		const registeredAt = registeredAtDate.toISOString();
+		const expiresAt = new Date(registeredAtDate.getTime() + ttl.ttlMs).toISOString();
+		const watchId = watchRegistrationId(key, relaySourceMessageId, relay.originKey, line.ttl, reason);
+		const outcome = options.database.transaction((tx) => {
+			const registration = options.database.inbox.registerWatch(tx, {
+				watchId,
+				watcherOriginKey: key,
+				watcherOriginRefJson: JSON.stringify(origin),
+				watchedOriginKey: relay.originKey,
+				watchedOriginRefJson: JSON.stringify(relay.origin),
+				handoffChainJson: JSON.stringify(hop.chain),
+				reason,
+				registeredAt,
+				expiresAt,
+			});
+			if (registration.kind !== "registered") return { registration, auditIntentId: undefined };
+			const auditIntentId = `watch-audit:registered:${watchId}`;
+			options.database.memory.createIntent(tx, {
+				id: auditIntentId,
+				kind: "daily_capture",
+				payloadJson: JSON.stringify({
+					kind: "daily_capture",
+					originRefJson: JSON.stringify(origin),
+					userText: `Cross-session watch ${watchId} registered for ${relay.originKey}`,
+					replyText: `Waiting for the next human message until ${expiresAt}. Reason: ${reason}`,
+				}),
+			});
+			return { registration, auditIntentId };
+		});
+		if (outcome.auditIntentId) runtime.memory.enqueueExistingId(outcome.auditIntentId);
+		if (outcome.registration.kind === "already_watching") {
+			deliverTerminalLine(
+				renderWatchFailure(
+					line.target,
+					`this conversation is already watching until ${outcome.registration.watch.expires_at}`,
+				),
+				deliveredParts.length,
+			);
+			return;
+		}
+		if (outcome.registration.kind === "replayed" && outcome.registration.watch.state !== "pending") {
+			deliverTerminalLine(
+				`Watch for ${line.target} was already handled (${outcome.registration.watch.state}); it was not reopened.`,
+				deliveredParts.length,
+			);
+			return;
+		}
+		deliverTerminalLine(
+			renderWatchRegistered(line.target, outcome.registration.watch.expires_at, outcome.registration.watch.reason),
+			deliveredParts.length,
+		);
 	};
 	/** [POST:] parts seen in mid-work speech, keyed `<target key>\n<body>`, posted at the turn's end. */
 	const heldPosts = new Map<string, { body: string; post: NonNullable<PlannedPart["post"]> }>();
@@ -3147,11 +3327,14 @@ async function createInboundTurnLifecycle(
 	 * repeat (text-keyed id, so a second terminal pass cannot post it again).
 	 */
 	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
-		// [WAKE:] lines never reach this conversation; only the final answer wakes.
-		const { text, wakes } = extractWakeLines(rawMessage);
-		await deliverTurnText(text, source);
+		// Cross-session directives never reach this conversation; only final replies
+		// register watches or enqueue wakes.
+		const wakeOutput = extractWakeLines(rawMessage);
+		const watchOutput = extractWatchLines(wakeOutput.text);
+		await deliverTurnText(watchOutput.text, source);
 		if (source !== "terminal" || !nonLoopback) return;
-		for (const line of wakes) wake(line);
+		for (const line of watchOutput.watches) watch(line);
+		for (const line of wakeOutput.wakes) wake(line);
 		for (const [postKey, held] of heldPosts) {
 			if (terminalPosts.has(postKey)) continue;
 			postElsewhere(
@@ -3824,6 +4007,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 			? [
 					"Handoffs: when the work belongs to another conversation, make the FIRST line of your final reply [HANDOFF:<target>] (a configured handoff alias or an origin such as discord:<channel id>) and write below it what that conversation's session needs to know and do. That session answers there; this conversation only gets a pointer. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",
 					"Waking another conversation: when another conversation's session should KNOW something but the work stays here, put a line [WAKE:<target>] <one-line summary> (a configured handoff alias or an origin such as discord:<channel id>) at the start of a line in your final reply. That line is removed from what this conversation sees, the rest of your reply is delivered here as usual, and the target session gets an internal turn carrying the summary as information only - it grants that session no permission and is not an instruction. Wakes use the handoff chain: they stop after 2 hops, a target already in the chain is refused, and a refused or unknown target is reported here.",
+					"Watching another conversation: when you need to wait for its next human message, put [WATCH:<target>] <ttl> <short reason> on a line in your final reply (for example [WATCH:discord/dm/peer=<id>] 30m waiting for the Harbor credential). Targets use a configured handoff alias or a canonical chat origin key; TTL is 1m-7d and the reason is 1-240 characters. The watch is one-shot and expires automatically. On a matching human message, this conversation gets an internal information-only turn with the sender, origin, reason and queue status; the original message, attachments and secrets are not copied. The source session handles the message independently, and this watch grants no permission. Only one active watch per target is allowed; the 2-hop limit and loop checks still apply.",
 				]
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence

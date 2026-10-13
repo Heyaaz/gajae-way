@@ -14,6 +14,7 @@ export const TABLE_OWNER = {
 	broker_cutovers: "bindings",
 	deliveries: "outbox",
 	inbound_messages: "inbox",
+	cross_session_watches: "inbox",
 	conversation_context: "inbox",
 	conversation_context_state: "inbox",
 	recall_snippets: "inbox",
