@@ -889,9 +889,11 @@ export function sessionPortFromScript(script: {
 		input: SessionBindInput,
 	) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>;
 	readonly respond: SessionPortResponder;
+	readonly onSteer?: (input: SessionSteerInput, port: ScriptedSessionPort) => void | Promise<void>;
 }): ScriptedSessionPort {
 	return new ScriptedSessionPort({
 		onBind: (input) => script.bind?.(input.originKey, input.epoch, input) ?? `session-${input.epoch}`,
+		onSteer: script.onSteer,
 		onSend: (input, port) => {
 			void (async () => {
 				try {
