@@ -297,6 +297,56 @@ describe("frames", () => {
 		} as unknown as Frame;
 		expect(g.guardFrame(response)).toBe(response);
 	});
+
+	test("askUserPanel question and options[].label are redacted", () => {
+		const logs: string[] = [];
+		const g = guard({ env: { OG_API_KEY: fake.opaque } }, logs);
+		const out = g.guardFrame(
+			message("clean", {
+				askUserPanel: {
+					panelId: "p1",
+					question: `What is your ${fake.opaque}?`,
+					expiresAt: "2024-01-01T00:00:00Z",
+					options: [
+						{ id: "o1", label: `Option A with ${fake.opaque}` },
+						{ id: "o2", label: "Option B clean" },
+						{ id: "o3", label: `Option C with ${fake.slackBot}` },
+					],
+				},
+			}),
+		) as any;
+		expect(out.payload.askUserPanel.question).toBe("What is your [REDACTED:known_secret]?");
+		expect(out.payload.askUserPanel.options[0].label).toBe("Option A with [REDACTED:known_secret]");
+		expect(out.payload.askUserPanel.options[1].label).toBe("Option B clean");
+		expect(out.payload.askUserPanel.options[2].label).toBe("Option C with [REDACTED:slack_token]");
+		const redacted = logs.filter((line) => line.startsWith("secret_guard_redacted"));
+		expect(redacted).toEqual(["secret_guard_redacted event=chat.message kinds=known_secret:2,slack_token:1"]);
+	});
+
+	test("approvalPanel message and options[].name are redacted", () => {
+		const logs: string[] = [];
+		const g = guard({ env: { OG_API_KEY: fake.opaque } }, logs);
+		const out = g.guardFrame(
+			message("clean", {
+				approvalPanel: {
+					panelId: "p2",
+					message: `Please approve access to ${fake.opaque}`,
+					expiresAt: "2024-01-01T00:00:00Z",
+					options: [
+						{ optionId: "a1", name: `Allow - token ${fake.opaque}`, kind: "allow" },
+						{ optionId: "a2", name: "Deny", kind: "deny" },
+						{ optionId: "a3", name: `Maybe with ${fake.github}`, kind: "maybe" },
+					],
+				},
+			}),
+		) as any;
+		expect(out.payload.approvalPanel.message).toBe("Please approve access to [REDACTED:known_secret]");
+		expect(out.payload.approvalPanel.options[0].name).toBe("Allow - token [REDACTED:known_secret]");
+		expect(out.payload.approvalPanel.options[1].name).toBe("Deny");
+		expect(out.payload.approvalPanel.options[2].name).toBe("Maybe with [REDACTED:github_token]");
+		const redacted = logs.filter((line) => line.startsWith("secret_guard_redacted"));
+		expect(redacted).toEqual(["secret_guard_redacted event=chat.message kinds=known_secret:2,github_token:1"]);
+	});
 });
 
 test("gajaeway-gateway redact filters stdin to stdout with the same sources", async () => {
