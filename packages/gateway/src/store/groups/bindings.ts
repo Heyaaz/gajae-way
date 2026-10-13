@@ -285,9 +285,9 @@ export class BindingsGroup {
 	): void {
 		this.#db
 			.prepare(
-				"UPDATE sessions SET last_activity_at = ?, origin_ref_json = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ?",
+				"UPDATE sessions SET last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END, origin_ref_json = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ?",
 			)
-			.run(tx, at, originRefJson, originKey, sessionId, epoch);
+			.run(tx, at, at, originRefJson, originKey, sessionId, epoch);
 	}
 
 	incrementTurnCount(tx: WriteTx, originKey: string, originRefJson?: string): number {
