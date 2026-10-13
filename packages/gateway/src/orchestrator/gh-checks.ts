@@ -1,3 +1,4 @@
+import { sanitizeDiagnostic } from "./rebind";
 import type { CheckStatusClient, CheckStatusSnapshot } from "./work-lane";
 
 /** One entry of `gh pr list --json statusCheckRollup`: a CheckRun or a commit StatusContext. */
@@ -8,7 +9,10 @@ interface RollupEntry {
 	readonly status?: string;
 	readonly conclusion?: string;
 	readonly state?: string;
+	readonly detailsUrl?: string;
 }
+
+const FAILED_LOG_LIMIT_BYTES = 1_600;
 
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const SUCCESS_CONCLUSIONS = new Set(["SUCCESS"]);
@@ -47,7 +51,7 @@ export function classifyCheckRollup(
 	return { prNumber, headSha, status, failingChecks: [...new Set(failingChecks)] };
 }
 
-/** Production client: one async `gh pr list` call bounded by `timeoutMs`; never blocks the event loop. */
+/** Production client: bounded async PR/check lookups; failed GitHub Actions logs are a best-effort red-check tail. */
 export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 	return {
 		async getCheckStatus(branch, cwd) {
@@ -79,10 +83,77 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 				if (!pr) return null;
 				const headSha = pr.headRefOid;
 				if (!headSha) return undefined;
-				return classifyCheckRollup(pr.number, headSha, pr.statusCheckRollup ?? []);
+				const rollup = pr.statusCheckRollup ?? [];
+				const snapshot = classifyCheckRollup(pr.number, headSha, rollup);
+				if (snapshot.status !== "red") return snapshot;
+				const targets = failedCheckLogTargets(rollup).slice(0, 3);
+				const tails = await Promise.all(
+					targets.map((target) => readFailedLogTail(target, cwd, Math.min(timeoutMs, 2_000))),
+				);
+				const failureLogTail = tails.filter(Boolean).join("\n---\n").slice(-FAILED_LOG_LIMIT_BYTES);
+				return failureLogTail ? { ...snapshot, failureLogTail } : snapshot;
 			} catch {
 				return undefined;
 			}
 		},
 	};
+}
+
+function failedCheckLogTargets(rollup: readonly RollupEntry[]): Array<{ runId: string; jobId?: string }> {
+	const targets = new Map<string, { runId: string; jobId?: string }>();
+	for (const entry of rollup) {
+		if (entry.status?.toUpperCase() !== "COMPLETED" || !FAILED_CONCLUSIONS.has(entry.conclusion?.toUpperCase() ?? ""))
+			continue;
+		if (!entry.detailsUrl) continue;
+		try {
+			const url = new URL(entry.detailsUrl);
+			if (url.hostname !== "github.com") continue;
+			const match = url.pathname.match(/^\/[^/]+\/[^/]+\/actions\/runs\/(\d+)(?:\/job\/(\d+))?/);
+			if (!match?.[1]) continue;
+			const target = match[2] ? { runId: match[1], jobId: match[2] } : { runId: match[1] };
+			targets.set(`${target.runId}/${target.jobId ?? ""}`, target);
+		} catch {
+			// Non-GitHub checks and malformed links have no GitHub Actions log tail.
+		}
+	}
+	return [...targets.values()];
+}
+
+async function readFailedLogTail(
+	target: { readonly runId: string; readonly jobId?: string },
+	cwd: string,
+	timeoutMs: number,
+): Promise<string | undefined> {
+	try {
+		const child = Bun.spawn(
+			["gh", "run", "view", target.runId, ...(target.jobId ? ["--job", target.jobId] : []), "--log-failed"],
+			{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
+		);
+		const [tail, exitCode] = await Promise.all([readBoundedTail(child.stdout), child.exited]);
+		if (exitCode !== 0 || tail.length === 0) return undefined;
+		const sanitized = sanitizeDiagnostic(new TextDecoder().decode(tail));
+		const bytes = Buffer.from(sanitized, "utf8");
+		return (
+			bytes
+				.subarray(Math.max(0, bytes.length - FAILED_LOG_LIMIT_BYTES))
+				.toString("utf8")
+				.trim() || undefined
+		);
+	} catch {
+		return undefined;
+	}
+}
+
+async function readBoundedTail(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+	const reader = stream.getReader();
+	let tail = new Uint8Array();
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) return tail;
+		if (!value) continue;
+		const combined = new Uint8Array(tail.length + value.length);
+		combined.set(tail);
+		combined.set(value, tail.length);
+		tail = combined.slice(Math.max(0, combined.length - FAILED_LOG_LIMIT_BYTES * 2));
+	}
 }

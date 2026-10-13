@@ -2856,7 +2856,8 @@ test("#481 a lane whose PR is already red at settle starts the bounded repair cy
 	expect(f.job().state).toBe("running");
 	expect(f.job().awaitingChecks?.retries).toBe(1);
 	expect(f.port.sends[1]?.text).toContain("test");
-	expect(checksNotice(f, "[lane a] completed")).toContain("checks=red(test)");
+	expect(checksNotice(f, "[lane a] completed")).toBeUndefined();
+	expect(checksNotice(f, "[lane a] attempt_ended")).toContain("checks=red(test)");
 });
 
 test("#481 a lane whose HEAD is unpushed never waits for checks", async () => {
@@ -2902,12 +2903,18 @@ test("#481 awaiting_checks: red checks re-steer the lane session with the failin
 	const { sessionId } = await awaitingLane(f, "fix/red-resteer");
 	const since = f.job().awaitingChecks?.since;
 	expect(f.port.sends).toHaveLength(1);
-	checks.set({ prNumber: 490, status: "red", failingChecks: ["unit-test", "lint-check"] });
+	checks.set({
+		prNumber: 490,
+		status: "red",
+		failingChecks: ["unit-test", "lint-check"],
+		failureLogTail: "FAILED unit-test: expected 2, received 1",
+	});
 	await pollUntil(f, () => f.port.sends.length === 2);
 	const steer = f.port.sends[1];
 	expect(steer.sessionId).toBe(sessionId);
 	expect(steer.text).toContain("PR #490 checks failed");
 	expect(steer.text).toContain("unit-test, lint-check");
+	expect(steer.text).toContain("Failed log tail:\nFAILED unit-test: expected 2, received 1");
 	const job = parseLaneJobRecord(f.db.work.laneJobJson(laneJobIdentity("a").jobId)!);
 	expect(job.awaitingChecks?.retries).toBe(1);
 	expect(job.state).toBe("running");

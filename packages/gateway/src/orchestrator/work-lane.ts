@@ -161,6 +161,8 @@ export interface CheckStatusSnapshot {
 	readonly headSha: string;
 	readonly status: "pending" | "green" | "red";
 	readonly failingChecks: readonly string[];
+	/** Bounded, sanitized tail from failed GitHub Actions checks when available. */
+	readonly failureLogTail?: string;
 }
 
 export interface CheckStatusClient {
@@ -1711,7 +1713,7 @@ export class WorkLaneManager {
 			if (outcome.kind === "red") {
 				if (activeCycle.prNumber === null) return undefined;
 				if (activeCycle.retries < AWAITING_CHECKS_RETRY_LIMIT) {
-					await this.#resteerRedChecks(name, job, outcome.failingChecks);
+					await this.#resteerRedChecks(name, job, outcome.failingChecks, outcome.failureLogTail);
 					return undefined;
 				}
 				return this.#settleChecks(name, job, {
@@ -1739,14 +1741,20 @@ export class WorkLaneManager {
 		if (effects.laneParent) await this.#drainLaneReports(effects.laneParent);
 	}
 	/** Spends one retry, then continues the lane's session with the failing check names. */
-	async #resteerRedChecks(name: string, job: LaneJobRecord, failingChecks: readonly string[]): Promise<void> {
+	async #resteerRedChecks(
+		name: string,
+		job: LaneJobRecord,
+		failingChecks: readonly string[],
+		failureLogTail?: string,
+	): Promise<void> {
 		const cycle = job.awaitingChecks!;
 		if (cycle.prNumber === null) throw new Error("cannot re-steer before discovering the open PR");
 		const counted = recordChecksRetry(job, this.#at());
 		this.#putJob(name, counted);
 		const retries = counted.awaitingChecks!.retries;
 		const names = failingChecks.length > 0 ? failingChecks.join(", ") : "unnamed checks";
-		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).`;
+		const log = failureLogTail ? `\nFailed log tail:\n${utf8Prefix(sanitizeDiagnostic(failureLogTail), 1_600)}` : "";
+		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).${log}`;
 		const last = job.attempts.at(-1);
 		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
 		try {
@@ -2745,7 +2753,12 @@ export function reportText(
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
 ): string {
-	const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
+	const label =
+		endState === "completed" && facts?.checkStatus?.status !== "red"
+			? "completed"
+			: endState === "failed"
+				? "failed"
+				: "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
 	const head = `[lane ${name}] ${label}: ${lead}`;
 	let body =
@@ -2800,7 +2813,7 @@ export function reportText(
 }
 type ChecksOutcome =
 	| { readonly kind: "wait" }
-	| { readonly kind: "red"; readonly failingChecks: readonly string[] }
+	| { readonly kind: "red"; readonly failingChecks: readonly string[]; readonly failureLogTail?: string }
 	| { readonly kind: "passed" }
 	| { readonly kind: "ended"; readonly reason: string };
 
@@ -2821,7 +2834,12 @@ function checksOutcome(
 				reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}`,
 			};
 		if (checks?.status === "green") return { kind: "passed" };
-		if (checks?.status === "red") return { kind: "red", failingChecks: checks.failingChecks };
+		if (checks?.status === "red")
+			return {
+				kind: "red",
+				failingChecks: checks.failingChecks,
+				...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
+			};
 		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 		return { kind: "wait" };
@@ -2832,7 +2850,12 @@ function checksOutcome(
 	if (checks && checks.headSha !== cycle.headSha)
 		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}` };
 	if (checks?.status === "green") return { kind: "passed" };
-	if (checks?.status === "red") return { kind: "red", failingChecks: checks.failingChecks };
+	if (checks?.status === "red")
+		return {
+			kind: "red",
+			failingChecks: checks.failingChecks,
+			...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
+		};
 	// Pending, or unavailable (lookup failed): keep waiting until the deadline.
 	if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 		return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
