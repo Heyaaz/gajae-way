@@ -68,7 +68,7 @@ SQLite records one active private broker authority and immutable gateway-created
 | `dispatch_leases` | `monitors` | `store/groups/monitors.ts` |
 | `memory_intents` | `memory` | `store/groups/memory.ts` |
 
-The current schema is version 34 and still contains `broker_quarantine` and `broker_cutovers`. Cross-session watches are owned by the inbox group and migrate in schema 34.
+The current schema is version 35 and still contains `broker_quarantine` and `broker_cutovers`. Cross-session watches are owned by the inbox group and migrate in schema 34.
 
 ### Transaction boundary
 

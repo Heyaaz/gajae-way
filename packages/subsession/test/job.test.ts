@@ -14,6 +14,9 @@ import {
 	planContinuation,
 	projectAttemptOutcome,
 	type RepositoryFacts,
+	recordChecksRetry,
+	settleAwaitingChecks,
+	transitionToAwaitingChecks,
 } from "../src/job";
 import { ATTEMPT_ENDED_CODES, projectOpState } from "../src/status";
 
@@ -593,5 +596,84 @@ describe("restart and recovery", () => {
 		expect(stored.stalledContinuations).toBe(0);
 		// The next prompt may continue the same job - which is exactly how this
 		// very slice was continued by its supervisor.
+	});
+});
+
+describe("awaiting_checks cycle (#481)", () => {
+	const HEAD = "c".repeat(40);
+	function awaiting() {
+		const closed = closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		return transitionToAwaitingChecks({ record: closed, at: NOW.toISOString(), prNumber: 7, headSha: HEAD });
+	}
+
+	test("the cycle persists PR, head, start and retries, and retries survive a re-steered attempt", () => {
+		const parked = awaiting();
+		expect(parked.state).toBe("awaiting_checks");
+		expect(parseLaneJobRecord(JSON.stringify(parked))).toEqual(parked);
+		const resteered = appendAttempt(recordChecksRetry(parked, NOW.toISOString()), attempt({ opRef: "gw-lanejob-02" }));
+		expect(resteered.state).toBe("running");
+		const closed = closeAttempt({
+			record: resteered,
+			opRef: "gw-lanejob-02",
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		const reparked = transitionToAwaitingChecks({ record: closed, at: NOW.toISOString(), prNumber: 7, headSha: HEAD });
+		expect(reparked.awaitingChecks?.retries).toBe(1);
+	});
+
+	test("a lookup-pending cycle can bind its PR later without resetting the deadline", () => {
+		const closed = closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		const startedAt = NOW.toISOString();
+		const discovering = transitionToAwaitingChecks({
+			record: closed,
+			at: startedAt,
+			prNumber: null,
+			headSha: HEAD,
+		});
+		const discovered = transitionToAwaitingChecks({
+			record: discovering,
+			at: new Date(NOW.getTime() + 60_000).toISOString(),
+			prNumber: 7,
+			headSha: HEAD,
+		});
+		expect(parseLaneJobRecord(JSON.stringify(discovering))).toEqual(discovering);
+		expect(discovered.awaitingChecks).toEqual({ prNumber: 7, headSha: HEAD, since: startedAt, retries: 0 });
+	});
+
+	test("settling closes the cycle: passed is done, failed holds for an operator, ended is continuable", () => {
+		const at = NOW.toISOString();
+		expect(settleAwaitingChecks(awaiting(), at, { kind: "passed" })).toMatchObject({ state: "done" });
+		const failed = settleAwaitingChecks(awaiting(), at, { kind: "failed", reason: "checks=red(lint)" });
+		expect(failed.state).toBe("awaiting_operator");
+		expect(failed.escalations.at(-1)).toBe(`${at} awaiting_checks failed: checks=red(lint)`);
+		const ended = settleAwaitingChecks(awaiting(), at, { kind: "ended", reason: "timeout" });
+		expect(ended.state).toBe("attempt_ended");
+		for (const settled of [failed, ended]) expect(settled.awaitingChecks).toBeUndefined();
+	});
+
+	test("continuation planning holds an awaiting_checks record until the cycle settles", () => {
+		const parked = awaiting();
+		const decision = planContinuation(planInput({ record: parked, latestAttempt: parked.attempts[0] }));
+		expect(decision.action).toBe("hold_for_operator");
+		expect(decision.reason).toMatch(/checks are still pending/);
+	});
+
+	test("an awaiting_checks record without its cycle, or with a corrupt one, fails closed", () => {
+		const { awaitingChecks: _, ...missing } = awaiting();
+		expect(() => parseLaneJobRecord(JSON.stringify(missing))).toThrow(/awaitingChecks/);
+		const corrupt = { ...awaiting(), awaitingChecks: { ...awaiting().awaitingChecks, retries: -1 } };
+		expect(() => parseLaneJobRecord(JSON.stringify(corrupt))).toThrow(/retries/);
+		expect(() => recordChecksRetry(record(), NOW.toISOString())).toThrow(LaneJobError);
 	});
 });

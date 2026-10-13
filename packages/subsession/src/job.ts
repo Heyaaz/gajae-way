@@ -71,16 +71,27 @@ export type WorkEvidenceClass = "work_committed_report_lost" | "work_in_progress
  *                  working/continuable; reconcile before continuing
  *  - awaiting_operator terminal_uncertainty holds for a human; automation must
  *                  neither resend nor recreate
+ *  - awaiting_checks the attempt completed and the pushed branch's open PR has
+ *                  checks to conclude; red re-steers (bounded), green is done,
+ *                  timeout / PR closed / HEAD moved settle with that reason
  *  - stalled       continuations stopped producing HEAD moves; escalation only
  *  - done          the deliverable landed (e.g. merged / confirmed complete)
  *  - aborted       operator-cancelled; never auto-resumed
  */
-export type LaneJobState = "running" | "attempt_ended" | "awaiting_operator" | "stalled" | "done" | "aborted";
+export type LaneJobState =
+	| "running"
+	| "attempt_ended"
+	| "awaiting_operator"
+	| "awaiting_checks"
+	| "stalled"
+	| "done"
+	| "aborted";
 
 const LANE_JOB_STATES = new Set<LaneJobState>([
 	"running",
 	"attempt_ended",
 	"awaiting_operator",
+	"awaiting_checks",
 	"stalled",
 	"done",
 	"aborted",
@@ -103,6 +114,18 @@ export type JobAttempt = {
 export type JobCheckpoint = {
 	readonly sha: string;
 	readonly createdAt: string;
+};
+
+/** A lane's PR-checks cycle; persisted so retries and the deadline survive restarts. */
+export type AwaitingChecks = {
+	/** Null until the first successful GitHub lookup discovers an open PR. */
+	readonly prNumber: number | null;
+	/** The pushed HEAD the checks run against; any other HEAD ends the wait. */
+	readonly headSha: string;
+	/** When the current wait began; the timeout is measured from here. */
+	readonly since: string;
+	/** Re-steers already spent on red checks in this cycle. */
+	readonly retries: number;
 };
 
 export type LaneJobRecord = {
@@ -137,6 +160,11 @@ export type LaneJobRecord = {
 	 * checkpoints only ever record moves BEYOND this SHA.
 	 */
 	readonly baselineSha?: string;
+	/**
+	 * Present while the job is in a PR-checks cycle: always in `awaiting_checks`,
+	 * and kept through a re-steered attempt so its retries carry over.
+	 */
+	readonly awaitingChecks?: AwaitingChecks;
 };
 
 export type CreateLaneJobInput = {
@@ -274,6 +302,10 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 	const checkpoints = parseCheckpoints(record.checkpoints);
 	const stalledContinuations = parseCounter(record.stalledContinuations, "stalledContinuations");
 	const escalations = parseEscalations(record.escalations);
+	const awaitingChecks = record.awaitingChecks === undefined ? undefined : parseAwaitingChecks(record.awaitingChecks);
+	if (record.state === "awaiting_checks" && awaitingChecks === undefined) {
+		throw new LaneJobError("awaiting_checks job is missing its awaitingChecks block");
+	}
 
 	return Object.freeze({
 		schemaVersion: LANE_JOB_SCHEMA_VERSION,
@@ -293,14 +325,32 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 		stalledContinuations,
 		...(record.reportSource === undefined ? {} : { reportSource: asReportSource(record.reportSource) }),
 		...(record.report === undefined ? {} : { report: asString(record.report) }),
-		...(record.baselineSha === undefined ? {} : { baselineSha: assertFullSha(asString(record.baselineSha)) }),
+		...(record.baselineSha === undefined
+			? {}
+			: { baselineSha: assertFullSha(asString(record.baselineSha), "baselineSha") }),
 		escalations,
+		...(awaitingChecks === undefined ? {} : { awaitingChecks }),
 	});
 }
 
-function assertFullSha(value: string): string {
+function parseAwaitingChecks(value: unknown): AwaitingChecks {
+	if (typeof value !== "object" || value === null) {
+		throw new LaneJobError("awaitingChecks must be an object");
+	}
+	const block = value as Record<string, unknown>;
+	const prNumber = block.prNumber === null ? null : parseCounter(block.prNumber, "awaitingChecks.prNumber");
+	if (prNumber === 0) throw new LaneJobError("awaitingChecks.prNumber must be positive");
+	return Object.freeze({
+		prNumber,
+		headSha: assertFullSha(asString(block.headSha), "awaitingChecks.headSha"),
+		since: assertRequiredTimestamp(block.since, "awaitingChecks.since"),
+		retries: parseCounter(block.retries, "awaitingChecks.retries"),
+	});
+}
+
+function assertFullSha(value: string, field: string): string {
 	if (!/^[0-9a-f]{40}$/.test(value)) {
-		throw new LaneJobError("baselineSha is not a full commit sha");
+		throw new LaneJobError(`${field} is not a full commit sha`);
 	}
 	return value;
 }
@@ -704,12 +754,101 @@ export function closeAttempt(input: CloseAttemptInput): LaneJobRecord {
 	});
 }
 
+export type AwaitingChecksInput = {
+	readonly record: LaneJobRecord;
+	readonly at: string;
+	readonly prNumber: number | null;
+	/** The pushed HEAD the PR checks run against. */
+	readonly headSha: string;
+};
+
+/**
+ * Parks a completed attempt in awaiting_checks while the lane's open PR has
+ * checks to conclude. Only an attempt_ended record transitions; any other
+ * record is returned unchanged. Retries already spent in this checks cycle
+ * carry over, so a re-steered attempt cannot reset the bound.
+ */
+export function transitionToAwaitingChecks(input: AwaitingChecksInput): LaneJobRecord {
+	if (input.record.state === "awaiting_checks") {
+		const cycle = input.record.awaitingChecks;
+		if (!cycle || cycle.prNumber !== null || input.prNumber === null) return input.record;
+		return Object.freeze({
+			...input.record,
+			awaitingChecks: Object.freeze({ ...cycle, prNumber: input.prNumber }),
+			updatedAt: input.at,
+		});
+	}
+	if (input.record.state !== "attempt_ended") {
+		return input.record;
+	}
+	return Object.freeze({
+		...input.record,
+		state: "awaiting_checks",
+		awaitingChecks: Object.freeze({
+			prNumber: input.prNumber,
+			headSha: assertFullSha(input.headSha, "awaitingChecks.headSha"),
+			since: input.record.awaitingChecks?.since ?? input.at,
+			retries: input.record.awaitingChecks?.retries ?? 0,
+		}),
+		updatedAt: input.at,
+	});
+}
+
+/** Counts one re-steer on red checks; the record stays in its checks cycle. */
+export function recordChecksRetry(record: LaneJobRecord, at: string): LaneJobRecord {
+	if (record.state !== "awaiting_checks" || !record.awaitingChecks) {
+		throw new LaneJobError(`${record.jobId} is not awaiting checks`);
+	}
+	return Object.freeze({
+		...record,
+		awaitingChecks: Object.freeze({ ...record.awaitingChecks, retries: record.awaitingChecks.retries + 1 }),
+		updatedAt: at,
+	});
+}
+
+/** Ends the checks cycle without touching the job state. */
+export function clearAwaitingChecks(record: LaneJobRecord): LaneJobRecord {
+	if (record.awaitingChecks === undefined) return record;
+	const { awaitingChecks: _, ...rest } = record;
+	return Object.freeze(rest);
+}
+
+/**
+ * How a checks cycle ends: `passed` (green), `failed` (red with the re-steer
+ * budget spent; automation gave up, so the job holds for an operator), or
+ * `ended` (the wait itself ended: timeout, PR closed, HEAD moved; continuable).
+ */
+export type ChecksSettlement =
+	| { readonly kind: "passed" }
+	| { readonly kind: "failed" | "ended"; readonly reason: string };
+
+/** Settles an awaiting_checks job and closes its checks cycle. */
+export function settleAwaitingChecks(record: LaneJobRecord, at: string, outcome: ChecksSettlement): LaneJobRecord {
+	if (record.state !== "awaiting_checks") {
+		throw new LaneJobError(`${record.jobId} is not awaiting checks`);
+	}
+	const rest = clearAwaitingChecks(record);
+	if (outcome.kind === "passed") return Object.freeze({ ...rest, state: "done", updatedAt: at });
+	return Object.freeze({
+		...rest,
+		state: outcome.kind === "failed" ? "awaiting_operator" : "attempt_ended",
+		updatedAt: at,
+		escalations: Object.freeze([...record.escalations, `${at} awaiting_checks ${outcome.kind}: ${outcome.reason}`]),
+	});
+}
+
 export function planContinuation(input: PlanContinuationInput): ContinuationPlan {
 	if (input.record.state === "aborted") {
 		return { action: "hold_for_operator", reason: "the job was aborted by an operator; never auto-resumed" };
 	}
 	if (input.record.state === "done") {
 		return { action: "hold_for_operator", reason: "job is done: run retirement/handoff, do not continue" };
+	}
+	if (input.record.state === "awaiting_checks") {
+		return {
+			action: "hold_for_operator",
+			reason: "checks are still pending; wait for the checks cycle to settle before continuing",
+		};
 	}
 	if (input.record.state === "awaiting_operator") {
 		return {
