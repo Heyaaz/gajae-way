@@ -54,6 +54,7 @@ import {
 	type LaneGovernor,
 	laneJobIdentity,
 	managedLaneRepositoryPath,
+	managedLaneWorktreePath,
 	workSessionKey,
 } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
@@ -66,6 +67,7 @@ const FAILURES_PER_READOPTION = 8;
 /** Ceiling for the failure backoff between reconciliation polls. */
 const MAX_FAILURE_BACKOFF_MS = 30_000;
 const REMOTE_REF_PROBE_TIMEOUT_MS = 5_000;
+const REMOTE_REPO_CLONE_TIMEOUT_MS = 30_000;
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
@@ -720,7 +722,7 @@ export class WorkLaneManager {
 
 		const laneRoot = this.#options.laneRoot ?? this.#options.gajaewayHome;
 		const candidateWorktreePath =
-			job?.lane.worktreePath ?? (input.repo !== undefined ? join(laneRoot, "lanes", input.name) : input.cwd);
+			job?.lane.worktreePath ?? (input.repo !== undefined ? managedLaneWorktreePath(laneRoot, input.name) : input.cwd);
 		if (candidateWorktreePath === undefined) throw new Error("work lane path was not resolved");
 		assertOutsideServiceDirectory(this.#options.serviceDirectory, candidateWorktreePath, input.name);
 		const candidateRepositoryPath =
@@ -2551,6 +2553,15 @@ function isGitRemoteUrl(value: string): boolean {
 	}
 }
 
+function resolveLocalRemoteUrl(sourceRepository: string, remoteUrl: string): string {
+	const windowsDrivePath = /^[A-Za-z]:/.test(remoteUrl);
+	const windowsAbsolutePath = /^[A-Za-z]:[\\/]/.test(remoteUrl) || remoteUrl.startsWith("\\\\");
+	const transportUrl = !windowsDrivePath && /^[A-Za-z][A-Za-z\d+.-]*:/.test(remoteUrl);
+	const scpLikeUrl = !windowsDrivePath && /^(?:[^/@:\s]+@)?[^/:\\\s]+:.+/.test(remoteUrl);
+	if (isAbsolute(remoteUrl) || windowsAbsolutePath || transportUrl || scpLikeUrl) return remoteUrl;
+	return resolve(sourceRepository, remoteUrl);
+}
+
 function canonicalPathIncludingMissing(target: string): string {
 	let current = resolve(target);
 	const missing: string[] = [];
@@ -2617,7 +2628,7 @@ async function createWorktreeFromRepo(
 ): Promise<CreatedRepoWorktree> {
 	const absoluteLaneRoot = resolve(laneRoot);
 	const lanesDir = join(absoluteLaneRoot, "lanes");
-	const worktreePath = join(lanesDir, laneName);
+	const worktreePath = managedLaneWorktreePath(absoluteLaneRoot, laneName);
 	const isRemote = isGitRemoteUrl(repo);
 	const repositoryPath = managedLaneRepositoryPath(absoluteLaneRoot, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, worktreePath, laneName);
@@ -2688,12 +2699,37 @@ async function createWorktreeFromRepo(
 			});
 		}
 		ownsRepositoryPath = true;
-		const clone = Bun.spawnSync(["git", "clone", "--bare", "--", repo, repositoryPath], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		if (clone.exitCode !== 0) {
-			const stderr = clone.stderr?.toString().trim() || "unknown error";
+		const cloneArgs = ["git", "clone", "--bare", "--", repo, repositoryPath];
+		let cloneExitCode: number;
+		let cloneStderr: string;
+		try {
+			if (isRemote) {
+				const clone = Bun.spawn(cloneArgs, {
+					stdout: "pipe",
+					stderr: "pipe",
+					signal: AbortSignal.timeout(REMOTE_REPO_CLONE_TIMEOUT_MS),
+				});
+				const [exitCode, , stderr] = await Promise.all([
+					clone.exited,
+					new Response(clone.stdout).arrayBuffer(),
+					new Response(clone.stderr).text(),
+				]);
+				cloneExitCode = exitCode;
+				cloneStderr = stderr.trim();
+			} else {
+				const clone = Bun.spawnSync(cloneArgs, { stdout: "pipe", stderr: "pipe" });
+				cloneExitCode = clone.exitCode;
+				cloneStderr = clone.stderr?.toString().trim() ?? "";
+			}
+		} catch (error) {
+			const stderr = error instanceof Error ? error.message : String(error);
+			throw new ProtocolError("invalid_params", `failed to clone lane repository: ${stderr || "unknown error"}`, {
+				reasonCode: "repo_clone_failed",
+				repo,
+			});
+		}
+		if (cloneExitCode !== 0) {
+			const stderr = cloneStderr || "unknown error";
 			throw new ProtocolError("invalid_params", `failed to clone lane repository: ${stderr}`, {
 				reasonCode: "repo_clone_failed",
 				repo,
@@ -2710,7 +2746,8 @@ async function createWorktreeFromRepo(
 					.toString()
 					.split(/\r?\n/)
 					.map((url) => url.trim())
-					.filter(Boolean);
+					.filter(Boolean)
+					.map((url) => resolveLocalRemoteUrl(repo, url));
 				for (const [index, fetchUrl] of fetchUrls.entries()) {
 					const setFetchUrl = Bun.spawnSync(
 						index === 0
@@ -2735,7 +2772,8 @@ async function createWorktreeFromRepo(
 					.toString()
 					.split(/\r?\n/)
 					.map((url) => url.trim())
-					.filter(Boolean)) {
+					.filter(Boolean)
+					.map((url) => resolveLocalRemoteUrl(repo, url))) {
 					const setPushUrl = Bun.spawnSync(["git", "remote", "set-url", "--add", "--push", "origin", pushUrl], {
 						stdout: "pipe",
 						stderr: "pipe",
@@ -2746,6 +2784,33 @@ async function createWorktreeFromRepo(
 							reasonCode: "repo_push_remote_failed",
 							repo,
 						});
+					}
+				}
+			}
+		}
+		if (!isRemote && base === undefined && defaultRef) {
+			const localDefaultBranch = `refs/heads/${defaultRef}`;
+			const localDefaultBranchCheck = Bun.spawnSync(
+				["git", "rev-parse", "--verify", "--quiet", `${localDefaultBranch}^{commit}`],
+				{ stdout: "ignore", stderr: "ignore", cwd: repositoryPath },
+			);
+			if (localDefaultBranchCheck.exitCode !== 0) {
+				const sourceDefaultRef = `refs/remotes/origin/${defaultRef}`;
+				const sourceDefaultRefCheck = Bun.spawnSync(
+					["git", "-C", repo, "rev-parse", "--verify", "--quiet", `${sourceDefaultRef}^{commit}`],
+					{ stdout: "ignore", stderr: "ignore" },
+				);
+				if (sourceDefaultRefCheck.exitCode === 0) {
+					const materializeDefault = Bun.spawnSync(
+						["git", "fetch", "--no-tags", "--", repo, `+${sourceDefaultRef}:${localDefaultBranch}`],
+						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+					);
+					if (materializeDefault.exitCode !== 0) {
+						throw new ProtocolError(
+							"invalid_params",
+							"default remote-tracking ref could not be copied to the lane repository",
+							{ reasonCode: "repo_base_not_found", repo },
+						);
 					}
 				}
 			}

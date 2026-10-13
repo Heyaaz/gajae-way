@@ -36,6 +36,10 @@ export function managedLaneRepositoryPath(laneRoot: string, workName: string): s
 	return join(resolve(laneRoot), "repositories", Buffer.from(workName, "utf8").toString("hex"));
 }
 
+export function managedLaneWorktreePath(laneRoot: string, workName: string): string {
+	return join(resolve(laneRoot), "lanes", Buffer.from(workName, "utf8").toString("hex"));
+}
+
 export function workSessionKey(name: string): string {
 	return `${WORK_LANE_PREFIX}${name}`;
 }

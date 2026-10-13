@@ -1,7 +1,9 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
 import {
 	appendAttempt,
@@ -16,6 +18,7 @@ import {
 	LaneGovernor,
 	laneJobIdentity,
 	managedLaneRepositoryPath,
+	managedLaneWorktreePath,
 	workSessionKey,
 } from "../src/orchestrator/lane-governor";
 import {
@@ -45,10 +48,12 @@ afterEach(async () => {
 });
 const origin: OriginRef = { platform: "discord", kind: "channel", conversationId: "work-results" };
 
-test("managed repository paths preserve exact lane-name identity", () => {
+test("managed repository and worktree paths preserve exact lane-name identity", () => {
 	const root = "/tmp/gajaeway";
 	expect(managedLaneRepositoryPath(root, "Foo")).not.toBe(managedLaneRepositoryPath(root, "foo"));
 	expect(managedLaneRepositoryPath(root, "Foo")).toBe(join(root, "repositories", Buffer.from("Foo").toString("hex")));
+	expect(managedLaneWorktreePath(root, "Foo")).not.toBe(managedLaneWorktreePath(root, "foo"));
+	expect(managedLaneWorktreePath(root, "Foo")).toBe(join(root, "lanes", Buffer.from("Foo").toString("hex")));
 });
 
 async function until(predicate: () => boolean): Promise<void> {
@@ -1194,7 +1199,7 @@ test("issue #480: repo URL creates a cwd-independent worktree with the bound pus
 			stderr: "ignore",
 		});
 
-		const repositoryUrl = `file://${bareRepo}`;
+		const repositoryUrl = pathToFileURL(bareRepo).href;
 		const f = await fixture({ serviceDirectory: process.cwd() });
 		const result = await f.manager.start({
 			name: "remote-binding",
@@ -1203,7 +1208,7 @@ test("issue #480: repo URL creates a cwd-independent worktree with the bound pus
 		});
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job("remote-binding");
-		expect(job.lane.worktreePath).toBe(join(f.gajaewayHome, "lanes", "remote-binding"));
+		expect(job.lane.worktreePath).toBe(managedLaneWorktreePath(f.gajaewayHome, "remote-binding"));
 		expect(job.lane.repository).toBe(repositoryUrl);
 		expect(job.lane.repositoryPath).toBe(managedLaneRepositoryPath(f.gajaewayHome, "remote-binding"));
 		expect(job.baselineSha).toMatch(/^[0-9a-f]{40}$/);
@@ -1220,6 +1225,38 @@ test("issue #480: repo URL creates a cwd-independent worktree with the bound pus
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("remote clones are asynchronous, preserve repo_clone_failed, and clean up managed paths", async () => {
+	const requestReceived = deferred<void>();
+	const server = createServer((socket) => {
+		socket.once("data", () => {
+			requestReceived.resolve(undefined);
+			setTimeout(() => socket.end("0014ERR unavailable\n"), 50);
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	try {
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("local git server did not bind a TCP port");
+		const f = await fixture();
+		const name = "missing-remote-clone";
+		const remoteUrl = `git://127.0.0.1:${address.port}/missing.git`;
+		const clone = f.manager.start({ name, text: "work", repo: remoteUrl });
+		await requestReceived.promise;
+		await Bun.sleep(10);
+		await expect(clone).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "repo_clone_failed", repo: remoteUrl },
+		});
+		await expect(lstat(managedLaneWorktreePath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(lstat(managedLaneRepositoryPath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
 	}
 });
 
@@ -2446,6 +2483,68 @@ test("#481 a local checkout lane pushes to its configured origin push URL", asyn
 	}
 });
 
+test("#550 local checkout lanes resolve relative origin fetch and push URLs against the source repository", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("relative-origin-url");
+	const pushRepo = await mkdtemp(join(tmpdir(), "relative-origin-push-"));
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		Bun.spawnSync(["git", "init", "--bare", "-q", pushRepo], { env });
+		git(repoDir, "remote", "add", "origin", relative(repoDir, bareRepo));
+		git(repoDir, "remote", "set-url", "--push", "origin", relative(repoDir, pushRepo));
+
+		const f = await fixture();
+		const name = "relative-remote";
+		const result = await f.manager.start({ name, text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const worktreePath = f.job(name).lane.worktreePath;
+		const branch = `work/${name}`;
+		expect(git(worktreePath, "remote", "get-url", "origin")).toBe(bareRepo);
+		expect(git(worktreePath, "remote", "get-url", "--push", "origin")).toBe(pushRepo);
+		git(worktreePath, "fetch", "origin");
+		git(worktreePath, "push", "-u", "origin", branch);
+		git(pushRepo, "show-ref", "--verify", `refs/heads/${branch}`);
+	} finally {
+		await cleanup();
+		await rm(pushRepo, { recursive: true, force: true });
+	}
+});
+
+test("#550 local checkout lanes preserve scp-like origin URLs", async () => {
+	const { repoDir, cleanup } = await bareRepoFixture("scp-origin-url");
+	const env = { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "test@test" };
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const fetchUrl = "git@github.com:example/project.git";
+		const pushUrl = "git@example.net:mirror/project.git";
+		git(repoDir, "remote", "add", "origin", fetchUrl);
+		git(repoDir, "remote", "set-url", "--push", "origin", pushUrl);
+
+		const f = await fixture();
+		const result = await f.manager.start({ name: "scp-origin", text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const worktreePath = f.job("scp-origin").lane.worktreePath;
+		expect(git(worktreePath, "remote", "get-url", "origin")).toBe(fetchUrl);
+		expect(git(worktreePath, "remote", "get-url", "--push", "origin")).toBe(pushUrl);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("#481 remote push probes are asynchronous and bounded", async () => {
 	const { bareRepo, cleanup } = await bareRepoFixture("bounded-remote-probe");
 	const f = await fixture({ ownerTarget: () => origin });
@@ -2562,7 +2661,7 @@ test("#407: laneLastCommits reads each distinct worktree once, concurrently, nul
 	}
 });
 
-test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a bare git repo", async () => {
+test("work.start with repo creates an encoded worktree path from a bare git repo", async () => {
 	// Create a bare git repo to test against
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-"));
 	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-"));
@@ -2601,7 +2700,7 @@ test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a 
 
 		expect(result.started).toBe(true);
 		const job = f.job("worktree-test");
-		expect(job.lane.worktreePath).toContain("lanes/worktree-test");
+		expect(job.lane.worktreePath).toBe(managedLaneWorktreePath(laneRoot, "worktree-test"));
 		expect(job.lane.worktreePath.startsWith(join(laneRoot, "lanes"))).toBe(true);
 		expect(job.lane.repository).toBe(bareRepo);
 		expect(job.lane.repositoryPath).toBe(managedLaneRepositoryPath(laneRoot, "worktree-test"));
@@ -2620,6 +2719,21 @@ test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a 
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("case-distinct lane names create distinct encoded worktree directories", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("case-distinct-worktrees");
+	try {
+		const f = await fixture();
+		for (const name of ["Foo", "foo"]) {
+			const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+			if (!result.started) throw new Error(`lane ${name} did not start`);
+			expect(f.job(name).lane.worktreePath).toBe(managedLaneWorktreePath(f.gajaewayHome, name));
+		}
+		expect(f.job("Foo").lane.worktreePath).not.toBe(f.job("foo").lane.worktreePath);
+	} finally {
+		await cleanup();
 	}
 });
 
@@ -2655,7 +2769,7 @@ test("work.start removes reserved paths when Git rejects the lane branch", async
 			code: "invalid_params",
 			detail: { reasonCode: "repo_worktree_failed" },
 		});
-		expect(await Bun.file(join(f.gajaewayHome, "lanes", name)).exists()).toBe(false);
+		expect(await Bun.file(managedLaneWorktreePath(f.gajaewayHome, name)).exists()).toBe(false);
 		expect(await Bun.file(join(managedLaneRepositoryPath(f.gajaewayHome, name), "HEAD")).exists()).toBe(false);
 		expect(f.db.work.laneJobJson(laneJobIdentity(name).jobId)).toBeUndefined();
 	} finally {
@@ -2844,6 +2958,61 @@ test("work.start resolves origin bases from local remote-tracking refs", async (
 			stderr: "pipe",
 		});
 		expect(worktreeHead.stdout?.toString().trim()).toBe(remoteDevSha);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("work.start defaults to origin/HEAD when its branch exists only as a remote-tracking ref", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("remote-default-base");
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repoDir, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const defaultBranch = git("branch", "--show-current");
+		git("remote", "add", "origin", bareRepo);
+		git("push", "-q", "-u", "origin", defaultBranch);
+		git("remote", "set-head", "origin", defaultBranch);
+		expect(git("symbolic-ref", "refs/remotes/origin/HEAD")).toBe(`refs/remotes/origin/${defaultBranch}`);
+		const remoteDefaultSha = git("rev-parse", `refs/remotes/origin/${defaultBranch}`);
+		const currentBranch = `${defaultBranch}-current`;
+		git("checkout", "-q", "-b", currentBranch);
+		git("commit", "-q", "--allow-empty", "-m", "current local branch");
+		git("branch", "-D", defaultBranch);
+		const deletedLocalDefault = Bun.spawnSync(
+			["git", "-C", repoDir, "show-ref", "--verify", `refs/heads/${defaultBranch}`],
+			{ env, stdout: "pipe", stderr: "pipe" },
+		);
+		expect(deletedLocalDefault.exitCode).not.toBe(0);
+
+		const f = await fixture();
+		const result = await f.manager.start({ name: "remote-default-base", text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("remote-default-base");
+		expect(job.baselineSha).toBe(remoteDefaultSha);
+		expect(git("rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(remoteDefaultSha);
+		const managedDefaultSha = Bun.spawnSync(["git", "rev-parse", "--verify", `refs/heads/${defaultBranch}^{commit}`], {
+			cwd: job.lane.repositoryPath,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(managedDefaultSha.exitCode).toBe(0);
+		expect(managedDefaultSha.stdout?.toString().trim()).toBe(remoteDefaultSha);
+		const worktreeHead = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(worktreeHead.stdout?.toString().trim()).toBe(remoteDefaultSha);
 	} finally {
 		await cleanup();
 	}
@@ -3046,7 +3215,7 @@ test("issue #480: operator retire tolerates an externally removed worktree", asy
 			.split(/\r?\n/)
 			.filter((line) => line.startsWith("worktree "))
 			.map((line) => line.slice("worktree ".length).replace(/\\/g, "/"));
-		expect(registeredPaths?.some((path) => path.endsWith(`/lanes/${name}`))).toBe(true);
+		expect(registeredPaths?.includes(managedLaneWorktreePath(f.gajaewayHome, name).replace(/\\/g, "/"))).toBe(true);
 
 		const retired = await f.lanes.retire(name, "operator");
 		expect(retired.retired).toBe(true);
