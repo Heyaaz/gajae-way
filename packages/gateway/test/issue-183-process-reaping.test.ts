@@ -8,6 +8,7 @@ import {
 	reapLeftoverWorkers,
 	selectOrphanedWorkers,
 } from "../src/ops/process-reaper";
+import { GJC_ATTACH_ONLY_ENV } from "../src/orchestrator/broker";
 
 const GJC = "/home/user/.gajaeway/gjc/0.18.11/bin/gjc";
 const GJC_PREFIX = "/home/user/.gajaeway/gjc";
@@ -217,7 +218,7 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	const spacedPrefix = "/home/user/gajae way/.gajaeway/gjc";
 	const spacedCurrentGjc = `${spacedPrefix}/0.18.11/bin/gjc`;
 	const spacedPreviousGjc = `${spacedPrefix}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
-	const attachOnlyEnv = "GJC_SDK_BROKER_AUTOSTART=0";
+	const attachOnlyEnv = `${GJC_ATTACH_ONLY_ENV}=0`;
 	const output = [
 		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
 		`300 401 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
@@ -226,10 +227,11 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 		`300 404 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} --extra HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
 		`300 405 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} other ${attachOnlyEnv}`,
 		`300 406 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} OTHER=value ${attachOnlyEnv}`,
+		`300 407 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv} ${attachOnlyEnv}`,
 	].join("\n");
 	const table = parseUnixProcessTable(output, spacedAgentDir);
 
-	expect(table).toHaveLength(7);
+	expect(table).toHaveLength(8);
 	expect(table[1]).toEqual({
 		pid: 401,
 		ppid: 300,
@@ -241,6 +243,7 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	expect(table[4]?.argv).toEqual([spacedCurrentGjc, "sdk", "serve", "--stdio", "--session", SESSION, "--extra"]);
 	expect(table[5]?.agentDir).toBeUndefined();
 	expect(table[6]?.agentDir).toBeUndefined();
+	expect(table[7]?.agentDir).toBeUndefined();
 	expect(
 		select(table, {
 			gjcPath: spacedCurrentGjc,
@@ -258,7 +261,7 @@ test("Unix ps parser preserves spaced gateway and Bun launcher paths", () => {
 	const spacedBun = "/home/user/gajae way/.bun/bin/bun";
 	const spacedSource = "/home/user/gajae way/packages/gateway/src/main.ts";
 	const spacedGateway = "/home/user/gajae way/.gajaeway/bin/gajaeway-gateway";
-	const attachOnlyEnv = "GJC_SDK_BROKER_AUTOSTART=0";
+	const attachOnlyEnv = `${GJC_ATTACH_ONLY_ENV}=0`;
 	const output = [
 		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
 		`300 501 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedSource} daemon`,

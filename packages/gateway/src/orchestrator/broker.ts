@@ -998,6 +998,7 @@ function trustedEnvironment(cwd: string): Record<string, string> {
 	delete env.GJC_CODING_AGENT_DIR;
 	delete env.PI_CODING_AGENT_DIR;
 	delete env.GJC_AGENT_DIR;
+	delete env[GJC_ATTACH_ONLY_ENV];
 	return env;
 }
 /** Canonicalize the configured agent directory, resolving existing ancestor aliases first. */
