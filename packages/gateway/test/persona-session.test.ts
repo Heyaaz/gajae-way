@@ -2551,7 +2551,8 @@ test("successful /model resumes the refused trigger on its existing session", as
 // spending a second send on the same trigger.
 test("an accepted turn resumed after an authenticated refusal reports its submission failure without a re-send", async () => {
 	const port = new ModelNotSelectedPort({
-		onSend: (input, scripted) => scripted.fail(input.opRef, "Prompt submission failed.", SUBMISSION_BUSY),
+		onSend: (input, scripted) =>
+			scripted.fail(input.opRef, "Prompt submission failed.", { code: "internal", outcome: REPEATABLE_SUBMISSION }),
 	});
 	const terminal: string[] = [];
 	const failures: string[] = [];
