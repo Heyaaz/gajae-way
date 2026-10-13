@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +16,7 @@ import {
 	supervisorArgv,
 } from "../src/restart-stack";
 
-import { GATEWAY_UNIT, serviceSpecs, systemdUnitName, systemdUnitPath } from "../src/services";
+import { launchAgentPlistPath, serviceSpecs, systemdUnitName, systemdUnitPath } from "../src/services";
 
 const DEPLOYED_AT = Date.parse("2026-08-29T06:40:00.000Z");
 const BIN_DIR = "/opt/gajaeway/bin";
@@ -77,6 +77,9 @@ async function fakeHost(options: {
 			platform: options.platform ?? "darwin",
 			uid: 501,
 			binDir: BIN_DIR,
+			env: { ...process.env, HOME: options.home },
+			launchAgentsDir: join(options.home, "agents"),
+			unitDir: join(options.home, "units"),
 			now: () => clock,
 			sleep: async (ms: number) => {
 				clock += ms;
@@ -274,6 +277,88 @@ test("systemd gateway restart verifies dependent services through their leases",
 	}
 });
 
+for (const platform of ["darwin", "linux"] as const) {
+	test(`${platform} restart-stack cleans stale service definitions deferred by --no-restart`, async () => {
+		const { home, cleanup } = await tempHome();
+		const binDir = join(home, "bin");
+		const definitionDir = join(home, platform === "darwin" ? "agents" : "units");
+		const staleAdmin = serviceSpecs().find((spec) => spec.id === "admin");
+		if (!staleAdmin) throw new Error("admin service spec not found");
+		const stalePath =
+			platform === "darwin"
+				? launchAgentPlistPath(staleAdmin, definitionDir)
+				: systemdUnitPath(staleAdmin, definitionDir);
+		const commands: string[][] = [];
+		try {
+			await mkdir(binDir);
+			await mkdir(definitionDir);
+			await writeFile(stalePath, "stale service definition");
+			const receipt = await runRestartStack({
+				home,
+				id: `${platform}-stale-cleanup`,
+				platform,
+				uid: 501,
+				binDir,
+				env: { ...process.env, HOME: home },
+				...(platform === "darwin" ? { launchAgentsDir: definitionDir } : { unitDir: definitionDir }),
+				runner: async (command) => {
+					commands.push([...command]);
+					return 0;
+				},
+			});
+			expect(receipt.state).toBe("ok");
+			expect(receipt.steps.every((step) => step.result === "skipped")).toBe(true);
+			expect(commands).toEqual(
+				platform === "darwin"
+					? [
+							["launchctl", "print", "gui/501/dev.gajaeway.admin"],
+							["launchctl", "bootout", "gui/501/dev.gajaeway.admin"],
+						]
+					: [
+							["systemctl", "--user", "disable", "--now", "gajaeway-admin.service"],
+							["systemctl", "--user", "daemon-reload"],
+						],
+			);
+			expect(await readdir(definitionDir)).not.toContain(stalePath.split("/").at(-1));
+		} finally {
+			await cleanup();
+		}
+	});
+}
+
+test("Linux restart-stack preserves a stale unit when systemd cannot stop it", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	const unitDir = join(home, "units");
+	const admin = serviceSpecs().find((spec) => spec.id === "admin");
+	if (!admin) throw new Error("admin service spec not found");
+	const stalePath = systemdUnitPath(admin, unitDir);
+	const commands: string[][] = [];
+	try {
+		await mkdir(binDir);
+		await mkdir(unitDir);
+		await writeFile(stalePath, "stale systemd unit");
+		await expect(
+			runRestartStack({
+				home,
+				id: "failed-stale-unit-cleanup",
+				platform: "linux",
+				binDir,
+				unitDir,
+				env: { ...process.env, HOME: home },
+				runner: async (command) => {
+					commands.push([...command]);
+					return 1;
+				},
+			}),
+		).rejects.toThrow("systemctl --user disable --now gajaeway-admin.service exited with status 1");
+		expect(commands).toEqual([["systemctl", "--user", "disable", "--now", "gajaeway-admin.service"]]);
+		expect(await Bun.file(stalePath).exists()).toBe(true);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("runRestartStack and launchRestartStack refuse while the update lease is held", async () => {
 	const { home, cleanup } = await tempHome();
 	const holder = await acquireLease(home, "update");
@@ -369,6 +454,8 @@ test("update-triggered broker restart provisions and verifies while manual resta
 				platform: "darwin",
 				uid: 501,
 				binDir: BIN_DIR,
+				env: { ...process.env, HOME: home },
+				launchAgentsDir: join(home, "agents"),
 				runner: async (command) => {
 					commands.push([...command]);
 					if (command.includes("provision")) return provisionStatus;
@@ -560,7 +647,8 @@ test("a supervisor that cannot start fails the receipt instead of leaving it que
 		expect(receipt?.state).toBe("failed");
 		expect(receipt?.finishedAt).toBeDefined();
 		expect(receipt?.steps.every((step) => step.result === "skipped")).toBe(true);
-		const rendered = renderRestartReceipt(receipt!);
+		if (receipt === undefined) throw new Error("restart receipt was not written");
+		const rendered = renderRestartReceipt(receipt);
 		expect(rendered[0]).toMatch(/: failed$/);
 		expect(rendered).toContainEqual(expect.stringContaining("detail: supervisor systemd-run could not be started"));
 	} finally {
@@ -571,7 +659,10 @@ test("a supervisor that cannot start fails the receipt instead of leaving it que
 test("an uninstalled service is skipped and does not abort the remaining stack", async () => {
 	const { home, cleanup } = await tempHome();
 	const unitDir = await mkdtemp(join(tmpdir(), "gajaeway-restart-units-"));
+	const binDir = join(home, "bin");
 	try {
+		await mkdir(binDir);
+		await writeFile(join(binDir, "gajaeway-gateway"), "gateway binary");
 		const gatewaySpec = serviceSpecs().find((spec) => spec.id === "gateway");
 		if (!gatewaySpec) throw new Error("gateway service spec not found");
 		await writeFile(systemdUnitPath(gatewaySpec, unitDir), "[Unit]\nDescription=test\n");
@@ -583,8 +674,8 @@ test("an uninstalled service is skipped and does not abort the remaining stack",
 				home,
 				id: "uninstalled",
 				platform: "linux",
-				binDir: BIN_DIR,
-				env: { HOME: "/home/testuser" },
+				binDir,
+				env: { ...process.env, HOME: home },
 
 				unitDir,
 				runner: async () => {
