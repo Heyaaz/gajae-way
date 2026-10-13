@@ -8,7 +8,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 34;
+export const LATEST_SCHEMA_VERSION = 35;
 
 export interface MigrationHost {
 	readonly database: {
@@ -686,25 +686,6 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 		});
 	}
 	if (current < 33) {
-		// Issue #481: Add 'awaiting_checks' state to lane_jobs for when a lane's PR has pending checks.
-		host.withTransaction(() => {
-			// SQLite doesn't support modifying CHECK constraints, so we recreate the table
-			host.database.execute(`
-				CREATE TABLE lane_jobs_v33 (
-					job_id TEXT PRIMARY KEY,
-					lane_key TEXT NOT NULL UNIQUE,
-					branch TEXT NOT NULL,
-					worktree_path TEXT NOT NULL,
-					state TEXT NOT NULL CHECK(state IN ('running','attempt_ended','awaiting_operator','awaiting_checks','stalled','done','aborted')),
-					record_json TEXT NOT NULL,
-					created_at TEXT NOT NULL,
-					updated_at TEXT NOT NULL
-				);
-				INSERT INTO lane_jobs_v33 SELECT * FROM lane_jobs;
-				DROP TABLE lane_jobs;
-				ALTER TABLE lane_jobs_v33 RENAME TO lane_jobs;
-			`);
-		});
 		// Issue #369: Add the terminal contract_unmet stage while retaining every monitor index.
 		host.withTransaction(() => {
 			host.database.execute(`CREATE TABLE monitor_events_v33 (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry','skipped','contract_unmet')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, skipped_by TEXT, updated_at TEXT NOT NULL, procedure_json TEXT);
@@ -749,6 +730,37 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(34, new Date().toISOString());
+		});
+	}
+	if (current < 35) {
+		// Issue #481: Add awaiting_checks without rewriting the already-deployed v33/v34 migrations.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE lane_jobs_v35 (
+					job_id TEXT PRIMARY KEY,
+					lane_key TEXT NOT NULL UNIQUE,
+					branch TEXT NOT NULL,
+					worktree_path TEXT NOT NULL,
+					state TEXT NOT NULL CHECK(state IN ('running','attempt_ended','awaiting_operator','awaiting_checks','stalled','done','aborted')),
+					record_json TEXT NOT NULL,
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL
+				);
+				INSERT INTO lane_jobs_v35 SELECT * FROM lane_jobs;
+				DROP TABLE lane_jobs;
+				ALTER TABLE lane_jobs_v35 RENAME TO lane_jobs;
+			`);
+			host.database.execute(`
+				CREATE TRIGGER lane_jobs_quarantine_update BEFORE UPDATE ON lane_jobs
+				WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+				BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+				CREATE TRIGGER lane_jobs_quarantine_delete BEFORE DELETE ON lane_jobs
+				WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+				BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(35, new Date().toISOString());
 		});
 	}
 }

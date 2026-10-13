@@ -18,7 +18,12 @@ const FAILED_STATES = new Set(["FAILURE", "ERROR"]);
  * otherwise any entry without a final verdict keeps it pending; an empty rollup is pending
  * because CI has not registered yet.
  */
-export function classifyCheckRollup(prNumber: number, rollup: readonly RollupEntry[]): CheckStatusSnapshot {
+export function classifyCheckRollup(
+	prNumber: number,
+	headSha: string,
+	rollup: readonly RollupEntry[],
+): CheckStatusSnapshot {
+	if (!/^[0-9a-f]{40}$/.test(headSha)) throw new Error("PR head SHA is invalid");
 	const failingChecks: string[] = [];
 	let pending = rollup.length === 0;
 	for (const entry of rollup) {
@@ -36,7 +41,7 @@ export function classifyCheckRollup(prNumber: number, rollup: readonly RollupEnt
 		if (FAILED_CONCLUSIONS.has(entry.conclusion?.toUpperCase() ?? "")) failingChecks.push(label);
 	}
 	const status = failingChecks.length > 0 ? "red" : pending ? "pending" : "green";
-	return { prNumber, status, failingChecks: [...new Set(failingChecks)] };
+	return { prNumber, headSha, status, failingChecks: [...new Set(failingChecks)] };
 }
 
 /** Production client: one async `gh pr list` call bounded by `timeoutMs`; never blocks the event loop. */
@@ -56,16 +61,22 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 						"--limit",
 						"1",
 						"--json",
-						"number,statusCheckRollup",
+						"number,commits,statusCheckRollup",
 					],
 					{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
 				);
 				const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
 				if (exitCode !== 0) return undefined;
-				const prs = JSON.parse(stdout) as Array<{ number: number; statusCheckRollup?: RollupEntry[] | null }>;
+				const prs = JSON.parse(stdout) as Array<{
+					number: number;
+					commits: Array<{ oid: string }>;
+					statusCheckRollup?: RollupEntry[] | null;
+				}>;
 				const pr = prs[0];
 				if (!pr) return null;
-				return classifyCheckRollup(pr.number, pr.statusCheckRollup ?? []);
+				const headSha = pr.commits.at(-1)?.oid;
+				if (!headSha) return undefined;
+				return classifyCheckRollup(pr.number, headSha, pr.statusCheckRollup ?? []);
 			} catch {
 				return undefined;
 			}

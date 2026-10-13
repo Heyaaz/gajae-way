@@ -777,7 +777,7 @@ export function transitionToAwaitingChecks(input: AwaitingChecksInput): LaneJobR
 		awaitingChecks: Object.freeze({
 			prNumber: input.prNumber,
 			headSha: assertFullSha(input.headSha, "awaitingChecks.headSha"),
-			since: input.at,
+			since: input.record.awaitingChecks?.since ?? input.at,
 			retries: input.record.awaitingChecks?.retries ?? 0,
 		}),
 		updatedAt: input.at,

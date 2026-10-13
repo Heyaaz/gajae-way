@@ -889,7 +889,7 @@ describe("work attempt durable transactions", () => {
 
 		const migrated = await Store.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(34);
+		expect(migrated.schemaVersion).toBe(35);
 		expect(migrated.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
 			decision: "fallback",
 			parent: { kind: "persona", origin: LOOPBACK_ORIGIN, originKey: originKey(LOOPBACK_ORIGIN) },
@@ -926,6 +926,58 @@ describe("work attempt durable transactions", () => {
 				.all()
 				.some((row) => row.name === "source"),
 		).toBe(false);
+	});
+	test("v35 migration adds awaiting_checks and restores lane-job quarantine triggers", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, { ...f.record, laneKey: f.runtime.laneKey, json: JSON.stringify(f.record) }),
+		);
+		f.raw.exec(`
+CREATE TABLE lane_jobs_v34 (
+	job_id TEXT PRIMARY KEY,
+	lane_key TEXT NOT NULL UNIQUE,
+	branch TEXT NOT NULL,
+	worktree_path TEXT NOT NULL,
+	state TEXT NOT NULL CHECK(state IN ('running','attempt_ended','awaiting_operator','stalled','done','aborted')),
+	record_json TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+INSERT INTO lane_jobs_v34 SELECT * FROM lane_jobs;
+DROP TABLE lane_jobs;
+ALTER TABLE lane_jobs_v34 RENAME TO lane_jobs;
+CREATE TRIGGER lane_jobs_quarantine_update BEFORE UPDATE ON lane_jobs
+	WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+	BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+CREATE TRIGGER lane_jobs_quarantine_delete BEFORE DELETE ON lane_jobs
+	WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+	BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+INSERT INTO broker_quarantine (kind, subject_id, cutover_id) VALUES ('work', '${f.record.jobId}', 'cutover-v35');
+DELETE FROM schema_migrations WHERE version > 34;
+`);
+
+		const migrated = await Store.open(f.path);
+		handles.push(migrated);
+		expect(migrated.schemaVersion).toBe(35);
+		expect(migrated.work.laneJobJson(f.record.jobId)).toBe(JSON.stringify(f.record));
+		expect(() =>
+			f.raw.query("UPDATE lane_jobs SET updated_at = ? WHERE job_id = ?").run(END, f.record.jobId),
+		).toThrow();
+		expect(() => f.raw.query("DELETE FROM lane_jobs WHERE job_id = ?").run(f.record.jobId)).toThrow();
+		f.raw
+			.query(
+				"INSERT INTO lane_jobs (job_id, lane_key, branch, worktree_path, state, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				"lanejob-awaiting-checks",
+				"work/task/awaiting-checks",
+				"fix/awaiting-checks",
+				f.runtime.cwd,
+				"awaiting_checks",
+				"{}",
+				END,
+				END,
+			);
 	});
 	test("v21 migration preserves historical open history and adopts without parent", async () => {
 		const f = await fixture();
@@ -968,7 +1020,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(34);
+		expect(migrated.schemaVersion).toBe(35);
 		expect(migrated.work.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, parent: null };
 		migrated.transaction((tx) => prepareAttempt(migrated, tx, historical, f.record));

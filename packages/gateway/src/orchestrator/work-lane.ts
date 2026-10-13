@@ -154,13 +154,15 @@ interface Waiter {
 }
 export interface CheckStatusSnapshot {
 	readonly prNumber: number;
+	/** The PR head for which this rollup was computed. */
+	readonly headSha: string;
 	readonly status: "pending" | "green" | "red";
 	readonly failingChecks: readonly string[];
 }
 
 export interface CheckStatusClient {
 	/**
-	 * Snapshot the checks of the open PR for `branch`: null when no PR is open,
+	 * Snapshot the open PR head and its checks for `branch`: null when no PR is open,
 	 * undefined when the lookup failed or timed out. Must not throw.
 	 */
 	getCheckStatus(branch: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
@@ -202,6 +204,8 @@ interface StartContext {
 	readonly parent: WorkParent | null;
 	readonly opRef?: string;
 	readonly wakeReportId?: string;
+	/** Only the check-polling path may add an attempt while the lane is parked. */
+	readonly checksRetry?: boolean;
 }
 
 /**
@@ -800,6 +804,14 @@ export class WorkLaneManager {
 				opRef: open.opRef,
 				sessionId: open.sessionId,
 			});
+		if (job?.state === "awaiting_checks" && !context.checksRetry)
+			return {
+				started: false,
+				held: true,
+				jobId,
+				state: job.state,
+				reason: "the lane is awaiting PR checks; wait for check polling to settle it",
+			};
 		if (job && (job.state === "awaiting_operator" || job.state === "stalled")) {
 			if (!input.resume)
 				return {
@@ -1451,16 +1463,25 @@ export class WorkLaneManager {
 					repository: { ...facts, observedAt: at },
 					classification: progressed ? "progressed" : endState === "completed" ? "held" : "stalled",
 				});
-				// A completed attempt waits for its PR checks to conclude (#481). Red checks
-				// park it too while a checks cycle is open, so the poll counts the retry.
+			}
+			if (endState === "completed" && facts?.headSha) {
 				const checks = facts.checkStatus;
-				if (
-					endState === "completed" &&
-					facts.headSha &&
-					checks &&
-					(checks.status === "pending" || (checks.status === "red" && job.awaitingChecks !== undefined))
-				)
-					job = transitionToAwaitingChecks({ record: job, at, prNumber: checks.prNumber, headSha: facts.headSha });
+				const previousCycle = job.awaitingChecks;
+				if (previousCycle !== undefined) {
+					job = transitionToAwaitingChecks({
+						record: job,
+						at,
+						prNumber: previousCycle.prNumber,
+						headSha: facts.headSha,
+					});
+				} else if (checks && (checks.status === "pending" || checks.status === "green")) {
+					job = transitionToAwaitingChecks({
+						record: job,
+						at,
+						prNumber: checks.prNumber,
+						headSha: facts.headSha,
+					});
+				}
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
@@ -1608,17 +1629,27 @@ export class WorkLaneManager {
 			if (this.#stopped) return undefined;
 			const job = this.#job(name);
 			// Another writer moved the lane on while the checks were read.
-			if (job?.state !== "awaiting_checks" || job.awaitingChecks?.since !== cycle.since) return undefined;
-			const outcome = checksOutcome(job.awaitingChecks, facts, this.#now());
+			const currentCycle = job?.awaitingChecks;
+			if (
+				!job ||
+				job.state !== "awaiting_checks" ||
+				!currentCycle ||
+				currentCycle.since !== cycle.since ||
+				currentCycle.prNumber !== cycle.prNumber ||
+				currentCycle.headSha !== cycle.headSha ||
+				currentCycle.retries !== cycle.retries
+			)
+				return undefined;
+			const outcome = checksOutcome(currentCycle, facts, this.#now());
 			if (outcome.kind === "wait") return undefined;
 			if (outcome.kind === "red") {
-				if (job.awaitingChecks.retries < AWAITING_CHECKS_RETRY_LIMIT) {
+				if (currentCycle.retries < AWAITING_CHECKS_RETRY_LIMIT) {
 					await this.#resteerRedChecks(name, job, outcome.failingChecks);
 					return undefined;
 				}
 				return this.#settleChecks(name, job, {
 					kind: "failed",
-					reason: `checks=red(${outcome.failingChecks.join(",")}) after ${job.awaitingChecks.retries} re-steers`,
+					reason: `checks=red(${outcome.failingChecks.join(",")}) after ${currentCycle.retries} re-steers`,
 				});
 			}
 			return this.#settleChecks(name, job, outcome);
@@ -1651,7 +1682,10 @@ export class WorkLaneManager {
 		const last = job.attempts.at(-1);
 		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
 		try {
-			await this.#startLocked({ name, text, cwd: job.lane.worktreePath, resume: false }, "start", { parent });
+			await this.#startLocked({ name, text, cwd: job.lane.worktreePath, resume: false }, "start", {
+				parent,
+				checksRetry: true,
+			});
 			console.error(`awaiting_checks_resteered jobId=${job.jobId} pr=${cycle.prNumber} retry=${retries}`);
 		} catch (error) {
 			// The retry stays spent, so a lane that cannot be re-steered still reaches its bound.
@@ -2707,6 +2741,8 @@ function checksOutcome(
 	// null: the branch has no open PR; a different number: the recorded PR is not the open one.
 	if (checks === null || (checks && checks.prNumber !== cycle.prNumber))
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
+	if (checks && checks.headSha !== cycle.headSha)
+		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}` };
 	if (checks?.status === "green") return { kind: "passed" };
 	if (checks?.status === "red") return { kind: "red", failingChecks: checks.failingChecks };
 	// Pending, or unavailable (lookup failed): keep waiting until the deadline.

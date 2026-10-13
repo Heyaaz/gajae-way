@@ -2366,12 +2366,23 @@ async function laneRepo(directory: string, branch: string, push: boolean) {
 	return git(directory, "rev-parse", "HEAD");
 }
 
-function recordingCheckClient(answer: CheckStatusSnapshot | null) {
+type CheckStatusAnswer = Omit<CheckStatusSnapshot, "headSha"> & { readonly headSha?: string };
+
+function withHeadSha(
+	answer: CheckStatusAnswer | null | undefined,
+	cwd: string,
+): CheckStatusSnapshot | null | undefined {
+	if (answer === null || answer === undefined) return answer;
+	const headSha = answer.headSha ?? Bun.spawnSync(["git", "-C", cwd, "rev-parse", "HEAD"]).stdout.toString().trim();
+	return { ...answer, headSha };
+}
+
+function recordingCheckClient(answer: CheckStatusAnswer | null) {
 	const calls: Array<{ branch: string; cwd: string }> = [];
 	const client: CheckStatusClient = {
 		async getCheckStatus(branch, cwd) {
 			calls.push({ branch, cwd });
-			return answer;
+			return withHeadSha(answer, cwd);
 		},
 	};
 	return { calls, client };
@@ -2629,40 +2640,44 @@ test("#481 settled report of a pushed lane with a red PR names the PR and failin
 
 test("#481 check rollup: any failure is red, unfinished is pending, all success is green", () => {
 	const run = (name: string, status: string, conclusion = "") => ({ __typename: "CheckRun", name, status, conclusion });
+	const headSha = "a".repeat(40);
 	expect(
-		classifyCheckRollup(1, [
+		classifyCheckRollup(1, headSha, [
 			run("lint", "COMPLETED", "FAILURE"),
 			run("lint", "COMPLETED", "FAILURE"),
 			run("test", "IN_PROGRESS"),
 		]),
-	).toEqual({ prNumber: 1, status: "red", failingChecks: ["lint"] });
-	expect(classifyCheckRollup(2, [run("lint", "COMPLETED", "SUCCESS"), run("test", "QUEUED")]).status).toBe("pending");
-	expect(classifyCheckRollup(3, []).status).toBe("pending");
+	).toEqual({ prNumber: 1, headSha, status: "red", failingChecks: ["lint"] });
+	expect(classifyCheckRollup(2, headSha, [run("lint", "COMPLETED", "SUCCESS"), run("test", "QUEUED")]).status).toBe(
+		"pending",
+	);
+	expect(classifyCheckRollup(3, headSha, []).status).toBe("pending");
 	expect(
-		classifyCheckRollup(4, [
+		classifyCheckRollup(4, headSha, [
 			run("lint", "COMPLETED", "SUCCESS"),
 			{ __typename: "StatusContext", context: "ci/x", state: "SUCCESS" },
 		]).status,
 	).toBe("green");
 	expect(
-		classifyCheckRollup(5, [{ __typename: "StatusContext", context: "ci/x", state: "ERROR" }]).failingChecks,
+		classifyCheckRollup(5, headSha, [{ __typename: "StatusContext", context: "ci/x", state: "ERROR" }]).failingChecks,
 	).toEqual(["ci/x"]);
+	expect(() => classifyCheckRollup(6, "invalid", [])).toThrow("PR head SHA is invalid");
 });
 
 /** A check client whose answer the test changes between polls. */
-function scriptedChecks(initial: CheckStatusSnapshot | null | undefined) {
+function scriptedChecks(initial: CheckStatusAnswer | null | undefined) {
 	let answer = initial;
 	const calls: Array<{ branch: string; cwd: string }> = [];
 	const client: CheckStatusClient = {
 		async getCheckStatus(branch, cwd) {
 			calls.push({ branch, cwd });
-			return answer;
+			return withHeadSha(answer, cwd);
 		},
 	};
 	return {
 		client,
 		calls,
-		set(next: CheckStatusSnapshot | null | undefined) {
+		set(next: CheckStatusAnswer | null | undefined) {
 			answer = next;
 		},
 	};
@@ -2710,6 +2725,15 @@ test("#481 a completed lane whose PR checks are pending waits in awaiting_checks
 	expect(notice).toContain("checks=pending");
 });
 
+test("#481 awaiting_checks rejects a new external attempt while checks are pending", async () => {
+	const checks = scriptedChecks({ prNumber: 488, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/reject-start-during-checks");
+	const held = await f.manager.start({ name: "a", text: "skip the check wait", cwd: f.directory });
+	expect(held).toMatchObject({ started: false, held: true, state: "awaiting_checks" });
+	expect(f.port.sends).toHaveLength(1);
+});
+
 test("#481 a lane whose PR is already red at settle without a checks cycle settles with the red checks", async () => {
 	const checks = scriptedChecks({ prNumber: 486, status: "red", failingChecks: ["test"] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
@@ -2734,6 +2758,20 @@ test("#481 a lane whose HEAD is unpushed never waits for checks", async () => {
 	expect(checks.calls).toHaveLength(0);
 });
 
+test("#481 completed lane with already-green checks settles done and reports the checked head", async () => {
+	const checks = scriptedChecks({ prNumber: 496, status: "green", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/already-green", true);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "[SILENT]");
+	await until(() => f.job().state === "awaiting_checks");
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	await until(() => checksNotice(f, "[lane a] checks passed") !== undefined);
+	expect(f.job().state).toBe("done");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(`head=${head.slice(0, 12)} pr=496 checks=green`);
+});
+
 test("#481 awaiting_checks: green checks settle the lane done and report the pass", async () => {
 	const checks = scriptedChecks({ prNumber: 487, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
@@ -2749,6 +2787,7 @@ test("#481 awaiting_checks: red checks re-steer the lane session with the failin
 	const checks = scriptedChecks({ prNumber: 490, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 	const { sessionId } = await awaitingLane(f, "fix/red-resteer");
+	const since = f.job().awaitingChecks?.since;
 	expect(f.port.sends).toHaveLength(1);
 	checks.set({ prNumber: 490, status: "red", failingChecks: ["unit-test", "lint-check"] });
 	await pollUntil(f, () => f.port.sends.length === 2);
@@ -2760,10 +2799,15 @@ test("#481 awaiting_checks: red checks re-steer the lane session with the failin
 	expect(job.awaitingChecks?.retries).toBe(1);
 	expect(job.state).toBe("running");
 	expect(job.attempts.at(-1)?.opRef).toBe(steer.opRef);
+	checks.set({ prNumber: 490, status: "pending", failingChecks: [] });
+	f.port.complete(steer.opRef, "tried a fix");
+	await until(() => f.job().state === "awaiting_checks");
+	expect(f.job().awaitingChecks?.since).toBe(since);
+	expect(f.job().awaitingChecks?.retries).toBe(1);
 });
 
 test("#481 awaiting_checks: the third red result settles the lane failed with the red checks in its report", async () => {
-	const red: CheckStatusSnapshot = { prNumber: 491, status: "red", failingChecks: ["unit-test", "lint-check"] };
+	const red: CheckStatusAnswer = { prNumber: 491, status: "red", failingChecks: ["unit-test", "lint-check"] };
 	const checks = scriptedChecks({ prNumber: 491, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 	await awaitingLane(f, "fix/red-exhausted");
@@ -2843,6 +2887,22 @@ test("#481 awaiting_checks: a HEAD other than the recorded one settles the lane 
 		`awaiting_checks ended: head_moved from=${head.slice(0, 12)} to=${moved.slice(0, 12)}`,
 	);
 	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks head_moved")).toContain("pr=494");
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 awaiting_checks binds a green rollup to the remote PR head, not the stale local checkout", async () => {
+	const checks = scriptedChecks({ prNumber: 496, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/remote-head-moved");
+	const remoteHead = "0".repeat(40);
+	checks.set({ prNumber: 496, headSha: remoteHead, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(f.job().escalations.at(-1)).toContain(
+		`awaiting_checks ended: head_moved from=${head.slice(0, 12)} to=${remoteHead.slice(0, 12)}`,
+	);
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks head_moved")).toContain("pr=496");
 	expect(f.port.sends).toHaveLength(1);
 });
 
