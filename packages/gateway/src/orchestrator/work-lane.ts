@@ -151,8 +151,8 @@ export interface WorkLaneManagerOptions {
 	readonly port: SessionPort;
 	readonly lanes: LaneGovernor;
 	readonly gajaewayHome: string;
-	/** Service directory (checkout root) where the gateway runs from. Derived from process.execPath if not provided. */
-	readonly serviceDirectory?: string;
+	/** Service directory (checkout root) where the gateway runs from. Lanes must not run inside this directory. */
+	readonly serviceDirectory: string;
 	/** Lane root directory where worktrees are created for repo bindings. If not provided, defaults to gajaewayHome. */
 	readonly laneRoot?: string;
 	readonly ownerTarget?: () => OriginRef | undefined;
@@ -188,7 +188,7 @@ interface StartContext {
  * Get the service directory where the gateway is running from.
  * This is the git root of the directory containing the running binary.
  */
-function getServiceDirectory(): string {
+export function getServiceDirectory(): string {
 	try {
 		const binaryDir = dirname(process.execPath);
 		// Find the git root by running git rev-parse --show-toplevel
@@ -690,7 +690,7 @@ export class WorkLaneManager {
 		// Validate that cwd is not inside the service directory (issue #480)
 		// Use realpath to properly handle symlinks and .. sequences
 		try {
-			const serviceDir = realpathSync(this.#options.serviceDirectory ?? getServiceDirectory());
+			const serviceDir = realpathSync(this.#options.serviceDirectory);
 
 			// Get the realpath of cwd, handling non-existent paths
 			let cwdRealpath: string;

@@ -87,7 +87,7 @@ import {
 	deterministicPostDeliveryId,
 	deterministicTerminalDeliveryId,
 } from "../orchestrator/tail-runner";
-import { laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
+import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
@@ -754,6 +754,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		port: sessionPort,
 		lanes,
 		gajaewayHome: options.config.home,
+		serviceDirectory: getServiceDirectory(),
 		ownerTarget: () => runtime.config.ownerTarget?.origin,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		allowNested: () => runtime.config.work?.allowNested === true,

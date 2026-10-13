@@ -13,7 +13,7 @@ import {
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { classifyCheckRollup } from "../src/orchestrator/gh-checks";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
-import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
+import { parseWorkerOutputResponse, type SessionBindInput, type WorkerOutputResult } from "../src/orchestrator/session-port";
 import { RelayClosedError } from "../src/orchestrator/tail-runner";
 import {
 	type CheckStatusClient,
@@ -103,6 +103,8 @@ async function fixture(
 				port,
 				lanes,
 				gajaewayHome,
+				// Use gajaewayHome as the service directory for tests (for issue #480 validation)
+				serviceDirectory: gajaewayHome,
 				ownerTarget,
 				pollMs: 5,
 				deliverFallback: (payload) => notices.push(payload),
@@ -1038,7 +1040,7 @@ test("invalid shared parameters have no bind/send effects and manager registrati
 	expect(f.port.binds).toHaveLength(0);
 	expect(f.port.sends).toHaveLength(0);
 	expect(
-		() => new WorkLaneManager({ database: f.db, port: f.port, lanes: f.lanes, gajaewayHome: f.gajaewayHome }),
+		() => new WorkLaneManager({ database: f.db, port: f.port, lanes: f.lanes, gajaewayHome: f.gajaewayHome, serviceDirectory: f.gajaewayHome }),
 	).toThrow("already registered");
 });
 
@@ -1411,6 +1413,8 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 	const path = join(directory, "gateway.db");
 	let db = await Store.open(path);
 	const gajaewayHome = join(directory, "gajaeway");
+	// Create gajaewayHome directory for service directory validation
+	await mkdir(gajaewayHome, { recursive: true });
 	const port = new ScriptedSessionPort({
 		onBind: (input) => {
 			const id = crypto.randomUUID();
@@ -1424,6 +1428,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 		port,
 		lanes: new LaneGovernor({ database: db, sessionPort: port }),
 		gajaewayHome,
+		serviceDirectory: gajaewayHome,
 		ownerTarget: () => origin,
 		pollMs: 5,
 		deliverFallback: (payload) => notices.push(payload),
@@ -1443,6 +1448,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 		port,
 		lanes: new LaneGovernor({ database: db, sessionPort: port }),
 		gajaewayHome,
+		serviceDirectory: gajaewayHome,
 		pollMs: 5,
 		ownerTarget: () => ({ ...origin, conversationId: "changed" }),
 		deliverFallback: (payload) => notices.push(payload),
@@ -2755,6 +2761,126 @@ test("issue #480: force retire cleans up worktree and branch", async () => {
 			stderr: "pipe",
 		});
 		expect(branchCheck.exitCode).not.toBe(0);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: session binding uses worktree path, not input cwd", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-session-bind-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-session-bind-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		// Create fixture first, then set up bind tracking
+		const f = await fixture();
+		const bindCalls: SessionBindInput[] = [];
+		// Spy on port.bind to capture the input
+		const originalBind = f.port.bind.bind(f.port);
+		f.port.bind = async (input: SessionBindInput) => {
+			bindCalls.push(input);
+			return originalBind(input);
+		};
+
+		const result = await f.manager.start({
+			name: "session-bind-test",
+			text: "work",
+			cwd: f.directory, // This is the input cwd
+			repo: bareRepo,
+		});
+
+		expect(result.started).toBe(true);
+		const job = f.job("session-bind-test");
+		const worktreePath = job.lane.worktreePath;
+
+		// Verify that the bind call received the worktree path, not the input cwd
+		const bindCall = bindCalls[bindCalls.length - 1]; // Last bind call should be for our lane
+		expect(bindCall).toBeDefined();
+		expect(bindCall!.repo).toBe(worktreePath); // Should be worktree path, not f.directory
+		expect(bindCall!.repo).not.toBe(f.directory); // Explicitly verify it's not the input cwd
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: all-dead retirement cleans up worktree", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-all-dead-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-all-dead-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "all-dead-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("all-dead-test");
+		const worktreePath = job.lane.worktreePath;
+
+		// Verify worktree exists before force retire
+		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(existsBefore.exitCode).toBe(0);
+
+		// Make the session dead so it qualifies for all-dead retirement
+		f.port.setSessionState(result.sessionId, { live: false });
+
+		// Force retire should clean up worktree (all-dead retirement path)
+		const retireOutcome = await f.lanes.forceRetire("all-dead-test");
+		expect(retireOutcome.retired).toBe(true);
+
+		// Verify worktree was deleted by all-dead retirement
+		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(exitsAfter.exitCode).not.toBe(0); // Should fail because worktree is gone
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
