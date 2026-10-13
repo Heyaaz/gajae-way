@@ -11,7 +11,7 @@ import {
 	stat,
 	writeFile,
 } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import pkg from "../package.json";
@@ -20,12 +20,10 @@ import { launchRestartStack } from "./restart-stack";
 import {
 	type InstallServicesOptions,
 	installServices,
-	launchAgentPlistPath,
+	removeStaleServices,
 	type ServicePlatform,
 	serviceSpecs,
-	systemdUnitDir,
 	systemdUnitName,
-	systemdUnitPath,
 } from "./services";
 
 /**
@@ -291,32 +289,16 @@ async function installUpdatedServices(options: {
 		const exitCode = await run(command);
 		if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
 	};
-	const userHome = env.HOME || homedir();
-	const definitionDir =
-		platform === "darwin"
-			? (deps.serviceOptions?.launchAgentsDir ?? join(userHome, "Library", "LaunchAgents"))
-			: (deps.serviceOptions?.unitDir ?? systemdUnitDir(env, userHome));
-	const expandedDefinitionDir = definitionDir.startsWith("~/") ? join(userHome, definitionDir.slice(2)) : definitionDir;
-	const staleDefinitions: Array<{ readonly label: string; readonly path: string; readonly unitName: string }> = [];
-	for (const spec of serviceSpecs()) {
-		if (await exists(join(binDir, spec.binary))) continue;
-		const path =
-			platform === "darwin"
-				? launchAgentPlistPath(spec, expandedDefinitionDir)
-				: systemdUnitPath(spec, expandedDefinitionDir);
-		if (await exists(path)) staleDefinitions.push({ label: spec.label, path, unitName: systemdUnitName(spec) });
+	if (!noRestart) {
+		await removeStaleServices({
+			binDir,
+			platform,
+			env,
+			reloadSystemd: false,
+			...deps.serviceOptions,
+			run,
+		});
 	}
-	if (platform === "linux" && staleDefinitions.length > 0) {
-		await execute(["systemctl", "--user", "disable", "--now", ...staleDefinitions.map(({ unitName }) => unitName)]);
-	} else if (platform === "darwin") {
-		const target = `gui/${process.getuid?.() ?? 0}`;
-		for (const { label } of staleDefinitions) {
-			const serviceTarget = `${target}/${label}`;
-			if ((await run(["launchctl", "print", serviceTarget], { allowFailure: true })) === 0)
-				await execute(["launchctl", "bootout", serviceTarget]);
-		}
-	}
-	for (const { path } of staleDefinitions) await rm(path, { force: true });
 	await installServices({
 		binDir,
 		platform,

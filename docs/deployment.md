@@ -79,6 +79,8 @@ gajaeway update --bin-dir /opt/gajaeway # when driving the update from elsewhere
 
 The updater stages the platform release, backs up replaced binaries, reads the staged gateway package's GJC pin, installs and verifies that exact version in the private prefix, then installs service definitions. When a broker manifest exists and restart is enabled, it enables the broker unit on Linux and queues the restart supervisor. The supervisor restarts the broker, gateway, and connected services in order. `--force` reinstalls the current release and its pinned GJC version. `GAJAEWAY_UPDATE_REPO=owner/name` redirects release checks to a fork.
 
+With `--no-restart`, stale service definitions for missing binaries are left alone so a healthy running process is not stopped during the staged update. The later `gajaeway ops restart-stack` stops and removes those stale services before restarting the installed stack.
+
 A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair`; when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
 
 ### macOS upgrade from 0.1.x to 0.2.0

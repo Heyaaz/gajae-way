@@ -342,8 +342,12 @@ describe("runUpdate", () => {
 	test("--no-restart replaces binaries without touching the service manager", async () => {
 		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
 		const home = await homeWithConfig();
+		const agentsDir = join(home, "agents");
+		const serviceCommands: string[][] = [];
 		const calls = recorder();
 		try {
+			await mkdir(agentsDir);
+			await writeFile(join(agentsDir, "dev.gajaeway.admin.plist"), "stale LaunchAgent");
 			const result = await runUpdate({
 				args: { check: false, force: false, noRestart: true, binDir: dir },
 				home,
@@ -353,6 +357,10 @@ describe("runUpdate", () => {
 					extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` }))),
 					gjcInstallRunner,
 					serviceOptions: serviceOptions(home),
+					serviceRunner: async (command) => {
+						serviceCommands.push([...command]);
+						return 0;
+					},
 					queueRestart: async (restartHome) => {
 						calls.restarts.push(restartHome);
 						return { receiptId: "r-1", supervisorPid: 42 };
@@ -366,6 +374,8 @@ describe("runUpdate", () => {
 			expect(JSON.parse(await readFile(join(dir, "package.json"), "utf8"))).toEqual({
 				gjc: { version: PINNED_GJC },
 			});
+			expect(serviceCommands).toEqual([]);
+			expect(await readdir(agentsDir)).toContain("dev.gajaeway.admin.plist");
 			expect(calls.restarts).toHaveLength(0);
 			expect(renderUpdate(result)).toContain("restart: skipped (--no-restart)");
 			expect(renderUpdate(result)).toContain("broker unit installed, not enabled: run gajaeway setup --broker-agent");
@@ -381,6 +391,8 @@ describe("runUpdate", () => {
 		const unitFiles = new Map<string, string>();
 		const serviceCommands: string[][] = [];
 		try {
+			await mkdir(join(home, "units"));
+			await writeFile(join(home, "units", "gajaeway-admin.service"), "stale systemd unit");
 			await writeFile(join(home, "adapter-discord.json"), "{}", "utf8");
 			const result = await runUpdate({
 				args: { check: false, force: false, noRestart: true, binDir: dir },
@@ -414,6 +426,7 @@ describe("runUpdate", () => {
 			expect([...unitFiles.keys()]).toContain(join(home, "units", "gajaeway-broker.service"));
 			expect([...unitFiles.keys()]).toContain(join(home, "units", "gajaeway-adapter-discord.service"));
 			expect([...unitFiles.keys()]).not.toContain(join(home, "units", "gajaeway-adapter-slack.service"));
+			expect(await readdir(join(home, "units"))).toContain("gajaeway-admin.service");
 			expect(await readlink(homeLayout(home).gjcCurrent)).toBe("0.19.2");
 		} finally {
 			await rm(dir, { recursive: true, force: true });
@@ -430,7 +443,7 @@ describe("runUpdate", () => {
 			await mkdir(unitDir);
 			await writeFile(join(unitDir, "gajaeway-admin.service"), "stale systemd unit");
 			const result = await runUpdate({
-				args: { check: false, force: false, noRestart: true, binDir: dir },
+				args: { check: false, force: false, noRestart: false, binDir: dir },
 				home,
 				deps: {
 					fetchLatestRelease: async () => release("v0.2.0", [releaseAssetName("linux", "arm64")]),
@@ -442,14 +455,16 @@ describe("runUpdate", () => {
 						serviceCommands.push([...command]);
 						return 0;
 					},
+					queueRestart: async () => ({ receiptId: "r-1", supervisorPid: 42 }),
 					platform: "linux",
 					arch: "arm64",
 				},
 			});
-			expect(result.restartSkipped).toBe(true);
+			expect(result.restartQueued).toBe("r-1");
 			expect(serviceCommands).toEqual([
 				["systemctl", "--user", "disable", "--now", "gajaeway-admin.service"],
 				["systemctl", "--user", "daemon-reload"],
+				["systemctl", "--user", "enable", "gajaeway-gateway.service"],
 			]);
 			expect(await readdir(unitDir)).not.toContain("gajaeway-admin.service");
 		} finally {
