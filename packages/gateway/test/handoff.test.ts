@@ -6,11 +6,12 @@ import { ConfigError, type GatewayConfig, parseConfigFile } from "../src/config"
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
+	extractHandoffAtBlockStart,
 	HANDOFF_DIGEST_MAX_LENGTH,
 	handoffMessageId,
 	parseHandoffReply,
 	resolveHandoffTarget,
-	stripHandoffTokens,
+	sanitizeHandoffTokens,
 } from "../src/server/handoff";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -273,10 +274,9 @@ test("handoffTargets must name chat origins", () => {
 		expect(() => parseConfigFile({ schemaVersion: 1, handoffTargets })).toThrow(ConfigError);
 });
 
-test("text before handoff token in message -> handoff enqueued", async () => {
+test("a handoff token at the start of a later [BREAK] block is parsed", async () => {
 	const { client, turns } = await gateway({
-		[KEY_A]: () =>
-			"Some initial analysis.\n\nMore context here.\n\n[HANDOFF:gajae-way-dev]\nPlease take this from here.",
+		[KEY_A]: () => "Some initial analysis.\n\n[BREAK]\n\n[HANDOFF:gajae-way-dev]\nPlease take this from here.",
 		[KEY_B]: () => "Got it, handling now.",
 	});
 	say(client, A, "m1", "work item");
@@ -291,24 +291,41 @@ test("text before handoff token in message -> handoff enqueued", async () => {
 	expect(delivered(client, "chan-b")).toEqual(["Got it, handling now."]);
 });
 
-test("line-standalone unparseable token (empty target) -> stripped from delivery", async () => {
+test("handoff parsing is limited to block starts, not arbitrary standalone lines", async () => {
 	const { client, turns } = await gateway({
+		[KEY_A]: () => "Analysis.\n[HANDOFF:gajae-way-dev]\nThis is ordinary text after the token.",
+	});
+	say(client, A, "m1", "work item");
+	await settle();
+
+	expect(turns.filter((turn) => turn.originKey === KEY_B)).toHaveLength(0);
+	const sourceMessages = delivered(client, "chan-a");
+	expect(sourceMessages).toHaveLength(2);
+	expect(sourceMessages[0]).toContain("Analysis.");
+	expect(sourceMessages[0]).toContain("This is ordinary text after the token.");
+	expect(sourceMessages.join("\n")).not.toContain("[HANDOFF:");
+	expect(sourceMessages[1]).toContain("no handoff was sent");
+});
+
+test("line-standalone unparseable token (empty target) -> stripped from delivery", async () => {
+	const { client } = await gateway({
 		[KEY_A]: () => "Some analysis.\n[HANDOFF:]\nThe target above is empty.",
 	});
 	say(client, A, "m1", "work item");
 	await settle();
 
 	const delivered_a = delivered(client, "chan-a");
-	expect(delivered_a).toHaveLength(1);
+	expect(delivered_a).toHaveLength(2);
 	// The line-standalone unparseable token (empty target) should be stripped
-	expect(delivered_a[0]).not.toContain("[HANDOFF:");
+	expect(delivered_a.join("\n")).not.toContain("[HANDOFF:");
 	// The surrounding text should remain
 	expect(delivered_a[0]).toContain("Some analysis");
 	expect(delivered_a[0]).toContain("The target above is empty");
+	expect(delivered_a[1]).toContain("no handoff was sent");
 });
 
 test("inline token mention -> preserved as literal text", async () => {
-	const { client, turns } = await gateway({
+	const { client } = await gateway({
 		[KEY_A]: () => "See [HANDOFF:dev] for more info. Use `[HANDOFF:code]` in your implementation.",
 	});
 	say(client, A, "m1", "work item");
@@ -338,26 +355,24 @@ test("parseHandoffReply requires token at message start", () => {
 		target: "target",
 		note: "the note",
 	});
-});
-
-test("regression: text before handoff token (same message) -> handoff enqueued", async () => {
-	const { client, turns } = await gateway({
-		[KEY_A]: () => "text\n[HANDOFF:gajae-way-dev]\nnote",
-		[KEY_B]: () => "received",
+	expect(sanitizeHandoffTokens("[HANDOFF:target] same-line text")).toEqual({
+		text: "same-line text",
+		strippedToken: true,
 	});
-	say(client, A, "m1", "work");
-	await settle();
-
-	const targetTurns = turns.filter((turn) => turn.originKey === KEY_B);
-	expect(targetTurns).toHaveLength(1);
-	const relayed = targetTurns[0]?.text ?? "";
-	expect(relayed).toContain("RELAYED HANDOFF");
-	expect(relayed).toContain("note");
 });
 
-test("mid-message handoff: simple text before token - delivered then pointer", async () => {
+test("later-block extraction preserves the preceding block and handles notes correctly", () => {
+	expect(extractHandoffAtBlockStart("preface\n\n[BREAK]\n\n[HANDOFF:target]\nThe note starts here.")).toEqual({
+		textBefore: "preface\n\n[BREAK]",
+		handoff: { target: "target", note: "The note starts here." },
+	});
+	expect(extractHandoffAtBlockStart("preface\n[HANDOFF:target]\nnote")).toBeUndefined();
+	expect(extractHandoffAtBlockStart("```md\n[BREAK]\n[HANDOFF:target]\nnote\n```")).toBeUndefined();
+});
+
+test("a later-block handoff delivers the preceding text before enqueueing", async () => {
 	const { client, turns } = await gateway({
-		[KEY_A]: () => "Analysis.\n[HANDOFF:gajae-way-dev]\nHandoff note.",
+		[KEY_A]: () => "Analysis.\n\n[BREAK]\n\n[HANDOFF:gajae-way-dev]\nHandoff note.",
 		[KEY_B]: () => "Received.",
 	});
 	say(client, A, "m1", "work");
@@ -370,29 +385,30 @@ test("mid-message handoff: simple text before token - delivered then pointer", a
 	expect(relayed).toContain("RELAYED HANDOFF");
 	expect(relayed).toContain("Handoff note");
 
-	// Check source: at least one message delivered (text or pointer)
-	const delivered_a = delivered(client, "chan-a");
-	expect(delivered_a.length).toBeGreaterThan(0);
+	const sourceMessages = delivered(client, "chan-a");
+	expect(sourceMessages).toHaveLength(2);
+	expect(sourceMessages[0]).toContain("Analysis.");
+	expect(sourceMessages[1]).toContain("Moved to gajae-way-dev");
 });
 
-test("mid-message handoff with [BREAK] separator -> handoff enqueued", async () => {
+test("a token later in a [BREAK] block is not mistaken for that block's opener", async () => {
 	const { client, turns } = await gateway({
-		[KEY_A]: () => "Block 1 analysis.\n\n[BREAK]\n\nMore analysis.\n[HANDOFF:gajae-way-dev]\nHandoff note here.",
-		[KEY_B]: () => "Received and processing.",
+		[KEY_A]: () =>
+			"Block 1 analysis.\n\n[BREAK]\n\nMore analysis.\n[HANDOFF:gajae-way-dev]\nThis token is not a directive.",
 	});
 	say(client, A, "m1", "complex work");
 	await settle();
 
-	const targetTurns = turns.filter((turn) => turn.originKey === KEY_B);
-	expect(targetTurns).toHaveLength(1);
-	const relayed = targetTurns[0]?.text ?? "";
-	expect(relayed).toContain("RELAYED HANDOFF");
-	expect(relayed).toContain("Handoff note here");
+	expect(turns.filter((turn) => turn.originKey === KEY_B)).toHaveLength(0);
+	const sourceMessages = delivered(client, "chan-a");
+	expect(sourceMessages.join("\n")).toContain("More analysis.");
+	expect(sourceMessages.join("\n")).toContain("This token is not a directive.");
+	expect(sourceMessages.join("\n")).not.toContain("[HANDOFF:");
 });
 
-test("reaction-only text before a mid-message handoff token -> reaction delivered and handoff still enqueued", async () => {
+test("a reaction in the preceding block is delivered before the handoff", async () => {
 	const { client, turns } = await gateway({
-		[KEY_A]: () => "[REACT:👀]\n[HANDOFF:gajae-way-dev]\nForward this.",
+		[KEY_A]: () => "[REACT:👀]\nAnalysis.\n\n[BREAK]\n\n[HANDOFF:gajae-way-dev]\nForward this.",
 		[KEY_B]: () => "Received.",
 	});
 	say(client, A, "m1", "work");
@@ -410,26 +426,30 @@ test("reaction-only text before a mid-message handoff token -> reaction delivere
 	expect(delivered(client, "chan-a").some((text) => text?.includes("[HANDOFF:"))).toBe(false);
 });
 
-test("interim: mid-line token not exposed (stripped from interim delivery)", async () => {
-	const { client, turns } = await gateway({
-		// Split into interim frames
+test("a standalone token line is removed from delivery", async () => {
+	const { client } = await gateway({
 		[KEY_A]: () => "Frame 1 text\n[HANDOFF:gajae-way-dev]\nFrame 2 content",
 	});
 	say(client, A, "m1", "work");
 	await settle();
 
-	// Interim deliveries should not contain the unparseable token line
 	const delivered_a = delivered(client, "chan-a");
-	// Should only have the pointer, no handoff token should appear
 	const hasToken = delivered_a.some((msg) => msg.includes("[HANDOFF:"));
 	expect(hasToken).toBe(false);
 });
 
-test("backtick and inline mentions preserved (not stripped)", () => {
-	// Verify that inline code mentions are not removed
-	const text = "Example usage: `[HANDOFF:code]` for reference. Also see [HANDOFF:example].";
-	const stripped = stripHandoffTokens(text);
-	// Inline mentions outside backticks at line start should be removed if invalid
-	// But mentions in backticks are preserved
-	expect(stripped).toContain("`[HANDOFF:code]`");
+test("inline and fenced-code token examples are preserved by sanitization", () => {
+	const text = "Example: `[HANDOFF:inline]`\n\n```text\n[HANDOFF:example]\n```";
+	expect(sanitizeHandoffTokens(text)).toEqual({ text, strippedToken: false });
+});
+
+test("a standalone token in a fenced code example is not parsed or stripped", async () => {
+	const { client, turns } = await gateway({
+		[KEY_A]: () => "Example syntax:\n```text\n[HANDOFF:gajae-way-dev]\n```\nThis is documentation.",
+	});
+	say(client, A, "m1", "work item");
+	await settle();
+
+	expect(turns.filter((turn) => turn.originKey === KEY_B)).toHaveLength(0);
+	expect(delivered(client, "chan-a").join("\n")).toContain("[HANDOFF:gajae-way-dev]");
 });

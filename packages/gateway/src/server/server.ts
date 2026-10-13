@@ -98,7 +98,7 @@ import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachme
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
-	extractHandoffIfMidMessage,
+	extractHandoffAtBlockStart,
 	type HandoffProvenance,
 	type HandoffReply,
 	handoffMessageId,
@@ -108,7 +108,7 @@ import {
 	renderHandoffPointer,
 	renderHandoffTurn,
 	resolveHandoffTarget,
-	stripHandoffTokens,
+	sanitizeHandoffTokens,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
@@ -2431,11 +2431,11 @@ async function createInboundTurnLifecycle(
 	 * Delivers one line into THIS conversation under the trigger's terminal slot,
 	 * so a replayed or reconciled answer can never post it twice.
 	 */
-	const deliverTerminalLine = (text: string) => {
-		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0);
+	const deliverTerminalLine = (text: string, partIndex = 0) => {
+		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, partIndex);
 		if (
 			options.database.transaction((tx) =>
-				options.database.inbox.claimTerminal(tx, input.turn.opRef, 0, deliveryId),
+				options.database.inbox.claimTerminal(tx, input.turn.opRef, partIndex, deliveryId),
 			) !== deliveryId
 		)
 			return;
@@ -2458,7 +2458,7 @@ async function createInboundTurnLifecycle(
 		if (!hop.ok || !resolved.ok) {
 			const reason = hop.ok ? "unresolvable target" : hop.reason;
 			console.error(`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${reason}`);
-			deliverTerminalLine(renderHandoffFailure(handoff.target, reason));
+			deliverTerminalLine(renderHandoffFailure(handoff.target, reason), deliveredParts.length);
 			return;
 		}
 		const sourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
@@ -2504,7 +2504,7 @@ async function createInboundTurnLifecycle(
 				.notifyInbound(resolved.originKey)
 				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
 		}
-		deliverTerminalLine(renderHandoffPointer(handoff.target));
+		deliverTerminalLine(renderHandoffPointer(handoff.target), deliveredParts.length);
 	};
 	/** [POST:] parts seen in mid-work speech, keyed `<target key>\n<body>`, posted at the turn's end. */
 	const heldPosts = new Map<string, { body: string; post: NonNullable<PlannedPart["post"]> }>();
@@ -2525,36 +2525,32 @@ async function createInboundTurnLifecycle(
 			return;
 		}
 
-		// Check if message contains a handoff token mid-message (after some text).
-		// If so, deliver the text before the token first, then trigger handoff.
-		const midMessageHandoff = extractHandoffIfMidMessage(rawMessage);
-		if (midMessageHandoff) {
+		// A token can open a later [BREAK]-delimited block. Deliver earlier blocks
+		// first, then hand off; tokens on ordinary lines remain non-directive text.
+		const blockHandoff = extractHandoffAtBlockStart(rawMessage);
+		if (blockHandoff) {
 			// Process only the text before the token
-			messageToProcess = midMessageHandoff.textBefore;
+			messageToProcess = blockHandoff.textBefore;
 			// Save handoff to trigger after delivery
 			if (source === "terminal") {
-				handoffAfterDelivery = midMessageHandoff.handoff;
+				handoffAfterDelivery = blockHandoff.handoff;
 			}
 		}
-		let message = messageToProcess;
-		// Strip tokens that failed to parse as handoff (e.g., [HANDOFF:] with empty target).
-		// These are tokens at line boundaries that don't have a valid target.
-		const lineTokens = message.match(/^\s*\[HANDOFF:[^\]]*\][^\S\n]*(?:\n|$)|\n\s*\[HANDOFF:[^\]]*\][^\S\n]*(?:\n|$)/g);
-		if (lineTokens) {
-			// Check if any of these tokens are invalid (have empty or whitespace-only targets)
-			const hasInvalidToken = lineTokens.some((token) => {
-				const targetMatch = token.match(/\[HANDOFF:([^\]\s]*)\]/);
-				return !targetMatch || !targetMatch[1];
-			});
-			if (hasInvalidToken) {
-				message = stripHandoffTokens(message);
-				console.warn(`gateway ${key}: invalid HANDOFF token at line boundary stripped from delivery`);
+		const sanitized = sanitizeHandoffTokens(messageToProcess);
+		let message = sanitized.text;
+		const reportInvalidHandoff = () => {
+			if (source === "terminal" && sanitized.strippedToken) {
+				deliverTerminalLine(
+					"A handoff token was removed because it did not form a valid reply-block directive; no handoff was sent.",
+					deliveredParts.length,
+				);
 			}
-		}
+		};
 		const reactionReply = parseReactionReply(message);
 		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
 			message = reactionReply.body;
 			if (!message) {
+				reportInvalidHandoff();
 				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
 				return;
 			}
@@ -2630,6 +2626,7 @@ async function createInboundTurnLifecycle(
 			}
 			message = reactionReply.body;
 			if (!message) {
+				reportInvalidHandoff();
 				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
 				return;
 			}
@@ -2780,6 +2777,7 @@ async function createInboundTurnLifecycle(
 		if (handoffAfterDelivery) {
 			await handOff(handoffAfterDelivery);
 		}
+		reportInvalidHandoff();
 	};
 	/**
 	 * Sends one [POST:] part to its target conversation through the ordinary

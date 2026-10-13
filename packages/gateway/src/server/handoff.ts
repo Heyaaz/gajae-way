@@ -23,9 +23,29 @@ export const HANDOFF_DIGEST_MAX_LENGTH = MONITOR_DIGEST_MAX_LENGTH;
 export const HANDOFF_NOTE_MAX_LENGTH = 4000;
 const DIGEST_LINE_MAX_LENGTH = 300;
 
-// Token must be at the very start of the message (possibly with leading whitespace).
-// No /m flag: this matches only at the start of the entire string, not at line boundaries.
+// A token is a directive only at the start of a text block. The first block is
+// handled by parseHandoffReply(); later blocks begin with [BREAK].
 const HANDOFF_TOKEN = /^\s*\[HANDOFF:([^\]\s]+)\][^\S\n]*(?:\n|$)/;
+const HANDOFF_TOKEN_PREFIX = /^[ \t]*\[HANDOFF:[^\]\r\n]*\]/;
+const HANDOFF_BLOCK_BREAK = /^[ \t]*\[BREAK\][ \t]*$/;
+
+interface CodeFence {
+	readonly character: string;
+	readonly length: number;
+}
+
+function codeFenceLine(
+	line: string,
+	fence: CodeFence | undefined,
+): { readonly fence: CodeFence | undefined; readonly isFenceLine: boolean } {
+	const match = line.match(/^ {0,3}(`{3,}|~{3,})/);
+	if (!match?.[1]) return { fence, isFenceLine: false };
+	if (!fence) return { fence: { character: match[1].charAt(0), length: match[1].length }, isFenceLine: true };
+
+	const closes =
+		match[1][0] === fence.character && match[1].length >= fence.length && /^[ \t]*$/.test(line.slice(match[0].length));
+	return { fence: closes ? undefined : fence, isFenceLine: true };
+}
 
 export interface HandoffReply {
 	readonly target: string;
@@ -33,48 +53,82 @@ export interface HandoffReply {
 }
 
 /**
- * A reply is a handoff only when the token is the first line of any text block.
- * Mid-text or mid-line tokens are not directives, but they must never be delivered verbatim.
- * Use stripHandoffTokens() to clean a message before delivery.
+ * The first text block is a handoff only when its first nonblank line is the
+ * token. Later [BREAK]-delimited blocks are handled by
+ * extractHandoffAtBlockStart().
  */
 export function parseHandoffReply(text: string): HandoffReply | undefined {
 	const match = text.match(HANDOFF_TOKEN);
 	if (!match?.[1]) return undefined;
-	// When /m flag matches at line start, calculate the note from the end of the token match.
-	const noteStart = match.index! + match[0].length;
-	return { target: match[1], note: text.slice(noteStart).trim() };
+	return { target: match[1], note: text.slice(match[0].length).trim() };
 }
 
 /**
- * Check if text contains a handoff token that's not at the start.
- * Returns the text before the token (to be delivered) and the handoff (if found).
+ * Find a handoff token at the beginning of a later [BREAK]-delimited text
+ * block. Tokens on arbitrary lines are not directives. Fenced code examples
+ * are ordinary text, even when they contain a standalone token line.
  */
-export function extractHandoffIfMidMessage(text: string): { textBefore: string; handoff: HandoffReply } | undefined {
-	// Check if a token appears anywhere in the text (at a line boundary)
-	const tokenMatch = text.match(/\n\s*\[HANDOFF:([^\]\s]+)\][^\S\n]*(?:\n|$)/);
-	if (!tokenMatch?.[1]) return undefined;
+export function extractHandoffAtBlockStart(text: string): { textBefore: string; handoff: HandoffReply } | undefined {
+	let fence: CodeFence | undefined;
+	let atBlockStart = false;
+	let lineStart = 0;
 
-	// Token found mid-message: extract text before it and the handoff
-	const tokenStart = tokenMatch.index! + 1; // +1 for the \n
-	const textBefore = text.slice(0, tokenStart).trimEnd();
-	const noteStart = tokenMatch.index! + tokenMatch[0].length;
-	const note = text.slice(noteStart).trim();
+	while (lineStart < text.length) {
+		const newline = text.indexOf("\n", lineStart);
+		const lineEnd = newline < 0 ? text.length : newline;
+		const rawLine = text.slice(lineStart, lineEnd);
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		const nextLineStart = newline < 0 ? lineEnd : newline + 1;
+		const fenceResult = codeFenceLine(line, fence);
+		fence = fenceResult.fence;
 
-	return {
-		textBefore,
-		handoff: { target: tokenMatch[1], note },
-	};
+		if (fenceResult.isFenceLine) {
+			atBlockStart = false;
+		} else if (!fence) {
+			if (atBlockStart && line.trim() === "") {
+				lineStart = nextLineStart;
+				continue;
+			}
+			if (atBlockStart) {
+				atBlockStart = false;
+				const token = line.match(/^[ \t]*\[HANDOFF:([^\]\s]+)\][ \t]*$/);
+				if (token?.[1]) {
+					return {
+						textBefore: text.slice(0, lineStart).trimEnd(),
+						handoff: { target: token[1], note: text.slice(nextLineStart).trim() },
+					};
+				}
+			}
+			if (HANDOFF_BLOCK_BREAK.test(line)) atBlockStart = true;
+		}
+
+		lineStart = nextLineStart;
+	}
+	return undefined;
 }
 
 /**
- * Strip only line-standalone HANDOFF tokens from text that are invalid directives.
- * Inline mentions (including in backticks or mid-sentence) are preserved as literal text.
- * The caller should have already checked parseHandoffReply before calling this.
+ * Remove unparsed handoff tokens at the start of a line, preserving any text
+ * that follows. Inline mentions and fenced-code examples remain ordinary text.
  */
-export function stripHandoffTokens(text: string): string {
-	// Remove tokens that are on a line by themselves (optionally with whitespace).
-	// Inline mentions are intentionally preserved.
-	return text.replace(/^\s*\[HANDOFF:[^\]]*\][^\S\n]*(?:\n|$)/gm, "").trim();
+export function sanitizeHandoffTokens(text: string): { readonly text: string; readonly strippedToken: boolean } {
+	let fence: CodeFence | undefined;
+	const kept: string[] = [];
+	let strippedToken = false;
+	for (const rawLine of text.split("\n")) {
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		const fenceResult = codeFenceLine(line, fence);
+		fence = fenceResult.fence;
+		const token = line.match(HANDOFF_TOKEN_PREFIX);
+		if (fenceResult.isFenceLine || fence || !token) {
+			kept.push(rawLine);
+		} else {
+			strippedToken = true;
+			const remainder = line.slice(token[0].length).trimStart();
+			if (remainder) kept.push(remainder);
+		}
+	}
+	return { text: kept.join("\n").trim(), strippedToken };
 }
 
 /**
