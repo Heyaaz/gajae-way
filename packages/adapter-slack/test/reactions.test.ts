@@ -20,7 +20,7 @@ test("Every protocol reaction has a Slack mapping and round trips", () => {
 	expect(reactionFromSlackName("thumbsdown")?.emojiName).toBe("thumbsdown");
 
 	// Custom emoji names are passed through to Slack, which validates existence
-	expect(reactionFromSlackName("custom")).toEqual({ emoji: ":custom:", emojiName: "custom:custom" });
+	expect(reactionFromSlackName("custom")).toEqual({ emoji: "custom:custom", emojiName: "custom:custom" });
 	expect(slackReactionFor({ emojiName: "custom" })).toBe("custom");
 
 	// Prototype pollution attempts are rejected at parse time (by resolveReactionEmoji)
@@ -47,7 +47,7 @@ test("Slack reaction names are Slack's own short names, unknown names are custom
 	});
 	expect(reactionFromSlackName("rolling_on_the_floor_laughing")).toEqual({ emoji: "🤣", emojiName: "laugh" });
 	// Slack doesn't have `rofl`, so it's treated as a custom emoji
-	expect(reactionFromSlackName("rofl")).toEqual({ emoji: ":rofl:", emojiName: "custom:rofl" });
+	expect(reactionFromSlackName("rofl")).toEqual({ emoji: "custom:rofl", emojiName: "custom:rofl" });
 });
 
 const event: SlackReactionEvent = {
@@ -68,15 +68,21 @@ test("Custom emoji names and allowlist entries are both handled correctly", () =
 	expect(slackReactionFor({ emojiName: "gajae-salute" })).toBe("gajae-salute");
 
 	// Inbound custom emoji are prefixed with 'custom:' to distinguish from allowlist names
-	expect(reactionFromSlackName("custom_emoji")).toEqual({ emoji: ":custom_emoji:", emojiName: "custom:custom_emoji" });
-	expect(reactionFromSlackName("gajae-salute")).toEqual({ emoji: ":gajae-salute:", emojiName: "custom:gajae-salute" });
+	expect(reactionFromSlackName("custom_emoji")).toEqual({
+		emoji: "custom:custom_emoji",
+		emojiName: "custom:custom_emoji",
+	});
+	expect(reactionFromSlackName("gajae-salute")).toEqual({
+		emoji: "custom:gajae-salute",
+		emojiName: "custom:gajae-salute",
+	});
 });
 
 test("Slack reactions describe routing, unknown emoji, engagement, and removal", () => {
 	expect(describeSlackReaction(event, "BOT", { userName: () => "Alice", channelName: () => "general" })).toEqual({
 		origin: { platform: "slack", kind: "channel", conversationId: "C1" },
 		targetMessageId: "C1:1.2",
-		emoji: ":custom:",
+		emoji: "custom:custom",
 		action: "add",
 		engagement: { mentioned: false, group: true, authorId: "U1", authorName: "Alice", channelLabel: "general" },
 	});
@@ -133,6 +139,26 @@ test("settleSlackReaction with action 'add' calls api.addReaction", async () => 
 
 	expect(requests).toEqual([{ verb: "addReaction", args: ["C1", "1.2", "+1"] }]);
 	expect(gatewayRequests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+
+	await settleSlackReaction(gateway, api, {
+		...message,
+		deliveryId: "delivery-2",
+		text: "",
+		reaction: {
+			targetMessageId: "C1:1.2",
+			emoji: "",
+			emojiName: "gajae-salute",
+			action: "add",
+		},
+	});
+	expect(requests).toEqual([
+		{ verb: "addReaction", args: ["C1", "1.2", "+1"] },
+		{ verb: "addReaction", args: ["C1", "1.2", "gajae-salute"] },
+	]);
+	expect(gatewayRequests).toEqual([
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-2" } },
+	]);
 });
 
 test("settleSlackReaction with action 'remove' calls api.removeReaction and not addReaction", async () => {
