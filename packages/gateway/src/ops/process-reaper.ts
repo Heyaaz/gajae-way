@@ -1,18 +1,28 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readdir, readFile, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 
 export interface ProcessReaperOptions {
-	/** Optional timeout for the reaper itself (ms). */
+	/** Timeout for each graceful/forceful termination attempt (ms). */
 	readonly timeoutMs?: number;
 	/** Log function for diagnostics. */
 	readonly log?: (line: string) => void;
-	/** Optional injected process table for testing. */
+	/** Injected process table; requires an injected kill function to prevent host signals in tests. */
 	readonly processTable?: ProcessTableEntry[];
-	/** Optional kill function for testing. If not provided, uses process.kill. */
+	/** Optional kill function for tests. If not provided, uses process.kill. */
 	readonly kill?: (pid: number, signal: string) => Promise<void>;
+	/** Optional liveness probe for tests. */
+	readonly isProcessAlive?: (pid: number) => Promise<boolean>;
+	/** Optional identity revalidation hook for tests. */
+	readonly isCurrentWorker?: (candidate: ProcessTableEntry) => Promise<boolean>;
 	/** Optional procRoot for testing (/proc filesystem root). */
 	readonly procRoot?: string;
+	/** Effective executable passed to the GJC client. */
+	readonly gjcExecutable?: string;
+	/** GJC installation prefix; prior versioned executables are accepted under this directory. */
+	readonly gjcPrefix?: string;
+	/** Effective configured GJC agent directory. */
+	readonly brokerAgentDir?: string;
 }
 
 export interface ProcessTableEntry {
@@ -20,6 +30,10 @@ export interface ProcessTableEntry {
 	readonly ppid: number;
 	readonly argv: string[];
 	readonly agentDir: string | undefined;
+	/** Stable process-start identity: /proc start ticks on Linux, lstart from ps elsewhere. */
+	readonly identity?: string;
+	/** Linux process state, used to treat unreaped zombies as exited. */
+	readonly state?: string;
 }
 
 export interface ReapResult {
@@ -28,52 +42,72 @@ export interface ReapResult {
 	readonly failed: number;
 }
 
+export interface WorkerMatchOptions {
+	readonly gjcPath: string;
+	readonly gjcPrefix?: string;
+	readonly brokerAgentDir: string;
+	readonly selfPid: number;
+}
+
 /**
- * Identifies and kills leftover child processes from the previous gateway epoch.
+ * Identifies and terminates leftover GJC session relays from a previous gateway epoch.
  *
- * Only reaps processes that are:
- * 1. Spawned with exactly argv = [gjcPath (or bun gjcPath), "sdk", "serve", "--stdio", "--session", <id>]
- * 2. With agentDir exactly matching our broker agent directory
- * 3. With ppid !== current process.pid (orphaned from this gateway instance)
- *
- * This ensures we never kill unrelated bun processes system-wide.
+ * A candidate must have an exact GJC relay argv, the canonical configured agent directory,
+ * and no live gateway as its parent. Every candidate's process-start identity is checked
+ * again immediately before each signal to avoid signaling a reused PID. A relay directly
+ * parented by a live gateway is still owned; after its gateway exits, the OS reparents it to
+ * systemd or another subreaper, where this scan can identify it as orphaned.
  */
 export async function reapLeftoverWorkers(home: string, options: ProcessReaperOptions = {}): Promise<ReapResult> {
-	const { log = (s) => console.warn(s) } = options;
+	if (options.processTable !== undefined && (options.kill === undefined || options.isProcessAlive === undefined)) {
+		throw new Error("processTable injection requires kill and isProcessAlive functions");
+	}
+
+	const { log = (line) => console.warn(line) } = options;
 	let found = 0;
 	let killed = 0;
 	let failed = 0;
 
 	try {
-		const resolvedHome = resolve(home);
-		const layout = homeLayout(resolvedHome);
-		const gjcExecutable = await resolvePath(layout.gjcExecutable());
-		const brokerAgentDir = layout.brokerAgentDir;
-
-		// Get current process's PID; orphaned workers will have ppid !== this
-		const selfPid = process.pid;
-
-		// Read process table (from injection or /proc or ps)
-		const processTable = options.processTable ?? (await readProcessTable(options.procRoot));
-
-		// Classify which processes are orphaned workers we should reap
-		const foundPids = selectOrphanedWorkers(processTable, {
-			gjcPath: gjcExecutable,
-			brokerAgentDir,
-			selfPid,
-		});
-
+		const layout = homeLayout(resolve(home));
+		const gjcPath =
+			options.gjcExecutable === undefined ? await canonicalizePath(layout.gjcExecutable()) : options.gjcExecutable;
+		const gjcPrefix =
+			options.gjcPrefix === undefined
+				? options.gjcExecutable === undefined
+					? await canonicalizePath(layout.gjcPrefix)
+					: undefined
+				: await canonicalizePath(options.gjcPrefix);
+		const brokerAgentDir = await canonicalizePath(options.brokerAgentDir ?? layout.brokerAgentDir);
+		const matchOptions: WorkerMatchOptions = { gjcPath, gjcPrefix, brokerAgentDir, selfPid: process.pid };
+		const processTable = options.processTable ?? (await readProcessTable(options.procRoot, matchOptions));
+		const foundPids = selectOrphanedWorkers(processTable, matchOptions);
 		found = foundPids.length;
 		if (foundPids.length === 0) return { found, killed, failed };
 
 		log(`process-reaper: found ${foundPids.length} orphaned worker processes to reap`);
 
-		// Kill each found process with SIGTERM then SIGKILL
 		for (const pid of foundPids) {
+			const candidate = processTable.find((entry) => entry.pid === pid);
+			if (!candidate) continue;
 			try {
-				await killProcess(pid, options.kill);
-				killed++;
-				log(`process-reaper: reaped leftover worker pid=${pid}`);
+				const reaped = await killProcess(candidate, {
+					kill: options.kill,
+					isAlive: options.isProcessAlive ?? ((targetPid) => isProcessAlive(targetPid, options.procRoot)),
+					isCurrentWorker:
+						options.isCurrentWorker ??
+						(async (original) => {
+							const currentTable = options.processTable ?? (await readProcessTable(options.procRoot, matchOptions));
+							const current = currentTable.find((entry) => entry.pid === original.pid);
+							if (!sameProcessIdentity(original, current, options.processTable !== undefined)) return false;
+							return selectOrphanedWorkers(currentTable, matchOptions).includes(original.pid);
+						}),
+					timeoutMs: options.timeoutMs ?? 2_000,
+				});
+				if (reaped) {
+					killed++;
+					log(`process-reaper: reaped leftover worker pid=${pid}`);
+				}
 			} catch (error) {
 				failed++;
 				log(`process-reaper: failed to reap pid=${pid}: ${error instanceof Error ? error.message : String(error)}`);
@@ -86,244 +120,389 @@ export async function reapLeftoverWorkers(home: string, options: ProcessReaperOp
 	return { found, killed, failed };
 }
 
-/** Resolve a path through symlinks; return undefined if it doesn't exist. */
-async function resolvePath(path: string): Promise<string> {
-	try {
-		const { realpath } = await import("node:fs/promises");
-		return await realpath(path);
-	} catch {
-		// Path doesn't exist; return as-is so matching will fail gracefully
-		return path;
-	}
-}
-
-/**
- * Pure classifier: identifies orphaned workers from a process table.
- *
- * A worker is selected for reaping if:
- * 1. Its argv matches [gjcPath or "bun" + gjcPath, "sdk", "serve", "--stdio", "--session", <id>]
- *    (argv is an exact token match, not substring or prefix)
- * 2. Its agentDir === brokerAgentDir (exact equality)
- * 3. Its ppid !== selfPid (not a child of the current gateway instance)
- */
-export function selectOrphanedWorkers(
-	table: ProcessTableEntry[],
-	options: { readonly gjcPath: string; readonly brokerAgentDir: string; readonly selfPid: number },
-): number[] {
+/** Pure classifier, shared by Linux, Unix, and injected fixtures. */
+export function selectOrphanedWorkers(table: ProcessTableEntry[], options: WorkerMatchOptions): number[] {
+	const gatewayPids = new Set(table.filter((entry) => isGatewayProcess(entry.argv)).map((entry) => entry.pid));
 	const result: number[] = [];
 
 	for (const entry of table) {
-		// Check argv token match: [gjcPath or bun+gjcPath, "sdk", "serve", "--stdio", "--session", id]
-		if (!isWorkerArgv(entry.argv, options.gjcPath)) continue;
-
-		// Check agentDir exact equality
+		if (!isWorkerArgv(entry.argv, options)) continue;
 		if (entry.agentDir !== options.brokerAgentDir) continue;
-
-		// Check if orphaned: ppid !== selfPid
-		if (entry.ppid === options.selfPid) continue;
-
+		if (entry.ppid === options.selfPid || gatewayPids.has(entry.ppid)) continue;
 		result.push(entry.pid);
 	}
 
 	return result;
 }
 
-/**
- * Checks if argv matches the exact pattern for a spawned worker.
- * Pattern: [gjcPath or "bun" + gjcPath, "sdk", "serve", "--stdio", "--session", <id>]
- */
-function isWorkerArgv(argv: string[], gjcPath: string): boolean {
-	if (argv.length < 6) return false;
+function isWorkerArgv(argv: string[], options: WorkerMatchOptions): boolean {
+	let executableIndex = 0;
+	if (basename(argv[0] ?? "") === "bun") executableIndex = 1;
+	if (argv.length !== executableIndex + 6) return false;
 
-	let idx = 0;
-
-	// Check first token: either gjcPath directly or "bun" followed by gjcPath
-	if (argv[0] === "bun") {
-		if (argv[1] !== gjcPath) return false;
-		idx = 2;
-	} else {
-		if (argv[0] !== gjcPath) return false;
-		idx = 1;
-	}
-
-	// Remaining argv must be exactly: "sdk", "serve", "--stdio", "--session", <id>
-	if (argv.length !== idx + 5) return false;
-	if (argv[idx] !== "sdk") return false;
-	if (argv[idx + 1] !== "serve") return false;
-	if (argv[idx + 2] !== "--stdio") return false;
-	if (argv[idx + 3] !== "--session") return false;
-	// argv[idx + 4] is the session ID, which can be any string
-
-	return true;
+	const executable = argv[executableIndex];
+	if (!executable || !isGjcExecutable(executable, options.gjcPath, options.gjcPrefix)) return false;
+	const args = argv.slice(executableIndex + 1);
+	return (
+		args[0] === "sdk" &&
+		args[1] === "serve" &&
+		args[2] === "--stdio" &&
+		args[3] === "--session" &&
+		args[4] !== undefined &&
+		args.length === 5
+	);
 }
 
-/**
- * Reads the process table from /proc (Linux) or ps (macOS/Unix).
- * On Linux, reads /proc/[pid]/stat, /proc/[pid]/cmdline, /proc/[pid]/environ.
- * On macOS, uses `ps eww` (environment may be incomplete; skip agentDir if not present).
- * Returns empty array if the system doesn't provide process information.
- */
-async function readProcessTable(procRoot?: string): Promise<ProcessTableEntry[]> {
-	if (procRoot !== undefined || process.platform === "linux") {
-		return await readProcessTableLinux(procRoot);
-	} else {
-		return await readProcessTableUnix();
+function isGjcExecutable(executable: string, gjcPath: string, gjcPrefix?: string): boolean {
+	if (executable === gjcPath) return true;
+	if (gjcPrefix === undefined) return false;
+
+	const pathFromPrefix = relative(gjcPrefix, executable);
+	if (!pathFromPrefix || isAbsolute(pathFromPrefix)) return false;
+	const [version, ...remainder] = pathFromPrefix.split(sep);
+	if (version === undefined || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+		return false;
 	}
+
+	// The versioned bin shim resolves to the package entrypoint. Accept either argv form,
+	// including an older version that an update has already pruned from disk.
+	return (
+		(remainder.length === 2 && remainder[0] === "bin" && remainder[1] === "gjc") ||
+		(remainder.length === 5 &&
+			remainder[0] === "node_modules" &&
+			remainder[1] === "@gajae-code" &&
+			remainder[2] === "coding-agent" &&
+			remainder[3] === "bin" &&
+			remainder[4] === "gjc.js")
+	);
 }
 
-/**
- * Linux-specific process discovery from /proc filesystem.
- * Reads /proc/[pid]/stat for ppid, /proc/[pid]/cmdline for argv, /proc/[pid]/environ for GJC_CODING_AGENT_DIR.
- */
-async function readProcessTableLinux(procRoot: string = "/proc"): Promise<ProcessTableEntry[]> {
-	const result: ProcessTableEntry[] = [];
+function isGatewayProcess(argv: string[]): boolean {
+	if (basename(argv[0] ?? "") === "gajaeway-gateway" && argv[1] === "daemon") return true;
+	if (basename(argv[0] ?? "") !== "bun" || argv[2] !== "daemon") return false;
+	const script = (argv[1] ?? "").replaceAll("\\", "/");
+	return script === "packages/gateway/src/main.ts" || script.endsWith("/packages/gateway/src/main.ts");
+}
 
+function sameProcessIdentity(
+	original: ProcessTableEntry,
+	current: ProcessTableEntry | undefined,
+	injectedTable: boolean,
+): boolean {
+	if (!current) return false;
+	if (original.identity !== undefined && current.identity !== undefined) return original.identity === current.identity;
+	return injectedTable && original === current;
+}
+
+async function canonicalizePath(path: string): Promise<string> {
+	const absolute = resolve(path);
 	try {
-		const entries = await readdir(procRoot);
+		return await realpath(absolute);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+		const parent = dirname(absolute);
+		if (parent === absolute) return absolute;
+		return join(await canonicalizePath(parent), basename(absolute));
+	}
+}
 
-		for (const entry of entries) {
-			const pid = Number(entry);
-			if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+async function readProcessTable(procRoot?: string, matchOptions?: WorkerMatchOptions): Promise<ProcessTableEntry[]> {
+	if (procRoot !== undefined || process.platform === "linux") return await readProcessTableLinux(procRoot);
+	return await readProcessTableUnix(matchOptions);
+}
 
-			try {
-				// Read /proc/[pid]/stat to extract ppid (field 3)
-				const stat = await readFile(join(procRoot, entry, "stat"), "utf-8").catch(() => "");
-				if (!stat) continue;
-
-				// comm (field 2) is parenthesized and may contain spaces or ')', so parse after the last ')'.
-				const afterComm = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-				const ppid = Number(afterComm[1]);
-				if (!Number.isSafeInteger(ppid)) continue;
-
-				// Read /proc/[pid]/cmdline (NUL-separated argv)
-				const cmdlineStr = await readFile(join(procRoot, entry, "cmdline"), "utf-8").catch(() => "");
-				const argv = cmdlineStr.split("\0").filter(Boolean);
-				if (argv.length === 0) continue;
-
-				// Read /proc/[pid]/environ to extract GJC_CODING_AGENT_DIR
-				const environStr = await readFile(join(procRoot, entry, "environ"), "utf-8").catch(() => "");
-				const environ = environStr.split("\0");
-				let agentDir: string | undefined;
-				for (const envVar of environ) {
-					if (envVar.startsWith("GJC_CODING_AGENT_DIR=")) {
-						agentDir = envVar.substring("GJC_CODING_AGENT_DIR=".length);
-						break;
-					}
-				}
-
-				result.push({ pid, ppid, argv, agentDir });
-			} catch {
-				// Ignore errors reading proc entries (permission denied, process died, etc)
-			}
-		}
+async function readProcessTableLinux(procRoot = "/proc"): Promise<ProcessTableEntry[]> {
+	let pids: string[];
+	try {
+		pids = await readdir(procRoot);
 	} catch {
-		// /proc not available or other error; return empty table
+		return [];
 	}
 
+	const result: ProcessTableEntry[] = [];
+	for (const name of pids) {
+		const pid = Number(name);
+		if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+		const entry = await readProcessEntryLinux(pid, procRoot);
+		if (entry) result.push(entry);
+	}
 	return result;
 }
 
-/**
- * Unix-specific process discovery using `ps eww` command.
- * Returns ppid, pid, argv, and environment variables.
- * Note: On macOS/Unix, environment may be incomplete or unavailable; this is best-effort.
- * If GJC_CODING_AGENT_DIR is not present in ps output, agentDir will be undefined.
- */
-async function readProcessTableUnix(): Promise<ProcessTableEntry[]> {
-	const result: ProcessTableEntry[] = [];
-
+async function readProcessEntryLinux(pid: number, procRoot: string): Promise<ProcessTableEntry | undefined> {
+	const directory = join(procRoot, String(pid));
 	try {
-		// ps eww output: all processes with all environment variables
-		// Format: PPID PID COMMAND [with embedded environ]
-		const proc = Bun.spawn(["ps", "eww"], {
-			stdout: "pipe",
-			stderr: "ignore",
+		const statText = await readFile(join(directory, "stat"), "utf8");
+		const stat = parseLinuxStat(statText);
+		if (!stat) return undefined;
+
+		const cmdline = await readFile(join(directory, "cmdline"), "utf8").catch(() => "");
+		const argv = cmdline.split("\0").filter(Boolean);
+		if (argv.length === 0) return undefined;
+
+		const environment = await readFile(join(directory, "environ"), "utf8").catch(() => "");
+		const agentDir = environment
+			.split("\0")
+			.find((variable) => variable.startsWith("GJC_CODING_AGENT_DIR="))
+			?.slice("GJC_CODING_AGENT_DIR=".length);
+		return { pid, ppid: stat.ppid, argv, agentDir, identity: stat.startTime, state: stat.state };
+	} catch {
+		return undefined;
+	}
+}
+
+interface LinuxStat {
+	readonly state: string;
+	readonly ppid: number;
+	readonly startTime: string;
+}
+
+function parseLinuxStat(stat: string): LinuxStat | undefined {
+	const closingParen = stat.lastIndexOf(")");
+	if (closingParen < 0) return undefined;
+	const fields = stat
+		.slice(closingParen + 1)
+		.trim()
+		.split(/\s+/);
+	const ppid = Number(fields[1]);
+	const startTime = fields[19];
+	if (!fields[0] || !Number.isSafeInteger(ppid) || startTime === undefined) return undefined;
+	return { state: fields[0], ppid, startTime };
+}
+
+/** Parses BSD-style ps rows with explicit PPID, PID, lstart, and command columns. */
+export function parseUnixProcessTable(
+	output: string,
+	expectedAgentDir?: string,
+	workerPathOptions?: Pick<WorkerMatchOptions, "gjcPath" | "gjcPrefix">,
+): ProcessTableEntry[] {
+	const result: ProcessTableEntry[] = [];
+	for (const line of output.split(/\r?\n/)) {
+		const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
+		if (!match) continue;
+
+		const ppid = Number(match[1]);
+		const pid = Number(match[2]);
+		if (!Number.isSafeInteger(ppid) || !Number.isSafeInteger(pid)) continue;
+
+		const commandAndEnvironment = match[4];
+		const envMatch = findUnixAgentDir(commandAndEnvironment, expectedAgentDir);
+		const environmentStart = envMatch ? findUnixEnvironmentStart(commandAndEnvironment, envMatch.index) : undefined;
+		const command =
+			environmentStart === undefined
+				? commandAndEnvironment
+				: commandAndEnvironment.slice(0, environmentStart).trimEnd();
+		const argv = parseUnixCommandArgv(command, workerPathOptions);
+		if (argv.length === 0) continue;
+		result.push({
+			pid,
+			ppid,
+			argv,
+			agentDir: envMatch?.value,
+			identity: match[3].trim(),
 		});
-
-		const output = await new Response(proc.stdout as ReadableStream).text();
-		const lines = output.trim().split("\n");
-
-		// Skip header line
-		for (let i = 1; i < lines.length; i++) {
-			const line = lines[i];
-			if (!line) continue;
-
-			// ps eww format: leading columns are PPID PID, followed by COMMAND
-			// COMMAND may contain spaces and environment variables (space-separated)
-			// We need to parse: PPID PID command args...
-			const parts = line.trim().split(/\s+/);
-			if (parts.length < 3) continue;
-
-			const ppid = Number(parts[0]);
-			const pid = Number(parts[1]);
-			if (!Number.isSafeInteger(ppid) || !Number.isSafeInteger(pid)) continue;
-
-			// The rest is the command and environment, space-separated
-			// For simplicity, treat the remaining parts as argv + environ
-			// argv[0] is the command name, argv[1:] are the arguments
-			const argv = [parts[2]];
-			let agentDir: string | undefined;
-
-			// Scan remaining parts for the session ID and environment
-			for (let j = 3; j < parts.length; j++) {
-				const part = parts[j];
-				if (part.startsWith("GJC_CODING_AGENT_DIR=")) {
-					agentDir = part.substring("GJC_CODING_AGENT_DIR=".length);
-				} else if (!part.includes("=")) {
-					// Argument (not an environment variable)
-					argv.push(part);
-				}
-			}
-
-			result.push({ pid, ppid, argv, agentDir });
-		}
-
-		await proc.exited;
-	} catch {
-		// ps not available or other error; return empty table
 	}
-
 	return result;
 }
 
-/**
- * Sends SIGTERM to a process, then SIGKILL if it doesn't die quickly.
- */
-async function killProcess(
-	pid: number,
-	killFn?: (pid: number, signal: string) => Promise<void>,
-	timeoutMs = 2_000,
-): Promise<void> {
-	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-		try {
-			if (killFn) {
-				await killFn(pid, signal);
-			} else {
-				process.kill(pid, signal);
-			}
-		} catch {
-			// Already dead or permission denied
-		}
+function parseUnixCommandArgv(
+	command: string,
+	workerPathOptions?: Pick<WorkerMatchOptions, "gjcPath" | "gjcPrefix">,
+): string[] {
+	const marker = " sdk serve --stdio --session ";
+	const markerIndex = command.lastIndexOf(marker);
+	if (markerIndex < 0) return parseUnixGatewayArgv(command) ?? command.split(/\s+/).filter(Boolean);
 
-		// Wait a bit for the process to exit
-		try {
-			const checkProc = Bun.spawn(["kill", "-0", String(pid)], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
-			const exitPromise = checkProc.exited;
-			const timeoutPromise = new Promise<boolean>((resolve) => {
-				setTimeout(() => resolve(false), timeoutMs);
-			});
+	const executable = command.slice(0, markerIndex);
+	const bunArgv = parseUnixBunLauncher(executable, workerPathOptions);
+	const launcher = bunArgv ?? [executable];
+	const args = command
+		.slice(markerIndex + 1)
+		.split(/\s+/)
+		.filter(Boolean);
+	return [...launcher, ...args];
+}
 
-			const stillAlive = await Promise.race([exitPromise.then(() => false), timeoutPromise]).catch(() => true);
+function parseUnixBunLauncher(
+	command: string,
+	workerPathOptions?: Pick<WorkerMatchOptions, "gjcPath" | "gjcPrefix">,
+): string[] | undefined {
+	for (let separator = command.indexOf(" "); separator >= 0; separator = command.indexOf(" ", separator + 1)) {
+		const launcher = command.slice(0, separator);
+		if (basename(launcher) !== "bun") continue;
 
-			if (!stillAlive) return; // Process is dead
-		} catch {
-			// Assume process is dead if we can't check
-			return;
+		const executable = command.slice(separator + 1);
+		const matchesGjc = workerPathOptions
+			? isGjcExecutable(executable, workerPathOptions.gjcPath, workerPathOptions.gjcPrefix)
+			: basename(executable) === "gjc" || basename(executable) === "gjc.js";
+		if (matchesGjc) return [launcher, executable];
+	}
+	return undefined;
+}
+
+function parseUnixGatewayArgv(command: string): string[] | undefined {
+	const directExecutable = "gajaeway-gateway";
+	for (
+		let index = command.indexOf(directExecutable);
+		index >= 0;
+		index = command.indexOf(directExecutable, index + directExecutable.length)
+	) {
+		const executableEnd = index + directExecutable.length;
+		const executable = command.slice(0, executableEnd);
+		if (basename(executable) === directExecutable && /^\s+daemon(?:\s|$)/.test(command.slice(executableEnd))) {
+			return [executable, "daemon"];
 		}
 	}
 
-	throw new Error(`Process ${pid} did not exit after SIGTERM and SIGKILL`);
+	const sourceScript = "packages/gateway/src/main.ts";
+	for (
+		let index = command.indexOf(sourceScript);
+		index >= 0;
+		index = command.indexOf(sourceScript, index + sourceScript.length)
+	) {
+		const scriptEnd = index + sourceScript.length;
+		if (!/^\s+daemon(?:\s|$)/.test(command.slice(scriptEnd))) continue;
+
+		for (
+			let separator = command.indexOf(" ");
+			separator >= 0 && separator < index;
+			separator = command.indexOf(" ", separator + 1)
+		) {
+			const executable = command.slice(0, separator);
+			if (basename(executable) !== "bun") continue;
+
+			const script = command.slice(separator + 1, scriptEnd);
+			if (script === sourceScript || script.endsWith(`/${sourceScript}`)) return [executable, script, "daemon"];
+		}
+	}
+	return undefined;
+}
+
+function findUnixAgentDir(
+	commandAndEnvironment: string,
+	expectedAgentDir?: string,
+): { readonly index: number; readonly value: string | undefined } | undefined {
+	if (expectedAgentDir === undefined) {
+		const match = /(?:^|\s)GJC_CODING_AGENT_DIR=([^\s]*)/.exec(commandAndEnvironment);
+		return match ? { index: match.index, value: match[1] || undefined } : undefined;
+	}
+
+	const key = "GJC_CODING_AGENT_DIR=";
+	for (
+		let index = commandAndEnvironment.indexOf(key);
+		index >= 0;
+		index = commandAndEnvironment.indexOf(key, index + key.length)
+	) {
+		const before = index === 0 || /\s/.test(commandAndEnvironment[index - 1] ?? "");
+		if (!before) continue;
+		const value = commandAndEnvironment.slice(index + key.length);
+		// ps flattens environment values into the command field, so no whitespace or marker
+		// suffix can prove where a path containing spaces ends. broker.ts orders the agent dir
+		// last; accept only an exact end-of-field match and skip ambiguous older layouts.
+		return value === expectedAgentDir ? { index, value: expectedAgentDir } : undefined;
+	}
+	return undefined;
+}
+
+function findUnixEnvironmentStart(commandAndEnvironment: string, agentDirIndex: number): number {
+	const marker = " sdk serve --stdio --session ";
+	const markerIndex = commandAndEnvironment.lastIndexOf(marker);
+	if (markerIndex < 0) return agentDirIndex;
+
+	const sessionStart = markerIndex + marker.length;
+	const sessionEnd = commandAndEnvironment.indexOf(" ", sessionStart);
+	if (sessionEnd < 0 || sessionEnd >= agentDirIndex) return agentDirIndex;
+
+	// BSD ps appends the whole environment after argv, not only the configured GJC variable.
+	const precedingEnvironment = commandAndEnvironment.slice(sessionEnd, agentDirIndex);
+	const firstVariable = /\s[A-Za-z_][A-Za-z0-9_]*=/.exec(precedingEnvironment);
+	return firstVariable ? sessionEnd + firstVariable.index : agentDirIndex;
+}
+
+async function readProcessTableUnix(matchOptions?: WorkerMatchOptions): Promise<ProcessTableEntry[]> {
+	const proc = Bun.spawn(["ps", "-A", "-ww", "eww", "-o", "ppid=,pid=,lstart=,command="], {
+		env: { ...process.env, LC_ALL: "C" },
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	const output = await new Response(proc.stdout as ReadableStream).text();
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`ps process-table scan exited with status ${exitCode}`);
+	return parseUnixProcessTable(output, matchOptions?.brokerAgentDir, matchOptions);
+}
+
+async function isProcessAlive(pid: number, procRoot?: string): Promise<boolean> {
+	if (process.platform === "linux" || procRoot !== undefined) {
+		const statRoot = procRoot ?? "/proc";
+		let statText: string;
+		try {
+			statText = await readFile(join(statRoot, String(pid), "stat"), "utf8");
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT" || code === "ENOTDIR") return false;
+			throw error;
+		}
+		const stat = parseLinuxStat(statText);
+		if (!stat) throw new Error(`invalid /proc stat for pid=${pid}`);
+		return stat.state !== "Z" && stat.state !== "X";
+	}
+
+	return await isProcessAliveUnix(pid);
+}
+
+async function isProcessAliveUnix(pid: number): Promise<boolean> {
+	const proc = Bun.spawn(["ps", "-p", String(pid), "-o", "pid=,stat="], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	const output = (await new Response(proc.stdout as ReadableStream).text()).trim();
+	const exitCode = await proc.exited;
+	if (output === "" && (exitCode === 0 || exitCode === 1)) return false;
+	if (exitCode !== 0) throw new Error(`ps liveness check exited with status ${exitCode} for pid=${pid}`);
+
+	const match = output.match(/^(\d+)\s+(\S+)/);
+	if (!match || Number(match[1]) !== pid) throw new Error(`ps returned an invalid liveness row for pid=${pid}`);
+	return match[2]?.[0] !== "Z" && match[2]?.[0] !== "X";
+}
+
+interface KillProcessOptions {
+	readonly kill?: (pid: number, signal: string) => Promise<void>;
+	readonly isAlive: (pid: number) => Promise<boolean>;
+	readonly isCurrentWorker: (candidate: ProcessTableEntry) => Promise<boolean>;
+	readonly timeoutMs: number;
+}
+
+async function killProcess(candidate: ProcessTableEntry, options: KillProcessOptions): Promise<boolean> {
+	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+		if (!(await options.isCurrentWorker(candidate))) {
+			if (!(await options.isAlive(candidate.pid))) return false;
+			throw new Error(`worker identity changed before ${signal} pid=${candidate.pid}`);
+		}
+
+		try {
+			if (options.kill) await options.kill(candidate.pid, signal);
+			else process.kill(candidate.pid, signal);
+		} catch {
+			// Check liveness after ESRCH, EPERM, or another signaling error before deciding what follows.
+		}
+
+		if (await waitForExit(candidate.pid, options.isAlive, options.timeoutMs)) return true;
+	}
+
+	throw new Error(`process ${candidate.pid} remained alive after SIGTERM and SIGKILL`);
+}
+
+async function waitForExit(
+	pid: number,
+	isAlive: (pid: number) => Promise<boolean>,
+	timeoutMs: number,
+): Promise<boolean> {
+	const deadline = Date.now() + Math.max(0, timeoutMs);
+	while (true) {
+		if (!(await isAlive(pid))) return true;
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return false;
+		await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, Math.min(25, remaining)));
+	}
 }
