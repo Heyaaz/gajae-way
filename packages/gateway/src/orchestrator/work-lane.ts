@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
 	type ChatMessagePayload,
@@ -189,18 +189,35 @@ interface StartContext {
  * This is the git root of the directory containing the running binary.
  */
 export function getServiceDirectory(): string {
+	// A source checkout runs this module from disk; a compiled binary embeds it under a
+	// virtual root, so fall back to the binary's own directory there. `process.execPath`
+	// alone is the bun runtime in a source checkout, never the service checkout.
+	const moduleDir = import.meta.dir;
+	const anchor = existsSync(moduleDir) ? moduleDir : dirname(process.execPath);
 	try {
-		const binaryDir = dirname(process.execPath);
-		// Find the git root by running git rev-parse --show-toplevel
-		const gitRoot = execSync("git rev-parse --show-toplevel", {
-			cwd: binaryDir,
-			encoding: "utf-8",
-		}).trim();
-		return gitRoot;
-	} catch (error) {
-		// If not in a git repo, return the binary directory
-		return dirname(process.execPath);
+		return execSync("git rev-parse --show-toplevel", { cwd: anchor, encoding: "utf-8" }).trim();
+	} catch {
+		return anchor;
 	}
+}
+
+/** Nearest existing ancestor's realpath with the missing tail re-appended. */
+function realpathOfPossiblyMissing(path: string): string {
+	const absolute = resolve(path);
+	let existing = absolute;
+	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+	return join(realpathSync(existing), absolute.slice(existing.length));
+}
+
+/** Refuses a lane path equal to or nested in the service checkout (issue #480). */
+export function assertOutsideServiceDirectory(serviceDirectory: string, path: string, name: string): void {
+	const serviceDir = realpathOfPossiblyMissing(serviceDirectory);
+	const candidate = realpathOfPossiblyMissing(path);
+	if (candidate === serviceDir || candidate.startsWith(`${serviceDir}/`))
+		throw new ProtocolError("invalid_params", "lane cwd cannot be inside service directory", {
+			reasonCode: "cwd_inside_service_dir",
+			name,
+		});
 }
 
 /** Attempt ownership is independent of sockets, response deadlines and broker generations. */
@@ -687,59 +704,15 @@ export class WorkLaneManager {
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
-		// Validate that cwd is not inside the service directory (issue #480)
-		// Use realpath to properly handle symlinks and .. sequences
-		try {
-			const serviceDir = realpathSync(this.#options.serviceDirectory);
-
-			// Get the realpath of cwd, handling non-existent paths
-			let cwdRealpath: string;
-			try {
-				cwdRealpath = realpathSync(input.cwd);
-			} catch (realpathError) {
-				// If realpath fails (e.g., path doesn't exist), resolve to absolute path
-				// and then try to resolve parent directories up to an existing ancestor
-				let current = resolve(input.cwd);
-				// Try to realpath the parent directories to handle the case where
-				// the path might be under a symlinked directory
-				while (current !== "/" && current !== dirname(current)) {
-					try {
-						const parent = dirname(current);
-						const realparent = realpathSync(parent);
-						// Reconstruct the path with the realpath of the parent
-						const relative = current.slice(parent.length);
-						current = realparent + relative;
-						break;
-					} catch {
-						current = dirname(current);
-					}
-				}
-				cwdRealpath = current;
-			}
-
-			// Normalize paths for comparison (remove trailing slashes)
-			const serviceDirNorm = serviceDir.endsWith("/") ? serviceDir.slice(0, -1) : serviceDir;
-			const cwdNorm = cwdRealpath.endsWith("/") ? cwdRealpath.slice(0, -1) : cwdRealpath;
-
-			// Refuse if cwd equals or is nested in service dir
-			if (cwdNorm === serviceDirNorm || cwdNorm.startsWith(`${serviceDirNorm}/`)) {
-				throw new ProtocolError("invalid_params", "lane cwd cannot be inside service directory", {
-					reasonCode: "cwd_inside_service_dir",
-					name: input.name,
-				});
-			}
-		} catch (error) {
-			// ProtocolError thrown by service dir validation should pass through
-			if (error instanceof ProtocolError) throw error;
-			throw new ProtocolError("invalid_params", `failed to validate lane cwd: ${error}`, {
-				reasonCode: "cwd_validation_failed",
-				name: input.name,
-			});
-		}
+		assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);
-		if (job && job.lane.worktreePath !== input.cwd)
+		// A repo-bound lane is identified by its repository; its cwd is the generated worktree.
+		if (
+			job &&
+			(job.lane.repository !== undefined ? job.lane.repository !== input.repo : job.lane.worktreePath !== input.cwd)
+		)
 			throw new ProtocolError("invalid_params", "work lane cwd mismatch", {
 				reasonCode: "lane_cwd_mismatch",
 				name: input.name,
@@ -769,6 +742,7 @@ export class WorkLaneManager {
 			if (input.repo !== undefined) {
 				const laneRoot = this.#options.laneRoot ?? this.#options.gajaewayHome;
 				worktreePath = await createWorktreeFromRepo(laneRoot, input.name, input.repo, input.base);
+				assertOutsideServiceDirectory(this.#options.serviceDirectory, worktreePath, input.name);
 			}
 			const facts = await collectRepoFacts(worktreePath);
 			job = createLaneJobRecord({
@@ -778,9 +752,9 @@ export class WorkLaneManager {
 				baselineSha: facts?.headSha,
 				...(input.repo !== undefined ? { repository: input.repo } : {}),
 			});
-			// Use the actual worktree path for binding, not the input cwd
-			input = { ...input, cwd: worktreePath };
 		}
+		// The session and the attempt share one path: the lane's recorded worktree (issue #480).
+		input = { ...input, cwd: job.lane.worktreePath };
 		const binding = await this.#port.runExclusive("work/admission", async () => {
 			this.#live();
 			this.#options.lanes.assertAdmission(input.name);

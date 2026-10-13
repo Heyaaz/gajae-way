@@ -1,7 +1,7 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
 import {
 	appendAttempt,
@@ -13,11 +13,16 @@ import {
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { classifyCheckRollup } from "../src/orchestrator/gh-checks";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
-import { parseWorkerOutputResponse, type SessionBindInput, type WorkerOutputResult } from "../src/orchestrator/session-port";
+import {
+	parseWorkerOutputResponse,
+	type SessionBindInput,
+	type WorkerOutputResult,
+} from "../src/orchestrator/session-port";
 import { RelayClosedError } from "../src/orchestrator/tail-runner";
 import {
 	type CheckStatusClient,
 	type CheckStatusSnapshot,
+	getServiceDirectory,
 	laneLastCommits,
 	laneSystemNotice,
 	reportText,
@@ -53,6 +58,9 @@ async function fixture(
 	const gajaewayHome = join(directory, "gajaeway");
 	// Create gajaewayHome directory for service directory validation tests
 	await mkdir(gajaewayHome, { recursive: true });
+	// The service checkout is a sibling of the lane root: lanes and their worktrees live outside it.
+	const serviceDirectory = join(directory, "service");
+	await mkdir(serviceDirectory, { recursive: true });
 	const db = await Store.open(join(directory, "gateway.db"));
 	const port = new ScriptedSessionPort({
 		...portOptions,
@@ -75,8 +83,7 @@ async function fixture(
 		pollMs: 5,
 		waitTimeoutMs: 2000,
 		deliverFallback: (payload) => notices.push(payload),
-		// Use gajaewayHome as the service directory for tests (for issue #480 validation)
-		serviceDirectory: gajaewayHome,
+		serviceDirectory,
 		...options,
 	});
 	cleanups.push(async () => {
@@ -92,6 +99,7 @@ async function fixture(
 		notices,
 		directory,
 		gajaewayHome,
+		serviceDirectory,
 		job,
 		get manager() {
 			return manager;
@@ -103,8 +111,7 @@ async function fixture(
 				port,
 				lanes,
 				gajaewayHome,
-				// Use gajaewayHome as the service directory for tests (for issue #480 validation)
-				serviceDirectory: gajaewayHome,
+				serviceDirectory,
 				ownerTarget,
 				pollMs: 5,
 				deliverFallback: (payload) => notices.push(payload),
@@ -1040,7 +1047,14 @@ test("invalid shared parameters have no bind/send effects and manager registrati
 	expect(f.port.binds).toHaveLength(0);
 	expect(f.port.sends).toHaveLength(0);
 	expect(
-		() => new WorkLaneManager({ database: f.db, port: f.port, lanes: f.lanes, gajaewayHome: f.gajaewayHome, serviceDirectory: f.gajaewayHome }),
+		() =>
+			new WorkLaneManager({
+				database: f.db,
+				port: f.port,
+				lanes: f.lanes,
+				gajaewayHome: f.gajaewayHome,
+				serviceDirectory: f.serviceDirectory,
+			}),
 	).toThrow("already registered");
 });
 
@@ -1093,20 +1107,6 @@ test("nested starts refuse self and ancestor cycles before binding", async () =>
 	expect(f.port.sendAttempts).toHaveLength(sends);
 });
 
-test("issue #480: cwd inside service directory is refused", async () => {
-	const f = await fixture();
-	const insideServiceDir = join(f.gajaewayHome, "nested");
-	await expect(
-		f.manager.start({ name: "a", text: "work inside service dir", cwd: insideServiceDir }),
-	).rejects.toMatchObject({
-		code: "invalid_params",
-		message: "lane cwd cannot be inside service directory",
-		detail: { reasonCode: "cwd_inside_service_dir" },
-	});
-	expect(f.port.binds).toHaveLength(0);
-	expect(f.port.sends).toHaveLength(0);
-});
-
 test("issue #480: repository binding is stored in job record", async () => {
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-binding-"));
 	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-binding-"));
@@ -1144,15 +1144,6 @@ test("issue #480: repository binding is stored in job record", async () => {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
 	}
-});
-
-test("issue #480: cwd equals service directory is refused", async () => {
-	const f = await fixture();
-	await expect(f.manager.start({ name: "a", text: "work", cwd: f.gajaewayHome })).rejects.toMatchObject({
-		code: "invalid_params",
-		message: "lane cwd cannot be inside service directory",
-		detail: { reasonCode: "cwd_inside_service_dir" },
-	});
 });
 
 test("run of the caller's own open lane is attempt_open, not a cycle", async () => {
@@ -2815,9 +2806,8 @@ test("issue #480: session binding uses worktree path, not input cwd", async () =
 
 		// Verify that the bind call received the worktree path, not the input cwd
 		const bindCall = bindCalls[bindCalls.length - 1]; // Last bind call should be for our lane
-		expect(bindCall).toBeDefined();
-		expect(bindCall!.repo).toBe(worktreePath); // Should be worktree path, not f.directory
-		expect(bindCall!.repo).not.toBe(f.directory); // Explicitly verify it's not the input cwd
+		expect(bindCall?.repo).toBe(worktreePath);
+		expect(bindCall?.repo).not.toBe(f.directory);
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
@@ -2885,4 +2875,82 @@ test("issue #480: all-dead retirement cleans up worktree", async () => {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
 	}
+});
+
+async function bareRepoFixture(prefix: string): Promise<{ bareRepo: string; cleanup: () => Promise<void> }> {
+	const repoDir = await mkdtemp(join(tmpdir(), `${prefix}-src-`));
+	const bareRepo = await mkdtemp(join(tmpdir(), `${prefix}-bare-`));
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	Bun.spawnSync(["git", "-C", repoDir, "init", "-q"], { env });
+	Bun.spawnSync(["git", "-C", repoDir, "commit", "-q", "--allow-empty", "-m", "initial"], { env });
+	Bun.spawnSync(["git", "clone", "-q", "--bare", repoDir, bareRepo], { env });
+	return {
+		bareRepo,
+		cleanup: async () => {
+			await rm(repoDir, { recursive: true, force: true });
+			await rm(bareRepo, { recursive: true, force: true });
+		},
+	};
+}
+
+test("issue #480: a lane cwd inside the service checkout is refused", async () => {
+	const f = await fixture();
+	const inside = join(f.serviceDirectory, "packages", "gateway");
+	await mkdir(inside, { recursive: true });
+	for (const cwd of [f.serviceDirectory, inside, join(f.serviceDirectory, "not-yet-created")]) {
+		await expect(f.manager.start({ name: "a", text: "work", cwd })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir", name: "a" },
+		});
+	}
+	expect(f.port.binds).toHaveLength(0);
+	expect(f.port.sends).toHaveLength(0);
+});
+
+test("issue #480: a generated worktree inside the service checkout is refused", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("svc-worktree");
+	try {
+		const f = await fixture();
+		const manager = await f.restart({ laneRoot: join(f.serviceDirectory, "lanes-root") });
+		await expect(manager.start({ name: "a", text: "work", cwd: f.directory, repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir" },
+		});
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: re-starting a repo-bound lane is matched by repository, not by the caller cwd", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("rebind");
+	try {
+		const f = await fixture();
+		const first = await f.manager.start({ name: "a", text: "work", cwd: f.directory, repo: bareRepo });
+		expect(first.started).toBe(true);
+		// Same repository from the same caller cwd: the lane is recognized (its attempt is still
+		// open), not rejected as a cwd mismatch against the generated worktree path.
+		await expect(f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: bareRepo })).rejects.toMatchObject(
+			{ detail: { reasonCode: "attempt_open" } },
+		);
+		// A different repository for the same lane name is a mismatch.
+		await expect(
+			f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: `${bareRepo}-other` }),
+		).rejects.toMatchObject({ detail: { reasonCode: "lane_cwd_mismatch" } });
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: the production service directory is this source checkout, not the bun runtime", () => {
+	const root = Bun.spawnSync(["git", "-C", import.meta.dir, "rev-parse", "--show-toplevel"])
+		.stdout.toString()
+		.trim();
+	expect(getServiceDirectory()).toBe(root);
+	expect(getServiceDirectory()).not.toBe(dirname(process.execPath));
 });

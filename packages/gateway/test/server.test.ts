@@ -1671,7 +1671,13 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	});
 	expect(sessionPort.sends[0]).toMatchObject({ text: "fix the bug", repo: "/tmp/some-repo", codingRegister: true });
 	// Invalid names are rejected before touching the SessionPort.
-	client.send({ v: "0.1", type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "bad",
+		verb: "work.run",
+		params: { cwd: directory, name: "../evil", text: "x" },
+	});
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
 	client.close();
@@ -1706,7 +1712,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		type: "request",
 		id: "w",
 		verb: "work.run",
-		params: { name: "Repo.Fix-2", text: "fix the bug" },
+		params: { cwd: directory, name: "Repo.Fix-2", text: "fix the bug" },
 	});
 	await runResponse;
 	const run = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
@@ -1738,7 +1744,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	expect(parsed.attempts).toHaveLength(1);
 	expect(parsed.attempts[0].endState).toBe("completed");
 	expect(parsed.attempts[0].sessionId).toBe("0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0");
-	expect(parsed.lane.worktreePath).toBe(process.cwd());
+	expect(parsed.lane.worktreePath).toBe(directory);
 
 	// Reopening a settled tombstone by editing history is corruption, not a
 	// crash predecessor. Neither an ordinary request nor resume may repair it.
@@ -1764,7 +1770,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 			type: "request",
 			id,
 			verb: "work.run",
-			params: { name: "Repo.Fix-2", text: "again", resume },
+			params: { cwd: directory, name: "Repo.Fix-2", text: "again", resume },
 		});
 		await waitFrame(client.frames, id);
 		expect(client.frames.find((frame) => frame.id === id)).toMatchObject({
@@ -1965,7 +1971,13 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
-	client.send({ v: "0.1", type: "request", id: "w", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-out", text: "x" },
+	});
 	await waitFor(client.frames, 2);
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w")).toBeDefined();
 	// Simulate the reconciliation outcome after repeated stalled continuations.
@@ -1983,7 +1995,13 @@ test("a stalled durable job holds the next work.run until resume (production pat
 			json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
 		}),
 	);
-	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w2",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-out", text: "x" },
+	});
 	async function waitId2(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
 			await Bun.sleep(5);
@@ -1999,7 +2017,7 @@ test("a stalled durable job holds the next work.run until resume (production pat
 		type: "request",
 		id: "w3",
 		verb: "work.run",
-		params: { name: "stall-out", text: "x", resume: true },
+		params: { cwd: directory, name: "stall-out", text: "x", resume: true },
 	});
 	await waitId2("w3");
 	expect(
@@ -2038,7 +2056,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	const jobId = `lanejob-${Buffer.from("stall-clear", "utf8").toString("hex")}`;
 
 	// First run succeeds (creates the job).
-	client.send({ v: "0.1", type: "request", id: "w1", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w1",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-clear", text: "x" },
+	});
 	async function waitId3(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
 			await Bun.sleep(5);
@@ -2060,7 +2084,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	);
 
 	// Ordinary call: held.
-	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w2",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-clear", text: "x" },
+	});
 	await waitId3("w2");
 	expect(client.frames.find((frame) => frame.id === "w2" && frame.type === "response")?.result).toMatchObject({
 		held: true,
@@ -2074,7 +2104,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 		type: "request",
 		id: "w3",
 		verb: "work.run",
-		params: { name: "stall-clear", text: "x", resume: true },
+		params: { cwd: directory, name: "stall-clear", text: "x", resume: true },
 	});
 	await waitId3("w3");
 	expect(client.frames.find((frame) => frame.id === "w3" && frame.type === "response")?.result).toMatchObject({
@@ -2086,7 +2116,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	expect(afterResume.escalations.some((entry) => entry.includes("operator resume acknowledged"))).toBe(true);
 
 	// The NEXT ordinary call is not held by the old stalled state.
-	client.send({ v: "0.1", type: "request", id: "w4", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w4",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-clear", text: "x" },
+	});
 	await waitId3("w4");
 	expect(client.frames.find((frame) => frame.id === "w4" && frame.type === "response")?.result).toMatchObject({
 		held: false,
@@ -2137,7 +2173,7 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 			type: "request",
 			id,
 			verb: "work.run",
-			params: { name: "model", text: "work", model },
+			params: { cwd: directory, name: "model", text: "work", model },
 		});
 		await waitFor(client.frames, 3 + index);
 		expect(client.frames.find((frame) => frame.id === id)).toMatchObject({
