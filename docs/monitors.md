@@ -1,6 +1,6 @@
 # Monitors
 
-A monitor turns an external or scheduled signal into a Gajae-authored event. It has a name, one trigger, a non-empty list of declared event types, an optional burst policy, and at most one output target. A cron is simply a monitor whose trigger is periodic.
+A monitor turns an external or scheduled signal into a Gajae-authored event. It has a name, one trigger, a non-empty list of declared event types, an optional burst policy, and at most one external channel-delivery target. A cron is simply a monitor whose trigger is periodic.
 
 ## MonitorSpec and triggers
 
