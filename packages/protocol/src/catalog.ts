@@ -852,7 +852,7 @@ export interface EngagementReactionParams {
 	readonly origin: OriginRef;
 	/** Platform id of the message that was reacted to. */
 	readonly targetMessageId: string;
-	/** Raw platform emoji as the reactor sent it; not restricted to the allowlist. */
+	/** Raw platform emoji as the reactor sent it; custom emoji without Unicode use `custom:<name>`. */
 	readonly emoji: string;
 	readonly action: ReactionAction;
 	readonly engagement: EngagementContext;

@@ -52,9 +52,10 @@ export function reactionFromSlackName(
 	const mapped = reverseNames.get(base === "thumbsup" ? "+1" : base === "thumbsdown" ? "-1" : base);
 	if (mapped) return mapped;
 
-	// Custom emoji: not in our reverse mapping, so return with custom: prefix
-	// to match Discord convention and ensure it won't be confused with allowlisted names.
-	return { emoji: `:${base}:`, emojiName: `custom:${base}` };
+	// Custom emoji have no portable Unicode spelling. Use the same explicit form
+	// as Discord so the persona cannot echo `:name:` as literal message text.
+	const customName = `custom:${base}`;
+	return { emoji: customName, emojiName: customName };
 }
 
 export interface SlackReactionEvent {
