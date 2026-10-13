@@ -2737,6 +2737,33 @@ test("case-distinct lane names create distinct encoded worktree directories", as
 	}
 });
 
+test("work.start normalizes a nested local repository path to its checkout root", async () => {
+	const { repoDir, cleanup } = await bareRepoFixture("nested-repo-path");
+	try {
+		const nestedPath = join(repoDir, "src");
+		await mkdir(nestedPath);
+		const f = await fixture();
+		const name = "nested-repo-path";
+		const result = await f.manager.start({ name, text: "work", repo: nestedPath });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const sourceHead = Bun.spawnSync(["git", "-C", repoDir, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(sourceHead.exitCode).toBe(0);
+		expect(job.baselineSha).toBe(sourceHead.stdout?.toString().trim());
+		expect(job.lane.repository).toBe(nestedPath);
+		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(originUrl.stdout?.toString().trim()).toBe(repoDir);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("work.start with invalid repo throws invalid_params with git stderr", async () => {
 	const f = await fixture();
 	const invalidRepo = "/nonexistent/repo";

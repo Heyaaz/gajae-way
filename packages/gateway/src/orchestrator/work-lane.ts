@@ -2630,6 +2630,7 @@ async function createWorktreeFromRepo(
 	const lanesDir = join(absoluteLaneRoot, "lanes");
 	const worktreePath = managedLaneWorktreePath(absoluteLaneRoot, laneName);
 	const isRemote = isGitRemoteUrl(repo);
+	let sourceRepository = repo;
 	const repositoryPath = managedLaneRepositoryPath(absoluteLaneRoot, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, worktreePath, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, repositoryPath, laneName);
@@ -2666,10 +2667,15 @@ async function createWorktreeFromRepo(
 					stderr,
 				});
 			}
+			const sourceRoot = Bun.spawnSync(["git", "-C", repo, "rev-parse", "--show-toplevel"], {
+				stdout: "pipe",
+				stderr: "ignore",
+			});
+			sourceRepository = sourceRoot.exitCode === 0 ? resolve(sourceRoot.stdout.toString().trim()) : resolve(repo);
 			const remoteHead = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], {
 				stdout: "pipe",
 				stderr: "pipe",
-				cwd: repo,
+				cwd: sourceRepository,
 			});
 			if (remoteHead.exitCode === 0) {
 				const match = remoteHead.stdout
@@ -2682,7 +2688,7 @@ async function createWorktreeFromRepo(
 				const head = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], {
 					stdout: "pipe",
 					stderr: "pipe",
-					cwd: repo,
+					cwd: sourceRepository,
 				});
 				if (head.exitCode === 0) defaultRef = head.stdout?.toString().trim() || undefined;
 			}
@@ -2699,7 +2705,7 @@ async function createWorktreeFromRepo(
 			});
 		}
 		ownsRepositoryPath = true;
-		const cloneArgs = ["git", "clone", "--bare", "--", repo, repositoryPath];
+		const cloneArgs = ["git", "clone", "--bare", "--", sourceRepository, repositoryPath];
 		let cloneExitCode: number;
 		let cloneStderr: string;
 		try {
@@ -2737,7 +2743,7 @@ async function createWorktreeFromRepo(
 		}
 		if (!isRemote) {
 			// Cloning a local checkout makes that path origin; retain its configured upstream URLs instead.
-			const sourceFetchUrls = Bun.spawnSync(["git", "-C", repo, "remote", "get-url", "--all", "origin"], {
+			const sourceFetchUrls = Bun.spawnSync(["git", "-C", sourceRepository, "remote", "get-url", "--all", "origin"], {
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -2747,7 +2753,7 @@ async function createWorktreeFromRepo(
 					.split(/\r?\n/)
 					.map((url) => url.trim())
 					.filter(Boolean)
-					.map((url) => resolveLocalRemoteUrl(repo, url));
+					.map((url) => resolveLocalRemoteUrl(sourceRepository, url));
 				for (const [index, fetchUrl] of fetchUrls.entries()) {
 					const setFetchUrl = Bun.spawnSync(
 						index === 0
@@ -2763,17 +2769,17 @@ async function createWorktreeFromRepo(
 					}
 				}
 			}
-			const sourcePushUrls = Bun.spawnSync(["git", "-C", repo, "remote", "get-url", "--push", "--all", "origin"], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
+			const sourcePushUrls = Bun.spawnSync(
+				["git", "-C", sourceRepository, "remote", "get-url", "--push", "--all", "origin"],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
 			if (sourcePushUrls.exitCode === 0) {
 				for (const pushUrl of sourcePushUrls.stdout
 					.toString()
 					.split(/\r?\n/)
 					.map((url) => url.trim())
 					.filter(Boolean)
-					.map((url) => resolveLocalRemoteUrl(repo, url))) {
+					.map((url) => resolveLocalRemoteUrl(sourceRepository, url))) {
 					const setPushUrl = Bun.spawnSync(["git", "remote", "set-url", "--add", "--push", "origin", pushUrl], {
 						stdout: "pipe",
 						stderr: "pipe",
@@ -2797,12 +2803,12 @@ async function createWorktreeFromRepo(
 			if (localDefaultBranchCheck.exitCode !== 0) {
 				const sourceDefaultRef = `refs/remotes/origin/${defaultRef}`;
 				const sourceDefaultRefCheck = Bun.spawnSync(
-					["git", "-C", repo, "rev-parse", "--verify", "--quiet", `${sourceDefaultRef}^{commit}`],
+					["git", "-C", sourceRepository, "rev-parse", "--verify", "--quiet", `${sourceDefaultRef}^{commit}`],
 					{ stdout: "ignore", stderr: "ignore" },
 				);
 				if (sourceDefaultRefCheck.exitCode === 0) {
 					const materializeDefault = Bun.spawnSync(
-						["git", "fetch", "--no-tags", "--", repo, `+${sourceDefaultRef}:${localDefaultBranch}`],
+						["git", "fetch", "--no-tags", "--", sourceRepository, `+${sourceDefaultRef}:${localDefaultBranch}`],
 						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
 					);
 					if (materializeDefault.exitCode !== 0) {
@@ -2845,15 +2851,14 @@ async function createWorktreeFromRepo(
 			if (!isRemote) {
 				const sourceRef = `refs/remotes/${baseRef}`;
 				const sourceRefCheck = Bun.spawnSync(
-					["git", "-C", repo, "rev-parse", "--verify", "--quiet", `${sourceRef}^{commit}`],
+					["git", "-C", sourceRepository, "rev-parse", "--verify", "--quiet", `${sourceRef}^{commit}`],
 					{ stdout: "ignore", stderr: "ignore" },
 				);
 				if (sourceRefCheck.exitCode === 0) {
-					const fetch = Bun.spawnSync(["git", "fetch", "--no-tags", "--", repo, `+${sourceRef}:${localBranch}`], {
-						stdout: "pipe",
-						stderr: "pipe",
-						cwd: repositoryPath,
-					});
+					const fetch = Bun.spawnSync(
+						["git", "fetch", "--no-tags", "--", sourceRepository, `+${sourceRef}:${localBranch}`],
+						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+					);
 					if (fetch.exitCode !== 0) {
 						throw new ProtocolError(
 							"invalid_params",
