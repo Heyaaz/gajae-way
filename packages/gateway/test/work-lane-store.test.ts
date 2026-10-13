@@ -1,11 +1,13 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { bootGateway } from "../src/boot";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
+import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
@@ -36,7 +38,7 @@ async function fixture() {
 	const path = join(directory, "gateway.db");
 	const database = await Store.open(path);
 	handles.push(database);
-	const canonicalAgentDir = join(directory, "agent");
+	const canonicalAgentDir = join(await realpath(directory), "agent");
 	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
 	database.transaction((tx) =>
 		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
@@ -116,7 +118,7 @@ async function fixture() {
 		},
 		fallbackPayload: payload,
 	};
-	return { path, database, raw, authority, record, runtime, closed, settlement, payload, admission };
+	return { directory, path, database, raw, authority, record, runtime, closed, settlement, payload, admission };
 }
 
 function touchWorkSession(database: Store, tx: WriteTx, runtime: WorkAttemptRuntime, at: string): void {
@@ -234,6 +236,132 @@ function seedLinkedWakeReport(
 		);
 	return reportId;
 }
+
+describe("work attempt boot reconciliation", () => {
+	test("reconciliation restores a settled attempt when only its database column is torn", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+		);
+		const deliveries = f.database.outbox.rows();
+		f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?").run(f.runtime.opRef);
+
+		const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx, () => {}));
+		expect(reconciled).toBe(1);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(END);
+		expect(f.database.outbox.rows()).toEqual(deliveries);
+	});
+
+	test("reconciliation settles a stale database column without replaying the open attempt", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.raw.query("UPDATE work_attempt_runtime SET settled_at = ? WHERE op_ref = ?").run(END, f.runtime.opRef);
+
+		const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx));
+		expect(reconciled).toBe(1);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
+			decision: "recovery_indeterminate",
+			settledAt: END,
+			terminal: { reasonCode: "recovery_indeterminate" },
+		});
+		const historyJson = f.database.work.laneJobJson(f.runtime.jobId);
+		expect(historyJson).toBeDefined();
+		if (historyJson === undefined) throw new Error("reconciled lane history is missing");
+		expect(parseLaneJobRecord(historyJson).attempts[0]?.endedAt).toBe(END);
+		expect(f.database.work.workAttemptOpen()).toEqual([]);
+	});
+
+	test("boot heals a torn work-history settlement before normal recovery starts", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, {
+				...f.closed,
+				laneKey: f.runtime.laneKey,
+				json: JSON.stringify(f.closed),
+			}),
+		);
+		await mkdir(f.authority.canonicalAgentDir, { recursive: true });
+		await Bun.write(
+			join(f.directory, "config.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				dbPath: f.path,
+				gjc: { agentDir: f.authority.canonicalAgentDir },
+			}),
+		);
+		const server = await bootGateway({
+			home: f.directory,
+			broker: {
+				executable: "/test-only/gjc",
+				command: async (args) => ({
+					exitCode: 0,
+					stdout:
+						args[0] === "--version"
+							? `gjc/${readPinnedGjcVersion()}\n`
+							: JSON.stringify({ ok: true, result: { sessions: [] } }),
+					stderr: "",
+				}),
+				healthProbe: async () => true,
+				discovery: async () => ({
+					pid: 1,
+					url: "ws://127.0.0.1:1",
+					token: "test-only",
+					heartbeatAt: Date.now(),
+				}),
+				healthIntervalMs: 60_000,
+				log: () => {},
+			},
+		});
+		try {
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
+				decision: "recovery_indeterminate",
+				settledAt: END,
+				terminal: { reasonCode: "recovery_indeterminate" },
+			});
+			expect(f.database.work.workAttemptOpen()).toEqual([]);
+		} finally {
+			await server.stop("test shutdown");
+		}
+	});
+
+	test("a torn unaccepted wake is held for operator recovery instead of discarded", async () => {
+		const f = await fixture();
+		const wakeReportId = seedLinkedWakeReport(f, null);
+		const runtime = { ...f.runtime, parent: null, wakeReportId };
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
+		const history = closeAttempt({
+			record: f.record,
+			opRef: runtime.opRef,
+			endState: "terminal_uncertain",
+			errorCode: "recovery_indeterminate",
+			endedAt: END,
+		});
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, { ...history, laneKey: runtime.laneKey, json: JSON.stringify(history) }),
+		);
+
+		const lines: string[] = [];
+		const reconciled = f.database.transaction((tx) =>
+			f.database.work.workAttemptReconcile(tx, (line) => lines.push(line)),
+		);
+		expect(reconciled).toBe(1);
+		expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({
+			decision: "wake_unaccepted",
+			settledAt: END,
+			terminal: { reasonCode: "recovery_indeterminate" },
+		});
+		expect(f.database.work.laneReportGet(wakeReportId)).toMatchObject({
+			state: "held",
+			hold_reason: "wake_acceptance_uncertain",
+			claim_ref: runtime.opRef,
+		});
+		expect(f.database.work.workAttemptOpen()).toEqual([]);
+		expect(f.database.outbox.rows()).toEqual([]);
+		expect(lines).toEqual(["work_attempt_runtime_reconciled count=1"]);
+	});
+});
 
 describe("work attempt durable transactions", () => {
 	for (const mode of ["start", "run"] as const) {

@@ -8,6 +8,7 @@ import {
 } from "@gajae-gateway/protocol";
 import {
 	assertValidOpRef,
+	closeAttempt,
 	type LaneJobRecord,
 	type PromptStatusBody,
 	parseLaneJobRecord,
@@ -25,7 +26,8 @@ export type WorkAttemptDecision =
 	| "fallback"
 	| "suppressed"
 	| "no_target"
-	| "wake_unaccepted";
+	| "wake_unaccepted"
+	| "recovery_indeterminate";
 export type WorkAttemptRequestedDecision = "report" | "suppressed" | "no_target" | "wake_unaccepted";
 
 export interface WorkReportRoot {
@@ -342,7 +344,15 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 	workAssert(output.disposition !== "available" || (output.proof !== null && output.excerpt !== null));
 	workAssert(output.disposition !== "silent" || output.knownSilence !== null);
 	workAssert(
-		["undecided", "reported", "fallback", "suppressed", "no_target", "wake_unaccepted"].includes(value.decision),
+		[
+			"undecided",
+			"reported",
+			"fallback",
+			"suppressed",
+			"no_target",
+			"wake_unaccepted",
+			"recovery_indeterminate",
+		].includes(value.decision),
 	);
 	workAssert(value.decision === "undecided" ? value.settledAt === null : workTime(value.settledAt));
 	if (value.decision !== "undecided") {
@@ -366,6 +376,7 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 				(value.wakeReportId !== null && value.mode === "start" && value.terminal !== null && !workAccepted(value)),
 		);
 		workAssert(value.wakeReportId === null || workAccepted(value) || value.decision === "wake_unaccepted");
+		if (value.decision === "recovery_indeterminate") workAssert(output.proof === null && output.knownSilence === null);
 	}
 	workAssert(Buffer.byteLength(JSON.stringify(value), "utf8") <= 16384);
 }
@@ -509,6 +520,138 @@ export class WorkGroup {
 				error instanceof WorkAttemptStateError ? error.assertion : "runtime record parsing",
 			);
 		}
+	}
+
+	/** Repair torn settlement timestamps before normal recovery starts. */
+	workAttemptReconcile(tx: WriteTx, log: (line: string) => void = console.error): number {
+		const rows = this.#db
+			.prepare(
+				"SELECT op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json FROM work_attempt_runtime WHERE settled_at IS NULL OR CASE WHEN json_valid(record_json) THEN settled_at IS NOT json_extract(record_json, '$.settledAt') ELSE 0 END",
+			)
+			.all() as Array<{
+			op_ref: string;
+			job_id: string;
+			lane_key: string;
+			session_id: string;
+			version: number;
+			settled_at: string | null;
+			delivery_id: string;
+			record_json: string;
+		}>;
+		let reconciled = 0;
+		const skipped: string[] = [];
+		const updates: {
+			runtime: WorkAttemptRuntime;
+			next: WorkAttemptRuntime;
+			history: LaneJobRecord;
+			priorSettledAt: string | null;
+		}[] = [];
+
+		for (const row of rows) {
+			try {
+				const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
+				validateWorkRuntime(runtime, this.instanceId);
+				workAssert(
+					runtime.opRef === row.op_ref &&
+						runtime.jobId === row.job_id &&
+						runtime.laneKey === row.lane_key &&
+						runtime.sessionId === row.session_id &&
+						runtime.version === row.version &&
+						runtime.deliveryId === row.delivery_id,
+				);
+				const json = this.laneJobJson(runtime.jobId);
+				workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+				const record = parseLaneJobRecord(json);
+				const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
+				workAssert(attempt !== undefined);
+				this.#workValidateHistory({ ...runtime, settledAt: attempt.endedAt ?? null }, record);
+				if (attempt.endedAt === undefined && runtime.settledAt === null && row.settled_at === null) continue;
+				this.#assertNotQuarantined(runtime.jobId);
+
+				const settledAt = runtime.terminal?.observedAt ?? attempt.endedAt ?? row.settled_at ?? runtime.settledAt;
+				workAssert(settledAt !== undefined && settledAt !== null && workTime(settledAt));
+				const terminal = runtime.terminal ?? {
+					kind: "local" as const,
+					reasonCode: "recovery_indeterminate",
+					observedAt: settledAt,
+				};
+				const decision =
+					runtime.decision !== "undecided"
+						? runtime.decision
+						: runtime.wakeReportId !== null && !workAccepted(runtime)
+							? "wake_unaccepted"
+							: "recovery_indeterminate";
+				const next: WorkAttemptRuntime = {
+					...runtime,
+					terminal,
+					output:
+						runtime.output.disposition === "pending"
+							? { ...runtime.output, disposition: "unavailable", nextReadAt: null }
+							: runtime.output,
+					decision,
+					settledAt,
+				};
+				validateWorkRuntime(next, this.instanceId);
+				const history: LaneJobRecord =
+					attempt.endedAt === undefined
+						? closeAttempt({
+								record,
+								opRef: runtime.opRef,
+								endState: "terminal_uncertain",
+								errorCode: "recovery_indeterminate",
+								endedAt: settledAt,
+							})
+						: {
+								...record,
+								attempts: record.attempts.map((item) =>
+									item.opRef === runtime.opRef ? { ...item, endedAt: settledAt } : item,
+								),
+							};
+				this.#workValidateHistory(next, history);
+				if (next.wakeReportId !== null) {
+					const report = this.#laneReportGetInside(next.wakeReportId);
+					workAssert(report?.claim_kind === "wake" && report.claim_ref === next.opRef);
+					if (workAccepted(next)) {
+						workAssert(
+							report.state === "claimed" ||
+								report.state === "held" ||
+								(report.state === "consumed" && report.consumed_op_ref === next.opRef),
+						);
+					} else {
+						workAssert(
+							report.state === "claimed" ||
+								(report.state === "held" && report.hold_reason === "wake_acceptance_uncertain"),
+						);
+					}
+				}
+				updates.push({ runtime, next, history, priorSettledAt: row.settled_at });
+			} catch (error) {
+				skipped.push(row.op_ref);
+				log(
+					`work_attempt_reconcile_skip opRef=${row.op_ref} reason=${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+
+		for (const { runtime, next, history, priorSettledAt } of updates) {
+			const changed = this.#db
+				.prepare("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ? WHERE op_ref = ? AND settled_at IS ?")
+				.run(tx, JSON.stringify(next), next.settledAt, runtime.opRef, priorSettledAt).changes;
+			workAssert(changed === 1);
+			this.#workPutHistory(tx, next, history);
+			if (next.wakeReportId !== null) {
+				if (workAccepted(next)) this.#consumeWakeReport(tx, next);
+				else workAssert(this.laneReportHold(tx, next.wakeReportId, "wake_acceptance_uncertain"));
+			}
+			reconciled++;
+		}
+
+		if (skipped.length > 0)
+			log(
+				`work_attempt_reconcile_report reconciled=${reconciled} skipped=${skipped.length} opRefs=${skipped.join(",")}`,
+			);
+		log(`work_attempt_runtime_reconciled count=${reconciled}`);
+		return reconciled;
 	}
 
 	/** Keyset pagination keeps recovery reads bounded; invalid rows can be quarantined by the caller. */
