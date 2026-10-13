@@ -93,7 +93,8 @@ $GAJAEWAY_HOME/
   adapter-slack.json
   adapters/discord/recovery-cursor.json
   broker.env                 # optional protected environment for the broker service
-  adapters/slack/recovery-cursor.json
+  adapters/slack/recovery-cursor.json  # Slack missed-message watermarks
+  attachments/telegram/<chat>/  # inbound Telegram photos/files (owner-only, pruned after 7 days)
   gateway.sock
   gateway.db                 # live SQLite WAL/SHM sidecars may also be present
   leases/
