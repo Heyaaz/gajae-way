@@ -249,3 +249,33 @@ for (const [sessions, field] of [
 		expect(parse).toThrow(field);
 	});
 }
+
+test("sqlite journalMode accepts only durable modes and requires restart when changed", async () => {
+	for (const [mode, expected] of [
+		["DELETE", "DELETE"],
+		["delete", "DELETE"],
+		["TRUNCATE", "TRUNCATE"],
+		["PERSIST", "PERSIST"],
+		["wal", "WAL"],
+	] as const) {
+		expect(parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: mode } }).sqlite?.journalMode).toBe(expected);
+	}
+	for (const mode of ["INVALID", "wal2", "MEMORY", "memory", "OFF", "off"])
+		expect(() => parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: mode } })).toThrow(
+			/sqlite\.journalMode must be one of/,
+		);
+	expect(() => parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: "" } })).toThrow(
+		"sqlite.journalMode must be a non-empty string",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: "WAL", extra: true } })).toThrow(
+		"sqlite may only contain journalMode",
+	);
+
+	const path = await home();
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, sqlite: { journalMode: "WAL" } }));
+	const current = await loadConfig({ home: path });
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, sqlite: { journalMode: "DELETE" } }));
+	const result = await reloadConfig(current);
+	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["sqlite"] });
+	if (result.ok) expect(result.config.sqlite).toEqual({ journalMode: "WAL" });
+});

@@ -16,6 +16,7 @@ import {
 	RuntimeConfigError,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
+import { isSqliteJournalMode, SQLITE_JOURNAL_MODES, type SqliteJournalMode } from "./sqlite-journal";
 
 export type { RuntimeConfig } from "@gajae-gateway/protocol";
 export const CONFIG_SCHEMA_VERSION = 1;
@@ -127,6 +128,8 @@ export interface GatewayConfigFile {
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
 	/** Optional absolute path override for the broker agent directory. */
 	readonly gjc?: { readonly agentDir?: string } | undefined;
+	/** SQLite journal mode; defaults to WAL. */
+	readonly sqlite?: { readonly journalMode?: SqliteJournalMode };
 }
 
 export interface MonitorCatchUpConfig {
@@ -589,6 +592,22 @@ function parseGjcConfig(value: unknown): { readonly agentDir?: string } | undefi
 	return undefined;
 }
 
+function parseSqliteConfig(value: unknown): { readonly journalMode?: SqliteJournalMode } | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "sqlite");
+	if (Object.keys(input).some((key) => key !== "journalMode"))
+		throw new ConfigError("config_invalid", "sqlite may only contain journalMode");
+	const journalMode = optionalString(input.journalMode, "sqlite.journalMode");
+	if (journalMode === undefined) return undefined;
+	const normalized = journalMode.toUpperCase();
+	if (!isSqliteJournalMode(normalized))
+		throw new ConfigError(
+			"config_invalid",
+			`sqlite.journalMode must be one of ${SQLITE_JOURNAL_MODES.join(", ")}, got ${journalMode}`,
+		);
+	return { journalMode: normalized };
+}
+
 export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const input = requireObject(value, "config");
 	if (input.schemaVersion !== CONFIG_SCHEMA_VERSION) {
@@ -613,6 +632,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const model = parseModel(input.model);
 	const serviceTier = parseServiceTier(input.serviceTier);
 	const runtime = parseRuntimeConfig(input.runtime);
+	const sqlite = parseSqliteConfig(input.sqlite);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
@@ -636,6 +656,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
 		...(input.sessions === undefined ? {} : { sessions: parseSessions(input.sessions) }),
+		...(sqlite === undefined ? {} : { sqlite }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
 		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 		...(input.monitorContextFailureRollThreshold === undefined
@@ -777,6 +798,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"work",
 	"interimSpeech",
 	"gjc",
+	"sqlite",
 ] as const;
 
 /**

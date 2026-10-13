@@ -204,3 +204,46 @@ test("refuses a database from a newer schema", async () => {
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("configures SQLite journal mode and changes an existing WAL database", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-journal-mode-"));
+	try {
+		const walPath = join(directory, "wal.db");
+		const wal = await Store.open(walPath);
+		const schemaVersion = wal.schemaVersion;
+		expect(wal.core.getJournalMode()).toBe("wal");
+		wal.close();
+
+		const deletePath = join(directory, "delete.db");
+		const deleteStore = await Store.open(deletePath, { journalMode: "DELETE" });
+		expect(deleteStore.core.getJournalMode()).toBe("delete");
+		deleteStore.close();
+
+		for (const mode of ["TRUNCATE", "PERSIST"] as const) {
+			const path = join(directory, `${mode.toLowerCase()}.db`);
+			const store = await Store.open(path, { journalMode: mode });
+			expect(store.core.getJournalMode()).toBe(mode.toLowerCase());
+			store.close();
+		}
+
+		const reopened = await Store.open(walPath, { journalMode: "DELETE" });
+		expect(reopened.schemaVersion).toBe(schemaVersion);
+		expect(reopened.core.getJournalMode()).toBe("delete");
+		reopened.close();
+
+		await expect(Store.open(join(directory, "invalid.db"), { journalMode: "OFF" as never })).rejects.toThrow(
+			/sqlite\.journalMode must be one of/,
+		);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("allows SQLite's intrinsic memory journal mode for an in-memory store", async () => {
+	const store = await Store.open(":memory:");
+	try {
+		expect(store.core.getJournalMode()).toBe("memory");
+	} finally {
+		store.close();
+	}
+});

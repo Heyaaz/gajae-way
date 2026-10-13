@@ -3,6 +3,7 @@ import { lstatSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { isSqliteJournalMode, SQLITE_JOURNAL_MODES, type SqliteJournalMode } from "../sqlite-journal";
 import { BrokerAuthorityError, DatabaseStartupError } from "./errors";
 import { BindingsGroup } from "./groups/bindings";
 import { WorkAttemptStateError, WorkGroup } from "./groups/work";
@@ -18,6 +19,7 @@ type RawStatement = ReturnType<Database["query"]>;
 export interface StoreOpenOptions {
 	readonly canonicalAgentDir?: string;
 	readonly backupsDir?: string;
+	readonly journalMode?: SqliteJournalMode;
 }
 
 export interface GroupStatement extends Omit<RawStatement, "all" | "get" | "run"> {
@@ -74,13 +76,21 @@ export class StoreCore {
 	}
 
 	static async open(path: string, options: StoreOpenOptions = {}): Promise<StoreCore> {
+		const journalMode = options.journalMode ?? "WAL";
+		if (!isSqliteJournalMode(journalMode))
+			throw new TypeError(`sqlite.journalMode must be one of ${SQLITE_JOURNAL_MODES.join(", ")}`);
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const database = new Database(path);
 		const core = new StoreCore(database, options.backupsDir);
 		try {
-			database.exec(
-				"PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864;",
-			);
+			const actualJournalMode = database
+				.query<{ journal_mode: string }, []>(`PRAGMA journal_mode = ${journalMode}`)
+				.get()?.journal_mode;
+			if (actualJournalMode !== journalMode.toLowerCase() && !(path === ":memory:" && actualJournalMode === "memory"))
+				throw new Error(
+					`SQLite journal_mode is ${actualJournalMode ?? "unknown"}, expected ${journalMode.toLowerCase()}`,
+				);
+			database.exec("PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864;");
 			database.exec(
 				"CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS broker_authority (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), authority_key TEXT NOT NULL);",
 			);
@@ -131,6 +141,10 @@ export class StoreCore {
 			if ((error as Error).message.includes("no such table: schema_migrations")) return 0;
 			throw error;
 		}
+	}
+
+	getJournalMode(): string {
+		return this.#database.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode ?? "unknown";
 	}
 
 	get instanceId(): string {
