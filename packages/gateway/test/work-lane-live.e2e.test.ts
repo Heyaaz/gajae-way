@@ -321,8 +321,9 @@ liveTest(
 			manager = new WorkLaneManager({
 				database,
 				port,
-				lanes: new LaneGovernor({ database, sessionPort: port, maxLanes: 1 }),
+				lanes: new LaneGovernor({ database, sessionPort: port, laneRoot: home, maxLanes: 1 }),
 				gajaewayHome: home,
+				serviceDirectory: home,
 				brokerGeneration: () => broker.generation,
 				pollMs: 500,
 				waitTimeoutMs: 120_000,

@@ -26,6 +26,25 @@ export interface InboundMessageRow {
 	readonly terminal_delivery_id: string | null;
 }
 
+export interface CrossSessionWatchRow {
+	readonly watch_id: string;
+	readonly watcher_origin_key: string;
+	readonly watcher_origin_ref_json: string;
+	readonly watched_origin_key: string;
+	readonly watched_origin_ref_json: string;
+	readonly handoff_chain_json: string;
+	readonly reason: string;
+	readonly expires_at: string;
+	readonly state: "pending" | "fired" | "expired";
+	readonly registered_at: string;
+	readonly triggered_message_id: string | null;
+	readonly triggered_at: string | null;
+}
+
+export type WatchRegistration =
+	| { readonly kind: "registered" | "replayed"; readonly watch: CrossSessionWatchRow }
+	| { readonly kind: "already_watching"; readonly watch: CrossSessionWatchRow };
+
 export type TerminalUnlinkedReason = "silent" | "loopback" | "turn_failed" | "retired" | "no_delivery";
 
 export function terminalDeliveryIds(json: string | null): string[] {
@@ -202,6 +221,134 @@ export class InboxGroup {
 		);
 	}
 
+	registerWatch(
+		tx: WriteTx,
+		input: {
+			readonly watchId: string;
+			readonly watcherOriginKey: string;
+			readonly watcherOriginRefJson: string;
+			readonly watchedOriginKey: string;
+			readonly watchedOriginRefJson: string;
+			readonly handoffChainJson: string;
+			readonly reason: string;
+			readonly registeredAt: string;
+			readonly expiresAt: string;
+		},
+	): WatchRegistration {
+		if (!input.watchId.trim()) throw new Error("watch id must not be empty");
+		if (!Number.isFinite(Date.parse(input.registeredAt)) || !Number.isFinite(Date.parse(input.expiresAt)))
+			throw new Error("watch timestamps must be valid ISO timestamps");
+		if (Date.parse(input.expiresAt) <= Date.parse(input.registeredAt))
+			throw new Error("watch expiry must be after registration");
+		this.#db
+			.prepare(
+				"UPDATE cross_session_watches SET state = 'expired' WHERE watcher_origin_key = ? AND watched_origin_key = ? AND state = 'pending' AND expires_at <= ?",
+			)
+			.run(tx, input.watcherOriginKey, input.watchedOriginKey, input.registeredAt);
+
+		const byId = this.#watch(input.watchId);
+		if (byId) return { kind: "replayed", watch: byId };
+		const existing = this.#db
+			.prepare(
+				"SELECT watch_id, watcher_origin_key, watcher_origin_ref_json, watched_origin_key, watched_origin_ref_json, handoff_chain_json, reason, expires_at, state, registered_at, triggered_message_id, triggered_at FROM cross_session_watches WHERE watcher_origin_key = ? AND watched_origin_key = ? AND state = 'pending'",
+			)
+			.get(input.watcherOriginKey, input.watchedOriginKey) as CrossSessionWatchRow | null;
+		if (existing) return { kind: "already_watching", watch: existing };
+
+		this.#db
+			.prepare(
+				"INSERT INTO cross_session_watches (watch_id, watcher_origin_key, watcher_origin_ref_json, watched_origin_key, watched_origin_ref_json, handoff_chain_json, reason, expires_at, state, registered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+			)
+			.run(
+				tx,
+				input.watchId,
+				input.watcherOriginKey,
+				input.watcherOriginRefJson,
+				input.watchedOriginKey,
+				input.watchedOriginRefJson,
+				input.handoffChainJson,
+				input.reason,
+				input.expiresAt,
+				input.registeredAt,
+			);
+		return { kind: "registered", watch: this.#watch(input.watchId) as CrossSessionWatchRow };
+	}
+
+	claimWatchesForOrigin(
+		tx: WriteTx,
+		watchedOriginKey: string,
+		sourceMessageId: string,
+		at: string,
+	): CrossSessionWatchRow[] {
+		if (!Number.isFinite(Date.parse(at))) throw new Error("watch match time must be a valid ISO timestamp");
+		this.#db
+			.prepare(
+				"UPDATE cross_session_watches SET state = 'expired' WHERE watched_origin_key = ? AND state = 'pending' AND expires_at <= ?",
+			)
+			.run(tx, watchedOriginKey, at);
+		const pending = this.#db
+			.prepare(
+				"SELECT watch_id, watcher_origin_key, watcher_origin_ref_json, watched_origin_key, watched_origin_ref_json, handoff_chain_json, reason, expires_at, state, registered_at, triggered_message_id, triggered_at FROM cross_session_watches WHERE watched_origin_key = ? AND state = 'pending' AND expires_at > ? ORDER BY registered_at, watch_id",
+			)
+			.all(watchedOriginKey, at) as CrossSessionWatchRow[];
+		const claimed: CrossSessionWatchRow[] = [];
+		for (const watch of pending) {
+			const changes = this.#db
+				.prepare(
+					"UPDATE cross_session_watches SET state = 'fired', triggered_message_id = ?, triggered_at = ? WHERE watch_id = ? AND state = 'pending' AND expires_at > ?",
+				)
+				.run(tx, sourceMessageId, at, watch.watch_id, at).changes;
+			if (changes === 1)
+				claimed.push({ ...watch, state: "fired", triggered_message_id: sourceMessageId, triggered_at: at });
+		}
+		return claimed;
+	}
+
+	sweepWatches(
+		tx: WriteTx,
+		cutoffs: { readonly now: string; readonly historyCutoff: string; readonly batch: number },
+	): { readonly deleted: number; readonly more: boolean } {
+		const expired = this.#db
+			.prepare(
+				"UPDATE cross_session_watches SET state = 'expired' WHERE watch_id IN (SELECT watch_id FROM cross_session_watches WHERE state = 'pending' AND expires_at <= ? LIMIT ?)",
+			)
+			.run(tx, cutoffs.now, cutoffs.batch).changes;
+		const moreExpired =
+			this.#db
+				.prepare("SELECT 1 AS n FROM cross_session_watches WHERE state = 'pending' AND expires_at <= ? LIMIT 1")
+				.get(cutoffs.now) !== null;
+		const deleted = this.#db
+			.prepare(
+				"DELETE FROM cross_session_watches WHERE watch_id IN (SELECT watch_id FROM cross_session_watches WHERE state <> 'pending' AND COALESCE(triggered_at, expires_at) < ? LIMIT ?)",
+			)
+			.run(tx, cutoffs.historyCutoff, cutoffs.batch).changes;
+		const moreDeleted =
+			this.#db
+				.prepare(
+					"SELECT 1 AS n FROM cross_session_watches WHERE state <> 'pending' AND COALESCE(triggered_at, expires_at) < ? LIMIT 1",
+				)
+				.get(cutoffs.historyCutoff) !== null;
+		return { deleted, more: expired >= cutoffs.batch || moreExpired || deleted >= cutoffs.batch || moreDeleted };
+	}
+
+	watchRows(): CrossSessionWatchRow[] {
+		return this.#db
+			.prepare(
+				"SELECT watch_id, watcher_origin_key, watcher_origin_ref_json, watched_origin_key, watched_origin_ref_json, handoff_chain_json, reason, expires_at, state, registered_at, triggered_message_id, triggered_at FROM cross_session_watches ORDER BY registered_at, watch_id",
+			)
+			.all() as CrossSessionWatchRow[];
+	}
+
+	#watch(watchId: string): CrossSessionWatchRow | undefined {
+		return (
+			(this.#db
+				.prepare(
+					"SELECT watch_id, watcher_origin_key, watcher_origin_ref_json, watched_origin_key, watched_origin_ref_json, handoff_chain_json, reason, expires_at, state, registered_at, triggered_message_id, triggered_at FROM cross_session_watches WHERE watch_id = ?",
+				)
+				.get(watchId) as CrossSessionWatchRow | null) ?? undefined
+		);
+	}
+
 	pendingOldest(originKey: string): InboundMessageRow | undefined {
 		const row = this.#db
 			.prepare(
@@ -323,11 +470,20 @@ export class InboxGroup {
 	}
 
 	turnComplete(tx: WriteTx, opRef: string, unlinkedReason: TerminalUnlinkedReason = "no_delivery"): number {
-		return this.#db
+		const unlinked = JSON.stringify({ none: unlinkedReason });
+		const completed = this.#db
 			.prepare(
 				"UPDATE inbound_messages SET state = 'done', turn_state = 'done', terminal_delivery_id = COALESCE(terminal_delivery_id, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
 			)
-			.run(tx, JSON.stringify({ none: unlinkedReason }), opRef).changes;
+			.run(tx, unlinked, opRef).changes;
+		if (completed === 0) {
+			this.#db
+				.prepare(
+					"UPDATE inbound_messages SET terminal_delivery_id = ? WHERE turn_op_ref = ? AND turn_role = 'trigger' AND turn_state = 'done' AND terminal_delivery_id IS NULL",
+				)
+				.run(tx, unlinked, opRef);
+		}
+		return completed;
 	}
 
 	turnRequeue(tx: WriteTx, opRef: string): number {

@@ -20,6 +20,7 @@ import { launchRestartStack } from "./restart-stack";
 import {
 	type InstallServicesOptions,
 	installServices,
+	removeStaleServices,
 	type ServicePlatform,
 	serviceSpecs,
 	systemdUnitName,
@@ -212,7 +213,10 @@ export type ReleaseFetcher = (repo: string) => Promise<ReleaseInfo>;
 export type AssetDownloader = (asset: ReleaseAsset) => Promise<Uint8Array>;
 export type TarballExtractor = (tarball: Uint8Array, intoDir: string) => Promise<void>;
 export type RestartQueuer = (home: string, binDir: string, trigger: "update") => Promise<RestartQueueReceipt>;
-export type UpdateCommandRunner = (command: readonly string[]) => Promise<number>;
+export interface UpdateCommandOptions {
+	readonly allowFailure?: boolean;
+}
+export type UpdateCommandRunner = (command: readonly string[], options?: UpdateCommandOptions) => Promise<number>;
 
 type UpdateServiceOptions = Pick<
 	InstallServicesOptions,
@@ -260,10 +264,10 @@ async function readPinnedGjcVersion(path: string): Promise<string> {
 	return version;
 }
 
-async function defaultUpdateCommandRunner(command: readonly string[]): Promise<number> {
+async function defaultUpdateCommandRunner(command: readonly string[], options?: UpdateCommandOptions): Promise<number> {
 	const child = Bun.spawn([...command], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
 	const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
-	if (exitCode !== 0) {
+	if (exitCode !== 0 && !options?.allowFailure) {
 		const detail = stderr.trim();
 		throw new Error(`${command.join(" ")} exited with status ${exitCode}${detail.length === 0 ? "" : `: ${detail}`}`);
 	}
@@ -279,7 +283,22 @@ async function installUpdatedServices(options: {
 }): Promise<boolean> {
 	const { home, binDir, platform, noRestart, deps } = options;
 	const brokerProvisioned = await exists(homeLayout(home).brokerProvisionManifest);
-	const env = { ...(deps.env ?? process.env), GAJAEWAY_HOME: home };
+	const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env), GAJAEWAY_HOME: home };
+	const run = deps.serviceRunner ?? defaultUpdateCommandRunner;
+	const execute = async (command: readonly string[]): Promise<void> => {
+		const exitCode = await run(command);
+		if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
+	};
+	if (!noRestart) {
+		await removeStaleServices({
+			binDir,
+			platform,
+			env,
+			reloadSystemd: false,
+			...deps.serviceOptions,
+			run,
+		});
+	}
 	await installServices({
 		binDir,
 		platform,
@@ -289,11 +308,6 @@ async function installUpdatedServices(options: {
 		...deps.serviceOptions,
 	});
 	if (platform === "linux") {
-		const run = deps.serviceRunner ?? defaultUpdateCommandRunner;
-		const execute = async (command: readonly string[]): Promise<void> => {
-			const exitCode = await run(command);
-			if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
-		};
 		await execute(["systemctl", "--user", "daemon-reload"]);
 		if (!noRestart) {
 			const enableUnits: string[] = [];

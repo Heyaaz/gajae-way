@@ -8,7 +8,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 33;
+export const LATEST_SCHEMA_VERSION = 34;
 
 export interface MigrationHost {
 	readonly database: {
@@ -704,9 +704,51 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 				DROP TABLE lane_jobs;
 				ALTER TABLE lane_jobs_v33 RENAME TO lane_jobs;
 			`);
+		});
+		// Issue #369: Add the terminal contract_unmet stage while retaining every monitor index.
+		host.withTransaction(() => {
+			host.database.execute(`CREATE TABLE monitor_events_v33 (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry','skipped','contract_unmet')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, skipped_by TEXT, updated_at TEXT NOT NULL, procedure_json TEXT);
+INSERT INTO monitor_events_v33 (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, skipped_by, updated_at, procedure_json) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, skipped_by, updated_at, procedure_json FROM monitor_events ORDER BY rowid;
+DROP TABLE monitor_events;
+ALTER TABLE monitor_events_v33 RENAME TO monitor_events;
+CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
+CREATE INDEX monitor_events_gc ON monitor_events(updated_at) WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet');
+CREATE INDEX monitor_events_open ON monitor_events(fired_at) WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet');
+CREATE INDEX monitor_events_batch ON monitor_events(batch_id);
+CREATE INDEX monitor_events_authored ON monitor_events(batch_id) WHERE stage = 'authored';
+CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
+			for (const action of ["UPDATE", "DELETE"])
+				host.database.execute(`CREATE TRIGGER monitor_events_quarantine_${action.toLowerCase()} BEFORE ${action} ON monitor_events
+				WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = OLD.event_id)
+				BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(33, new Date().toISOString());
+		});
+	}
+	if (current < 34) {
+		host.withTransaction(() => {
+			host.database.execute(`CREATE TABLE IF NOT EXISTS cross_session_watches (
+				watch_id TEXT PRIMARY KEY,
+				watcher_origin_key TEXT NOT NULL,
+				watcher_origin_ref_json TEXT NOT NULL,
+				watched_origin_key TEXT NOT NULL,
+				watched_origin_ref_json TEXT NOT NULL,
+				handoff_chain_json TEXT NOT NULL,
+				reason TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				state TEXT NOT NULL CHECK(state IN ('pending','fired','expired')),
+				registered_at TEXT NOT NULL,
+				triggered_message_id TEXT,
+				triggered_at TEXT,
+				CHECK((state = 'fired' AND triggered_message_id IS NOT NULL AND triggered_at IS NOT NULL) OR (state <> 'fired' AND triggered_message_id IS NULL AND triggered_at IS NULL))
+			);
+			CREATE UNIQUE INDEX IF NOT EXISTS cross_session_watches_pending_pair ON cross_session_watches(watcher_origin_key, watched_origin_key) WHERE state = 'pending';
+			CREATE INDEX IF NOT EXISTS cross_session_watches_pending_target ON cross_session_watches(watched_origin_key, expires_at) WHERE state = 'pending';
+			CREATE INDEX IF NOT EXISTS cross_session_watches_retention ON cross_session_watches(state, expires_at, triggered_at);`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(34, new Date().toISOString());
 		});
 	}
 }

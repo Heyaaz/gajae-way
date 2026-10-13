@@ -1,3 +1,4 @@
+import type { FileRef } from "./files";
 import type { OriginRef } from "./origin";
 import type { ReactionAction, ReactionRef } from "./reactions";
 
@@ -281,6 +282,13 @@ export interface ChatMessagePayload {
 	 */
 	readonly reaction?: ReactionRef;
 	/**
+	 * When present this delivery is a FILE UPLOAD: the adapter uploads `file.path`
+	 * into the conversation (inside `replyToMessageId`'s thread when set) and posts
+	 * no other message. `text` carries a short "📎 name" line so an adapter without
+	 * upload support degrades to a visible mention instead of a lost delivery.
+	 */
+	readonly file?: FileRef;
+	/**
 	 * When present the adapter must ALSO post this text as a spoken voice
 	 * message, in addition to delivering `text` normally.
 	 *
@@ -414,9 +422,15 @@ export interface SessionBootstrapProjection {
 
 /**
  * Memory system surface (P3, spec fact 8): filesystem-first Markdown memory.
- * memory.audit runs the structural validator; memory.search is map-then-BM25
- * retrieval over the canonical tree. Both are read-only verbs.
+ * memory.audit runs the structural validator; memory.autolink commits canonical
+ * crosslinks; memory.search is map-then-BM25 retrieval over the canonical tree.
+ * Audit and autolink return an operation ID immediately and expose the outcome
+ * through memory.status, so client request timeouts do not imply operation failure.
  */
+export interface MemoryOperationAccepted {
+	readonly opRef: string;
+}
+
 export interface MemoryAuditResult {
 	readonly ok: boolean;
 	readonly issues: readonly {
@@ -424,6 +438,21 @@ export interface MemoryAuditResult {
 		readonly path: string;
 		readonly message: string;
 	}[];
+}
+
+export interface MemoryAutolinkResult {
+	readonly filesChanged: number;
+	readonly linksAdded: number;
+	readonly aliases: number;
+	readonly commitSha: string | null;
+	readonly elapsedMs: number;
+}
+
+export interface MemoryOperationStatusResult {
+	readonly status: "pending" | "completed" | "failed";
+	readonly elapsedMs: number;
+	readonly result?: MemoryAuditResult | MemoryAutolinkResult;
+	readonly error?: string;
 }
 
 export interface MemorySearchParams {
@@ -512,6 +541,8 @@ export interface MonitorSpec {
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
 	readonly serviceTier?: MonitorServiceTier;
+	/** Inject each reportable authored result as an internal report into this conversation session. */
+	readonly reportTo?: OriginRef | null;
 	readonly enabled?: boolean;
 }
 
@@ -594,6 +625,14 @@ export interface MonitorEventRecord {
 	readonly recovery?: MonitorEventRecovery;
 }
 
+/** Result of an operator action on one monitor event. */
+export interface MonitorEventOperatorResult {
+	readonly eventId: string;
+	readonly done: boolean;
+	readonly previousStage?: string;
+	readonly reason?: string;
+}
+
 /** Version of one declared procedure file as read for one firing. */
 export interface MonitorProcedureVersion {
 	readonly path: string;
@@ -610,8 +649,10 @@ export interface WorkRunParams {
 	readonly text: string;
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
-	/** Repository binding: remote URL, configured alias, or repo key for worktree creation and push target (issue #480). */
+	/** Absolute local Git repository path or Git URL used for the worktree and its push remote (issue #480). */
 	readonly repo?: string;
+	/** Base branch or ref for worktree creation when repo is specified (issue #480). */
+	readonly base?: string;
 	/**
 	 * Explicit operator acknowledgement that lets a new attempt start while
 	 * the durable job is awaiting_operator (issue #10 hold semantics).
@@ -681,6 +722,7 @@ export interface WorkStatusResult {
 	readonly op: PromptStatusBody | null;
 	/** Repository binding information (issue #480) */
 	readonly repository?: {
+		/** Repository identity: a Git URL or the absolute local path supplied to work.start. */
 		readonly url: string;
 		readonly branch: string;
 		readonly base?: string;
@@ -1097,11 +1139,9 @@ export interface VerbCatalogV01 {
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
 	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
-	"memory.audit": { params: undefined; result: MemoryAuditResult };
-	"memory.autolink": {
-		params: undefined;
-		result: { readonly filesChanged: number; readonly linksAdded: number; readonly aliases: number };
-	};
+	"memory.audit": { params: undefined; result: MemoryOperationAccepted };
+	"memory.autolink": { params: undefined; result: MemoryOperationAccepted };
+	"memory.status": { params: { readonly opRef: string }; result: MemoryOperationStatusResult };
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
@@ -1123,6 +1163,14 @@ export interface VerbCatalogV01 {
 		};
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
+	"monitor.settle": {
+		params: { readonly eventId: string };
+		result: MonitorEventOperatorResult;
+	};
+	"monitor.retry": {
+		params: { readonly eventId: string };
+		result: MonitorEventOperatorResult;
+	};
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
 	"ops.backup": {
 		params: { readonly path: string };
@@ -1167,11 +1215,14 @@ export const VERBS_V01 = [
 	"memory.audit",
 	"memory.autolink",
 	"memory.search",
+	"memory.status",
 	"monitor.add",
 	"monitor.update",
 	"monitor.list",
 	"monitor.inspect",
 	"monitor.test",
+	"monitor.settle",
+	"monitor.retry",
 	"monitor.remove",
 	"ops.backup",
 	"ops.redeliver",

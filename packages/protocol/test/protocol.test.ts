@@ -108,6 +108,34 @@ describe("origin normalization", () => {
 		expect(key).toBe("discord/thread/111/parent=222");
 	});
 
+	test("Discord thread visibility is validated metadata, not part of origin identity", () => {
+		const publicThread = {
+			platform: "discord",
+			kind: "thread",
+			conversationId: "111",
+			parentId: "222",
+			threadVisibility: "public",
+		} as const;
+		const privateThread = { ...publicThread, threadVisibility: "private" } as const;
+		expect(validateOriginRef(publicThread)).toEqual(publicThread);
+		expect(validateOriginRef(privateThread)).toEqual(privateThread);
+		expect(originKey(publicThread)).toBe(originKey(privateThread));
+		expect(() =>
+			validateOriginRef({ ...publicThread, platform: "slack", threadVisibility: "private" } as never),
+		).toThrow(/Discord thread origins/);
+		expect(() =>
+			validateOriginRef({
+				platform: "discord",
+				kind: "channel",
+				conversationId: "111",
+				threadVisibility: "private",
+			} as never),
+		).toThrow(/Discord thread origins/);
+		expect(() => validateOriginRef({ ...publicThread, threadVisibility: "unknown" } as never)).toThrow(
+			/invalid Discord thread visibility/,
+		);
+	});
+
 	test("dm requires peerId; channel forbids it", () => {
 		expect(() => validateOriginRef({ platform: "discord", kind: "dm", conversationId: "c1" })).toThrow();
 		expect(() =>
@@ -126,6 +154,17 @@ describe("origin normalization", () => {
 		expect(key).not.toBe(originKey(monitorSessionOrigin("m-2", "backlog.watch")));
 		expect(parseOriginKey(key)).toEqual(monitorSessionOrigin("m-1", "backlog.watch"));
 		expect(() => originKey(monitorSessionOrigin("bad/id", "backlog.watch"))).toThrow();
+	});
+
+	test("work lane origins are valid and round-trip", () => {
+		// The gateway stores its own lane sessions as `work/task/<name>`
+		// (WORK_LANE_PREFIX) and writes that ref into sessions.origin_ref_json, so
+		// omitting the pair here made `gajaeway sessions list` fail on a gateway
+		// that has any lane history: "unknown platform: work".
+		const origin = { platform: "work", kind: "task", conversationId: "gw-smoke" } as const;
+		expect(validateOriginRef(origin)).toEqual(origin);
+		expect(originKey(origin)).toBe("work/task/gw-smoke");
+		expect(parseOriginKey("work/task/gw-smoke")).toEqual(origin);
 	});
 
 	test("thread requires parentId", () => {

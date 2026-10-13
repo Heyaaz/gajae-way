@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type {
+	MonitorEventOperatorResult,
 	MonitorEventRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
@@ -84,7 +85,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -225,6 +226,13 @@ interface ParsedMonitorTestArgs {
 
 const MONITOR_TEST_USAGE = "usage: gajaeway monitors test <id> [--type T] [--payload J] [--wait[=SECONDS]]";
 const MONITOR_WAIT_ERROR = `${MONITOR_TEST_USAGE}\n--wait expects a finite non-negative integer up to 86400`;
+const MONITOR_OPERATOR_USAGE = "usage: gajaeway monitors settle <eventId>|retry <eventId>";
+
+function parseMonitorEventOperatorArgs(args: readonly string[]): string {
+	const eventId = args[0];
+	if (args.length !== 1 || !eventId?.trim() || eventId.startsWith("--")) throw new Error(MONITOR_OPERATOR_USAGE);
+	return eventId;
+}
 
 function parseMonitorTestArgs(args: readonly string[]): ParsedMonitorTestArgs {
 	const [monitorId, ...flags] = args;
@@ -265,7 +273,7 @@ function parseMonitorTestArgs(args: readonly string[]): ParsedMonitorTestArgs {
 	};
 }
 
-const TERMINAL_MONITOR_STAGES = new Set(["delivered", "authored_no_delivery", "failed", "failed_no_retry"]);
+const TERMINAL_MONITOR_STAGES = new Set(["delivered", "authored_no_delivery", "failed", "failed_no_retry", "skipped"]);
 
 function waitForMonitorStage(client: GajaewayClient, eventId: string, timeoutSeconds: number): Promise<string> {
 	return new Promise((resolve) => {
@@ -543,6 +551,49 @@ async function chat(socket: string): Promise<void> {
 	}
 }
 
+/**
+ * Poll for memory operation completion. Memory operations (audit, autolink) are
+ * long-running and return an opRef immediately; this function polls for the result.
+ * If the CLI wait expires before completion, report 'still running' instead of failure.
+ */
+export async function pollMemoryOp(
+	client: Pick<GajaewayClient, "request">,
+	opRef: string,
+	maxWaitMs = 300_000, // 5 min default CLI timeout
+	pollIntervalMs = 1_000,
+): Promise<{ status: "completed" | "failed" | "still_running"; elapsedMs: number; result?: unknown; error?: string }> {
+	const startTime = Date.now();
+	let operationElapsedMs = 0;
+
+	while (Date.now() - startTime < maxWaitMs) {
+		const status = await client.request<{
+			status: "pending" | "completed" | "failed";
+			elapsedMs: number;
+			result?: unknown;
+			error?: string;
+		}>("memory.status", { opRef });
+		operationElapsedMs = status.elapsedMs;
+
+		if (status.status === "completed") {
+			return { status: "completed", elapsedMs: status.elapsedMs, result: status.result };
+		}
+
+		if (status.status === "failed") {
+			return { status: "failed", elapsedMs: status.elapsedMs, error: status.error };
+		}
+
+		// Wait before polling again
+		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+	}
+
+	// CLI wait expired, but operation may still be running on the server
+	const waitedMs = Date.now() - startTime;
+	console.error(
+		`memory operation still running (${Math.round(operationElapsedMs / 1000)}s operation elapsed; CLI wait ended after ${Math.round(waitedMs / 1000)}s).\nCheck status: gajaeway memory status ${opRef}`,
+	);
+	return { status: "still_running", elapsedMs: operationElapsedMs };
+}
+
 export async function main(args = process.argv.slice(2), options: MainOptions = {}): Promise<void> {
 	const parsed = parseArgs(args);
 	if (parsed.command === "--version" && parsed.rest.length === 0) {
@@ -721,24 +772,64 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				break;
 			}
 			case "memory": {
-				const usage = "usage: gajaeway memory audit|memory autolink|memory search <query>";
+				const usage = "usage: gajaeway memory audit|autolink|search <query>|status <opRef>";
 				// An unrecognised argument is refused before the socket is opened rather
 				// than ignored: a run of `memory audit --fix` that silently degraded to a
 				// plain audit would read as a repair attempt that reproduced the failure.
 				if ((parsed.rest[0] === "audit" || parsed.rest[0] === "autolink") && parsed.rest.length > 1)
 					throw new Error(`${usage} (unknown argument: ${parsed.rest[1]})`);
+				if (parsed.rest[0] === "status" && parsed.rest.length < 2) throw new Error(`${usage} (status requires opRef)`);
 				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					if (parsed.rest[0] === "audit") {
-						const result = await client.request<{ ok: boolean; issues: unknown[] }>("memory.audit");
-						console.log(JSON.stringify(result.issues));
-						if (!result.ok) process.exitCode = 1;
+						// Request audit operation; get opRef and poll for completion
+						const initResp = await client.request<{ opRef: string }>("memory.audit");
+						const poll = await pollMemoryOp(client, initResp.opRef);
+						if (poll.status === "failed") {
+							console.error(`audit failed after ${poll.elapsedMs}ms: ${poll.error}`);
+							process.exitCode = 1;
+						} else if (poll.status === "still_running") {
+							// Operation is still running; exit with distinct code so it's not reported as failure
+							process.exitCode = 75;
+						} else {
+							const auditResult = poll.result as { ok?: boolean; issues?: unknown[] };
+							console.log(JSON.stringify(auditResult?.issues ?? []));
+							console.error(`audit completed in ${poll.elapsedMs}ms`);
+							if (!auditResult?.ok) process.exitCode = 1;
+						}
 					} else if (parsed.rest[0] === "autolink") {
-						console.log(JSON.stringify(await client.request("memory.autolink")));
+						// Request autolink operation; get opRef and poll for completion
+						const initResp = await client.request<{ opRef: string }>("memory.autolink");
+						const poll = await pollMemoryOp(client, initResp.opRef);
+						if (poll.status === "failed") {
+							console.error(`autolink failed after ${poll.elapsedMs}ms: ${poll.error}`);
+							process.exitCode = 1;
+						} else if (poll.status === "still_running") {
+							// Operation is still running; exit with distinct code so it's not reported as failure
+							process.exitCode = 75;
+						} else {
+							console.log(JSON.stringify(poll.result));
+						}
 					} else if (parsed.rest[0] === "search" && parsed.rest.slice(1).join(" ")) {
 						console.log(
 							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),
 						);
+					} else if (parsed.rest[0] === "status" && parsed.rest[1]) {
+						const opRef = parsed.rest[1];
+						const result = await client.request<{
+							status: "pending" | "completed" | "failed";
+							elapsedMs: number;
+							result?: unknown;
+							error?: string;
+						}>("memory.status", { opRef });
+						if (result.status === "failed") {
+							console.error(`operation ${opRef} failed after ${result.elapsedMs}ms: ${result.error}`);
+							process.exitCode = 1;
+						} else if (result.status === "completed") {
+							console.log(JSON.stringify(result));
+						} else {
+							console.log(JSON.stringify({ status: result.status, elapsedMs: result.elapsedMs }));
+						}
 					} else throw new Error(usage);
 				} finally {
 					await client.close();
@@ -750,6 +841,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const listOptions = command === "list" ? parseListOptions(args, MONITOR_COLUMNS) : undefined;
 				const update = command === "update" ? parseMonitorUpdateArgs(args) : undefined;
 				const monitorTest = command === "test" ? parseMonitorTestArgs(args) : undefined;
+				const operatorEventId =
+					command === "settle" || command === "retry" ? parseMonitorEventOperatorArgs(args) : undefined;
 				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					if (command === "add" && args[0] === "--json" && args[1])
@@ -787,9 +880,15 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							const stage = await waitForMonitorStage(client, result.eventId, monitorTest.waitSeconds);
 							console.log(JSON.stringify({ eventId: result.eventId, stage }));
 						}
+					} else if ((command === "settle" || command === "retry") && operatorEventId !== undefined) {
+						const result = await client.request<MonitorEventOperatorResult>(`monitor.${command}`, {
+							eventId: operatorEventId,
+						});
+						console.log(JSON.stringify(result));
+						if (!result.done) process.exitCode = 1;
 					} else
 						throw new Error(
-							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J] [--wait[=SECONDS]]`,
+							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]]`,
 						);
 				} finally {
 					await client.close();
@@ -799,7 +898,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
 				if (command === "status" || command === "steer") {
 					const name = args[0];
 					const text = args.slice(1).join(" ").trim();
@@ -907,16 +1006,24 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const name = args[0];
 				let cwd: string | undefined;
 				let resume = false;
+				let repo: string | undefined;
+				let base: string | undefined;
 				let model: string | { preset: string } | undefined;
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
 					const arg = args[i];
-					if (arg === "--cwd" || arg === "--model" || arg === "--preset") {
+					if (arg === "--cwd" || arg === "--repo" || arg === "--base" || arg === "--model" || arg === "--preset") {
 						const value = args[++i];
 						if (!value?.trim() || value.startsWith("--")) throw new Error(usage);
 						if (arg === "--cwd") {
 							if (cwd !== undefined || !isAbsolute(value)) throw new Error(usage);
 							cwd = value;
+						} else if (arg === "--repo") {
+							if (repo !== undefined) throw new Error(usage);
+							repo = value.includes("://") || /^[^/@\s]+@[^:/\s]+:/.test(value) ? value : resolve(value);
+						} else if (arg === "--base") {
+							if (base !== undefined) throw new Error(usage);
+							base = value;
 						} else {
 							if (model !== undefined) throw new Error(`${usage}\n--model and --preset are mutually exclusive`);
 							model = arg === "--preset" ? { preset: value } : value;
@@ -927,6 +1034,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				}
 				const text = textParts.join(" ").trim();
 				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text) throw new Error(usage);
+				if (base !== undefined && repo === undefined) throw new Error(usage);
 				// This is a caller response-wait budget, never an attempt deadline.
 				// Timeout/disconnect leaves the attempt observable via work.status.
 				const client = await connectGatewaySocket(parsed.socket, {
@@ -938,6 +1046,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						name,
 						text,
 						...(cwd ? { cwd } : {}),
+						...(repo ? { repo } : {}),
+						...(base ? { base } : {}),
 						...(resume ? { resume: true } : {}),
 						...(model === undefined ? {} : { model }),
 						...(callerSessionId ? { callerSessionId } : {}),

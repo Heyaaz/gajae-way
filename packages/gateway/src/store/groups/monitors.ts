@@ -66,6 +66,8 @@ export interface MonitorFailureOptions {
  * - skipped: terminal — the monitor's overlap policy is `skip` and an earlier
  *   event of the same monitor was still awaiting authoring when this one
  *   fired (`skipped_by` names it). A scheduling outcome, never a failure.
+ * - contract_unmet: terminal — the authored note only restated the contract
+ *   and provided no new evidence of work.
  */
 export const MONITOR_EVENT_STAGES = [
 	"admitted",
@@ -77,6 +79,7 @@ export const MONITOR_EVENT_STAGES = [
 	"failed",
 	"failed_no_retry",
 	"skipped",
+	"contract_unmet",
 ] as const;
 export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
 /** Stages whose rows reconcile() may claim and redispatch. */
@@ -87,6 +90,7 @@ export const TERMINAL_STAGES: readonly MonitorEventStage[] = [
 	"authored_no_delivery",
 	"failed_no_retry",
 	"skipped",
+	"contract_unmet",
 ];
 
 /** Minimum wait, measured from the last failure, before reconcile reclaims the next attempt. */
@@ -99,6 +103,8 @@ export const MONITOR_EVENT_RETRY_BACKOFF_MS: readonly number[] = [
 ];
 /** Upper bound on how often a single event may be reclaimed by reconcile. */
 export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = MONITOR_EVENT_RETRY_BACKOFF_MS.length;
+/** Reap open events unchanged for a full day, measured from their last update. */
+export const MONITOR_EVENT_MAX_OPEN_AGE_MS = 24 * 60 * 60_000;
 
 export interface MonitorEventDbRow {
 	readonly event_id: string;
@@ -116,8 +122,10 @@ export interface MonitorEventDbRow {
 
 const REPLAYABLE_MONITOR =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)";
-const OPEN_MONITOR_EVENT = "stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped')";
-const TERMINAL_MONITOR_EVENT = "stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped')";
+const OPEN_MONITOR_EVENT =
+	"stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
+const TERMINAL_MONITOR_EVENT =
+	"stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
 const IN_FLIGHT_MONITOR_STAGES = "'admitted','batched','dispatched','failed'";
 
 /** Persistence for monitor definitions, event dispatch, authored output and cron slots. */
@@ -158,7 +166,7 @@ export class MonitorsGroup {
 	authoringLossStreaks(sinceIso: string): Array<{ eventType: string; consecutive: number; lastFiredAt: string }> {
 		const rows = this.#db
 			.prepare(
-				`SELECT event_type, fired_at, (stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)) AS lost FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND fired_at >= ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
+				`SELECT event_type, fired_at, (stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)) AS lost FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry','contract_unmet') AND fired_at >= ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
 			)
 			.all(sinceIso) as Array<{ event_type: string; fired_at: string; lost: number }>;
 		const streaks = new Map<string, { consecutive: number; lastFiredAt: string; open: boolean }>();
@@ -180,10 +188,10 @@ export class MonitorsGroup {
 	consecutiveTerminalFailures(limit = 100): number {
 		const rows = this.#db
 			.prepare(
-				`SELECT stage FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND ${REPLAYABLE_MONITOR} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
+				`SELECT stage FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry','contract_unmet') AND ${REPLAYABLE_MONITOR} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
 			)
 			.all(limit) as Array<{ stage: string }>;
-		const streak = rows.findIndex((row) => row.stage !== "failed_no_retry");
+		const streak = rows.findIndex((row) => row.stage !== "failed_no_retry" && row.stage !== "contract_unmet");
 		return streak < 0 ? rows.length : streak;
 	}
 
@@ -315,6 +323,7 @@ export class MonitorsGroup {
 			overlap?: "queue" | "skip";
 		},
 	): string | undefined {
+		if (row.overlap === "skip") this.#supersedeFailedPredecessors(tx, row.monitorId, row.eventId);
 		const predecessor =
 			row.overlap === "skip"
 				? `(SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid LIMIT 1)`
@@ -336,6 +345,42 @@ export class MonitorsGroup {
 		return inserted?.skipped_by ?? undefined;
 	}
 
+	#supersedeFailedPredecessors(tx: WriteTx, monitorId: string, successorId: string): void {
+		const now = Date.now();
+		const nowIso = new Date(now).toISOString();
+		const failed = this.#db
+			.prepare(
+				`SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage = 'failed' AND ${REPLAYABLE_MONITOR}
+				AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)`,
+			)
+			.all(monitorId) as Array<{ event_id: string }>;
+		for (const { event_id } of failed) {
+			if (
+				this.eventLiveLeaseOwner(event_id, now) ||
+				this.#core.metaGet(`monitor_authoring_turn:${event_id}`) !== undefined
+			)
+				continue;
+			const changed = this.#db
+				.prepare(
+					`UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage = 'failed' AND NOT EXISTS (
+						SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.expires_at > ?
+					) AND NOT EXISTS (
+						SELECT 1 FROM meta m WHERE m.key = 'monitor_authoring_turn:' || monitor_events.event_id
+					) AND NOT EXISTS (
+						SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id
+					)`,
+				)
+				.run(tx, nowIso, event_id, nowIso).changes;
+			if (changed === 0) continue;
+			this.failureRecord(
+				tx,
+				event_id,
+				"superseded",
+				`failed event superseded by the next fire ${successorId} under overlap=skip; it is not retried`,
+			);
+		}
+	}
+
 	eventAcquireLease(
 		tx: WriteTx,
 		eventId: string,
@@ -350,11 +395,13 @@ export class MonitorsGroup {
 		return (
 			this.#db
 				.prepare(
-					`INSERT INTO dispatch_leases (event_id, owner, lease_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)
+					`INSERT INTO dispatch_leases (event_id, owner, lease_id, acquired_at, expires_at)
+SELECT ?, ?, ?, ?, ? FROM monitor_events
+WHERE event_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES})
 ON CONFLICT(event_id) DO UPDATE SET owner = excluded.owner, lease_id = excluded.lease_id, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at
 WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leases WHERE event_id = excluded.event_id) <= excluded.acquired_at`,
 				)
-				.run(tx, eventId, owner, leaseId, nowIso, expiresIso).changes > 0
+				.run(tx, eventId, owner, leaseId, nowIso, expiresIso, eventId).changes > 0
 		);
 	}
 
@@ -405,7 +452,7 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 			this.#db
 				.prepare(
 					`UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ?
-WHERE event_id = ? AND EXISTS (
+WHERE event_id = ? AND stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND EXISTS (
 SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
 )`,
 				)
@@ -428,7 +475,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				: "EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?)";
 		const leaseParams = leaseId === "" ? [] : [leaseId, new Date(now).toISOString()];
 		const changes = this.#db
-			.prepare(`UPDATE monitor_events SET stage = ?, updated_at = ? WHERE event_id = ? AND ${leasePredicate}`)
+			.prepare(
+				`UPDATE monitor_events SET stage = ?, updated_at = ? WHERE event_id = ? AND stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND ${leasePredicate}`,
+			)
 			.run(
 				tx,
 				noDelivery ? "authored_no_delivery" : "authored",
@@ -458,7 +507,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				`UPDATE monitor_events SET stage = ?, batch_id = ?, updated_at = ?
 WHERE event_id = ? AND EXISTS (
 SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
-)`,
+) AND stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')`,
 			)
 			.run(
 				tx,
@@ -474,10 +523,33 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return true;
 	}
 
+	eventFencedContractUnmet(
+		tx: WriteTx,
+		eventId: string,
+		leaseId: string,
+		batchId: string,
+		code: string,
+		detail: string,
+		now = Date.now(),
+	): boolean {
+		this.#core.assertNotQuarantined("monitor", eventId);
+		const changes = this.#db
+			.prepare(
+				`UPDATE monitor_events SET stage = 'contract_unmet', batch_id = ?, updated_at = ?
+WHERE event_id = ? AND stage = 'authored' AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+			)
+			.run(tx, batchId, new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+		if (changes === 0) return false;
+		this.failureRecord(tx, eventId, code, detail);
+		return true;
+	}
+
 	eventTerminalFail(tx: WriteTx, eventId: string, code: string, detail: string): boolean {
 		const changes = this.#db
 			.prepare(
-				"UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage NOT IN ('delivered', 'authored_no_delivery', 'failed_no_retry')",
+				"UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage NOT IN ('delivered', 'authored_no_delivery', 'failed_no_retry', 'contract_unmet')",
 			)
 			.run(tx, new Date().toISOString(), eventId).changes;
 		if (changes === 0) return false;
@@ -497,7 +569,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		this.#core.assertNotQuarantined("monitor", eventId);
 		this.#db
 			.prepare(
-				"UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?",
+				"UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ? AND stage <> 'contract_unmet'",
 			)
 			.run(tx, stage, batchId, new Date().toISOString(), eventId);
 	}
@@ -528,12 +600,95 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			stage === "authored" &&
 			row.stage !== "delivered" &&
 			row.stage !== "authored_no_delivery" &&
-			row.stage !== "failed_no_retry"
+			row.stage !== "failed_no_retry" &&
+			row.stage !== "contract_unmet"
 		) {
 			this.eventUpdate(tx, eventId, "authored");
 			return true;
 		}
 		return false;
+	}
+
+	/** Reap old, unauthored open events without a live dispatch or saved authoring turn. */
+	eventReapStale(tx: WriteTx, cutoff: string, now = Date.now()): MonitorEventDbRow[] {
+		const nowIso = new Date(now).toISOString();
+		const candidates = this.#db
+			.prepare(
+				`SELECT * FROM monitor_events WHERE stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND updated_at < ? AND ${REPLAYABLE_MONITOR}
+				AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)
+				AND NOT EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.expires_at > ?)
+				AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = 'monitor_authoring_turn:' || monitor_events.event_id)
+				ORDER BY updated_at, rowid`,
+			)
+			.all(cutoff, nowIso) as MonitorEventDbRow[];
+		const reaped: MonitorEventDbRow[] = [];
+		for (const row of candidates) {
+			const changed = this.#db
+				.prepare(
+					`UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ?
+					WHERE event_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND updated_at < ?
+					AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)
+					AND NOT EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.expires_at > ?)
+					AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = 'monitor_authoring_turn:' || monitor_events.event_id)`,
+				)
+				.run(tx, nowIso, row.event_id, cutoff, nowIso).changes;
+			if (changed === 0) continue;
+			this.failureRecord(
+				tx,
+				row.event_id,
+				"stale_open_event",
+				`event left ${row.stage} after ${row.dispatch_attempts} reclaims, updated ${row.updated_at}; reaped as stale`,
+			);
+			reaped.push(row);
+		}
+		return reaped;
+	}
+
+	/** Operator settle: terminalize a reconcilable event only when no dispatch lease is live. */
+	eventOperatorSettle(
+		tx: WriteTx,
+		eventId: string,
+		now = Date.now(),
+	): { settled: true; previousStage: string } | { settled: false; reason: string } {
+		const row = this.eventGet(eventId);
+		if (!row) return { settled: false, reason: "unknown_event" };
+		if (!(RECONCILABLE_STAGES as readonly string[]).includes(row.stage))
+			return { settled: false, reason: `stage_${row.stage}` };
+		if (this.authoredOutput(eventId) !== undefined) return { settled: false, reason: "already_authored" };
+		const nowIso = new Date(now).toISOString();
+		const changed = this.#db
+			.prepare(
+				`UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES})
+				AND NOT EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.expires_at > ?)`,
+			)
+			.run(tx, nowIso, eventId, nowIso).changes;
+		if (changed === 0) return { settled: false, reason: "dispatch_in_flight" };
+		this.failureRecord(tx, eventId, "operator_settled", `settled by operator from ${row.stage}`);
+		return { settled: true, previousStage: row.stage };
+	}
+
+	/** Reset a failed event's reclaim budget without changing its fired time or saved authoring turn. */
+	eventOperatorRetry(
+		tx: WriteTx,
+		eventId: string,
+		now = Date.now(),
+	): { retried: true; previousStage: string } | { retried: false; reason: string } {
+		const row = this.eventGet(eventId);
+		if (!row) return { retried: false, reason: "unknown_event" };
+		if (row.stage !== "failed" && row.stage !== "failed_no_retry")
+			return { retried: false, reason: `stage_${row.stage}` };
+		if (this.authoredOutput(eventId) !== undefined) return { retried: false, reason: "already_authored" };
+		const nowIso = new Date(now).toISOString();
+		const changed = this.#db
+			.prepare(
+				"UPDATE monitor_events SET stage = 'failed', dispatch_attempts = 0, updated_at = ? WHERE event_id = ? AND stage IN ('failed','failed_no_retry') AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id) AND NOT EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.expires_at > ?)",
+			)
+			.run(tx, nowIso, eventId, nowIso).changes;
+		if (changed === 0) {
+			if (this.authoredOutput(eventId) !== undefined) return { retried: false, reason: "already_authored" };
+			return { retried: false, reason: "dispatch_in_flight" };
+		}
+		return { retried: true, previousStage: row.stage };
 	}
 
 	eventsFailExpiredDelivery(

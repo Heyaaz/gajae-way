@@ -672,41 +672,20 @@ export class BindingsGroup {
 			(
 				this.#db
 					.prepare(
-						"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+						"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
 					)
 					.get() as { n: number } | null
 			)?.n ?? 0;
 		if ((openInbound || openWork || openMonitors) && input.disposition !== "quarantine")
 			throw new BrokerAuthorityError("old_work_open");
 
-		const snapshotTables = [
-			"sessions",
-			"deliveries",
-			"recall_snippets",
-			"meta",
-			"memory_intents",
-			"monitors",
-			"monitor_events",
-			"authored_outputs",
-			"inbound_messages",
-			"conversation_context",
-			"lane_jobs",
-			"monitor_failures",
-			"monitor_slots",
-			"dispatch_leases",
-			"conversation_context_state",
-			"conversation_model",
-			"session_tail_cursors",
-			"work_attempt_runtime",
-			"lane_reports",
-			"broker_owned_bindings",
-			"broker_tail_cursors",
-			"broker_retired_sessions",
-			"broker_quarantine",
-		] as const;
-		const snapshot = Object.fromEntries(
-			snapshotTables.map((table) => [table, this.#db.prepare(`SELECT * FROM ${table}`).all()]),
-		);
+		// The snapshot holds only the rows this cutover overwrites: `sessions`
+		// (epoch/gjc_session_id/turn_count are rewritten below). Every other table
+		// is left untouched or only gains quarantine/retirement rows, and the full
+		// pre-cutover state is the integrity-checked backup named in `evidence`.
+		// Serializing the whole database here exceeded the JS string limit on a
+		// multi-GB home and failed the cutover with `Out of memory`.
+		const snapshot = { sessions: this.#db.prepare("SELECT * FROM sessions").all() };
 		const id = crypto.randomUUID();
 		this.#db
 			.prepare(

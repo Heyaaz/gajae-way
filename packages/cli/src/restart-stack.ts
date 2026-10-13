@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, readlink, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
 	acquireLease,
 	homeLayout,
@@ -17,6 +17,7 @@ import {
 	BROKER_UNIT,
 	currentPlatform,
 	launchAgentPlistPath,
+	removeStaleServices,
 	restartOrder,
 	restartStackCommands,
 	type ServicePlatform,
@@ -296,7 +297,26 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 	const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 	const timeoutMs = options.verifyTimeoutMs ?? VERIFY_TIMEOUT_MS;
 	const pollMs = options.pollMs ?? POLL_MS;
-	const binDir = options.binDir ?? process.env.GAJAEWAY_BIN_DIR ?? dirname(process.execPath);
+	const env = options.env ?? process.env;
+	const deployedExecutable = await realpath(process.execPath).catch(() => undefined);
+	const installedBinDir =
+		options.binDir ??
+		env.GAJAEWAY_BIN_DIR ??
+		(deployedExecutable !== undefined && basename(deployedExecutable).startsWith("gajaeway")
+			? dirname(deployedExecutable)
+			: undefined);
+	const binDir = installedBinDir ?? dirname(process.execPath);
+	if (installedBinDir !== undefined) {
+		await removeStaleServices({
+			binDir: installedBinDir,
+			platform,
+			uid: options.uid,
+			env,
+			...(options.launchAgentsDir === undefined ? {} : { launchAgentsDir: options.launchAgentsDir }),
+			...(options.unitDir === undefined ? {} : { unitDir: options.unitDir }),
+			run: runner,
+		});
+	}
 
 	const originalPids = new Map<string, number | undefined>();
 	for (const spec of restartOrder()) {
@@ -305,8 +325,10 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 	}
 
 	const existing = await readRestartReceipt(options.home);
+	if (existing?.id === options.id && existing.state !== "queued")
+		throw new Error(`restart-stack ${options.id}: receipt is ${existing.state}; refusing to start worker`);
 	const receipt =
-		existing?.id === options.id && existing.state === "queued"
+		existing?.id === options.id
 			? existing
 			: newReceipt(options.id, platform, options.uid, now(), options.trigger ?? "manual");
 	receipt.state = "running";
@@ -501,7 +523,13 @@ export interface LaunchRestartOptions {
 	/** Argv that re-enters the CLI; `--run <id>` is appended. */
 	readonly worker?: readonly string[];
 	readonly env?: NodeJS.ProcessEnv;
+	/** Starts systemd-run; injectable for launcher-result handling. */
+	readonly systemdRun?: (command: readonly string[]) => Bun.Subprocess;
+	/** Maximum time to wait for systemd-run to acknowledge the worker exec. */
+	readonly systemdRunTimeoutMs?: number;
 }
+
+const SYSTEMD_RUN_TIMEOUT_MS = 30_000;
 
 /** The argv that runs this CLI again, whether compiled or run from source. */
 export function cliCommand(): string[] {
@@ -509,8 +537,8 @@ export function cliCommand(): string[] {
 }
 
 /**
- * Queues a restart and hands it to a detached supervisor, returning as soon as
- * the supervisor is spawned so the caller may be killed by the restart itself.
+ * Queues a restart and hands it to a detached supervisor, returning once the
+ * platform launcher acknowledges it so the caller may be killed by the restart.
  */
 export async function launchRestartStack(
 	options: LaunchRestartOptions,
@@ -522,33 +550,73 @@ export async function launchRestartStack(
 	await writeReceipt(options.home, receipt);
 	const worker = [...(options.worker ?? [...cliCommand(), "ops", "restart-stack"]), "--run", receipt.id];
 	const argv = supervisorArgv(platform, worker, options.home, receipt.id, options.binDir);
+	const spawnOptions = {
+		detached: true,
+		stdin: "ignore" as const,
+		stdout: "ignore" as const,
+		stderr: "ignore" as const,
+		env: {
+			...(options.env ?? process.env),
+			GAJAEWAY_HOME: options.home,
+			...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
+		},
+	};
 	let child: Bun.Subprocess;
 	try {
-		child = Bun.spawn(argv, {
-			detached: true,
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
-			env: {
-				...(options.env ?? process.env),
-				GAJAEWAY_HOME: options.home,
-				...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
-			},
-		});
+		child =
+			platform === "linux"
+				? (options.systemdRun ?? ((command) => Bun.spawn([...command], spawnOptions)))(argv)
+				: Bun.spawn(argv, spawnOptions);
 	} catch (error) {
-		// Nothing will ever pick this receipt up: leaving it `queued` reads as a
-		// restart still on its way. A host without a systemd user manager (a
-		// container) has no `systemd-run`, and its restart belongs to whatever
-		// supervises that host.
-		receipt.state = "failed";
-		receipt.finishedAt = new Date().toISOString();
-		receipt.detail = `supervisor ${argv[0]} could not be started (${error instanceof Error ? error.message : String(error)}); without a service manager here, restart through the host's own supervisor`;
-		for (const step of receipt.steps) step.result = "skipped";
-		await writeReceipt(options.home, receipt);
-		throw new Error(`restart-stack ${receipt.id}: failed: ${receipt.detail}`);
+		const detail =
+			platform === "linux"
+				? `supervisor systemd-run could not be started (${error instanceof Error ? error.message : String(error)}); without a service manager here, restart through the host's own supervisor`
+				: `supervisor ${argv[0]} could not be started (${error instanceof Error ? error.message : String(error)})`;
+		await failLaunch(options.home, receipt, detail);
+		throw new Error(`restart-stack ${receipt.id}: failed: ${detail}`);
+	}
+	if (platform === "linux") {
+		const outcome = await waitForLauncher(child, options.systemdRunTimeoutMs ?? SYSTEMD_RUN_TIMEOUT_MS);
+		if (outcome.kind === "timed_out") {
+			const detail = `supervisor systemd-run timed out after ${options.systemdRunTimeoutMs ?? SYSTEMD_RUN_TIMEOUT_MS}ms; handoff outcome is indeterminate`;
+			await failLaunch(options.home, receipt, detail);
+			throw new Error(`restart-stack ${receipt.id}: failed: ${detail}`);
+		}
+		if (outcome.exitStatus !== 0) {
+			const detail = `supervisor systemd-run exited with status ${outcome.exitStatus}`;
+			await failLaunch(options.home, receipt, detail);
+			throw new Error(`restart-stack ${receipt.id}: failed: ${detail}`);
+		}
 	}
 	child.unref();
 	return { receipt, supervisorPid: child.pid };
+}
+
+async function failLaunch(home: string, receipt: RestartReceipt, detail: string): Promise<void> {
+	receipt.state = "failed";
+	receipt.finishedAt = new Date().toISOString();
+	receipt.detail = detail;
+	for (const step of receipt.steps) step.result = "skipped";
+	await writeReceipt(home, receipt);
+}
+
+async function waitForLauncher(
+	child: Bun.Subprocess,
+	timeoutMs: number,
+): Promise<{ readonly kind: "exited"; readonly exitStatus: number } | { readonly kind: "timed_out" }> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const outcome = await Promise.race([
+		child.exited.then((exitStatus) => ({ kind: "exited" as const, exitStatus })),
+		new Promise<{ readonly kind: "timed_out" }>((resolve) => {
+			timer = setTimeout(() => resolve({ kind: "timed_out" }), timeoutMs);
+		}),
+	]);
+	if (timer !== undefined) clearTimeout(timer);
+	if (outcome.kind === "timed_out") {
+		child.kill("SIGKILL");
+		void child.exited.catch(() => undefined);
+	}
+	return outcome;
 }
 
 /**
@@ -570,6 +638,7 @@ export function supervisorArgv(
 		"--user",
 		"--collect",
 		"--quiet",
+		"--service-type=exec",
 		`--unit=gajaeway-restart-stack-${id}`,
 		`--setenv=GAJAEWAY_HOME=${home}`,
 		...(binDir === undefined ? [] : [`--setenv=GAJAEWAY_BIN_DIR=${binDir}`]),

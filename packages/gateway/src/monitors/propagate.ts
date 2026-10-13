@@ -3,6 +3,7 @@ import {
 	type ChatMessagePayload,
 	eventTypeOrigin,
 	isSilentOutput,
+	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	monitorSessionOrigin,
@@ -14,14 +15,25 @@ import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
-import { isSessionBusy, type SessionPort } from "../orchestrator/session-port";
-import type { Store } from "../store";
+import {
+	isSessionBusy,
+	LastAssistantUnreadableError,
+	type SessionPort,
+	SessionRequestTimeoutError,
+	SessionTerminalError,
+	sessionRequestStep,
+} from "../orchestrator/session-port";
+import { RelayClosedError, RelayHelloError, RelayRefusedError } from "../orchestrator/tail-runner";
+import { BrokerAuthorityError, type Store } from "../store";
 import {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
+	MONITOR_EVENT_MAX_OPEN_AGE_MS,
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
+	type MonitorEventDbRow,
 	RECONCILABLE_STAGES,
 	TERMINAL_STAGES,
 } from "../store/groups/monitors";
+import type { WriteTx } from "../store/tx";
 import {
 	type AuthoringFailureClass,
 	buildMonitorCompactionDigest,
@@ -32,6 +44,7 @@ import {
 	decideSessionRoll,
 	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
+	isAuthoredEchoSuspected,
 	isOrphanedExecutorFailure,
 	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
@@ -44,6 +57,8 @@ import {
 } from "./compaction";
 import { readMonitorProcedure } from "./procedure";
 import type { MonitorRegistry } from "./registry";
+
+export const MONITOR_REPORT_MESSAGE_ID_PREFIX = "monitor-report:";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
 const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
@@ -86,6 +101,9 @@ type DispatchFailureCode =
 	// re-dispatches instead of waiting for the lease to expire, and the failure
 	// row names the session whose host may have outlived the gateway.
 	| "gateway_shutdown"
+	| "session_host_unavailable"
+	| "authoring_result_unreadable"
+	| "broker_authority_refused"
 	| "event_type_invalid"
 	| "monitor_invalid"
 	| "internal_error";
@@ -96,7 +114,11 @@ type DispatchFailureCode =
  * attempt to a fresh session), `gateway_shutdown` was this process's own stop
  * (#225: the next boot re-dispatches at once). Both still consume the budget.
  */
-const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode>(["session_busy", "gateway_shutdown"]);
+const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode>([
+	"session_busy",
+	"gateway_shutdown",
+	"session_host_unavailable",
+]);
 
 /**
  * How long shutdown waits for in-flight authoring turns before marking them
@@ -114,6 +136,18 @@ interface LiveClaim {
 	readonly phase: () => string;
 	readonly sessionId: () => string | undefined;
 }
+
+interface AuthoringTurnPointer {
+	readonly sessionId: string;
+	readonly opRef: string;
+	readonly eventIds: readonly string[];
+}
+
+type ExhaustedTurnDisposition =
+	| { readonly kind: "terminal"; readonly raw: string | undefined }
+	| { readonly kind: "hold" }
+	| { readonly kind: "resume"; readonly turn: AuthoringTurnPointer }
+	| { readonly kind: "monitor_invalid"; readonly raw: string };
 
 export interface MonitorDispatchFailure {
 	readonly eventId: string;
@@ -194,6 +228,7 @@ export class MonitorPropagator {
 	readonly #emit: (event: MonitorEventRecord) => void;
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
+	readonly #notifyInbound: ((originKey: string) => Promise<void>) | undefined;
 	readonly #now: () => number;
 	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
@@ -236,6 +271,8 @@ export class MonitorPropagator {
 		ownerTarget?: { readonly origin: OriginRef };
 		/** Broadcasts a prepared chat.message to live adapter connections. */
 		deliver?: (payload: ChatMessagePayload) => void;
+		/** Wakes the persona actor after a durable monitor report is enqueued. */
+		notifyInbound?: (originKey: string) => Promise<void>;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
@@ -277,6 +314,7 @@ export class MonitorPropagator {
 		this.#emit = options.emit;
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
+		this.#notifyInbound = options.notifyInbound;
 		this.#now = options.now ?? (() => Date.now());
 		this.#acquireLease =
 			options.acquireLease ??
@@ -505,6 +543,7 @@ export class MonitorPropagator {
 	 * than five consecutive sweeps (#179); BACKOFF_EXEMPT_FAILURES retry at once.
 	 */
 	async reconcile(): Promise<void> {
+		this.reapStale();
 		if (this.#reconciling) {
 			// Yield once so a caller racing the first sweep observes its claimed work
 			// rather than an artificial pre-bind microtask gap in the shared port.
@@ -543,7 +582,11 @@ export class MonitorPropagator {
 				});
 			}
 			// Replay oldest-first: recovery must re-author events in the order they fired.
-			for (const row of this.#database.monitors.eventsOpen()) {
+			const resumedAuthoringEvents = new Set<string>();
+			for (const candidate of this.#database.monitors.eventsOpen()) {
+				if (resumedAuthoringEvents.has(candidate.event_id)) continue;
+				const row = this.#database.monitors.eventGet(candidate.event_id);
+				if (!row) continue;
 				// A closing propagator starts no new dispatch: the rows stay recoverable
 				// for the next boot's sweep instead of being claimed by a dying process.
 				if (this.#closing) break;
@@ -565,12 +608,57 @@ export class MonitorPropagator {
 					// are reclaimed here (the dispatcher acquires its own lease).
 					if (this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())) continue;
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
+						// Exhausting dispatch attempts does not settle the turn they may have started.
+						const disposition = await this.#exhaustedTurnDisposition(row);
+						if (disposition.kind === "hold") continue;
+						if (disposition.kind === "resume") {
+							for (const eventId of disposition.turn.eventIds) resumedAuthoringEvents.add(eventId);
+							await this.#dispatch([...disposition.turn.eventIds], disposition.turn);
+							continue;
+						}
+						if (disposition.kind === "monitor_invalid") {
+							const failedRow = this.#database.transaction((tx) => {
+								const current = this.#database.monitors.eventGet(row.event_id);
+								if (
+									!current ||
+									this.#database.core.metaGet(authoringTurnKey(row.event_id)) !== disposition.raw ||
+									current.dispatch_attempts !== row.dispatch_attempts ||
+									current.dispatch_attempts < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS ||
+									(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
+									this.#database.monitors.authoredOutput(row.event_id) !== undefined ||
+									this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())
+								)
+									return undefined;
+								if (
+									!this.#database.monitors.eventTerminalFail(
+										tx,
+										row.event_id,
+										"monitor_invalid",
+										"dispatch setup failed (monitor_invalid)",
+									)
+								)
+									return undefined;
+								return current;
+							});
+							if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
+							continue;
+						}
+						const expectedRaw = disposition.kind === "terminal" ? disposition.raw : undefined;
 						const failedRow = this.#database.transaction((tx) => {
-							const current = this.#database.monitors.eventGet(row.event_id, true);
-							if (!current) return undefined;
+							const current = this.#database.monitors.eventGet(row.event_id);
+							if (
+								!current ||
+								this.#database.core.metaGet(authoringTurnKey(row.event_id)) !== expectedRaw ||
+								current.dispatch_attempts !== row.dispatch_attempts ||
+								current.dispatch_attempts < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS ||
+								(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
+								this.#database.monitors.authoredOutput(row.event_id) !== undefined ||
+								this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())
+							)
+								return undefined;
 							this.#database.monitors.eventUpdate(tx, row.event_id, "failed_no_retry", null);
 							this.#database.core.metaDelete(authoringTurnKey(row.event_id));
-							return current.stage === "failed_no_retry" ? undefined : current;
+							return current;
 						});
 						if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
 						continue;
@@ -590,6 +678,74 @@ export class MonitorPropagator {
 		}
 	}
 
+	/** End one recoverable event without discarding its saved authoring-turn pointer. */
+	settle(eventId: string): MonitorEventOperatorResult {
+		const result = this.#database.transaction((tx) =>
+			this.#database.monitors.eventOperatorSettle(tx, eventId, this.#now()),
+		);
+		if (!result.settled) return { eventId, done: false, reason: result.reason };
+		const row = this.#database.monitors.eventGet(eventId);
+		if (row) this.#emitStage(row, "failed_no_retry");
+		return { eventId, done: true, previousStage: result.previousStage };
+	}
+
+	/** Reset a failed event's reclaim budget and immediately run reconciliation. */
+	retry(eventId: string): MonitorEventOperatorResult {
+		const result = this.#database.transaction((tx) =>
+			this.#database.monitors.eventOperatorRetry(tx, eventId, this.#now()),
+		);
+		if (!result.retried) return { eventId, done: false, reason: result.reason };
+		const row = this.#database.monitors.eventGet(eventId);
+		if (row) this.#emitStage(row, "failed");
+		void this.reconcile().catch(() => console.error(`monitor retry reconcile failed: event ${eventId}`));
+		return { eventId, done: true, previousStage: result.previousStage };
+	}
+
+	/** Reap stale open events while retaining any #508 authoring-turn pointer for recovery. */
+	reapStale(): number {
+		const now = this.#now();
+		const cutoff = new Date(now - MONITOR_EVENT_MAX_OPEN_AGE_MS).toISOString();
+		const rows = this.#database.transaction((tx) => this.#database.monitors.eventReapStale(tx, cutoff, now));
+		for (const row of rows) this.#emitStage(row, "failed_no_retry");
+		return rows.length;
+	}
+
+	/** Only an explicitly failed operation can be discarded; completed output is resumed under its original op-ref. */
+	async #exhaustedTurnDisposition(row: MonitorEventDbRow): Promise<ExhaustedTurnDisposition> {
+		const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+		if (raw === undefined) return { kind: "terminal", raw };
+		const turn = parseAuthoringTurnPointer(raw);
+		if (!turn?.eventIds.includes(row.event_id)) return { kind: "hold" };
+		const monitor = this.#registry.get(row.monitor_id);
+		// The per-event pointer owns the original session/op-ref. Do not infer the
+		// session from row.event_type (including catch-all) or the current binding.
+		let report: Awaited<ReturnType<SessionPort["status"]>>;
+		try {
+			report = await this.#sessionPort.status({ sessionId: turn.sessionId, repo: this.#repo, opRef: turn.opRef });
+		} catch {
+			// An unreadable status is not proof that the turn stopped running.
+			return { kind: "hold" };
+		}
+		const state = report.status?.status;
+		if (state === "failed") return { kind: "terminal", raw };
+		if (state !== "terminal_ok") return { kind: "hold" };
+		// The turn has ended. If the monitor is gone, the events are now unrecoverable.
+		if (!monitor) return { kind: "monitor_invalid", raw };
+		for (const eventId of turn.eventIds) {
+			const related = this.#database.monitors.eventGet(eventId);
+			if (
+				!related ||
+				related.monitor_id !== row.monitor_id ||
+				related.event_type !== row.event_type ||
+				(TERMINAL_STAGES as readonly string[]).includes(related.stage) ||
+				this.#database.core.metaGet(authoringTurnKey(eventId)) !== raw ||
+				this.#database.monitors.eventLiveLeaseOwner(eventId, this.#now())
+			)
+				return { kind: "hold" };
+		}
+		return { kind: "resume", turn };
+	}
+
 	/**
 	 * `batched` is a live stage: a dispatch that is still awaiting its authoring turn sits there
 	 * for minutes. It is also where an event is stranded forever if the process dies mid-dispatch,
@@ -605,11 +761,11 @@ export class MonitorPropagator {
 		if (row.stage === "batched") return !this.#inFlight.has(row.event_id);
 		return ["admitted", "dispatched", "failed"].includes(row.stage);
 	}
-	async #dispatch(eventIds: string[]): Promise<void> {
+	async #dispatch(eventIds: string[], resumeTurn?: AuthoringTurnPointer): Promise<void> {
 		for (const id of eventIds) this.#inFlight.add(id);
 		// Track the exact in-flight promise per event so awaitable submission can
 		// await the ORIGINAL chain (no second dispatch, no double authoring).
-		const promise = this.#dispatchBatch(eventIds).finally(() => {
+		const promise = this.#dispatchBatch(eventIds, resumeTurn).finally(() => {
 			for (const id of eventIds) {
 				this.#inFlight.delete(id);
 				if (this.#inFlightPromises.get(id) === promise) this.#inFlightPromises.delete(id);
@@ -618,11 +774,40 @@ export class MonitorPropagator {
 		for (const id of eventIds) this.#inFlightPromises.set(id, promise);
 		await promise;
 	}
-	async #dispatchBatch(eventIds: string[]): Promise<void> {
+	async #dispatchBatch(eventIds: string[], resumeTurn?: AuthoringTurnPointer): Promise<void> {
+		if (
+			resumeTurn &&
+			(resumeTurn.eventIds.length !== eventIds.length || !resumeTurn.eventIds.every((id) => eventIds.includes(id)))
+		)
+			return;
+		const savedTurnMatches = () =>
+			!resumeTurn ||
+			resumeTurn.eventIds.every((eventId) => {
+				const raw = this.#database.core.metaGet(authoringTurnKey(eventId));
+				const saved = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
+				return saved !== undefined && sameAuthoringTurn(saved, resumeTurn);
+			});
+		const resumeRowsSafe = (candidateRows: readonly MonitorEventDbRow[]) => {
+			if (!resumeTurn) return true;
+			const first = candidateRows[0];
+			return (
+				candidateRows.length === eventIds.length &&
+				first !== undefined &&
+				candidateRows.every(
+					(row) =>
+						row.monitor_id === first.monitor_id &&
+						row.event_type === first.event_type &&
+						!(TERMINAL_STAGES as readonly string[]).includes(row.stage) &&
+						this.#database.monitors.authoredOutput(row.event_id) === undefined,
+				)
+			);
+		};
+		if (!savedTurnMatches()) return;
 		const rows = this.#database.monitors.eventsByIds(eventIds);
-		if (!rows.length) return;
+		if (!rows.length || !resumeRowsSafe(rows)) return;
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) {
+			if (resumeTurn) return;
 			for (const row of rows) {
 				const failed = this.#database.transaction((tx) =>
 					this.#database.monitors.eventTerminalFail(
@@ -657,21 +842,30 @@ export class MonitorPropagator {
 				leased.push(row);
 			}
 		}
-		if (!leased.length) return;
+		if (!leased.length || (resumeTurn && leased.length !== rows.length)) {
+			for (const row of leased)
+				this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
+			return;
+		}
+		const currentRows = this.#database.monitors.eventsByIds(eventIds);
+		if (resumeTurn && (!savedTurnMatches() || !resumeRowsSafe(currentRows))) {
+			for (const row of leased)
+				this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
+			return;
+		}
 		// Fence the initial stage claim: only rows we still own transition.
 		const claimed: typeof leased = [];
 		for (const row of leased) {
 			if (this.#fencedUpdate(row.event_id, leaseId, batchId, now())) claimed.push(row);
 		}
-		if (!claimed.length) {
-			// Ownership stolen between claim and batching: release every acquired
-			// lease and bail — no heartbeat, no dispatch, no writes.
+		if (!claimed.length || (resumeTurn && claimed.length !== leased.length)) {
+			// Ownership changed during the claim: release every acquired lease and
+			// let a later sweep reclaim any rows already moved to `batched`.
 			for (const row of leased)
 				this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
 			return;
 		}
 		for (const row of claimed) this.#emitStage(row, "batched");
-		const declared = new Set(monitor.eventTypes);
 		const claimedEventType = claimed[0]?.event_type;
 		let sessionOrigin: OriginRef;
 		let sessionOriginKey: string;
@@ -680,10 +874,7 @@ export class MonitorPropagator {
 			originKey(eventTypeOrigin(claimedEventType));
 			// The session is owned by THIS monitor (#177): monitors that declare the
 			// same event type must not share history, instruction, or failure domain.
-			sessionOrigin = monitorSessionOrigin(
-				monitor.monitorId,
-				declared.has(claimedEventType) ? claimedEventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
-			);
+			sessionOrigin = monitorOriginForEvent(monitor, claimedEventType);
 			sessionOriginKey = originKey(sessionOrigin);
 		} catch {
 			this.#database.transaction((tx) => {
@@ -749,55 +940,63 @@ export class MonitorPropagator {
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
 			try {
-				// Safety-net roll boundary (issue #68). It sits HERE, after the
-				// per-origin turn chain has been acquired and before this batch's
-				// session is bound: the previous batch's authoring turn has already
-				// settled, and this batch's events are claimed under live leases but
-				// not yet authored. A roll can therefore neither strand an in-flight
-				// batch nor let one be authored twice — the events simply land in the
-				// new epoch's session. Leases and fencing are untouched.
-				const digest = this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
-				const boundEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+				// A completed saved turn must be harvested before a pending roll changes
+				// its session ID. Fresh dispatches still roll at this boundary (#68).
+				const digest = resumeTurn
+					? undefined
+					: this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
 				const effectiveModel = (monitor.model as GjcModelSelection | undefined) ?? this.#model;
 				const effectiveServiceTier = (monitor.serviceTier as GjcServiceTier | undefined) ?? this.#serviceTier;
-				dispatchOperation = "bind";
-				dispatchOperationArgs = {
-					epoch: boundEpoch,
-					hasModel: effectiveModel !== undefined,
-				};
-				const binding = await this.#sessionPort.bind({
-					originKey: sessionOriginKey,
-					epoch: boundEpoch,
-					repo: this.#repo,
-					...(effectiveModel ? { model: effectiveModel } : {}),
-				});
-				const { sessionId } = binding;
+				let sessionId: string;
+				if (resumeTurn) {
+					sessionId = resumeTurn.sessionId;
+					const current = this.#database.bindings.getSessionRecord(sessionOriginKey);
+					boundSessionEpoch = current?.sessionId === sessionId ? current.epoch : undefined;
+					dispatchOperation = "request";
+					dispatchOperationArgs = { opRef: resumeTurn.opRef };
+					dispatchPhase = "procedure";
+				} else {
+					const boundEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+					dispatchOperation = "bind";
+					dispatchOperationArgs = {
+						epoch: boundEpoch,
+						hasModel: effectiveModel !== undefined,
+					};
+					const binding = await this.#sessionPort.bind({
+						originKey: sessionOriginKey,
+						epoch: boundEpoch,
+						repo: this.#repo,
+						...(effectiveModel ? { model: effectiveModel } : {}),
+					});
+					sessionId = binding.sessionId;
+					boundSessionId = sessionId;
+					boundSessionEpoch = binding.epoch;
+					dispatchPhase = "configure";
+					const modelKey = effectiveModel
+						? typeof effectiveModel === "string"
+							? effectiveModel
+							: `preset:${effectiveModel.preset}`
+						: undefined;
+					if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
+						dispatchOperation = "setModel";
+						dispatchOperationArgs = {
+							model: modelKey,
+						};
+						await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
+						this.#appliedModels.set(sessionId, modelKey!);
+					} else if (effectiveModel && binding.startupModelApplied) {
+						this.#appliedModels.set(sessionId, modelKey!);
+					}
+					if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
+						dispatchOperation = "setServiceTier";
+						dispatchOperationArgs = {
+							tier: effectiveServiceTier,
+						};
+						await this.#sessionPort.setServiceTier({ sessionId, repo: this.#repo, tier: effectiveServiceTier });
+						this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
+					}
+				}
 				boundSessionId = sessionId;
-				boundSessionEpoch = binding.epoch;
-				dispatchPhase = "configure";
-				const modelKey = effectiveModel
-					? typeof effectiveModel === "string"
-						? effectiveModel
-						: `preset:${effectiveModel.preset}`
-					: undefined;
-				if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
-					dispatchOperation = "setModel";
-					dispatchOperationArgs = {
-						model: modelKey,
-					};
-					await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
-					this.#appliedModels.set(sessionId, modelKey!);
-				} else if (effectiveModel && binding.startupModelApplied) {
-					this.#appliedModels.set(sessionId, modelKey!);
-				}
-				if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
-					dispatchOperation = "setServiceTier";
-					dispatchOperationArgs = {
-						tier: effectiveServiceTier,
-					};
-					await this.#sessionPort.setServiceTier({ sessionId, repo: this.#repo, tier: effectiveServiceTier });
-					this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
-				}
 				// Guidance order: the monitor's own instruction first (it is what the
 				// owner actually asked this monitor to do), then any built-in
 				// maintenance semantics for the claimed event types. Without either,
@@ -821,12 +1020,12 @@ export class MonitorPropagator {
 				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${procedure.prompt ? `\n${procedure.prompt}\n` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 				// #187: a request-phase failure does not mean the prompt was refused —
 				// the turn it started may still be running. Reuse its op-ref on retry.
+				const authoringEventIds = resumeTurn?.eventIds ?? claimed.map((row) => row.event_id);
 				const opRef =
-					(await this.#reusableAuthoringTurn(
-						claimed.map((row) => row.event_id),
-						sessionId,
-					)) ?? `gw-m-${batchId.replaceAll("-", "")}`;
-				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: claimed.map((row) => row.event_id) });
+					resumeTurn?.opRef ??
+					(await this.#reusableAuthoringTurn(authoringEventIds, sessionId)) ??
+					`gw-m-${batchId.replaceAll("-", "")}`;
+				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: authoringEventIds });
 				this.#database.transaction(() => {
 					for (const row of claimed) this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
 				});
@@ -855,17 +1054,22 @@ export class MonitorPropagator {
 				// validated. The count is OBSERVATIONAL: it is reported, and it never
 				// rolls a session on its own — native gjc compaction owns keeping the
 				// context bounded while the session is answering.
-				const turns = this.#database.transaction((tx) =>
-					this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
-				);
-				this.#safetyState(sessionOriginKey).turns = turns;
+				if (boundSessionEpoch !== undefined) {
+					const turns = this.#database.transaction((tx) =>
+						this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
+					);
+					this.#safetyState(sessionOriginKey).turns = turns;
+				}
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
 				// answer: it must not arm the safety net.
-				if (response.trim()) this.#safetyState(sessionOriginKey).contextFailures = 0;
-				else throw new Error("authoring response is empty");
-				// The runtime accepted and finished a turn, so it is not stalled.
-				this.#safetyState(sessionOriginKey).busyFailures = 0;
+				if (!response.trim()) throw new Error("authoring response is empty");
+				if (boundSessionEpoch !== undefined) {
+					const safety = this.#safetyState(sessionOriginKey);
+					safety.contextFailures = 0;
+					// The runtime accepted and finished a turn, so it is not stalled.
+					safety.busyFailures = 0;
+				}
 				// Lease fencing: after an await, this attempt may no longer own the
 				// claim (expired + stolen). Every write below is conditional on the
 				// live lease; a stale attempt's completion becomes a no-op.
@@ -914,6 +1118,9 @@ export class MonitorPropagator {
 						const row = this.#database.monitors.eventGet(entry.eventId);
 						if (!row) continue;
 						const intentId = `monitor-event-intent:${entry.eventId}`;
+						const reportable = Boolean(
+							monitor.reportTo && this.#isReportableResult(monitor, row.event_type, entry.note),
+						);
 						const authoredOk = this.#database.transaction((tx) => {
 							const authored = this.#database.monitors.authorFenced(
 								tx,
@@ -934,12 +1141,14 @@ export class MonitorPropagator {
 										replyText: entry.note,
 									}),
 								});
+							if (reportable) this.#enqueueMonitorReport(tx, monitor, row, entry.note as string);
 							return true;
 						});
 						if (!authoredOk) continue;
 						// Wake the closure queue so the atomically admitted intent is
 						// processed in the same run (no restart needed).
 						this.#memory.enqueueExistingId(intentId);
+						if (reportable && monitor.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 						this.#emit({
 							eventId: entry.eventId,
 							monitorId: monitor.monitorId,
@@ -994,8 +1203,29 @@ export class MonitorPropagator {
 						this.#database.monitors.eventFencedUpdate(tx, entry.eventId, leaseId, "authored_no_delivery", batchId),
 					);
 				}
-				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
-				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
+				const validDeliveryEntries: typeof nonSilentEntries = [];
+				for (const entry of nonSilentEntries) {
+					const eventRow = fenced.find((row) => row.event_id === entry.eventId);
+					const isEcho = this.#isContractEcho(monitor, eventRow?.event_type, entry.note);
+					if (!isEcho) {
+						validDeliveryEntries.push(entry);
+						continue;
+					}
+					const updated = this.#database.transaction((tx) =>
+						this.#database.monitors.eventFencedContractUnmet(
+							tx,
+							entry.eventId,
+							leaseId,
+							batchId,
+							"authored_echo_suspected",
+							"delivery suppressed: note echoes the monitor contract without new evidence",
+							this.#now(),
+						),
+					);
+					if (updated && eventRow) this.#emitStage(eventRow, "contract_unmet");
+				}
+				// Deliver only non-silent notes that contain information beyond the contract.
+				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
 				if (deliveryText.length > 0) {
 					const origin = target.origin;
 					// Typed mentions (issue #180) are added here, in code: the author is
@@ -1037,7 +1267,10 @@ export class MonitorPropagator {
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
-				const failureClass = classifyAuthoringFailure(error);
+				const failureClass =
+					error instanceof LastAssistantUnreadableError || sessionRequestStep(error) === "last_assistant"
+						? "executor"
+						: classifyAuthoringFailure(error);
 				const protocolFailure =
 					protocolValidationActive && failureClass === "protocol" && protocolResponseByteLength !== undefined
 						? {
@@ -1214,6 +1447,16 @@ export class MonitorPropagator {
 			}
 			return;
 		}
+		if (isSessionHostUnavailable(error)) {
+			state.busyFailures = 0;
+			if (currentEpoch && !state.pendingRoll) {
+				state.pendingRoll = "session_host_unavailable";
+				console.error(
+					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_host_unavailable session=${sessionId ?? "none"} turns=${state.turns}`,
+				);
+			}
+			return;
+		}
 		// Any other outcome means the runtime accepted a prompt: not stalled.
 		state.busyFailures = 0;
 		if (failureClass === "executor") {
@@ -1378,6 +1621,8 @@ export class MonitorPropagator {
 	): void {
 		const eventRow = row ?? this.#database.monitors.eventGet(eventId);
 		if (!eventRow) return;
+		const monitor = this.#registry.get(eventRow.monitor_id);
+		const reportable = Boolean(monitor?.reportTo && this.#isReportableResult(monitor, eventRow.event_type, note));
 		const intentId = `monitor-event-intent:${eventId}`;
 		const authored = this.#database.transaction((tx) => {
 			const updated = this.#database.monitors.authorFenced(tx, eventId, "", note, noDelivery);
@@ -1394,12 +1639,49 @@ export class MonitorPropagator {
 						replyText: note,
 					}),
 				});
+			if (reportable && monitor) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
 			return true;
 		});
 		if (!authored) return;
 		// Wake the closure queue for the intent admitted above.
 		this.#memory.enqueueExistingId(intentId);
+		if (reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
+	}
+	#isReportableResult(monitor: MonitorRecord, eventType: string, note: string): boolean {
+		if (isSilentOutput(note)) return false;
+		if (!monitor.channelTarget && !this.#ownerTarget) return true;
+		return !this.#isContractEcho(monitor, eventType, note);
+	}
+	#isContractEcho(monitor: MonitorRecord, eventType: string | undefined, note: string): boolean {
+		return isAuthoredEchoSuspected(monitor.instruction, note) || isAuthoredEchoSuspected(eventType, note);
+	}
+	#enqueueMonitorReport(
+		tx: WriteTx,
+		monitor: MonitorRecord,
+		event: { readonly event_id: string; readonly event_type: string },
+		note: string,
+	): void {
+		const target = monitor.reportTo;
+		if (!target) return;
+		this.#database.inbox.enqueue(tx, {
+			messageId: `${MONITOR_REPORT_MESSAGE_ID_PREFIX}${event.event_id}`,
+			originKey: originKey(target),
+			originRefJson: JSON.stringify(target),
+			body: `Monitor ${JSON.stringify(monitor.name)} result for ${event.event_type} (${event.event_id}):\n\n${note}`,
+			source: "lane_report",
+		});
+	}
+	#notifyMonitorReport(target: OriginRef): void {
+		if (!this.#notifyInbound) return;
+		const key = originKey(target);
+		try {
+			void this.#notifyInbound(key).catch(() => {
+				console.error(`monitor report notify failed origin=${key}`);
+			});
+		} catch {
+			console.error(`monitor report notify failed origin=${key}`);
+		}
 	}
 	#emitStage(row: { event_id: string; monitor_id: string; event_type: string; fired_at: string }, stage: string): void {
 		this.#emit({
@@ -1413,6 +1695,12 @@ export class MonitorPropagator {
 }
 
 function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase: string): DispatchFailureCode {
+	const step = phase === "request" ? sessionRequestStep(error) : undefined;
+	if (error instanceof LastAssistantUnreadableError || step === "last_assistant") return "authoring_result_unreadable";
+	if (isSessionHostUnavailable(error)) return "session_host_unavailable";
+	if (error instanceof BrokerAuthorityError) return "broker_authority_refused";
+	if (error instanceof SessionTerminalError || error instanceof SessionRequestTimeoutError)
+		return "authoring_turn_failed";
 	// Context exhaustion outranks the phase codes: it is the one class the safety
 	// net acts on, and an operator must be able to see it in the event row.
 	if (failureClass === "context") return "authoring_context_exhausted";
@@ -1441,7 +1729,16 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	if (message.includes("session send") || message.includes("SessionPort")) return "authoring_turn_failed";
 	if (message.includes("session bind")) return "session_bind_failed";
 	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
+	if (step !== undefined) return "authoring_turn_failed";
 	return "internal_error";
+}
+
+/** Only positive evidence that the prompt was not sent can justify rolling a session. */
+function isSessionHostUnavailable(error: unknown): boolean {
+	if (error instanceof RelayHelloError) return true;
+	const step = sessionRequestStep(error);
+	if (error instanceof RelayRefusedError) return step === "attach" && error.code === "session_unavailable";
+	return error instanceof RelayClosedError && step === "attach";
 }
 
 /**
@@ -1500,6 +1797,46 @@ function authoringTurnKey(eventId: string): string {
 	return `monitor_authoring_turn:${eventId}`;
 }
 
+function parseAuthoringTurnPointer(raw: string): AuthoringTurnPointer | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!value || typeof value !== "object") return undefined;
+	const record = value as Record<string, unknown>;
+	const eventIds = record.eventIds;
+	if (
+		typeof record.sessionId !== "string" ||
+		!record.sessionId ||
+		typeof record.opRef !== "string" ||
+		!record.opRef ||
+		!Array.isArray(eventIds) ||
+		eventIds.length === 0 ||
+		!eventIds.every((eventId): eventId is string => typeof eventId === "string" && eventId.length > 0) ||
+		new Set(eventIds).size !== eventIds.length
+	)
+		return undefined;
+	return { sessionId: record.sessionId, opRef: record.opRef, eventIds };
+}
+
+function sameAuthoringTurn(left: AuthoringTurnPointer, right: AuthoringTurnPointer): boolean {
+	return (
+		left.sessionId === right.sessionId &&
+		left.opRef === right.opRef &&
+		left.eventIds.length === right.eventIds.length &&
+		left.eventIds.every((eventId) => right.eventIds.includes(eventId))
+	);
+}
+
+function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): OriginRef {
+	return monitorSessionOrigin(
+		monitor.monitorId,
+		monitor.eventTypes.includes(eventType) ? eventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
+	);
+}
+
 /** Only explicit diagnostic vocabulary crosses the durable boundary, never raw error text. */
 function failureDetail(error: unknown): string {
 	const object = (value: unknown): Record<string, unknown> =>
@@ -1519,8 +1856,20 @@ function failureDetail(error: unknown): string {
 		"SessionTerminalError",
 		"SessionRequestTimeoutError",
 		"RebindCapExceededError",
+		"RelayHelloError",
+		"RelayRefusedError",
+		"RelayClosedError",
+		"RelayRequestTimeoutError",
+		"TailCapacityError",
+		"TranscriptIncompleteError",
+		"OpRefError",
+		"OpRefRejectedError",
+		"GjcCliUnavailableError",
+		"LastAssistantUnreadableError",
+		"BrokerAuthorityError",
 	]);
 	const allowedCodes = new Set([
+		"broker_unavailable",
 		"session_not_found",
 		"session_closed",
 		"session_expired",
@@ -1540,6 +1889,20 @@ function failureDetail(error: unknown): string {
 		"invalid_request",
 		"resource_gone",
 		"usage",
+		"relay_hello_missing",
+		"relay_closed",
+		"relay_timeout",
+		"cutover_required",
+		"authority_mismatch",
+		"unowned_session",
+		"old_work_open",
+		"quarantined",
+		"invalid_authority",
+		"last_assistant_not_json",
+		"last_assistant_no_page",
+		"last_assistant_no_items",
+		"last_assistant_null_item",
+		"last_assistant_non_text_item",
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
@@ -1590,8 +1953,10 @@ function failureDetail(error: unknown): string {
 		error instanceof Error && error.stack
 			? frameNames.find((candidate) => error.stack?.split("\n").some((line) => line.includes(candidate)))
 			: undefined;
+	const step = sessionRequestStep(error);
 	return JSON.stringify({
 		class: name,
+		...(step ? { step } : {}),
 		...(code ? { code } : {}),
 		...(transport ? { transport } : {}),
 		...(typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255
