@@ -512,6 +512,8 @@ export interface MonitorSpec {
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
 	readonly serviceTier?: MonitorServiceTier;
+	/** Inject each authored result as an internal report into this conversation session. */
+	readonly reportTo?: OriginRef | null;
 	readonly enabled?: boolean;
 }
 

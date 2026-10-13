@@ -16,6 +16,7 @@ import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { isSessionBusy, type SessionPort } from "../orchestrator/session-port";
 import type { Store } from "../store";
+import type { WriteTx } from "../store/tx";
 import {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
@@ -195,6 +196,7 @@ export class MonitorPropagator {
 	readonly #emit: (event: MonitorEventRecord) => void;
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
+	readonly #notifyInbound: ((originKey: string) => Promise<void>) | undefined;
 	readonly #now: () => number;
 	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
@@ -237,6 +239,8 @@ export class MonitorPropagator {
 		ownerTarget?: { readonly origin: OriginRef };
 		/** Broadcasts a prepared chat.message to live adapter connections. */
 		deliver?: (payload: ChatMessagePayload) => void;
+		/** Wakes the persona actor after a durable monitor report is enqueued. */
+		notifyInbound?: (originKey: string) => Promise<void>;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
@@ -278,6 +282,7 @@ export class MonitorPropagator {
 		this.#emit = options.emit;
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
+		this.#notifyInbound = options.notifyInbound;
 		this.#now = options.now ?? (() => Date.now());
 		this.#acquireLease =
 			options.acquireLease ??
@@ -935,12 +940,14 @@ export class MonitorPropagator {
 										replyText: entry.note,
 									}),
 								});
+							if (monitor.reportTo) this.#enqueueMonitorReport(tx, monitor, row, entry.note as string);
 							return true;
 						});
 						if (!authoredOk) continue;
 						// Wake the closure queue so the atomically admitted intent is
 						// processed in the same run (no restart needed).
 						this.#memory.enqueueExistingId(intentId);
+						if (monitor.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 						this.#emit({
 							eventId: entry.eventId,
 							monitorId: monitor.monitorId,
@@ -1402,6 +1409,7 @@ export class MonitorPropagator {
 	): void {
 		const eventRow = row ?? this.#database.monitors.eventGet(eventId);
 		if (!eventRow) return;
+		const monitor = this.#registry.get(eventRow.monitor_id);
 		const intentId = `monitor-event-intent:${eventId}`;
 		const authored = this.#database.transaction((tx) => {
 			const updated = this.#database.monitors.authorFenced(tx, eventId, "", note, noDelivery);
@@ -1418,12 +1426,41 @@ export class MonitorPropagator {
 						replyText: note,
 					}),
 				});
+			if (monitor?.reportTo) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
 			return true;
 		});
 		if (!authored) return;
 		// Wake the closure queue for the intent admitted above.
 		this.#memory.enqueueExistingId(intentId);
+		if (monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
+	}
+	#enqueueMonitorReport(
+		tx: WriteTx,
+		monitor: MonitorRecord,
+		event: { readonly event_id: string; readonly event_type: string },
+		note: string,
+	): void {
+		const target = monitor.reportTo;
+		if (!target) return;
+		this.#database.inbox.enqueue(tx, {
+			messageId: `monitor-report:${event.event_id}`,
+			originKey: originKey(target),
+			originRefJson: JSON.stringify(target),
+			body: `Monitor ${JSON.stringify(monitor.name)} result for ${event.event_type} (${event.event_id}):\n\n${note}`,
+			source: "lane_report",
+		});
+	}
+	#notifyMonitorReport(target: OriginRef): void {
+		if (!this.#notifyInbound) return;
+		const key = originKey(target);
+		try {
+			void this.#notifyInbound(key).catch(() => {
+				console.error(`monitor report notify failed origin=${key}`);
+			});
+		} catch {
+			console.error(`monitor report notify failed origin=${key}`);
+		}
 	}
 	#emitStage(row: { event_id: string; monitor_id: string; event_type: string; fired_at: string }, stage: string): void {
 		this.#emit({

@@ -707,6 +707,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		memory,
 		delivery,
 		ownerTarget: options.config.ownerTarget,
+		notifyInbound: (originKey) => personaSessions.notifyInbound(originKey),
 		contextFailureRollThreshold: options.config.monitorContextFailureRollThreshold,
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
@@ -3274,7 +3275,7 @@ function reportTerminalLinkAudit(database: Store): void {
 }
 
 function laneReportTriggerText(body: string): string {
-	return `[Internal lane report: from your work lane, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
+	return `[Internal report from another Gajae session, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
 }
 function deliveryProjection(payloadJson: string): { readonly conversationId: string; readonly text: string } {
 	try {
