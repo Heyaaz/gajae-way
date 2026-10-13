@@ -623,9 +623,11 @@ export class WorkGroup {
 		};
 
 		for (const row of rows) {
+			let runtimeJobId: string | undefined;
 			try {
 				const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
 				validateWorkRuntime(runtime, this.instanceId);
+				runtimeJobId = runtime.jobId;
 				workAssert(
 					runtime.opRef === row.op_ref &&
 						runtime.jobId === row.job_id &&
@@ -705,7 +707,10 @@ export class WorkGroup {
 				updates.push({ runtime, next, priorSettledAt: row.settled_at });
 			} catch (error) {
 				skipped.push(row.op_ref);
-				if (row.settled_at !== null) quarantinedJobs.add(row.job_id);
+				if (runtimeJobId !== undefined && runtimeJobId !== row.job_id) {
+					quarantinedJobs.add(row.job_id);
+					quarantinedJobs.add(runtimeJobId);
+				} else if (row.settled_at !== null) quarantinedJobs.add(row.job_id);
 				log(
 					`work_attempt_reconcile_skip opRef=${row.op_ref} reason=${error instanceof Error ? error.message : String(error)}`,
 				);

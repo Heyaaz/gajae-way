@@ -341,6 +341,33 @@ describe("work attempt boot reconciliation", () => {
 		expect(f.database.work.laneParentAvailable("a")).toBe(false);
 	});
 
+	test("reconciliation quarantines both jobs when a settled SQL identity disagrees", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+		);
+		const unrelated = createLaneJobRecord({
+			jobId: "lanejob-62",
+			branch: "main",
+			worktreePath: "/other",
+			sessionId: SESSION,
+			now: () => new Date(START),
+		});
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, {
+				...unrelated,
+				laneKey: "work-b",
+				json: JSON.stringify(unrelated),
+			}),
+		);
+		f.raw.query("UPDATE work_attempt_runtime SET job_id = ? WHERE op_ref = ?").run(unrelated.jobId, f.runtime.opRef);
+
+		expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
+		expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(true);
+		expect(f.database.bindings.isQuarantined("work", unrelated.jobId)).toBe(true);
+	});
+
 	test("quarantining a settled candidate skips other repairs in the same lane", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
