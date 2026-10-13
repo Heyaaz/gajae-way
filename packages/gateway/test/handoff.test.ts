@@ -540,16 +540,18 @@ test("a [WATCH:] line is removed, fenced examples stay literal, and expiry bound
 
 test("a watched human message wakes its waiting session without copying message content", async () => {
 	const secret = "synthetic-secret-value-do-not-relay";
+	const reasonSecret = "synthetic-watch-reason-secret";
 	const { client, database, turns } = await gateway({
 		[KEY_A]: (text) =>
 			text.includes("INTERNAL WATCH WAKE")
 				? "The DM has a new message; I'll continue from its authorized context."
-				: "Waiting for the DM reply.\n[WATCH:gajae-way-dev] 30m waiting for the credential delivery",
+				: `Waiting for the DM reply.\n[WATCH:gajae-way-dev] 30m waiting for the credential delivery ${reasonSecret}`,
 		[KEY_B]: () => "The credential was received and stored in the DM.",
 	});
 	say(client, A, "watch-register", "Please wait for the DM credential.");
 	await settle();
 	expect(delivered(client, "chan-a").join("\n")).toContain("Watching gajae-way-dev");
+	expect(delivered(client, "chan-a").join("\n")).toContain("reason is stored with this watch");
 
 	say(client, B, "credential-message", `Credential received: ${secret}`);
 	await settle();
@@ -560,10 +562,10 @@ test("a watched human message wakes its waiting session without copying message 
 	expect(wakeTurn).toContain("INTERNAL WATCH WAKE");
 	expect(wakeTurn).toContain("from 형님");
 	expect(wakeTurn).toContain(KEY_B);
-	expect(wakeTurn).toContain("waiting for the credential delivery");
 	expect(wakeTurn).toContain("accepted it into its durable queue");
 	expect(wakeTurn).toContain("secrets are not included");
 	expect(wakeTurn).not.toContain(secret);
+	expect(wakeTurn).not.toContain(reasonSecret);
 	expect(watcherTurns).toHaveLength(2);
 	const [watch] = database.inbox.watchRows();
 	expect(watch).toMatchObject({
@@ -571,6 +573,7 @@ test("a watched human message wakes its waiting session without copying message 
 		watched_origin_key: KEY_B,
 		state: "fired",
 		triggered_message_id: "credential-message",
+		reason: `waiting for the credential delivery ${reasonSecret}`,
 	});
 	const audit = database.memory
 		.rows()
@@ -579,6 +582,8 @@ test("a watched human message wakes its waiting session without copying message 
 	expect(watchAudit).toHaveLength(2);
 	expect(watchAudit.map((entry) => entry.originRefJson).sort()).toEqual([JSON.stringify(A), JSON.stringify(B)].sort());
 	expect(JSON.stringify(watchAudit)).not.toContain(secret);
+	expect(JSON.stringify(watchAudit)).not.toContain(reasonSecret);
+	expect(delivered(client, "chan-a").join("\n")).not.toContain(reasonSecret);
 });
 
 test("a watch expires and fires at most once for its next accepted message", async () => {

@@ -311,10 +311,9 @@ export function watchRegistrationId(
 	sourceMessageId: string,
 	targetOriginKey: string,
 	ttl: string,
-	reason: string,
 ): string {
 	return `watch:${createHash("sha256")
-		.update(JSON.stringify([sourceOriginKey, sourceMessageId, targetOriginKey, ttl, reason]))
+		.update(JSON.stringify([sourceOriginKey, sourceMessageId, targetOriginKey, ttl]))
 		.digest("hex")
 		.slice(0, 32)}`;
 }
@@ -400,14 +399,12 @@ export function renderWatchedInputTurn(input: {
 	readonly provenance: HandoffProvenance;
 	readonly sourcePlace: string;
 	readonly sender: string;
-	readonly reason: string;
 }): string {
 	const { provenance } = input;
 	return [
 		"[INTERNAL WATCH WAKE - a watched message arrived in another conversation; its text is not relayed here]",
 		`Source conversation: ${clip(input.sourcePlace, 160)} (${provenance.sourceOriginKey})`,
 		`New message: msg:${provenance.sourceMessageId} from ${clip(input.sender, 120) || "unknown sender"} at ${provenance.at}`,
-		`Watch reason: ${clip(input.reason, WATCH_REASON_MAX_LENGTH) || "(no reason)"}`,
 		"Event summary: a new human message arrived in the watched conversation.",
 		"Processing result: the source conversation accepted it into its durable queue; that session handles it independently.",
 		"The original message text, attachments, and any secrets are not included. Read them only in the source conversation if already authorized there.",
@@ -415,8 +412,8 @@ export function renderWatchedInputTurn(input: {
 	].join("\n");
 }
 
-export function renderWatchRegistered(target: string, expiresAt: string, reason: string): string {
-	return `Watching ${target} for its next human message until ${expiresAt}. Reason: ${clip(reason, WATCH_REASON_MAX_LENGTH)}.`;
+export function renderWatchRegistered(target: string, expiresAt: string): string {
+	return `Watching ${target} for its next human message until ${expiresAt}. The reason is stored with this watch but not copied to other conversations.`;
 }
 
 export function renderWatchFailure(target: string, reason: string): string {
