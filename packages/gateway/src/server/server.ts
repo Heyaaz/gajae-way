@@ -1494,6 +1494,7 @@ async function handleRequest(
 						conversationId: projection.conversationId,
 						state: row.state,
 						createdAt: row.createdAt,
+						lastError: row.lastError,
 						textPrefix: projection.text.slice(0, 80),
 					};
 				});

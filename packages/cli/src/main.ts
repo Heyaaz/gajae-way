@@ -486,7 +486,7 @@ export function renderDeliveries(result: OpsDeliveriesResult): string[] {
 		`deliveries: ${result.rows.length}`,
 		...result.rows.map(
 			(row) =>
-				`${row.createdAt} ${row.state} delivery=${row.deliveryId} turn=${row.turnId} origin=${row.originKey} conversation=${row.conversationId} text=${JSON.stringify(row.textPrefix)}`,
+				`${row.createdAt} ${row.state} delivery=${row.deliveryId} turn=${row.turnId} origin=${row.originKey} conversation=${row.conversationId} lastError=${row.lastError ?? "-"} text=${JSON.stringify(row.textPrefix)}`,
 		),
 	];
 }
