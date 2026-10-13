@@ -674,8 +674,14 @@ export class WorkGroup {
 							: attempt.endedAt !== undefined && attempt.endedAt === row.settled_at
 								? attempt.endedAt
 								: undefined;
-				const settledAt =
-					sharedSettledAt ?? runtime.settledAt ?? attempt.endedAt ?? row.settled_at ?? runtime.terminal?.observedAt;
+				const storedSettledAt = [runtime.settledAt, attempt.endedAt ?? null, row.settled_at].filter(
+					(at): at is string => at !== null,
+				);
+				workAssert(
+					sharedSettledAt !== undefined || storedSettledAt.length <= 1,
+					"settlement timestamps conflict without corroboration",
+				);
+				const settledAt = sharedSettledAt ?? storedSettledAt[0] ?? runtime.terminal?.observedAt;
 				workAssert(settledAt !== undefined && settledAt !== null && workTime(settledAt));
 				const terminal = runtime.terminal ?? {
 					kind: "local" as const,

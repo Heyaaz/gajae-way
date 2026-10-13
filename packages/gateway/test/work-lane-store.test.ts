@@ -282,6 +282,24 @@ describe("work attempt boot reconciliation", () => {
 		expect(parseLaneJobRecord(historyJson).attempts[0]?.endedAt).toBe(END);
 	});
 
+	test("reconciliation quarantines conflicting settled timestamps without corroboration", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+		);
+		const runtime = f.database.work.workAttemptGet(f.runtime.opRef);
+		if (runtime === undefined) throw new Error("settled work attempt is missing");
+		const tornRuntime = { ...runtime, settledAt: "2026-09-08T00:00:20.000Z" };
+		f.raw
+			.query("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ? WHERE op_ref = ?")
+			.run(JSON.stringify(tornRuntime), "2026-09-08T00:00:30.000Z", runtime.opRef);
+
+		expect(() => f.database.work.workAttemptGet(runtime.opRef)).toThrow(WorkAttemptStateError);
+		expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
+		expect(f.database.bindings.isQuarantined("work", runtime.jobId)).toBe(true);
+	});
+
 	test("reconciliation quarantines settled attempts with mismatched history identity", async () => {
 		for (const [field, value] of [
 			["sessionId", "59bd7e80-cfbb-429a-b06b-bcf28cf75890"],
