@@ -572,12 +572,30 @@ export class WorkGroup {
 								'$.attempts'
 							) AS history_attempt
 						WHERE history.job_id = work_attempt_runtime.job_id
+							AND history.lane_key = work_attempt_runtime.lane_key
 							AND CASE
 								WHEN history_attempt.type = 'object' AND json_valid(work_attempt_runtime.record_json)
 									THEN json_extract(history_attempt.value, '$.opRef') = work_attempt_runtime.op_ref
-										AND json_extract(history_attempt.value, '$.endedAt') IS NOT json_extract(work_attempt_runtime.record_json, '$.settledAt')
+										AND (
+											json_extract(history_attempt.value, '$.sessionId') IS NOT json_extract(work_attempt_runtime.record_json, '$.sessionId')
+											OR json_extract(history_attempt.value, '$.startedAt') IS NOT json_extract(work_attempt_runtime.record_json, '$.startedAt')
+											OR json_extract(history_attempt.value, '$.endedAt') IS NOT json_extract(work_attempt_runtime.record_json, '$.settledAt')
+										)
 								ELSE 0
 							END
+					)
+					OR NOT EXISTS (
+						SELECT 1
+						FROM lane_jobs AS history,
+							json_each(
+								CASE WHEN json_valid(history.record_json) THEN history.record_json ELSE '{}' END,
+								'$.attempts'
+							) AS history_attempt
+						WHERE history.job_id = work_attempt_runtime.job_id
+							AND history.lane_key = work_attempt_runtime.lane_key
+							AND history_attempt.type = 'object'
+							AND json_valid(work_attempt_runtime.record_json)
+							AND json_extract(history_attempt.value, '$.opRef') = work_attempt_runtime.op_ref
 					)`,
 			)
 			.all() as Array<{

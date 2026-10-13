@@ -282,6 +282,35 @@ describe("work attempt boot reconciliation", () => {
 		expect(parseLaneJobRecord(historyJson).attempts[0]?.endedAt).toBe(END);
 	});
 
+	test("reconciliation quarantines settled attempts with mismatched history identity", async () => {
+		for (const [field, value] of [
+			["sessionId", "59bd7e80-cfbb-429a-b06b-bcf28cf75890"],
+			["startedAt", "2026-09-08T00:00:01.000Z"],
+		] as const) {
+			const f = await fixture();
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+			f.database.transaction((tx) =>
+				settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+			);
+			const historyJson = f.database.work.laneJobJson(f.runtime.jobId);
+			if (historyJson === undefined) throw new Error("settled lane history is missing");
+			const history = parseLaneJobRecord(historyJson);
+			const corrupted = {
+				...history,
+				attempts: history.attempts.map((attempt) =>
+					attempt.opRef === f.runtime.opRef ? { ...attempt, [field]: value } : attempt,
+				),
+			};
+			f.raw
+				.query("UPDATE lane_jobs SET record_json = ? WHERE job_id = ?")
+				.run(JSON.stringify(corrupted), f.runtime.jobId);
+
+			expect(() => f.database.work.workAttemptGet(f.runtime.opRef)).toThrow(WorkAttemptStateError);
+			expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
+			expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(true);
+		}
+	});
+
 	test("reconciliation settles a stale database column without replaying the open attempt", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
