@@ -577,6 +577,9 @@ export class WorkGroup {
 								WHEN history_attempt.type = 'object' AND json_valid(work_attempt_runtime.record_json)
 									THEN json_extract(history_attempt.value, '$.opRef') = work_attempt_runtime.op_ref
 										AND (
+											json_extract(history.record_json, '$.jobId') IS NOT json_extract(work_attempt_runtime.record_json, '$.jobId')
+											OR json_extract(history.record_json, '$.lane.worktreePath') IS NOT json_extract(work_attempt_runtime.record_json, '$.cwd')
+											OR
 											json_extract(history_attempt.value, '$.sessionId') IS NOT json_extract(work_attempt_runtime.record_json, '$.sessionId')
 											OR json_extract(history_attempt.value, '$.startedAt') IS NOT json_extract(work_attempt_runtime.record_json, '$.startedAt')
 											OR json_extract(history_attempt.value, '$.endedAt') IS NOT json_extract(work_attempt_runtime.record_json, '$.settledAt')
