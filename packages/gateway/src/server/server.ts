@@ -102,6 +102,7 @@ import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachme
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
+	extractHandoffAtBlockStart,
 	type HandoffProvenance,
 	type HandoffReply,
 	handoffMessageId,
@@ -111,6 +112,7 @@ import {
 	renderHandoffPointer,
 	renderHandoffTurn,
 	resolveHandoffTarget,
+	sanitizeHandoffTokens,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
@@ -2595,11 +2597,11 @@ async function createInboundTurnLifecycle(
 	 * Delivers one line into THIS conversation under the trigger's terminal slot,
 	 * so a replayed or reconciled answer can never post it twice.
 	 */
-	const deliverTerminalLine = (text: string) => {
-		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0);
+	const deliverTerminalLine = (text: string, partIndex = 0) => {
+		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, partIndex);
 		if (
 			options.database.transaction((tx) =>
-				options.database.inbox.claimTerminal(tx, input.turn.opRef, 0, deliveryId),
+				options.database.inbox.claimTerminal(tx, input.turn.opRef, partIndex, deliveryId),
 			) !== deliveryId
 		)
 			return;
@@ -2622,7 +2624,7 @@ async function createInboundTurnLifecycle(
 		if (!hop.ok || !resolved.ok) {
 			const reason = hop.ok ? "unresolvable target" : hop.reason;
 			console.error(`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${reason}`);
-			deliverTerminalLine(renderHandoffFailure(handoff.target, reason));
+			deliverTerminalLine(renderHandoffFailure(handoff.target, reason), deliveredParts.length);
 			return;
 		}
 		const sourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
@@ -2668,7 +2670,7 @@ async function createInboundTurnLifecycle(
 				.notifyInbound(resolved.originKey)
 				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
 		}
-		deliverTerminalLine(renderHandoffPointer(handoff.target));
+		deliverTerminalLine(renderHandoffPointer(handoff.target), deliveredParts.length);
 	};
 	/** [POST:] parts seen in mid-work speech, keyed `<target key>\n<body>`, posted at the turn's end. */
 	const heldPosts = new Map<string, { body: string; post: NonNullable<PlannedPart["post"]> }>();
@@ -2723,17 +2725,46 @@ async function createInboundTurnLifecycle(
 	};
 	const deliverTurnText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
-		const handoff = parseHandoffReply(rawMessage);
-		if (handoff) {
+		let messageToProcess = rawMessage;
+		let handoffAfterDelivery: HandoffReply | undefined;
+
+		// Check if message STARTS with a handoff token
+		const handoffAtStart = parseHandoffReply(rawMessage);
+		if (handoffAtStart) {
 			// The work itself never posts here; only the final answer hands off.
-			if (source === "terminal") await handOff(handoff);
+			if (source === "terminal") await handOff(handoffAtStart);
 			return;
 		}
-		let message = rawMessage;
+
+		// A token can open a later [BREAK]-delimited block. Deliver earlier blocks
+		// first, then hand off; tokens on ordinary lines remain non-directive text.
+		const blockHandoff = extractHandoffAtBlockStart(rawMessage);
+		if (blockHandoff) {
+			// Process only the text before the token
+			messageToProcess = blockHandoff.textBefore;
+			// Save handoff to trigger after delivery
+			if (source === "terminal") {
+				handoffAfterDelivery = blockHandoff.handoff;
+			}
+		}
+		const sanitized = sanitizeHandoffTokens(messageToProcess);
+		let message = sanitized.text;
+		const reportInvalidHandoff = () => {
+			if (source === "terminal" && sanitized.strippedToken) {
+				deliverTerminalLine(
+					"A handoff token was removed because it did not form a valid reply-block directive; no handoff was sent.",
+					deliveredParts.length,
+				);
+			}
+		};
 		const reactionReply = parseReactionReply(message);
 		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
 			message = reactionReply.body;
-			if (!message) return;
+			if (!message) {
+				reportInvalidHandoff();
+				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
+				return;
+			}
 		} else if (reactionReply) {
 			reactionsClaimedFor.add(rawMessage);
 			reactionTokensSeen = true;
@@ -2805,7 +2836,11 @@ async function createInboundTurnLifecycle(
 				}
 			}
 			message = reactionReply.body;
-			if (!message) return;
+			if (!message) {
+				reportInvalidHandoff();
+				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
+				return;
+			}
 		}
 		// MEDIA:<path> lines become their own deliveries after the text parts, on
 		// platforms whose upload goes through the ledger. Elsewhere the lines stay in
@@ -2956,6 +2991,10 @@ async function createInboundTurnLifecycle(
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
 		}
 		if (fileReply) await deliverFiles(fileReply.paths, planned.at(-1)?.replyTo ?? inboundThreadRoot);
+		if (handoffAfterDelivery) {
+			await handOff(handoffAfterDelivery);
+		}
+		reportInvalidHandoff();
 	};
 	/**
 	 * Sends one [POST:] part to its target conversation through the ordinary

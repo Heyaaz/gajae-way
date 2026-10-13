@@ -33,6 +33,7 @@ import {
 	decideSessionRoll,
 	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
+	isAuthoredEchoSuspected,
 	isOrphanedExecutorFailure,
 	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
@@ -1139,8 +1140,31 @@ export class MonitorPropagator {
 						this.#database.monitors.eventFencedUpdate(tx, entry.eventId, leaseId, "authored_no_delivery", batchId),
 					);
 				}
-				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
-				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
+				const validDeliveryEntries: typeof nonSilentEntries = [];
+				for (const entry of nonSilentEntries) {
+					const eventRow = fenced.find((row) => row.event_id === entry.eventId);
+					const isEcho =
+						isAuthoredEchoSuspected(monitor.instruction, entry.note) ||
+						isAuthoredEchoSuspected(eventRow?.event_type, entry.note);
+					if (!isEcho) {
+						validDeliveryEntries.push(entry);
+						continue;
+					}
+					const updated = this.#database.transaction((tx) =>
+						this.#database.monitors.eventFencedContractUnmet(
+							tx,
+							entry.eventId,
+							leaseId,
+							batchId,
+							"authored_echo_suspected",
+							"delivery suppressed: note echoes the monitor contract without new evidence",
+							this.#now(),
+						),
+					);
+					if (updated && eventRow) this.#emitStage(eventRow, "contract_unmet");
+				}
+				// Deliver only non-silent notes that contain information beyond the contract.
+				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
 				if (deliveryText.length > 0) {
 					const origin = target.origin;
 					// Typed mentions (issue #180) are added here, in code: the author is

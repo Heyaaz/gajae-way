@@ -66,6 +66,8 @@ export interface MonitorFailureOptions {
  * - skipped: terminal — the monitor's overlap policy is `skip` and an earlier
  *   event of the same monitor was still awaiting authoring when this one
  *   fired (`skipped_by` names it). A scheduling outcome, never a failure.
+ * - contract_unmet: terminal — the authored note only restated the contract
+ *   and provided no new evidence of work.
  */
 export const MONITOR_EVENT_STAGES = [
 	"admitted",
@@ -77,6 +79,7 @@ export const MONITOR_EVENT_STAGES = [
 	"failed",
 	"failed_no_retry",
 	"skipped",
+	"contract_unmet",
 ] as const;
 export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
 /** Stages whose rows reconcile() may claim and redispatch. */
@@ -87,6 +90,7 @@ export const TERMINAL_STAGES: readonly MonitorEventStage[] = [
 	"authored_no_delivery",
 	"failed_no_retry",
 	"skipped",
+	"contract_unmet",
 ];
 
 /** Minimum wait, measured from the last failure, before reconcile reclaims the next attempt. */
@@ -116,8 +120,10 @@ export interface MonitorEventDbRow {
 
 const REPLAYABLE_MONITOR =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)";
-const OPEN_MONITOR_EVENT = "stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped')";
-const TERMINAL_MONITOR_EVENT = "stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped')";
+const OPEN_MONITOR_EVENT =
+	"stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
+const TERMINAL_MONITOR_EVENT =
+	"stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
 const IN_FLIGHT_MONITOR_STAGES = "'admitted','batched','dispatched','failed'";
 
 /** Persistence for monitor definitions, event dispatch, authored output and cron slots. */
@@ -158,7 +164,7 @@ export class MonitorsGroup {
 	authoringLossStreaks(sinceIso: string): Array<{ eventType: string; consecutive: number; lastFiredAt: string }> {
 		const rows = this.#db
 			.prepare(
-				`SELECT event_type, fired_at, (stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)) AS lost FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND fired_at >= ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
+				`SELECT event_type, fired_at, (stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)) AS lost FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry','contract_unmet') AND fired_at >= ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
 			)
 			.all(sinceIso) as Array<{ event_type: string; fired_at: string; lost: number }>;
 		const streaks = new Map<string, { consecutive: number; lastFiredAt: string; open: boolean }>();
@@ -180,10 +186,10 @@ export class MonitorsGroup {
 	consecutiveTerminalFailures(limit = 100): number {
 		const rows = this.#db
 			.prepare(
-				`SELECT stage FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND ${REPLAYABLE_MONITOR} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
+				`SELECT stage FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry','contract_unmet') AND ${REPLAYABLE_MONITOR} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
 			)
 			.all(limit) as Array<{ stage: string }>;
-		const streak = rows.findIndex((row) => row.stage !== "failed_no_retry");
+		const streak = rows.findIndex((row) => row.stage !== "failed_no_retry" && row.stage !== "contract_unmet");
 		return streak < 0 ? rows.length : streak;
 	}
 
@@ -405,7 +411,7 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 			this.#db
 				.prepare(
 					`UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ?
-WHERE event_id = ? AND EXISTS (
+WHERE event_id = ? AND stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND EXISTS (
 SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
 )`,
 				)
@@ -428,7 +434,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				: "EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?)";
 		const leaseParams = leaseId === "" ? [] : [leaseId, new Date(now).toISOString()];
 		const changes = this.#db
-			.prepare(`UPDATE monitor_events SET stage = ?, updated_at = ? WHERE event_id = ? AND ${leasePredicate}`)
+			.prepare(
+				`UPDATE monitor_events SET stage = ?, updated_at = ? WHERE event_id = ? AND stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND ${leasePredicate}`,
+			)
 			.run(
 				tx,
 				noDelivery ? "authored_no_delivery" : "authored",
@@ -458,7 +466,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				`UPDATE monitor_events SET stage = ?, batch_id = ?, updated_at = ?
 WHERE event_id = ? AND EXISTS (
 SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
-)`,
+) AND stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')`,
 			)
 			.run(
 				tx,
@@ -474,10 +482,33 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return true;
 	}
 
+	eventFencedContractUnmet(
+		tx: WriteTx,
+		eventId: string,
+		leaseId: string,
+		batchId: string,
+		code: string,
+		detail: string,
+		now = Date.now(),
+	): boolean {
+		this.#core.assertNotQuarantined("monitor", eventId);
+		const changes = this.#db
+			.prepare(
+				`UPDATE monitor_events SET stage = 'contract_unmet', batch_id = ?, updated_at = ?
+WHERE event_id = ? AND stage = 'authored' AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+			)
+			.run(tx, batchId, new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+		if (changes === 0) return false;
+		this.failureRecord(tx, eventId, code, detail);
+		return true;
+	}
+
 	eventTerminalFail(tx: WriteTx, eventId: string, code: string, detail: string): boolean {
 		const changes = this.#db
 			.prepare(
-				"UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage NOT IN ('delivered', 'authored_no_delivery', 'failed_no_retry')",
+				"UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage NOT IN ('delivered', 'authored_no_delivery', 'failed_no_retry', 'contract_unmet')",
 			)
 			.run(tx, new Date().toISOString(), eventId).changes;
 		if (changes === 0) return false;
@@ -497,7 +528,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		this.#core.assertNotQuarantined("monitor", eventId);
 		this.#db
 			.prepare(
-				"UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?",
+				"UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ? AND stage <> 'contract_unmet'",
 			)
 			.run(tx, stage, batchId, new Date().toISOString(), eventId);
 	}
@@ -528,7 +559,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			stage === "authored" &&
 			row.stage !== "delivered" &&
 			row.stage !== "authored_no_delivery" &&
-			row.stage !== "failed_no_retry"
+			row.stage !== "failed_no_retry" &&
+			row.stage !== "contract_unmet"
 		) {
 			this.eventUpdate(tx, eventId, "authored");
 			return true;

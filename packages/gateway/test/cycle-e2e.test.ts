@@ -437,6 +437,52 @@ test("issue #189: consecutive failed_no_retry monitor events degrade the project
 	}
 });
 
+test("issue #369: contract-unmet events are terminal dispatch failures, not pre-author losses", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-contract-unmet-"));
+	const database = await Store.open(join(directory, "gateway.db"));
+	try {
+		const fire = (id: string) =>
+			database.transaction((tx) =>
+				database.monitors.eventCreate(tx, {
+					eventId: id,
+					monitorId: "m1",
+					eventType: "digest",
+					payloadJson: "{}",
+					firedAt: new Date().toISOString(),
+				}),
+			);
+		fire("lost-before-authoring");
+		database.transaction((tx) =>
+			database.monitors.eventTerminalFail(tx, "lost-before-authoring", "internal_error", "authoring turn failed"),
+		);
+		fire("contract-unmet-1");
+		database.transaction((tx) => database.monitors.eventUpdate(tx, "contract-unmet-1", "contract_unmet"));
+		database.transaction((tx) => database.monitors.eventUpdate(tx, "contract-unmet-1", "delivered"));
+		expect(database.monitors.eventGet("contract-unmet-1")?.stage).toBe("contract_unmet");
+		expect(
+			database.transaction((tx) =>
+				database.monitors.eventTerminalFail(tx, "contract-unmet-1", "internal_error", "late failure"),
+			),
+		).toBe(false);
+		expect(database.monitors.authoringLossStreaks("2026-01-01T00:00:00.000Z")).toEqual([]);
+
+		const projector = new RuntimeCycleProjector(database, { queueDepth: 0 });
+		for (const id of ["contract-unmet-2", "contract-unmet-3"]) {
+			fire(id);
+			database.transaction((tx) => database.monitors.eventUpdate(tx, id, "contract_unmet"));
+		}
+		expect(database.monitors.consecutiveTerminalFailures()).toBe(4);
+		expect(projector.project().gates).toEqual(["monitor_dispatch_failing"]);
+		await Bun.sleep(2);
+		fire("recovered");
+		database.transaction((tx) => database.monitors.eventUpdate(tx, "recovered", "delivered"));
+		expect(database.monitors.consecutiveTerminalFailures()).toBe(0);
+		expect(projector.project().gates).toEqual([]);
+	} finally {
+		database.close();
+	}
+});
+
 test("ops.cycle serves a fresh fail-closed snapshot and broker provisioning status without a BrokerClient", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-e2e-"));
 	const config = testConfig(directory);

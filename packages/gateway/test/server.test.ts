@@ -36,11 +36,16 @@ afterEach(async () => {
 	directory = "";
 });
 
-async function connect(
-	socketPath: string,
-): Promise<{ send(value: unknown): void; frames: any[]; wireLines: string[]; close(): void }> {
+async function connect(socketPath: string): Promise<{
+	send(value: unknown): void;
+	frames: any[];
+	wireLines: string[];
+	waitForFrame(id: string): Promise<void>;
+	close(): void;
+}> {
 	const frames: any[] = [];
 	const wireLines: string[] = [];
+	const frameWaiters = new Map<string, Array<() => void>>();
 	let buffered = Buffer.alloc(0);
 	const socket = await Bun.connect({
 		unix: socketPath,
@@ -53,14 +58,36 @@ async function connect(
 					buffered = buffered.subarray(newline + 1);
 					if (line) {
 						wireLines.push(line);
-						frames.push(JSON.parse(line));
+						const frame = JSON.parse(line);
+						frames.push(frame);
+						if (typeof frame.id === "string") {
+							const waiters = frameWaiters.get(frame.id);
+							if (waiters) {
+								frameWaiters.delete(frame.id);
+								for (const resolve of waiters) resolve();
+							}
+						}
 					}
 					newline = buffered.indexOf(10);
 				}
 			},
 		},
 	});
-	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, wireLines, close: () => socket.end() };
+	const waitForFrame = (id: string): Promise<void> => {
+		if (frames.some((frame) => frame.id === id)) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			const waiters = frameWaiters.get(id) ?? [];
+			waiters.push(resolve);
+			frameWaiters.set(id, waiters);
+		});
+	};
+	return {
+		send: (value) => socket.write(`${JSON.stringify(value)}\n`),
+		frames,
+		wireLines,
+		waitForFrame,
+		close: () => socket.end(),
+	};
 }
 
 async function waitFor(frames: any[], count: number): Promise<void> {
@@ -154,7 +181,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(32);
+	expect(client.frames[2].result.schemaVersion).toBe(33);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -1767,6 +1794,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
+	const runResponse = client.waitForFrame("w");
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -1774,15 +1802,18 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		verb: "work.run",
 		params: { cwd: directory, name: "Repo.Fix-2", text: "fix the bug" },
 	});
-	await waitFor(client.frames, 2);
+	await runResponse;
 	const run = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
+	expect(run).toMatchObject({ type: "response", id: "w" });
 	expect(run.result).toMatchObject({ held: false, text: "worker result" });
 	const jobId = run.result.jobId;
 	expect(jobId).toBe(`lanejob-${Buffer.from("Repo.Fix-2", "utf8").toString("hex")}`);
 
+	const jobsResponse = client.waitForFrame("jobs");
 	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
-	await waitFor(client.frames, 3);
+	await jobsResponse;
 	const jobs = client.frames.find((frame) => frame.type === "response" && frame.id === "jobs");
+	expect(jobs).toMatchObject({ type: "response", id: "jobs" });
 	expect(jobs.result.jobs).toHaveLength(1);
 	expect(jobs.result.jobs[0].job_id).toBe(jobId);
 	expect(jobs.result.jobs[0].lane_key).toBe("work-Repo.Fix-2");
