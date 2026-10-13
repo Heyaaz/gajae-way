@@ -298,36 +298,11 @@ export class LaneGovernor {
 			// resumable and its unpushed commits must survive.
 			if (!expected && record?.lane.worktreePath && record.lane.repository) {
 				try {
-					// Remove the worktree using git worktree remove --force
-					const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", record.lane.worktreePath], {
-						cwd: record.lane.repository,
-						stdout: "ignore",
-						stderr: "ignore",
-					});
-
-					// Delete the branch using git branch -D
-					if (removeResult.exitCode === 0) {
-						const branchName = `work/${name.toLowerCase()}`;
-						const branchResult = Bun.spawnSync(["git", "branch", "-D", branchName], {
-							cwd: record.lane.repository,
-							stdout: "ignore",
-							stderr: "ignore",
-						});
-						if (branchResult.exitCode !== 0) {
-							this.#log(
-								`lane_branch_delete_failed name=${name} session=${lane.sessionId} branch=${branchName}`,
-								"warn",
-							);
-						}
-					} else {
-						this.#log(
-							`lane_worktree_remove_failed name=${name} session=${lane.sessionId} path=${record.lane.worktreePath}`,
-							"warn",
-						);
-					}
+					this.#cleanupWorktree(name, lane.sessionId, record.lane.worktreePath, record.lane.repository);
 				} catch (error) {
 					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
-					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "warn");
+					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "error");
+					return { retired: false, sessionKey, reason: `worktree cleanup failed: ${detail}` };
 				}
 			}
 
@@ -445,6 +420,16 @@ export class LaneGovernor {
 					return { retired: false, sessionKey, reason: detail };
 				}
 			}
+			// Clean up the worktree for force retire as well (issue #480)
+			if (record?.lane.worktreePath && record.lane.repository) {
+				try {
+					this.#cleanupWorktree(name, lane.sessionId, record.lane.worktreePath, record.lane.repository);
+				} catch (error) {
+					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
+					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "error");
+					return { retired: false, sessionKey, reason: `worktree cleanup failed: ${detail}` };
+				}
+			}
 			// Close the session and rebind the epoch.
 			let closed = false;
 			try {
@@ -558,6 +543,38 @@ export class LaneGovernor {
 			this.#log(`liveness_probe_failed session=${sessionId} repo=${repo} reason=${detail}`);
 			// Conservative: assume session still alive if we can't probe.
 			return { live: undefined, disowned: false };
+		}
+	}
+
+	/** Cleans up a runtime-created worktree and its branch. Throws on error (issue #480). */
+	#cleanupWorktree(name: string, sessionId: string, worktreePath: string, repository: string): void {
+		// Remove the worktree using git worktree remove --force
+		const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
+			cwd: repository,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		if (removeResult.exitCode !== 0) {
+			const stderr = removeResult.stderr?.toString().trim() || "unknown error";
+			throw new Error(`git worktree remove failed: ${stderr}`);
+		}
+
+		// Delete the branch using git branch -D
+		const branchName = `work/${name.toLowerCase()}`;
+		const branchResult = Bun.spawnSync(["git", "branch", "-D", branchName], {
+			cwd: repository,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		// Branch deletion failure is non-fatal; only log it
+		if (branchResult.exitCode !== 0) {
+			const stderr = branchResult.stderr?.toString().trim() || "unknown error";
+			this.#log(
+				`lane_branch_delete_failed name=${name} session=${sessionId} branch=${branchName} detail=${stderr}`,
+				"warn",
+			);
 		}
 	}
 

@@ -22,6 +22,7 @@ import {
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
 	TypingIndicator,
+	type TypingPort,
 	UnnamedThreads,
 	WorkingStatus,
 } from "../src/main";
@@ -562,7 +563,7 @@ test("delivery subscription filters non-Discord and missing delivery ids", async
 	off();
 });
 
-test("typing indicator pulses while a turn runs and stops when the delivery settles", async () => {
+test("typing indicator keeps pulsing during interim delivery and stops on final progress", async () => {
 	let typingCount = 0;
 	const discord: DiscordClientLike = {
 		channels: {
@@ -572,15 +573,140 @@ test("typing indicator pulses while a turn runs and stops when the delivery sett
 			}),
 		},
 	};
-	const typing = new TypingIndicator(discord, 5, 10_000, { error: () => {} });
+	const typing = new TypingIndicator(discord, 10_000, 10_000, { error: () => {} });
+	let releaseConfirmation: (() => void) | undefined;
+	const confirmation = new Promise<void>((resolve) => {
+		releaseConfirmation = resolve;
+	});
+	let confirmationRequested = false;
+	let emit: ((progress: ChatProgressPayload) => void) | undefined;
+	const gateway: GatewayClientLike = {
+		request: async <T>(verb: string) => {
+			if (verb === "delivery.confirm") {
+				confirmationRequested = true;
+				await confirmation;
+			}
+			return {} as T;
+		},
+		onChatMessage: () => () => {},
+		onChatProgress: (handler) => {
+			emit = handler;
+			return () => {};
+		},
+	};
+	subscribeDiscordProgress(gateway, { update: async () => {}, clear: async () => {} }, { error: () => {} }, typing);
 	typing.begin("channel-1");
 	await Bun.sleep(20);
-	expect(typingCount).toBeGreaterThanOrEqual(2);
-	const requests: Array<{ verb: string; params: unknown }> = [];
-	await settleDiscordDelivery(mockGateway(requests), discord, delivery("reply"), typing);
-	const settled = typingCount;
+	expect(typingCount).toBe(1);
+	const beforeDeliver = typingCount;
+	// Interim delivery arrives while turn is still working
+	const settling = settleDiscordDelivery(gateway, discord, { ...delivery("reply"), final: false }, typing);
+	await Bun.sleep(20);
+	expect(confirmationRequested).toBe(true);
+	// Re-pulse immediately after posting, before waiting on the gateway ledger.
+	expect(typingCount).toBeGreaterThan(beforeDeliver);
+	releaseConfirmation?.();
+	await settling;
+	const beforeFinal = typingCount;
+	// Final progress arrives, which should end typing
+	emit?.({
+		turnId: "turn-1",
+		origin: { platform: "discord", kind: "channel", conversationId: "channel-1" },
+		final: true,
+		elapsedMs: 1,
+		toolCalls: 0,
+		outputTokens: 0,
+	});
 	await Bun.sleep(25);
-	expect(typingCount).toBe(settled);
+	// Typing should stop after final progress
+	expect(typingCount).toBe(beforeFinal);
+});
+
+test("an interim voice delivery refreshes typing after posting the voice message", async () => {
+	const events: string[] = [];
+	const ogg = new Uint8Array(27);
+	ogg.set([0x4f, 0x67, 0x67, 0x53]);
+	ogg[6] = 48_000 % 256;
+	ogg[7] = Math.floor(48_000 / 256);
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (payload: unknown) => void events.push(typeof payload === "string" ? "text" : "voice"),
+			}),
+		},
+	};
+	const typing: TypingPort = {
+		begin: () => {},
+		refresh: () => events.push("typing"),
+		end: () => {},
+	};
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	await settleDiscordDelivery(
+		mockGateway(requests),
+		discord,
+		{ ...delivery("spoken reply"), final: false, voiceText: "spoken reply" },
+		typing,
+		undefined,
+		undefined,
+		{
+			config: { apiKey: "test-key" },
+			ports: { fetch: (async () => new Response(ogg)) as unknown as typeof globalThis.fetch },
+		},
+	);
+	expect(events).toEqual(["text", "typing", "voice", "typing"]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a final progress tick cannot race the presence arm from its chat.send response", async () => {
+	const calls: string[] = [];
+	let emit: ((progress: ChatProgressPayload) => void) | undefined;
+	const gateway: GatewayClientLike = {
+		request: async <T>() => ({}) as T,
+		onChatMessage: () => () => {},
+		onChatProgress: (handler) => {
+			emit = handler;
+			return () => {};
+		},
+	};
+	const typing: TypingPort = {
+		begin: () => calls.push("begin"),
+		refresh: () => {},
+		end: () => calls.push("end"),
+	};
+	subscribeDiscordProgress(
+		gateway,
+		{
+			update: async () => {},
+			clear: async () => void calls.push("clear"),
+		},
+		{ error: () => {} },
+		typing,
+	);
+	// The response continuation arms presence synchronously after the event batch.
+	emit?.({
+		turnId: "turn-1",
+		origin: { platform: "discord", kind: "channel", conversationId: "channel-1" },
+		final: true,
+		elapsedMs: 1,
+		toolCalls: 0,
+		outputTokens: 0,
+	});
+	calls.push("arm");
+	typing.begin("channel-1");
+	await Promise.resolve();
+	expect(calls).toEqual(["arm", "begin", "end", "clear"]);
+});
+
+test("interim delivery with no active typing run stays harmless", async () => {
+	// Redelivery after restart, monitor delivery, etc.
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async () => {} }) },
+	};
+	const typing = new TypingIndicator(discord, 5, 10_000, { error: () => {} });
+	// No typing started, then delivery arrives
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	// Should not throw or fail
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("reply"), typing);
 });
 
 test("a final progress event ends the typing hint even when the turn delivered nothing", async () => {
@@ -683,7 +809,7 @@ function presenceDiscord() {
 	return { discord, reacted, removed };
 }
 
-test("working status is a reaction gradient on the triggering message and clears on delivery", async () => {
+test("working status is a reaction gradient on the triggering message and clears on final progress", async () => {
 	const { discord, reacted, removed } = presenceDiscord();
 	let clock = 0;
 	const status = new WorkingStatus(
@@ -714,15 +840,38 @@ test("working status is a reaction gradient on the triggering message and clears
 	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 });
 	expect(reacted).toHaveLength(4);
 	const requests: Array<{ verb: string; params: unknown }> = [];
-	await settleDiscordDelivery(mockGateway(requests), discord, delivery("real reply"), undefined, status);
+	let emit: ((progress: ChatProgressPayload) => void) | undefined;
+	const gateway: GatewayClientLike = {
+		request: async <T>() => ({}) as T,
+		onChatMessage: () => () => {},
+		onChatProgress: (handler) => {
+			emit = handler;
+			return () => {};
+		},
+	};
+	subscribeDiscordProgress(gateway, status, { error: () => {} });
+	const beforeDeliver = removed.length;
+	await settleDiscordDelivery(gateway, discord, { ...delivery("real reply"), final: false }, undefined, status);
+	// Interim delivery should NOT clear the reactions
+	expect(removed).toHaveLength(beforeDeliver);
+	// Final progress should clear the interim status reactions.
+	emit?.({
+		turnId: "turn-1",
+		origin,
+		final: true,
+		elapsedMs: 1,
+		toolCalls: 0,
+		outputTokens: 0,
+	});
+	await Bun.sleep(1);
 	expect(new Set(removed)).toEqual(new Set(["⏳:bot-1", "🔧:bot-1", "🕐:bot-1", "1️⃣:bot-1"]));
 	// A later delivery with no live gradient is a no-op.
 	const before = removed.length;
-	await settleDiscordDelivery(mockGateway(requests), discord, delivery("again"), undefined, status);
+	await settleDiscordDelivery(gateway, discord, { ...delivery("again"), final: false }, undefined, status);
 	expect(removed).toHaveLength(before);
 });
 
-test("an interim delivery keeps the working status and re-pulses typing; only the final reply clears", async () => {
+test("an interim delivery keeps the working status and re-pulses typing; the final delivery clears", async () => {
 	const { discord, removed } = presenceDiscord();
 	let typingCount = 0;
 	const typingDiscord: DiscordClientLike = {
@@ -732,35 +881,74 @@ test("an interim delivery keeps the working status and re-pulses typing; only th
 	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
 	const engagement = { group: false, mentioned: false };
 	status.arm("channel-1", "m-1", engagement);
+	let emit: ((progress: ChatProgressPayload) => void) | undefined;
+	let holdConfirmation = false;
+	let confirmationRequested = false;
+	let releaseConfirmation: (() => void) | undefined;
+	const confirmation = new Promise<void>((resolve) => {
+		releaseConfirmation = resolve;
+	});
+	const gateway: GatewayClientLike = {
+		request: async <T>(verb: string) => {
+			if (holdConfirmation && verb === "delivery.confirm") {
+				confirmationRequested = true;
+				await confirmation;
+			}
+			return {} as T;
+		},
+		onChatMessage: () => () => {},
+		onChatProgress: (handler) => {
+			emit = handler;
+			return () => {};
+		},
+	};
+	subscribeDiscordProgress(gateway, status, { error: () => {} }, typing);
 	typing.begin("channel-1");
 	await Bun.sleep(5);
 	const beforeInterim = typingCount;
-	const requests: Array<{ verb: string; params: unknown }> = [];
-	await settleDiscordDelivery(
-		mockGateway(requests),
-		discord,
-		{ ...delivery("still working"), final: false },
-		typing,
-		status,
-	);
+	// Interim delivery arrives
+	await settleDiscordDelivery(gateway, discord, { ...delivery("still working"), final: false }, typing, status);
 	await Bun.sleep(5);
-	// Posting cleared Discord's hint; it was re-sent at once, not after the 10s tick.
-	expect(typingCount).toBe(beforeInterim + 1);
+	// Typing should immediately pulse again after the interim post.
+	expect(typingCount).toBeGreaterThan(beforeInterim);
 	expect(removed).toEqual([]);
+	// Reaction delivery also shouldn't stop typing
+	const beforeReaction = typingCount;
 	await settleDiscordDelivery(
-		mockGateway(requests),
+		gateway,
 		discord,
 		{ ...delivery("👍"), final: false, reaction: { targetMessageId: "m-1", emoji: "👍", emojiName: "thumbsup" } },
 		typing,
 		status,
 	);
 	expect(removed).toEqual([]);
-	await settleDiscordDelivery(mockGateway(requests), discord, delivery("done"), typing, status);
-	expect(removed).toEqual(["⏳:bot-1"]);
-	const settled = typingCount;
-	typing.refresh("channel-1");
 	await Bun.sleep(5);
-	expect(typingCount).toBe(settled);
+	expect(typingCount).toBe(beforeReaction);
+	const beforeFinal = typingCount;
+	// Final delivery also cleans up command replies and reconnect redeliveries.
+	holdConfirmation = true;
+	const finalSettlement = settleDiscordDelivery(gateway, discord, delivery("done"), typing, status);
+	await Bun.sleep(5);
+	const removedBeforeConfirm = [...removed];
+	const typingCountBeforeConfirm = typingCount;
+	const confirmationWasRequested = confirmationRequested;
+	releaseConfirmation?.();
+	await finalSettlement;
+	expect(confirmationWasRequested).toBe(true);
+	expect(removedBeforeConfirm).toEqual(["⏳:bot-1"]);
+	expect(typingCountBeforeConfirm).toBe(beforeFinal);
+	// Final progress remains authoritative and is idempotent with delivery cleanup.
+	emit?.({
+		turnId: "turn-1",
+		origin: { platform: "discord", kind: "channel", conversationId: "channel-1" },
+		final: true,
+		elapsedMs: 1,
+		toolCalls: 0,
+		outputTokens: 0,
+	});
+	await Bun.sleep(5);
+	expect(removed).toEqual(["⏳:bot-1"]);
+	expect(typingCount).toBe(beforeFinal);
 });
 
 test("working status ignores non-discord progress and survives channel failures", async () => {

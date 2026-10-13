@@ -3,11 +3,16 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey, WORK_JOBS_DEFAULT_LIMIT, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import {
+	type MemoryOperationStatusResult,
+	originKey,
+	WORK_JOBS_DEFAULT_LIMIT,
+	WORK_JOBS_MAX_LIMIT,
+} from "@gajae-gateway/protocol";
 import { createLaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
-import { memoryRoot } from "../src/memory/doctrine";
+import { initializeMemory, memoryGit, memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
@@ -1022,6 +1027,7 @@ test("large memory.audit and concurrent progress remain independently parseable 
 			engagement: { mentioned: false, group: false, authorId: "p1" },
 		},
 	});
+	// Wait for the initial audit response (returns opRef) and chat.message event
 	for (let attempt = 0; attempt < 800; attempt++) {
 		if (
 			client.frames.some((frame) => frame.type === "response" && frame.id === "audit") &&
@@ -1030,12 +1036,30 @@ test("large memory.audit and concurrent progress remain independently parseable 
 			break;
 		await Bun.sleep(5);
 	}
-	const audit = client.frames.find((frame) => frame.type === "response" && frame.id === "audit");
-	expect(audit).toBeDefined();
-	const auditIndex = client.frames.indexOf(audit);
-	const auditLine = client.wireLines[auditIndex];
-	expect(Buffer.byteLength(`${auditLine}\n`, "utf8")).toBeGreaterThan(219_000);
-	expect(JSON.parse(auditLine)).toEqual(audit);
+	const auditResponse = client.frames.find((frame) => frame.type === "response" && frame.id === "audit");
+	expect(auditResponse).toBeDefined();
+	expect(auditResponse?.result?.opRef).toBeDefined();
+	const opRef = (auditResponse?.result as { opRef: string }).opRef;
+
+	// Poll for the audit result via memory.status
+	let auditStatus: any;
+	for (let attempt = 0; attempt < 200; attempt++) {
+		client.send({ v: "0.1", type: "request", id: `status-${attempt}`, verb: "memory.status", params: { opRef } });
+		await waitFor(client.frames, client.frames.length + 1);
+		const statusFrame = client.frames[client.frames.length - 1];
+		if (statusFrame?.result?.status === "completed") {
+			auditStatus = statusFrame.result;
+			break;
+		}
+		await Bun.sleep(10);
+	}
+	expect(auditStatus).toBeDefined();
+	expect(auditStatus?.status).toBe("completed");
+	expect(auditStatus?.result).toBeDefined();
+
+	// Verify the audit result contains large data (the issues list is comprehensive)
+	const auditResultJson = JSON.stringify(auditStatus.result);
+	expect(Buffer.byteLength(auditResultJson, "utf8")).toBeGreaterThan(219_000);
 	expect(
 		client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.progress").length,
 	).toBeGreaterThan(0);
@@ -1044,6 +1068,70 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	);
 	expect(client.frames.filter((frame) => frame.type === "response" && frame.id === "audit")).toHaveLength(1);
 	expect(client.wireLines).toHaveLength(client.frames.length);
+	client.close();
+});
+
+test("memory.autolink returns an operation ID and reports its committed result", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-memory-autolink-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	const root = await initializeMemory(directory);
+	await mkdir(join(root, "people"), { recursive: true });
+	await writeFile(join(root, "people/alice-example.md"), "# Alice Example\n\nCanonical person.");
+	await mkdir(join(root, "ops/rules"), { recursive: true });
+	await writeFile(join(root, "ops/rules/example.md"), "Alice Example appears here.\n");
+	await memoryGit(root, ["add", "-A"]);
+	await memoryGit(root, ["commit", "-m", "autolink fixture"]);
+
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "unused",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({ v: "0.1", type: "request", id: "autolink", verb: "memory.autolink" });
+	await waitFrame(client.frames, "autolink");
+	const accepted = client.frames.find((frame) => frame.id === "autolink");
+	const opRef = accepted?.result?.opRef as string;
+	expect(opRef).toMatch(/^gw-ml-/);
+
+	let completed: MemoryOperationStatusResult | undefined;
+	for (let attempt = 0; attempt < 200; attempt++) {
+		const id = `autolink-status-${attempt}`;
+		client.send({ v: "0.1", type: "request", id, verb: "memory.status", params: { opRef } });
+		await waitFrame(client.frames, id);
+		const status = client.frames.find((frame) => frame.id === id)?.result as MemoryOperationStatusResult | undefined;
+		if (status?.status === "completed") {
+			completed = status;
+			break;
+		}
+		await Bun.sleep(5);
+	}
+	const report = completed?.result;
+	expect(completed?.elapsedMs).toBeNumber();
+	expect(report && "commitSha" in report).toBe(true);
+	if (!report || !("commitSha" in report)) throw new Error("autolink status omitted its report");
+	expect(report.filesChanged).toBe(1);
+	expect(report.linksAdded).toBeGreaterThan(0);
+	if (typeof report.commitSha !== "string") throw new Error("autolink report omitted its commit SHA");
+	expect(report.commitSha).toMatch(/^[0-9a-f]{40}$/);
+	expect(report.elapsedMs).toBeNumber();
+	expect(await memoryGit(root, ["rev-parse", "HEAD"])).toBe(report.commitSha);
+	expect(await Bun.file(join(root, "ops/rules/example.md")).text()).toContain(
+		"[Alice Example](../../people/alice-example.md)",
+	);
 	client.close();
 });
 
@@ -1644,7 +1732,13 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	});
 	expect(sessionPort.sends[0]).toMatchObject({ text: "fix the bug", repo: "/tmp/some-repo", codingRegister: true });
 	// Invalid names are rejected before touching the SessionPort.
-	client.send({ v: "0.1", type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "bad",
+		verb: "work.run",
+		params: { cwd: directory, name: "../evil", text: "x" },
+	});
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
 	client.close();
@@ -1678,7 +1772,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		type: "request",
 		id: "w",
 		verb: "work.run",
-		params: { name: "Repo.Fix-2", text: "fix the bug" },
+		params: { cwd: directory, name: "Repo.Fix-2", text: "fix the bug" },
 	});
 	await waitFor(client.frames, 2);
 	const run = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
@@ -1707,7 +1801,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	expect(parsed.attempts).toHaveLength(1);
 	expect(parsed.attempts[0].endState).toBe("completed");
 	expect(parsed.attempts[0].sessionId).toBe("0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0");
-	expect(parsed.lane.worktreePath).toBe(process.cwd());
+	expect(parsed.lane.worktreePath).toBe(directory);
 
 	// Reopening a settled tombstone by editing history is corruption, not a
 	// crash predecessor. Neither an ordinary request nor resume may repair it.
@@ -1733,7 +1827,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 			type: "request",
 			id,
 			verb: "work.run",
-			params: { name: "Repo.Fix-2", text: "again", resume },
+			params: { cwd: directory, name: "Repo.Fix-2", text: "again", resume },
 		});
 		await waitFrame(client.frames, id);
 		expect(client.frames.find((frame) => frame.id === id)).toMatchObject({
@@ -1934,7 +2028,13 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
-	client.send({ v: "0.1", type: "request", id: "w", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-out", text: "x" },
+	});
 	await waitFor(client.frames, 2);
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w")).toBeDefined();
 	// Simulate the reconciliation outcome after repeated stalled continuations.
@@ -1952,7 +2052,13 @@ test("a stalled durable job holds the next work.run until resume (production pat
 			json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
 		}),
 	);
-	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w2",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-out", text: "x" },
+	});
 	async function waitId2(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
 			await Bun.sleep(5);
@@ -1968,7 +2074,7 @@ test("a stalled durable job holds the next work.run until resume (production pat
 		type: "request",
 		id: "w3",
 		verb: "work.run",
-		params: { name: "stall-out", text: "x", resume: true },
+		params: { cwd: directory, name: "stall-out", text: "x", resume: true },
 	});
 	await waitId2("w3");
 	expect(
@@ -2007,7 +2113,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	const jobId = `lanejob-${Buffer.from("stall-clear", "utf8").toString("hex")}`;
 
 	// First run succeeds (creates the job).
-	client.send({ v: "0.1", type: "request", id: "w1", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w1",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-clear", text: "x" },
+	});
 	async function waitId3(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
 			await Bun.sleep(5);
@@ -2029,7 +2141,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	);
 
 	// Ordinary call: held.
-	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w2",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-clear", text: "x" },
+	});
 	await waitId3("w2");
 	expect(client.frames.find((frame) => frame.id === "w2" && frame.type === "response")?.result).toMatchObject({
 		held: true,
@@ -2043,7 +2161,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 		type: "request",
 		id: "w3",
 		verb: "work.run",
-		params: { name: "stall-clear", text: "x", resume: true },
+		params: { cwd: directory, name: "stall-clear", text: "x", resume: true },
 	});
 	await waitId3("w3");
 	expect(client.frames.find((frame) => frame.id === "w3" && frame.type === "response")?.result).toMatchObject({
@@ -2055,7 +2173,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	expect(afterResume.escalations.some((entry) => entry.includes("operator resume acknowledged"))).toBe(true);
 
 	// The NEXT ordinary call is not held by the old stalled state.
-	client.send({ v: "0.1", type: "request", id: "w4", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w4",
+		verb: "work.run",
+		params: { cwd: directory, name: "stall-clear", text: "x" },
+	});
 	await waitId3("w4");
 	expect(client.frames.find((frame) => frame.id === "w4" && frame.type === "response")?.result).toMatchObject({
 		held: false,
@@ -2106,7 +2230,7 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 			type: "request",
 			id,
 			verb: "work.run",
-			params: { name: "model", text: "work", model },
+			params: { cwd: directory, name: "model", text: "work", model },
 		});
 		await waitFor(client.frames, 3 + index);
 		expect(client.frames.find((frame) => frame.id === id)).toMatchObject({

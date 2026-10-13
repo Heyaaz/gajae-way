@@ -41,6 +41,17 @@ import {
 	type TailRunner,
 } from "./tail-runner";
 
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+/** `anthropic/claude-opus-5-5:xhigh` → model id + thinking level; a string without a known level suffix is returned whole. */
+export function splitThinkingSuffix(selection: string): { readonly model: string; readonly thinking?: string } {
+	const at = selection.lastIndexOf(":");
+	if (at <= 0) return { model: selection };
+	const level = selection.slice(at + 1);
+	if (!THINKING_LEVELS.has(level)) return { model: selection };
+	return { model: selection.slice(0, at), thinking: level };
+}
+
 /**
  * Generic broker-backed session surface. Callers own prompt composition,
  * operation-reference selection, and recovery policy; this port only binds,
@@ -498,6 +509,12 @@ export class BrokerSessionPort implements SessionPort {
 		// a moment later. A tail/send before that answers session_unavailable, so
 		// wait until the broker reports the id live before handing the binding out.
 		await this.#awaitIndexed(sessionId, input.repo);
+		// Apply a model selector's thinking level while the newly-created host is
+		// ready and before the binding escapes; a later turn can hit endpoint_stale.
+		if (typeof input.model === "string") {
+			const { thinking } = splitThinkingSuffix(input.model);
+			if (thinking) await this.#setThinking(this.#cliTransport(sessionId), thinking);
+		}
 		this.#resetCreateRotations(input.originKey);
 		return {
 			sessionId,
@@ -593,7 +610,13 @@ export class BrokerSessionPort implements SessionPort {
 						JSON.stringify({
 							cwd: repo,
 							readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
-							...(typeof model === "string" ? { modelId: model } : model ? { modelPreset: model.preset } : {}),
+							// session.create takes a bare model id; a `:level` suffix is applied
+							// with thinking.set once the host is up (see bind()).
+							...(typeof model === "string"
+								? { modelId: splitThinkingSuffix(model).model }
+								: model
+									? { modelPreset: model.preset }
+									: {}),
 						}),
 					]),
 					"session.create",
@@ -833,14 +856,28 @@ export class BrokerSessionPort implements SessionPort {
 				return { changed };
 			});
 		}
+		// `provider/model:level` is the gjc CLI selector; `model.set` accepts it but keeps the
+		// session's thinking at `inherit`, so the level suffix was silently a no-op (2026-09-26:
+		// `:xhigh` and `:low` produced identical reasoning budgets). Apply the level explicitly.
+		const { model, thinking } = splitThinkingSuffix(selection);
 		return await this.#overRelay(input, "model.set", async (sdk) => {
 			const result = parseEnvelope<{ changed?: unknown } | undefined>(
-				await sdk("control", "model.set", { id: selection }),
+				await sdk("control", "model.set", { id: model }),
 				"model.set",
 			);
 			if (typeof result?.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
-			return { changed: result.changed };
+			const thinkingChanged = thinking ? await this.#setThinking(sdk, thinking) : false;
+			return { changed: result.changed || thinkingChanged };
 		});
+	}
+
+	async #setThinking(sdk: SdkTransport, level: string): Promise<boolean> {
+		const applied = parseEnvelope<{ changed?: unknown } | undefined>(
+			await sdk("control", "thinking.set", { level }),
+			"thinking.set",
+		);
+		if (typeof applied?.changed !== "boolean") throw new Error("thinking.set succeeded without a changed receipt");
+		return applied.changed;
 	}
 
 	async setServiceTier(input: {

@@ -452,6 +452,72 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 	expect(relay.streams[0]!.closed).toBe(true);
 });
 
+test("model thinking suffix is applied on create and explicit model changes", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-thinking-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const calls: string[][] = [];
+	const run: CliRunner = async (args) => {
+		calls.push([...args]);
+		if (args.includes("session.create"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { sessionId: "thinking-session" } }),
+				stderr: "",
+			};
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "thinking-session", live: true } } }),
+				stderr: "",
+			};
+		if (args.includes("thinking.set"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
+		if (args.includes("model.set"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: false } }), stderr: "" };
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "thinking-test",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const binding = await port.bind({
+		originKey: "discord/dm/thinking",
+		epoch: 0,
+		repo,
+		model: "anthropic/claude-opus-5-5:xhigh",
+	});
+	await expect(
+		port.setModel({
+			sessionId: binding.sessionId,
+			repo,
+			selection: "openai-codex/gpt-5.5:high",
+		}),
+	).resolves.toEqual({ changed: true });
+
+	const create = calls.find((args) => args.includes("session.create"))!;
+	const createInput = JSON.parse(create[create.indexOf("--json-input") + 1]!) as Record<string, unknown>;
+	expect(createInput).toMatchObject({ cwd: repo, modelId: "anthropic/claude-opus-5-5" });
+	const controlInputs = calls
+		.filter((args) => args.includes("--op") && args.includes("--json-input") && !args.includes("session.create"))
+		.map((args) => ({
+			operation: args[args.indexOf("--op") + 1],
+			input: JSON.parse(args[args.indexOf("--json-input") + 1]!) as Record<string, unknown>,
+		}));
+	expect(controlInputs).toEqual([
+		{ operation: "thinking.set", input: { level: "xhigh" } },
+		{ operation: "model.set", input: { id: "openai-codex/gpt-5.5" } },
+		{ operation: "thinking.set", input: { level: "high" } },
+	]);
+	expect(calls.findIndex((args) => args.includes("inspect"))).toBeLessThan(
+		calls.findIndex((args) => args.includes("thinking.set")),
+	);
+});
+
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -1598,3 +1664,16 @@ for (const progressing of [true, false]) {
 		}
 	});
 }
+
+test("splitThinkingSuffix separates a trailing thinking level and leaves other colons alone", async () => {
+	const { splitThinkingSuffix } = await import("../src/orchestrator/session-port");
+	expect(splitThinkingSuffix("anthropic/claude-opus-5-5:xhigh")).toEqual({
+		model: "anthropic/claude-opus-5-5",
+		thinking: "xhigh",
+	});
+	expect(splitThinkingSuffix("anthropic/claude-opus-5-5")).toEqual({ model: "anthropic/claude-opus-5-5" });
+	expect(splitThinkingSuffix("openai-codex/gpt-5.5:high")).toEqual({ model: "openai-codex/gpt-5.5", thinking: "high" });
+	// An unknown suffix is not a level: keep the whole selector so the SDK reports it.
+	expect(splitThinkingSuffix("anthropic/claude-opus-5-5:turbo")).toEqual({ model: "anthropic/claude-opus-5-5:turbo" });
+	expect(splitThinkingSuffix(":xhigh")).toEqual({ model: ":xhigh" });
+});

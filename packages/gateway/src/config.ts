@@ -115,6 +115,8 @@ export interface GatewayConfigFile {
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
+	/** Absolute directories, besides the persona workspace, whose files a `MEDIA:` line may upload. */
+	readonly outboundFileRoots?: readonly string[];
 	readonly runtime?: RuntimeConfig;
 	/** Worker-lane governance: admission cap and idle retirement for `work.run` sessions. */
 	readonly work?: WorkLaneConfig;
@@ -453,6 +455,12 @@ function parseStringArray(value: unknown, field: string): readonly string[] {
 		throw new ConfigError("config_invalid", `${field} must be a non-empty string array`);
 	return value;
 }
+function parseAbsolutePaths(value: unknown, field: string): readonly string[] {
+	const paths = parseStringArray(value, field);
+	if (paths.some((item) => !isAbsolute(item)))
+		throw new ConfigError("config_invalid", `${field} entries must be absolute paths`);
+	return paths;
+}
 function parseWebhook(value: unknown): {
 	readonly bind?: string;
 	readonly port: number;
@@ -645,6 +653,9 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.webhook === undefined ? {} : { webhook: parseWebhook(input.webhook) }),
 		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
 		...(input.scriptRoot === undefined ? {} : { scriptRoot: optionalString(input.scriptRoot, "scriptRoot") }),
+		...(input.outboundFileRoots === undefined
+			? {}
+			: { outboundFileRoots: parseAbsolutePaths(input.outboundFileRoots, "outboundFileRoots") }),
 		...(runtime === undefined ? {} : { runtime }),
 		...(input.mentionAllowlist === undefined
 			? {}
@@ -791,6 +802,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"webhook",
 	"watcherRoots",
 	"scriptRoot",
+	"outboundFileRoots",
 	"runtime",
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",

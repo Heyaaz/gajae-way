@@ -148,6 +148,7 @@ export function resetFailedTurn(
 		readonly sessionId: string;
 		readonly opRef: string;
 		readonly triggerMessageId: string;
+		readonly bypassCap?: boolean;
 	},
 ): number | undefined {
 	store.core.assertActive(tx);
@@ -169,7 +170,7 @@ export function resetFailedTurn(
 		session?.epoch !== input.epoch ||
 		session.sessionId !== input.sessionId ||
 		store.core.metaGet(dedupeKey) !== undefined ||
-		(cap !== undefined && cap !== "0")
+		(cap !== undefined && cap !== "0" && !input.bypassCap)
 	)
 		return undefined;
 	if (store.inbox.turnComplete(tx, input.opRef, "turn_failed") !== 1)
@@ -3322,6 +3323,7 @@ class OriginActor {
 				sessionId: bound.sessionId,
 				opRef: bound.turn.opRef,
 				triggerMessageId: bound.turn.triggerMessageId,
+				bypassCap: resetReason === "repeated_submission_failure",
 			}),
 		);
 		if (nextEpoch === undefined) {

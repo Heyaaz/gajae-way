@@ -396,15 +396,13 @@ function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
 	return root;
 }
 
-/** Resolve channel roots to a thread when a persona parent has a trigger message. */
+/** Resolve Slack channel roots to trigger threads; Discord message ids are not thread channel ids. */
 export function resolveLaneReportOrigin(parent: WorkParent | null, admissionOriginRefJson: string): string {
 	if (parent?.kind !== "persona" || !parent.triggerMessageId) return admissionOriginRefJson;
 	try {
 		const origin = JSON.parse(admissionOriginRefJson) as OriginRef;
-		if (origin.kind !== "channel") return admissionOriginRefJson;
-		if (origin.platform === "slack" && !parent.triggerMessageId.startsWith(`${origin.conversationId}:`))
-			return admissionOriginRefJson;
-		if (origin.platform !== "slack" && origin.platform !== "discord") return admissionOriginRefJson;
+		if (origin.kind !== "channel" || origin.platform !== "slack") return admissionOriginRefJson;
+		if (!parent.triggerMessageId.startsWith(`${origin.conversationId}:`)) return admissionOriginRefJson;
 		const threadOrigin: OriginRef = {
 			platform: origin.platform,
 			kind: "thread",
