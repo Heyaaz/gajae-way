@@ -86,15 +86,18 @@ A source checkout upgrades through `git`, `bun run build`, and `gajaeway service
 When migrating the broker to its private GJC agent directory, keep the updated gateway stopped until provisioning and the authority cutover are complete:
 
 ```sh
+export GAJAEWAY_HOME=/absolute/path/to/gajaeway-home
 gajaeway update --no-restart
 gajaeway setup --broker-agent
-GAJAEWAY_HOME=ABS gajaeway-gateway census
-GAJAEWAY_HOME=ABS gajaeway-gateway cutover --agent-dir CANONICAL
+gajaeway-gateway census
+gajaeway-gateway cutover --agent-dir CANONICAL
 gajaeway ops restart-stack
 gajaeway ops restart-stack --status
 ```
 
 Before census, stop the gateway service and disable managed startup for the entire cutover window; follow [Explicit broker-authority cutover](runbooks/gajaeway-v1.md#explicit-broker-authority-cutover) and retain its census and cutover evidence. The final restart loads a missing macOS LaunchAgent from its plist, including `dev.gajaeway.broker` once its provision manifest exists.
+
+Check `schemaVersion` in the census report before cutover. This procedure requires schema 32; cutover refuses older databases. Gateway startup migrates older schemas only after confirming that configured `gjc.agentDir` matches the authority recorded in the database. If census reports an older version, stop here, migrate under the recorded authority, stop the gateway again, and repeat census. Do not start it against the new private directory or manually alter the recorded authority.
 
 ## Home and configuration
 
