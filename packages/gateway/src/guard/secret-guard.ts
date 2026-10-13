@@ -1,8 +1,8 @@
-import { Database } from "bun:sqlite";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, ChatProgressPayload, Frame } from "@gajae-gateway/protocol";
+import { readAuthCredentialData } from "../broker-agent/agent-db";
 
 /**
  * Outbound secret redaction: the last step before a chat-bound frame leaves the
@@ -326,15 +326,10 @@ export function collectSecretValues(sources: SecretSources): Set<string> {
 		}
 	}
 	if (sources.gjcDatabase) {
-		let db: Database | undefined;
 		try {
-			db = new Database(sources.gjcDatabase, { readonly: true });
-			for (const row of db.query("SELECT data FROM auth_credentials").all() as { data: unknown }[])
-				if (typeof row.data === "string") addContent(row.data, add);
+			for (const data of readAuthCredentialData(sources.gjcDatabase)) addContent(data, add);
 		} catch {
 			// No agent.db yet, or no auth table: nothing to index.
-		} finally {
-			db?.close();
 		}
 	}
 	return values;
