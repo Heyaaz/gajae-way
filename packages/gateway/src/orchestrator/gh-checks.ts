@@ -12,7 +12,7 @@ interface RollupEntry {
 	readonly detailsUrl?: string;
 }
 
-const FAILED_LOG_LIMIT_BYTES = 1_600;
+const FAILED_LOG_TAIL_LIMIT_BYTES = 3_200;
 
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const SUCCESS_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
@@ -64,11 +64,11 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 						"--head",
 						branch,
 						"--state",
-						"open",
+						"all",
 						"--limit",
 						"1",
 						"--json",
-						"number,headRefOid,statusCheckRollup",
+						"number,headRefOid,state,mergedAt,statusCheckRollup",
 					],
 					{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
 				);
@@ -77,6 +77,8 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 				const prs = JSON.parse(stdout) as Array<{
 					number: number;
 					headRefOid: string;
+					state: string;
+					mergedAt?: string | null;
 					statusCheckRollup?: RollupEntry[] | null;
 				}>;
 				const pr = prs[0];
@@ -85,13 +87,19 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 				if (!headSha) return undefined;
 				const rollup = pr.statusCheckRollup ?? [];
 				const snapshot = classifyCheckRollup(pr.number, headSha, rollup);
-				if (snapshot.status !== "red") return snapshot;
+				const withPrState: CheckStatusSnapshot = {
+					...snapshot,
+					prState: pr.state.toUpperCase() === "OPEN" ? "open" : "closed",
+					merged: Boolean(pr.mergedAt),
+				};
+				if (snapshot.status !== "red") return withPrState;
 				const targets = failedCheckLogTargets(rollup).slice(0, 3);
 				const tails = await Promise.all(
 					targets.map((target) => readFailedLogTail(target, cwd, Math.min(timeoutMs, 2_000))),
 				);
-				const failureLogTail = tails.filter(Boolean).join("\n---\n").slice(-FAILED_LOG_LIMIT_BYTES);
-				return failureLogTail ? { ...snapshot, failureLogTail } : snapshot;
+				const joinedTail = tails.filter(Boolean).join("\n---\n");
+				const failureLogTail = utf8Suffix(joinedTail, FAILED_LOG_TAIL_LIMIT_BYTES);
+				return failureLogTail ? { ...withPrState, failureLogTail } : withPrState;
 			} catch {
 				return undefined;
 			}
@@ -129,31 +137,21 @@ async function readFailedLogTail(
 			["gh", "run", "view", target.runId, ...(target.jobId ? ["--job", target.jobId] : []), "--log-failed"],
 			{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
 		);
-		const [tail, exitCode] = await Promise.all([readBoundedTail(child.stdout), child.exited]);
-		if (exitCode !== 0 || tail.length === 0) return undefined;
-		const sanitized = sanitizeDiagnostic(new TextDecoder().decode(tail));
-		const bytes = Buffer.from(sanitized, "utf8");
-		return (
-			bytes
-				.subarray(Math.max(0, bytes.length - FAILED_LOG_LIMIT_BYTES))
-				.toString("utf8")
-				.trim() || undefined
-		);
+		const [log, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+		if (exitCode !== 0 || log.length === 0) return undefined;
+		return sanitizedFailureLogTail(log);
 	} catch {
 		return undefined;
 	}
 }
 
-async function readBoundedTail(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-	const reader = stream.getReader();
-	let tail = new Uint8Array();
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) return tail;
-		if (!value) continue;
-		const combined = new Uint8Array(tail.length + value.length);
-		combined.set(tail);
-		combined.set(value, tail.length);
-		tail = combined.slice(Math.max(0, combined.length - FAILED_LOG_LIMIT_BYTES * 2));
-	}
+/** Redact while full line/key context is present, then retain only the diagnostic tail. */
+export function sanitizedFailureLogTail(log: string): string | undefined {
+	const sanitized = sanitizeDiagnostic(log);
+	return utf8Suffix(sanitized, FAILED_LOG_TAIL_LIMIT_BYTES).trim() || undefined;
+}
+
+function utf8Suffix(text: string, byteLimit: number): string {
+	const bytes = Buffer.from(text, "utf8");
+	return bytes.subarray(Math.max(0, bytes.length - byteLimit)).toString("utf8");
 }

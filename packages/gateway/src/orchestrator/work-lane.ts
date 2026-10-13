@@ -161,13 +161,16 @@ export interface CheckStatusSnapshot {
 	readonly headSha: string;
 	readonly status: "pending" | "green" | "red";
 	readonly failingChecks: readonly string[];
+	/** Lifecycle of the PR returned by discovery; merged PRs are terminal success. */
+	readonly prState?: "open" | "closed";
+	readonly merged?: boolean;
 	/** Bounded, sanitized tail from failed GitHub Actions checks when available. */
 	readonly failureLogTail?: string;
 }
 
 export interface CheckStatusClient {
 	/**
-	 * Snapshot the open PR head and its checks for `branch`: null when no PR is open,
+	 * Snapshot the PR head and its checks for `branch`: null when no matching PR exists,
 	 * undefined when the lookup failed or timed out. Must not throw.
 	 */
 	getCheckStatus(branch: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
@@ -1758,7 +1761,7 @@ export class WorkLaneManager {
 		this.#putJob(name, counted);
 		const retries = counted.awaitingChecks!.retries;
 		const names = failingChecks.length > 0 ? failingChecks.join(", ") : "unnamed checks";
-		const log = failureLogTail ? `\nFailed log tail:\n${utf8Prefix(sanitizeDiagnostic(failureLogTail), 1_600)}` : "";
+		const log = failureLogTail ? `\nFailed log tail:\n${utf8Prefix(sanitizeDiagnostic(failureLogTail), 3_200)}` : "";
 		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).${log}`;
 		const last = job.attempts.at(-1);
 		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
@@ -1895,6 +1898,15 @@ export class WorkLaneManager {
 							continue;
 						this.#logLaneReportTransition(row, "claimed", "pending", "wake_unprepared_parent_open");
 						row = this.#db.work.laneReportGet(row.report_id)!;
+					} else if (job.state === "awaiting_checks" || job.state === "done") {
+						if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, row.claim_ref!)))
+							continue;
+						this.#logLaneReportTransition(row, "claimed", "pending", "wake_parent_parked");
+						this.#fallbackLaneReport(
+							this.#db.work.laneReportGet(row.report_id)!,
+							job.state === "done" ? "parent_done" : "parent_awaiting_checks",
+						);
+						continue;
 					} else {
 						await this.#wakeLaneReport(row, job);
 						try {
@@ -1920,6 +1932,10 @@ export class WorkLaneManager {
 				}
 				if (job.state === "awaiting_operator" || job.state === "stalled") {
 					this.#fallbackLaneReport(row, "parent_held");
+					continue;
+				}
+				if (job.state === "awaiting_checks" || job.state === "done") {
+					this.#fallbackLaneReport(row, job.state === "done" ? "parent_done" : "parent_awaiting_checks");
 					continue;
 				}
 				await this.#wakeLaneReport(row, job);
@@ -2108,8 +2124,14 @@ export class WorkLaneManager {
 		if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, opRef))) return;
 		this.#logLaneReportTransition(fresh, "claimed", "pending", "wake_unprepared");
 		const parentJob = this.#job(row.parent_name);
-		if (parentJob && (parentJob.state === "awaiting_operator" || parentJob.state === "stalled"))
+		if (parentJob?.state === "awaiting_operator" || parentJob?.state === "stalled") {
 			this.#fallbackLaneReport(this.#db.work.laneReportGet(row.report_id)!, "parent_held");
+		} else if (parentJob?.state === "awaiting_checks" || parentJob?.state === "done") {
+			this.#fallbackLaneReport(
+				this.#db.work.laneReportGet(row.report_id)!,
+				parentJob.state === "done" ? "parent_done" : "parent_awaiting_checks",
+			);
+		}
 	}
 
 	/** Registers recovery work, never waits for a worker's terminal transition. */
@@ -2846,11 +2868,16 @@ function checksOutcome(
 	const checks = facts?.checkStatus;
 	if (cycle.prNumber === null) {
 		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
-		if (checks && checks.headSha !== cycle.headSha)
-			return {
-				kind: "ended",
-				reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}`,
-			};
+		if (checks?.prState === "closed") {
+			if (checks.merged && checks.headSha === cycle.headSha) return { kind: "passed" };
+			if (checks.merged)
+				return {
+					kind: "ended",
+					reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}`,
+				};
+			return { kind: "ended", reason: `pr_closed pr=${checks.prNumber}` };
+		}
+		if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
 		if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
 			if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 				return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
@@ -2870,8 +2897,16 @@ function checksOutcome(
 	// null: the branch has no open PR; a different number: the recorded PR is not the open one.
 	if (checks === null || (checks && checks.prNumber !== cycle.prNumber))
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
-	if (checks && checks.headSha !== cycle.headSha)
-		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}` };
+	if (checks?.prState === "closed") {
+		if (checks.merged && checks.headSha === cycle.headSha) return { kind: "passed" };
+		if (checks.merged)
+			return {
+				kind: "ended",
+				reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}`,
+			};
+		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
+	}
+	if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
 	if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
 		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
@@ -2885,6 +2920,21 @@ function checksOutcome(
 			...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
 		};
 	// Pending, or unavailable (lookup failed): keep waiting until the deadline.
+	if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+		return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+	return { kind: "wait" };
+}
+
+function checksHeadNotCurrent(
+	cycle: AwaitingChecks,
+	facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+	now: number,
+): ChecksOutcome {
+	if (facts?.remoteHeadSha && facts.remoteHeadSha !== cycle.headSha)
+		return {
+			kind: "ended",
+			reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.remoteHeadSha.slice(0, 12)}`,
+		};
 	if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 		return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 	return { kind: "wait" };

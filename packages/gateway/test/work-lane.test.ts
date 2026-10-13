@@ -13,7 +13,7 @@ import {
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
-import { classifyCheckRollup, failedCheckLogTargets } from "../src/orchestrator/gh-checks";
+import { classifyCheckRollup, failedCheckLogTargets, sanitizedFailureLogTail } from "../src/orchestrator/gh-checks";
 import {
 	LaneGovernor,
 	laneJobIdentity,
@@ -1746,6 +1746,14 @@ test("repository and PR head facts survive a large completion excerpt", () => {
 	expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(2048);
 });
 
+test("failed CI log secrets are redacted before the bounded tail is taken", () => {
+	const secret = "z".repeat(4_000);
+	const tail = sanitizedFailureLogTail(`${"x".repeat(4_000)} secret=${secret}`);
+	expect(tail).toContain("secret=[redacted]");
+	expect(tail).not.toContain(secret);
+	expect(Buffer.byteLength(tail ?? "", "utf8")).toBeLessThanOrEqual(3_200);
+});
+
 test("AC-K notice names persona parent", () => {
 	expect(
 		laneSystemNotice({
@@ -1881,6 +1889,40 @@ test("lane inbox steers an open nested parent and consumes only after acceptance
 	expect(f.port.steers[0]?.text).toContain("Report from child work lane child; not from a human.");
 	expect(f.port.sendAttempts).toHaveLength(2);
 	expect(f.notices).toHaveLength(0);
+});
+
+test("child reports fall back when a nested parent is parked or done", async () => {
+	for (const parentState of ["awaiting_checks", "done"] as const) {
+		const checks = scriptedChecks({ prNumber: 510, status: "pending", failingChecks: [] });
+		const f = await fixture({
+			allowNested: () => true,
+			checkStatusClient: checks.client,
+			ownerTarget: () => origin,
+		});
+		f.setOwnerTarget(origin);
+		await laneRepo(f.directory, `fix/parent-${parentState}`, true);
+		const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
+		if (!parent.started) throw new Error("parent did not start");
+		const child = await f.manager.start({
+			name: "child",
+			text: "child work",
+			cwd: f.directory,
+			callerSessionId: parent.sessionId,
+		});
+		if (!child.started) throw new Error("child did not start");
+		f.port.complete(parent.opRef, "parent result");
+		await until(() => f.job("parent").state === "awaiting_checks");
+		if (parentState === "done") {
+			checks.set({ prNumber: 510, status: "green", failingChecks: [] });
+			await pollUntil(f, () => f.job("parent").state === "done");
+		}
+		f.port.complete(child.opRef, "child result after parent parked");
+		await until(() => f.notices.some((notice) => notice.text.includes("child result after parent parked")));
+		expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+		expect(f.notices.at(-1)?.text).toContain(
+			parentState === "done" ? "[lane child] completed" : "[lane child] attempt_ended",
+		);
+	}
 });
 
 test("torn nested steer replays with the same clientRef after restart and consumes once", async () => {
@@ -3075,7 +3117,23 @@ test("#481 awaiting_checks binds a green rollup to the remote PR head, not the s
 	const checks = scriptedChecks({ prNumber: 496, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 	const { head } = await awaitingLane(f, "fix/remote-head-moved");
-	const remoteHead = "0".repeat(40);
+	const branch = Bun.spawnSync(["git", "-C", f.job().lane.worktreePath, "branch", "--show-current"])
+		.stdout.toString()
+		.trim();
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const worktree = f.job().lane.worktreePath;
+	expect(
+		Bun.spawnSync(["git", "-C", worktree, "commit", "-q", "--allow-empty", "-m", "move PR head"], { env }).exitCode,
+	).toBe(0);
+	const remoteHead = Bun.spawnSync(["git", "-C", worktree, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(Bun.spawnSync(["git", "-C", worktree, "push", "-q", "origin", branch]).exitCode).toBe(0);
+	expect(Bun.spawnSync(["git", "-C", worktree, "reset", "-q", "--hard", head]).exitCode).toBe(0);
 	checks.set({ prNumber: 496, headSha: remoteHead, status: "green", failingChecks: [] });
 	await pollUntil(f, () => f.job().state !== "awaiting_checks");
 	expect(f.job().state).toBe("attempt_ended");
@@ -3085,6 +3143,30 @@ test("#481 awaiting_checks binds a green rollup to the remote PR head, not the s
 	);
 	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks head_moved")).toContain("pr=496");
 	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 waits when GitHub check metadata still reports the prior head", async () => {
+	const checks = scriptedChecks({ prNumber: 501, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/gh-head-lag");
+	checks.set({ prNumber: 501, headSha: "0".repeat(40), status: "green", failingChecks: [] });
+	await pollTimes(f, 3);
+	expect(f.job().state).toBe("awaiting_checks");
+	expect(f.port.sends).toHaveLength(1);
+	expect(checksNotice(f, "[lane a] checks passed")).toBeUndefined();
+	checks.set({ prNumber: 501, headSha: head, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state === "done");
+});
+
+test("#481 a merged PR settles successfully even when its source branch was deleted", async () => {
+	const checks = scriptedChecks({ prNumber: 502, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const branch = "fix/merged-source-deleted";
+	const { head } = await awaitingLane(f, branch);
+	expect(Bun.spawnSync(["git", "-C", f.directory, "push", "-q", "origin", "--delete", branch]).exitCode).toBe(0);
+	checks.set({ prNumber: 502, headSha: head, status: "pending", failingChecks: [], prState: "closed", merged: true });
+	await pollUntil(f, () => f.job().state === "done");
+	expect(checksNotice(f, "[lane a] checks passed")).toContain("pr=502");
 });
 
 test("#481 green checks cannot settle after the remote branch advances beyond the local head", async () => {

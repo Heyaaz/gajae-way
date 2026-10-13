@@ -812,7 +812,14 @@ export class WorkGroup {
 		const json = this.laneJobJsonByLaneKey(`work-${name}`);
 		if (json === undefined) return false;
 		try {
-			return parseLaneJobRecord(json).jobId === jobId;
+			const parent = parseLaneJobRecord(json);
+			return (
+				parent.jobId === jobId &&
+				parent.state !== "awaiting_checks" &&
+				parent.state !== "awaiting_operator" &&
+				parent.state !== "stalled" &&
+				parent.state !== "done"
+			);
 		} catch {
 			return false;
 		}
