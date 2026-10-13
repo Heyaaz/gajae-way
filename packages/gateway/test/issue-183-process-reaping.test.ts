@@ -1,474 +1,404 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ProcessTableEntry, reapLeftoverWorkers, selectOrphanedWorkers } from "../src/ops/process-reaper";
+import {
+	type ProcessTableEntry,
+	parseUnixProcessTable,
+	reapLeftoverWorkers,
+	selectOrphanedWorkers,
+} from "../src/ops/process-reaper";
 
-/**
- * Test suite for issue #183: Agent child processes outlive their unit and are never reaped.
- * Verifies that:
- * 1. selectOrphanedWorkers correctly identifies orphaned workers belonging to this gateway
- * 2. selectOrphanedWorkers does NOT match unrelated bun processes
- * 3. reapLeftoverWorkers handles missing gjc executable gracefully
- * 4. reapLeftoverWorkers does not crash on permission errors or missing /proc
- */
+const GJC = "/home/user/.gajaeway/gjc/0.18.11/bin/gjc";
+const GJC_PREFIX = "/home/user/.gajaeway/gjc";
+const AGENT_DIR = "/home/user/.gajaeway/broker/agent";
+const SELF_PID = 1000;
+const SESSION = "00000000-0000-4000-8000-000000000001";
 
-test("process reaper: returns consistent result structure in clean environment", async () => {
-	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-clean-")));
+function worker(
+	pid: number,
+	ppid: number,
+	overrides: Partial<ProcessTableEntry> & { executable?: string } = {},
+): ProcessTableEntry {
+	const { executable = GJC, ...entryOverrides } = overrides;
+	return {
+		pid,
+		ppid,
+		argv: [executable, "sdk", "serve", "--stdio", "--session", SESSION],
+		agentDir: AGENT_DIR,
+		identity: `start-${pid}`,
+		...entryOverrides,
+	};
+}
+
+function select(
+	table: ProcessTableEntry[],
+	options: { gjcPath?: string; gjcPrefix?: string; brokerAgentDir?: string } = {},
+) {
+	return selectOrphanedWorkers(table, {
+		gjcPath: options.gjcPath ?? GJC,
+		gjcPrefix: options.gjcPrefix,
+		brokerAgentDir: options.brokerAgentDir ?? AGENT_DIR,
+		selfPid: SELF_PID,
+	});
+}
+
+async function temporaryHome(prefix: string): Promise<string> {
+	return await realpath(await mkdtemp(join(tmpdir(), prefix)));
+}
+
+function linuxStat(pid: number, ppid: number, startTime: number, comm = "gjc worker ) (fixture)"): string {
+	const fields = Array.from({ length: 20 }, () => "0");
+	fields[0] = "S";
+	fields[1] = String(ppid);
+	fields[19] = String(startTime);
+	return `${pid} (${comm}) ${fields.join(" ")}`;
+}
+
+test("reaper returns an empty result in a clean home", async () => {
+	const home = await temporaryHome("gajaeway-process-reaper-clean-");
 	try {
-		// Create minimal home layout structure for reapLeftoverWorkers to discover
+		const executable = join(home, "gjc", "current", "bin", "gjc");
 		await mkdir(join(home, "gjc", "current", "bin"), { recursive: true });
-		await writeFile(join(home, "gjc", "current", "bin", "gjc"), "");
-
-		const result = await reapLeftoverWorkers(home);
-		// In a clean test environment, we shouldn't find SDK serve processes
-		expect(typeof result.found).toBe("number");
-		expect(typeof result.killed).toBe("number");
-		expect(typeof result.failed).toBe("number");
-		expect(result.found).toBeGreaterThanOrEqual(0);
-		expect(result.killed).toBe(0);
-		expect(result.failed).toBe(0);
-		// Invariant: killed + failed <= found
-		expect(result.killed + result.failed).toBeLessThanOrEqual(result.found);
+		await writeFile(executable, "");
+		expect(await reapLeftoverWorkers(home, { log: () => {} })).toEqual({ found: 0, killed: 0, failed: 0 });
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
 });
 
-test("process reaper: handles missing gjc executable gracefully", async () => {
-	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-missing-gjc-")));
+test("reaper tolerates a missing default GJC executable", async () => {
+	const home = await temporaryHome("gajaeway-process-reaper-missing-gjc-");
 	try {
-		// Create home layout but NOT the gjc executable
 		await mkdir(join(home, "broker", "agent"), { recursive: true });
-
-		// Should not throw even if gjc executable doesn't exist
-		const result = await reapLeftoverWorkers(home, {
-			log: () => {
-				/* suppress logs */
-			},
-		});
-		expect(typeof result.found).toBe("number");
-		expect(typeof result.killed).toBe("number");
-		expect(typeof result.failed).toBe("number");
-		expect(result.found).toBeGreaterThanOrEqual(0);
-		// No processes should be matched if gjc executable doesn't exist
-		expect(result.killed).toBe(0);
+		expect(await reapLeftoverWorkers(home, { log: () => {} })).toEqual({ found: 0, killed: 0, failed: 0 });
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
 });
 
-test("process reaper: respects home directory parameter", async () => {
-	const home1 = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-reaper-home1-")));
-	const home2 = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-reaper-home2-")));
+test("reaper scopes executable and agent matching to the supplied home", async () => {
+	const home1 = await temporaryHome("gajaeway-reaper-home1-");
+	const home2 = await temporaryHome("gajaeway-reaper-home2-");
+	const executable = join(home1, "gjc", "current", "bin", "gjc");
+	const agentDir = join(home1, "broker", "agent");
+	const calls: number[] = [];
 	try {
-		// Set up both home directories
-		for (const h of [home1, home2]) {
-			await mkdir(join(h, "gjc", "current", "bin"), { recursive: true });
-			await writeFile(join(h, "gjc", "current", "bin", "gjc"), "");
-		}
-
-		// Should work independently for each home
-		const result1 = await reapLeftoverWorkers(home1, {
-			log: () => {
-				/* suppress */
+		await mkdir(join(home1, "gjc", "current", "bin"), { recursive: true });
+		await mkdir(agentDir, { recursive: true });
+		await mkdir(join(home2, "gjc", "current", "bin"), { recursive: true });
+		await mkdir(join(home2, "broker", "agent"), { recursive: true });
+		await writeFile(executable, "");
+		const table = [worker(2401, 2, { executable, agentDir })];
+		const options = {
+			processTable: table,
+			kill: async (pid: number) => {
+				calls.push(pid);
 			},
-		});
-		const result2 = await reapLeftoverWorkers(home2, {
-			log: () => {
-				/* suppress */
-			},
-		});
+			isProcessAlive: async () => false,
+			log: () => {},
+		};
 
-		// Both should return valid results
-		expect(typeof result1.found).toBe("number");
-		expect(typeof result2.found).toBe("number");
-		expect(result1.killed).toBe(0);
-		expect(result2.killed).toBe(0);
+		expect(await reapLeftoverWorkers(home1, options)).toEqual({ found: 1, killed: 1, failed: 0 });
+		expect(await reapLeftoverWorkers(home2, options)).toEqual({ found: 0, killed: 0, failed: 0 });
+		expect(calls).toEqual([2401]);
 	} finally {
-		await rm(home1, { recursive: true, force: true });
-		await rm(home2, { recursive: true, force: true });
+		await Promise.all([rm(home1, { recursive: true, force: true }), rm(home2, { recursive: true, force: true })]);
 	}
 });
 
-test("process reaper: does not throw on unreadable /proc entries", async () => {
-	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-unreadable-")));
+test("reaper tolerates an unavailable or malformed proc root", async () => {
+	const home = await temporaryHome("gajaeway-reaper-proc-unavailable-");
 	try {
-		await mkdir(join(home, "gjc", "current", "bin"), { recursive: true });
-		await writeFile(join(home, "gjc", "current", "bin", "gjc"), "");
-
-		// Should complete without throwing, even if some /proc entries are unreadable
-		const result = await reapLeftoverWorkers(home, {
-			log: () => {
-				/* suppress */
-			},
-		});
-
-		expect(typeof result.found).toBe("number");
-		expect(typeof result.killed).toBe("number");
-		expect(typeof result.failed).toBe("number");
+		const missing = await reapLeftoverWorkers(home, { procRoot: join(home, "missing-proc"), log: () => {} });
+		const malformedRoot = join(home, "proc");
+		await mkdir(join(malformedRoot, "4001"), { recursive: true });
+		await writeFile(join(malformedRoot, "4001", "stat"), "invalid");
+		const malformed = await reapLeftoverWorkers(home, { procRoot: malformedRoot, log: () => {} });
+		expect(missing).toEqual({ found: 0, killed: 0, failed: 0 });
+		expect(malformed).toEqual({ found: 0, killed: 0, failed: 0 });
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
 });
 
-/**
- * Fixture tests using selectOrphanedWorkers directly with injected process tables.
- * These tests verify each guard condition independently.
- * All SKIP tests must NOT match (invariant: found = 0).
- * All POSITIVE tests must match (invariant: found = 1).
- */
-
-test("fixture: SKIP unrelated orphaned bun process (different command)", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: 2000,
-			ppid: 9999, // Non-existent parent (orphaned)
-			argv: ["bun", "some-unrelated-script.ts"],
-			agentDir: brokerAgentDir,
-		},
-	];
-
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should NOT match because argv doesn't match worker pattern
-	expect(orphaned.length).toBe(0);
-});
-
-test("fixture: SKIP worker with different agent directory", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const otherAgentDir = "/home/user/gajaeway/other/agent";
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: 2001,
-			ppid: 9999,
-			argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000001"],
-			agentDir: otherAgentDir, // Different agent dir
-		},
-	];
-
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should NOT match because agentDir is different
-	expect(orphaned.length).toBe(0);
-});
-
-test("fixture: SKIP prefix-colliding agent directory", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const collidingAgentDir = "/home/user/gajaeway/broker/agent2"; // Prefix collision
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: 2002,
-			ppid: 9999,
-			argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000002"],
-			agentDir: collidingAgentDir,
-		},
-	];
-
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should NOT match because agentDir is not exactly equal
-	expect(orphaned.length).toBe(0);
-});
-
-test("fixture: SKIP worker whose ppid === selfPid (child of current gateway)", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: 2003,
-			ppid: selfPid, // Child of the current gateway
-			argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000003"],
-			agentDir: brokerAgentDir,
-		},
-	];
-
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should NOT reap because parent is the current gateway
-	expect(orphaned.length).toBe(0);
-});
-
-test("fixture: SKIP argv superset/prefix match (extra token)", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: 2010,
-			ppid: 9999,
-			argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "id", "--extra-flag"],
-			agentDir: brokerAgentDir,
-		},
-	];
-
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should NOT match because argv has extra tokens (not exact match)
-	expect(orphaned.length).toBe(0);
-});
-
-test("fixture: SKIP argv variant (serve-x instead of serve)", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: 2011,
-			ppid: 9999,
-			argv: [gjcPath, "sdk", "serve-x", "--stdio", "--session", "id"],
-			agentDir: brokerAgentDir,
-		},
-	];
-
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should NOT match because "serve-x" !== "serve"
-	expect(orphaned.length).toBe(0);
-});
-
-test("fixture: POSITIVE reap worker with dead parent (ppid=9999 not in table)", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: 2004,
-			ppid: 9999, // Non-existent PID (not in process table)
-			argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000002"],
-			agentDir: brokerAgentDir,
-		},
-	];
-
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should MATCH and be reaped (parent is dead, not in the table)
-	expect(orphaned.length).toBe(1);
-	expect(orphaned[0]).toBe(2004);
-});
-
-test("fixture: POSITIVE reap worker with ppid=1", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: 2005,
-			ppid: 1, // Init process; orphaned worker
-			argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000003"],
-			agentDir: brokerAgentDir,
-		},
-	];
-
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should MATCH and be reaped (parent is init, which is not the current gateway)
-	expect(orphaned.length).toBe(1);
-	expect(orphaned[0]).toBe(2005);
-});
-
-test("fixture: POSITIVE reap worker with systemd --user subreaper (live non-gateway parent)", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const selfPid = 1000;
-	const systemdPid = 1234;
-
-	const processTable: ProcessTableEntry[] = [
-		{
-			pid: systemdPid,
-			ppid: 1,
-			argv: ["/usr/lib/systemd/systemd", "--user"],
-			agentDir: undefined,
-		},
+test("classifier selects exact relays orphaned under systemd and skips live gateway children", () => {
+	const systemdPid = 1100;
+	const gatewayPid = 1200;
+	const table: ProcessTableEntry[] = [
+		{ pid: systemdPid, ppid: 1, argv: ["/usr/lib/systemd/systemd", "--user"], agentDir: undefined },
+		worker(2001, systemdPid),
+		worker(2002, SELF_PID),
+		{ pid: gatewayPid, ppid: 1, argv: ["/usr/local/bin/gajaeway-gateway", "daemon"], agentDir: undefined },
+		worker(2003, gatewayPid),
+		worker(2004, systemdPid, { agentDir: "/home/user/.gajaeway/broker/agent2" }),
+		worker(2005, systemdPid, { executable: "/opt/other-gjc/bin/gjc" }),
 		{
 			pid: 2006,
 			ppid: systemdPid,
-			argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000004"],
-			agentDir: brokerAgentDir,
+			argv: ["bun", "unrelated.ts", "sdk", "serve", "--stdio", "--session", SESSION],
+			agentDir: AGENT_DIR,
 		},
+		worker(2007, systemdPid, {
+			argv: [GJC, "sdk", "serve", "--stdio", "--session", SESSION, "--extra"],
+		}),
+		worker(2008, systemdPid, { argv: [GJC, "sdk", "serve-x", "--stdio", "--session", SESSION] }),
 	];
 
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should MATCH and be reaped (parent is systemd, which is NOT the current gateway)
-	expect(orphaned.length).toBe(1);
-	expect(orphaned[0]).toBe(2006);
+	expect(select(table)).toEqual([2001]);
 });
 
-test("fixture: POSITIVE reap worker spawned as bun gjcPath (argv[0] = bun)", async () => {
-	const gjcPath = "/home/user/gajaeway/gjc/current/bin/gjc";
-	const brokerAgentDir = "/home/user/gajaeway/broker/agent";
-	const selfPid = 1000;
-
-	const processTable: ProcessTableEntry[] = [
+test("classifier accepts the source-run gateway as a live parent", () => {
+	const table: ProcessTableEntry[] = [
 		{
-			pid: 2007,
-			ppid: 9999,
-			argv: ["bun", gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000005"],
-			agentDir: brokerAgentDir,
+			pid: 1300,
+			ppid: 1,
+			argv: ["/usr/local/bin/bun", "/srv/gajaeway/packages/gateway/src/main.ts", "daemon"],
+			agentDir: undefined,
 		},
+		worker(2100, 1300),
 	];
 
-	const orphaned = selectOrphanedWorkers(processTable, {
-		gjcPath,
-		brokerAgentDir,
-		selfPid,
-	});
-
-	// Should MATCH (argv pattern allows bun as first token)
-	expect(orphaned.length).toBe(1);
-	expect(orphaned[0]).toBe(2007);
+	expect(select(table)).toEqual([]);
 });
 
-test("integration: reapLeftoverWorkers with injected process table", async () => {
-	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-integration-kill-")));
-	const brokerAgentDir = join(home, "broker", "agent");
-	const gjcPath = join(home, "gjc", "current", "bin", "gjc");
+test("classifier accepts only exact current and previously pinned executable identities", () => {
+	const currentExecutable = `${GJC_PREFIX}/0.18.11/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
+	const previousExecutable = `${GJC_PREFIX}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
+	const table = [
+		worker(2201, 2, { executable: previousExecutable }),
+		worker(2202, 2, { executable: currentExecutable }),
+		worker(2203, 2, { executable: `${GJC_PREFIX}/current/bin/gjc` }),
+		worker(2204, 2, {
+			executable: "/home/other/.gajaeway/gjc/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js",
+		}),
+	];
+
+	expect(select(table, { gjcPath: currentExecutable, gjcPrefix: GJC_PREFIX })).toEqual([2201, 2202]);
+	expect(select(table, { gjcPath: "/opt/custom/gjc" })).toEqual([]);
+});
+
+test("reaper recognizes a previous GJC entrypoint after its version directory was pruned", async () => {
+	const home = await temporaryHome("gajaeway-reaper-old-pin-");
+	const prefix = join(home, "gjc");
+	const currentPackageBin = join(prefix, "0.18.11", "node_modules", "@gajae-code", "coding-agent", "bin");
+	const currentExecutable = join(prefix, "0.18.11", "bin", "gjc");
+	const oldProcessExecutable = join(prefix, "0.18.9", "node_modules", "@gajae-code", "coding-agent", "bin", "gjc.js");
+	const calls: Array<{ pid: number; signal: string }> = [];
 	try {
-		await mkdir(join(home, "gjc", "current", "bin"), { recursive: true });
-		await writeFile(gjcPath, "");
-		await mkdir(brokerAgentDir, { recursive: true });
-
-		const processTable: ProcessTableEntry[] = [
-			{
-				pid: 2008,
-				ppid: 9999, // Dead parent
-				argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000006"],
-				agentDir: brokerAgentDir,
-			},
-			{
-				pid: 2009,
-				ppid: 1, // Init parent
-				argv: [gjcPath, "sdk", "serve", "--stdio", "--session", "00000000-0000-4000-8000-000000000007"],
-				agentDir: brokerAgentDir,
-			},
-		];
-
-		const killCalled: Array<{ pid: number; signal: string }> = [];
+		await mkdir(currentPackageBin, { recursive: true });
+		await mkdir(join(prefix, "0.18.11", "bin"), { recursive: true });
+		await writeFile(join(currentPackageBin, "gjc.js"), "");
+		await symlink("../node_modules/@gajae-code/coding-agent/bin/gjc.js", currentExecutable);
+		const currentProcessExecutable = await realpath(currentExecutable);
 		const result = await reapLeftoverWorkers(home, {
-			log: () => {
-				/* suppress */
+			gjcExecutable: currentProcessExecutable,
+			gjcPrefix: prefix,
+			brokerAgentDir: AGENT_DIR,
+			processTable: [
+				worker(2205, 2, { executable: oldProcessExecutable }),
+				worker(2206, 2, { executable: join(prefix, "0.18.9", "bin", "unrelated") }),
+			],
+			kill: async (pid, signal) => {
+				calls.push({ pid, signal });
 			},
-			processTable,
-			kill: (pid, signal) => {
-				killCalled.push({ pid, signal });
-				return Promise.resolve();
-			},
+			isProcessAlive: async () => false,
 		});
 
-		// Should find and kill both orphaned workers
-		expect(result.found).toBe(2);
-		expect(result.killed).toBe(2);
-		expect(killCalled.length).toBe(2);
-		expect(killCalled[0]).toEqual({ pid: 2008, signal: "SIGTERM" });
-		expect(killCalled[1]).toEqual({ pid: 2009, signal: "SIGTERM" });
+		expect(result).toEqual({ found: 1, killed: 1, failed: 0 });
+		expect(calls).toEqual([{ pid: 2205, signal: "SIGTERM" }]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
 });
 
-test("proc reader: reads ppid, argv and agent dir from a /proc fixture, including a comm with spaces and parens", async () => {
-	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-procroot-")));
-	const brokerAgentDir = join(home, "broker", "agent");
-	const gjcPath = join(home, "gjc", "current", "bin", "gjc");
-	const procRoot = join(home, "proc");
-	const writeProc = async (pid: number, stat: string, argv: string[], env: string[]): Promise<void> => {
-		await mkdir(join(procRoot, String(pid)), { recursive: true });
-		await writeFile(join(procRoot, String(pid), "stat"), stat);
-		await writeFile(join(procRoot, String(pid), "cmdline"), `${argv.join("\0")}\0`);
-		await writeFile(join(procRoot, String(pid), "environ"), `${env.join("\0")}\0`);
-	};
-	try {
-		await mkdir(join(home, "gjc", "current", "bin"), { recursive: true });
-		await writeFile(gjcPath, "");
-		await mkdir(brokerAgentDir, { recursive: true });
-		const workerArgv = (id: string): string[] => [gjcPath, "sdk", "serve", "--stdio", "--session", id];
-		// Orphan reparented to a subreaper; comm contains ") " which breaks a naive split(" ").
-		await writeProc(
-			4001,
-			"4001 (gjc) x (y) S 1234 4001 4001 0 -1 4194560",
-			workerArgv("00000000-0000-4000-8000-000000000011"),
-			["HOME=/x", `GJC_CODING_AGENT_DIR=${brokerAgentDir}`],
-		);
-		// Child of the booting gateway: must be kept.
-		await writeProc(
-			4002,
-			`4002 (gjc) S ${process.pid} 4002 4002 0 -1 4194560`,
-			workerArgv("00000000-0000-4000-8000-000000000012"),
-			[`GJC_CODING_AGENT_DIR=${brokerAgentDir}`],
-		);
-		// Prefix-colliding agent dir: must be kept.
-		await writeProc(4003, "4003 (gjc) S 1 4003 4003 0 -1 4194560", workerArgv("00000000-0000-4000-8000-000000000013"), [
-			`GJC_CODING_AGENT_DIR=${brokerAgentDir}2`,
-		]);
+test("Unix ps parser preserves exact agent directories, including paths with spaces", () => {
+	const spacedAgentDir = "/home/user/gajae way/agent";
+	const spacedPrefix = "/home/user/gajae way/.gajaeway/gjc";
+	const spacedCurrentGjc = `${spacedPrefix}/0.18.11/bin/gjc`;
+	const spacedPreviousGjc = `${spacedPrefix}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
+	const output = [
+		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
+		`300 401 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} PATH=/bin`,
+		`300 402 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}2 PATH=/bin`,
+		`300 403 Mon Oct 13 03:20:00 2026 bun ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} PATH=/bin`,
+	].join("\n");
+	const table = parseUnixProcessTable(output, spacedAgentDir);
 
-		const killCalled: Array<{ pid: number; signal: string }> = [];
+	expect(table).toHaveLength(4);
+	expect(table[1]).toEqual({
+		pid: 401,
+		ppid: 300,
+		argv: [spacedCurrentGjc, "sdk", "serve", "--stdio", "--session", SESSION],
+		agentDir: spacedAgentDir,
+		identity: "Mon Oct 13 03:20:00 2026",
+	});
+	expect(table[3]?.argv).toEqual(["bun", spacedPreviousGjc, "sdk", "serve", "--stdio", "--session", SESSION]);
+	expect(
+		select(table, {
+			gjcPath: spacedCurrentGjc,
+			gjcPrefix: spacedPrefix,
+			brokerAgentDir: spacedAgentDir,
+		}),
+	).toEqual([401, 403]);
+});
+
+test("injected process tables require isolated signal and liveness seams", async () => {
+	await expect(reapLeftoverWorkers("/tmp/gajaeway-process-reaper", { processTable: [] })).rejects.toThrow(
+		"processTable injection requires kill and isProcessAlive functions",
+	);
+});
+
+test("reaper canonicalizes the configured agent directory and uses a custom executable", async () => {
+	const home = await temporaryHome("gajaeway-reaper-custom-");
+	const targetAgent = join(home, "custom-agent");
+	const agentAlias = join(home, "agent-alias");
+	const customExecutable = join(home, "custom-gjc");
+	const calls: Array<{ pid: number; signal: string }> = [];
+	try {
+		await mkdir(targetAgent);
+		await symlink(targetAgent, agentAlias);
+		const canonicalAgent = await realpath(targetAgent);
+		const table = [worker(2301, 2, { executable: customExecutable, agentDir: canonicalAgent })];
 		const result = await reapLeftoverWorkers(home, {
-			log: () => {
-				/* suppress */
+			gjcExecutable: customExecutable,
+			brokerAgentDir: agentAlias,
+			processTable: table,
+			kill: async (pid, signal) => {
+				calls.push({ pid, signal });
 			},
-			procRoot,
-			kill: (pid, signal) => {
-				killCalled.push({ pid, signal });
-				return Promise.resolve();
-			},
+			isProcessAlive: async () => false,
 		});
 
-		expect(result.found).toBe(1);
-		expect(killCalled[0]).toEqual({ pid: 4001, signal: "SIGTERM" });
-		expect(killCalled.every((call) => call.pid === 4001)).toBe(true);
+		expect(result).toEqual({ found: 1, killed: 1, failed: 0 });
+		expect(calls).toEqual([{ pid: 2301, signal: "SIGTERM" }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("Linux proc reader parses comm with spaces and parentheses and selects a systemd-adopted worker", async () => {
+	const home = await temporaryHome("gajaeway-procroot-");
+	const procRoot = join(home, "proc");
+	const brokerAgentDir = join(home, "broker", "agent");
+	const gjcExecutable = join(home, "gjc", "0.18.11", "bin", "gjc");
+	const calls: Array<{ pid: number; signal: string }> = [];
+	const writeProc = async (
+		pid: number,
+		ppid: number,
+		startTime: number,
+		argv: string[],
+		environment: string[],
+		comm?: string,
+	) => {
+		const directory = join(procRoot, String(pid));
+		await mkdir(directory, { recursive: true });
+		await writeFile(join(directory, "stat"), linuxStat(pid, ppid, startTime, comm));
+		await writeFile(join(directory, "cmdline"), `${argv.join("\0")}\0`);
+		await writeFile(join(directory, "environ"), `${environment.join("\0")}\0`);
+	};
+	try {
+		await mkdir(brokerAgentDir, { recursive: true });
+		const workerArgv = [gjcExecutable, "sdk", "serve", "--stdio", "--session", SESSION];
+		await writeProc(4500, 1, 10, ["/usr/lib/systemd/systemd", "--user"], [], "systemd (user) manager");
+		await writeProc(4501, 4500, 11, workerArgv, [`GJC_CODING_AGENT_DIR=${brokerAgentDir}`], "gjc relay ) (worker)");
+		await writeProc(4502, process.pid, 12, workerArgv, [`GJC_CODING_AGENT_DIR=${brokerAgentDir}`]);
+		await writeProc(4503, 4500, 13, workerArgv, [`GJC_CODING_AGENT_DIR=${brokerAgentDir}2`]);
+		await writeProc(
+			4504,
+			4500,
+			14,
+			["/opt/other-gjc/bin/gjc", ...workerArgv.slice(1)],
+			[`GJC_CODING_AGENT_DIR=${brokerAgentDir}`],
+		);
+
+		const result = await reapLeftoverWorkers(home, {
+			gjcExecutable,
+			brokerAgentDir,
+			procRoot,
+			timeoutMs: 1,
+			kill: async (pid, signal) => {
+				calls.push({ pid, signal });
+			},
+			isProcessAlive: async () => false,
+		});
+
+		expect(result).toEqual({ found: 1, killed: 1, failed: 0 });
+		expect(calls).toEqual([{ pid: 4501, signal: "SIGTERM" }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reaper sends SIGKILL when SIGTERM leaves the worker alive and counts only confirmed exits", async () => {
+	const home = await temporaryHome("gajaeway-reaper-kill-escalation-");
+	let alive = true;
+	const signals: string[] = [];
+	try {
+		const result = await reapLeftoverWorkers(home, {
+			gjcExecutable: GJC,
+			brokerAgentDir: AGENT_DIR,
+			processTable: [worker(4601, 2)],
+			timeoutMs: 1,
+			kill: async (_pid, signal) => {
+				signals.push(signal);
+				if (signal === "SIGKILL") alive = false;
+			},
+			isProcessAlive: async () => alive,
+		});
+
+		expect(result).toEqual({ found: 1, killed: 1, failed: 0 });
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reaper does not report a live worker as killed when both signals fail", async () => {
+	const home = await temporaryHome("gajaeway-reaper-kill-failed-");
+	const signals: string[] = [];
+	try {
+		const result = await reapLeftoverWorkers(home, {
+			gjcExecutable: GJC,
+			brokerAgentDir: AGENT_DIR,
+			processTable: [worker(4602, 2)],
+			timeoutMs: 0,
+			kill: async (_pid, signal) => {
+				signals.push(signal);
+				throw new Error("EPERM");
+			},
+			isProcessAlive: async () => true,
+			log: () => {},
+		});
+
+		expect(result).toEqual({ found: 1, killed: 0, failed: 1 });
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reaper revalidates process identity before escalating a stale PID", async () => {
+	const home = await temporaryHome("gajaeway-reaper-pid-reuse-");
+	const signals: string[] = [];
+	let identityChecks = 0;
+	try {
+		const result = await reapLeftoverWorkers(home, {
+			gjcExecutable: GJC,
+			brokerAgentDir: AGENT_DIR,
+			processTable: [worker(4603, 2)],
+			timeoutMs: 0,
+			kill: async (_pid, signal) => {
+				signals.push(signal);
+			},
+			isProcessAlive: async () => true,
+			isCurrentWorker: async () => ++identityChecks === 1,
+			log: () => {},
+		});
+
+		expect(result).toEqual({ found: 1, killed: 0, failed: 1 });
+		expect(signals).toEqual(["SIGTERM"]);
+		expect(identityChecks).toBe(2);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
