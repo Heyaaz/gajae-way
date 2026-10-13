@@ -1,3 +1,4 @@
+import { originKey } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { StoreCore, type StoreOpenOptions } from "./core";
 import { BindingsGroup, type BrokerAuthority } from "./groups/bindings";
@@ -73,7 +74,7 @@ export class Store {
 		return this.transaction((tx) =>
 			this.work.workAttemptReconcile(
 				tx,
-				(runtime, at) =>
+				(runtime, at, childFallback) => {
 					this.bindings.touchWorkSession(
 						tx,
 						runtime.sessionKey,
@@ -85,7 +86,18 @@ export class Store {
 							kind: "task",
 							conversationId: runtime.sessionKey.slice("work/task/".length),
 						}),
-					),
+					);
+					if (!childFallback) return;
+					if (typeof childFallback.deliveryId !== "string")
+						throw new Error("reconciled wake fallback has no delivery id");
+					this.outbox.enqueue(tx, {
+						deliveryId: childFallback.deliveryId,
+						turnId: childFallback.turnId,
+						originKey: originKey(childFallback.origin),
+						payloadJson: JSON.stringify(childFallback),
+					});
+				},
+				(jobId) => this.bindings.quarantineInvalidWork(tx, jobId),
 				log,
 			),
 		);

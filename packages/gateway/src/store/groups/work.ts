@@ -376,7 +376,7 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 				(value.wakeReportId !== null && value.mode === "start" && value.terminal !== null && !workAccepted(value)),
 		);
 		workAssert(value.wakeReportId === null || workAccepted(value) || value.decision === "wake_unaccepted");
-		if (value.decision === "recovery_indeterminate") workAssert(output.proof === null && output.knownSilence === null);
+		if (value.decision === "recovery_indeterminate") workAssert(output.knownSilence === null);
 	}
 	workAssert(Buffer.byteLength(JSON.stringify(value), "utf8") <= 16384);
 }
@@ -525,7 +525,8 @@ export class WorkGroup {
 	/** Repair torn settlement state and refresh lane activity before normal recovery starts. */
 	workAttemptReconcile(
 		tx: WriteTx,
-		refreshWorkSession: (runtime: WorkAttemptRuntime, at: string) => void,
+		refreshWorkSession: (runtime: WorkAttemptRuntime, at: string, childFallback?: ChatMessagePayload) => void,
+		quarantineInvalidWork: (jobId: string) => void,
 		log: (line: string) => void = console.error,
 	): number {
 		const rows = this.#db
@@ -533,6 +534,18 @@ export class WorkGroup {
 				`SELECT op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json
 				FROM work_attempt_runtime
 				WHERE settled_at IS NULL
+					OR (
+						settled_at IS NOT NULL
+						AND CASE WHEN json_valid(work_attempt_runtime.record_json) THEN
+							work_attempt_runtime.op_ref IS NOT json_extract(work_attempt_runtime.record_json, '$.opRef')
+							OR work_attempt_runtime.job_id IS NOT json_extract(work_attempt_runtime.record_json, '$.jobId')
+							OR work_attempt_runtime.lane_key IS NOT json_extract(work_attempt_runtime.record_json, '$.laneKey')
+							OR work_attempt_runtime.session_id IS NOT json_extract(work_attempt_runtime.record_json, '$.sessionId')
+							OR work_attempt_runtime.version IS NOT json_extract(work_attempt_runtime.record_json, '$.version')
+							OR work_attempt_runtime.delivery_id IS NOT json_extract(work_attempt_runtime.record_json, '$.deliveryId')
+							OR work_attempt_runtime.settled_at IS NOT json_extract(work_attempt_runtime.record_json, '$.settledAt')
+						ELSE 1 END
+					)
 					OR CASE WHEN json_valid(work_attempt_runtime.record_json)
 						THEN settled_at IS NOT json_extract(work_attempt_runtime.record_json, '$.settledAt')
 						ELSE 0
@@ -565,6 +578,7 @@ export class WorkGroup {
 		}>;
 		let reconciled = 0;
 		const skipped: string[] = [];
+		const quarantinedJobs = new Set<string>();
 		const updates: {
 			runtime: WorkAttemptRuntime;
 			next: WorkAttemptRuntime;
@@ -608,7 +622,7 @@ export class WorkGroup {
 				if (attempt.endedAt === undefined && runtime.settledAt === null && row.settled_at === null) continue;
 				this.#assertNotQuarantined(runtime.jobId);
 
-				const settledAt = runtime.terminal?.observedAt ?? attempt.endedAt ?? row.settled_at ?? runtime.settledAt;
+				const settledAt = runtime.settledAt ?? attempt.endedAt ?? row.settled_at ?? runtime.terminal?.observedAt;
 				workAssert(settledAt !== undefined && settledAt !== null && workTime(settledAt));
 				const terminal = runtime.terminal ?? {
 					kind: "local" as const,
@@ -618,16 +632,20 @@ export class WorkGroup {
 				const decision =
 					runtime.decision !== "undecided"
 						? runtime.decision
-						: runtime.wakeReportId !== null && !workAccepted(runtime)
-							? "wake_unaccepted"
-							: "recovery_indeterminate";
+						: runtime.output.knownSilence !== null
+							? "suppressed"
+							: runtime.wakeReportId !== null && !workAccepted(runtime)
+								? "wake_unaccepted"
+								: "recovery_indeterminate";
 				const next: WorkAttemptRuntime = {
 					...runtime,
 					terminal,
 					output:
-						runtime.output.disposition === "pending"
-							? { ...runtime.output, disposition: "unavailable", nextReadAt: null }
-							: runtime.output,
+						runtime.output.knownSilence !== null
+							? { ...runtime.output, disposition: "silent", nextReadAt: null }
+							: runtime.output.disposition === "pending"
+								? { ...runtime.output, disposition: "unavailable", nextReadAt: null }
+								: runtime.output,
 					decision,
 					settledAt,
 				};
@@ -666,13 +684,16 @@ export class WorkGroup {
 				updates.push({ runtime, next, priorSettledAt: row.settled_at });
 			} catch (error) {
 				skipped.push(row.op_ref);
+				if (row.settled_at !== null) quarantinedJobs.add(row.job_id);
 				log(
 					`work_attempt_reconcile_skip opRef=${row.op_ref} reason=${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
 		}
 
+		for (const jobId of quarantinedJobs) quarantineInvalidWork(jobId);
 		for (const { runtime, next, priorSettledAt } of updates) {
+			if (quarantinedJobs.has(runtime.jobId)) continue;
 			const json = this.laneJobJson(runtime.jobId);
 			workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
 			const record = parseLaneJobRecord(json);
@@ -685,15 +706,25 @@ export class WorkGroup {
 				.run(tx, JSON.stringify(next), next.settledAt, runtime.opRef, priorSettledAt).changes;
 			workAssert(changed === 1);
 			this.#workPutHistory(tx, next, history);
+			let childFallback: ChatMessagePayload | undefined;
 			if (next.wakeReportId !== null) {
 				if (workAccepted(next)) this.#consumeWakeReport(tx, next);
 				else {
 					const report = this.#laneReportGetInside(next.wakeReportId);
-					if (report?.state === "claimed" && report.claim_kind === "wake" && report.claim_ref === next.opRef)
+					const unresolvedClaim =
+						report !== undefined &&
+						report.claim_kind === "wake" &&
+						report.claim_ref === next.opRef &&
+						(report.state === "claimed" ||
+							(report.state === "held" && report.hold_reason === "wake_acceptance_uncertain"));
+					if (next.decision === "wake_unaccepted" && next.terminal?.reasonCode === "send_rejected" && unresolvedClaim) {
+						workAssert(report !== undefined);
+						childFallback = this.#settleWakeReport(tx, next, history, report).childFallback;
+					} else if (report?.state === "claimed" && report.claim_kind === "wake" && report.claim_ref === next.opRef)
 						workAssert(this.laneReportHold(tx, next.wakeReportId, "wake_acceptance_uncertain"));
 				}
 			}
-			refreshWorkSession(next, settledAt);
+			refreshWorkSession(next, settledAt, childFallback);
 			reconciled++;
 		}
 
@@ -945,44 +976,10 @@ export class WorkGroup {
 			);
 		}
 		if (next.decision === "wake_unaccepted") {
-			const row = linkedReport!;
-			const definitiveRefusal = draft.terminal?.reasonCode === "send_rejected";
-			const isHeld = record.state === "awaiting_operator" || record.state === "stalled";
-			let state: LaneReportState;
-			let holdReason: string | null = null;
-			let clearClaim = false;
-			if (!definitiveRefusal) {
-				state = "held";
-				holdReason = "wake_acceptance_uncertain";
-			} else if (!isHeld) {
-				state = "pending";
-				clearClaim = true;
-				requeuedParent = row.parent_name;
-			} else if (row.root_json !== null) {
-				state = "fallback";
-				const root = laneReportRoot(row)!;
-				const deliveryId = workAttemptDeliveryId(this.instanceId, laneJobDatabaseId(row.child_name), row.child_op_ref);
-				childFallback = buildDeliveryPayload(row.child_op_ref, root.origin, row.body, deliveryId)!;
-			} else {
-				state = "undeliverable";
-			}
-			const changed = this.#db
-				.prepare(
-					"UPDATE lane_reports SET state = ?, claim_kind = ?, claim_ref = ?, claim_target_op_ref = ?, hold_reason = ?, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = 'claimed' AND claim_kind = 'wake' AND claim_ref = ? AND claim_seq = ?",
-				)
-				.run(
-					tx,
-					state,
-					clearClaim ? null : row.claim_kind,
-					clearClaim ? null : row.claim_ref,
-					clearClaim ? null : row.claim_target_op_ref,
-					holdReason,
-					next.settledAt,
-					row.report_id,
-					opRef,
-					row.claim_seq,
-				).changes;
-			workAssert(changed === 1);
+			workAssert(linkedReport !== undefined);
+			const wakeEffects = this.#settleWakeReport(tx, next, record, linkedReport);
+			childFallback = wakeEffects.childFallback;
+			requeuedParent = wakeEffects.requeuedParent;
 		}
 		return {
 			runtime: next,
@@ -1003,6 +1000,68 @@ export class WorkGroup {
 		} catch {
 			return false;
 		}
+	}
+
+	#settleWakeReport(
+		tx: WriteTx,
+		runtime: WorkAttemptRuntime,
+		record: LaneJobRecord,
+		row: LaneReportRow,
+	): { readonly childFallback?: ChatMessagePayload; readonly requeuedParent?: string } {
+		workAssert(
+			runtime.wakeReportId === row.report_id &&
+				row.claim_kind === "wake" &&
+				row.claim_ref === runtime.opRef &&
+				(row.state === "claimed" || row.state === "held") &&
+				(row.state !== "held" || row.hold_reason === "wake_acceptance_uncertain"),
+		);
+		workAssert(runtime.settledAt !== null);
+		const definitiveRefusal = runtime.terminal?.reasonCode === "send_rejected";
+		const isHeld = record.state === "awaiting_operator" || record.state === "stalled";
+		let state: LaneReportState;
+		let holdReason: string | null = null;
+		let clearClaim = false;
+		let childFallback: ChatMessagePayload | undefined;
+		let requeuedParent: string | undefined;
+		if (!definitiveRefusal) {
+			state = "held";
+			holdReason = "wake_acceptance_uncertain";
+		} else if (!isHeld) {
+			state = "pending";
+			clearClaim = true;
+			requeuedParent = row.parent_name;
+		} else if (row.root_json !== null) {
+			state = "fallback";
+			const root = laneReportRoot(row);
+			workAssert(root !== null);
+			const deliveryId = workAttemptDeliveryId(this.instanceId, laneJobDatabaseId(row.child_name), row.child_op_ref);
+			childFallback = buildDeliveryPayload(row.child_op_ref, root.origin, row.body, deliveryId);
+			workAssert(childFallback !== undefined);
+		} else {
+			state = "undeliverable";
+		}
+		const changed = this.#db
+			.prepare(
+				"UPDATE lane_reports SET state = ?, claim_kind = ?, claim_ref = ?, claim_target_op_ref = ?, hold_reason = ?, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = ? AND claim_kind = 'wake' AND claim_ref = ? AND claim_seq = ?",
+			)
+			.run(
+				tx,
+				state,
+				clearClaim ? null : row.claim_kind,
+				clearClaim ? null : row.claim_ref,
+				clearClaim ? null : row.claim_target_op_ref,
+				holdReason,
+				runtime.settledAt,
+				row.report_id,
+				row.state,
+				runtime.opRef,
+				row.claim_seq,
+			).changes;
+		workAssert(changed === 1);
+		return {
+			...(childFallback ? { childFallback } : {}),
+			...(requeuedParent ? { requeuedParent } : {}),
+		};
 	}
 
 	#consumeWakeReport(tx: WriteTx, runtime: WorkAttemptRuntime): void {

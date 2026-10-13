@@ -240,16 +240,23 @@ function seedLinkedWakeReport(
 describe("work attempt boot reconciliation", () => {
 	test("reconciliation restores a settled attempt when only its database column is torn", async () => {
 		const f = await fixture();
+		const settledAt = "2026-09-08T00:00:20.000Z";
+		const settlement = { ...f.settlement, settledAt };
+		const closed = closeAttempt({
+			record: f.record,
+			opRef: f.runtime.opRef,
+			endState: "completed",
+			endedAt: settledAt,
+		});
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
-		f.database.transaction((tx) =>
-			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
-		);
+		f.database.transaction((tx) => settleAttempt(f.database, tx, f.runtime.opRef, 0, closed, settlement, f.admission));
 		const deliveries = f.database.outbox.rows();
 		f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?").run(f.runtime.opRef);
 
 		const reconciled = f.database.reconcileWorkAttempts(() => {});
 		expect(reconciled).toBe(1);
-		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(END);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(settledAt);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.terminal?.observedAt).toBe(END);
 		expect(f.database.outbox.rows()).toEqual(deliveries);
 	});
 
@@ -298,6 +305,61 @@ describe("work attempt boot reconciliation", () => {
 		expect(historyJson).toBeDefined();
 		if (historyJson === undefined) throw new Error("reconciled lane history is missing");
 		expect(parseLaneJobRecord(historyJson).attempts[0]?.endedAt).toBe(END);
+	});
+
+	test("reconciliation quarantines invalid settled candidates", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+		);
+		f.raw.query("UPDATE work_attempt_runtime SET version = version + 1 WHERE op_ref = ?").run(f.runtime.opRef);
+
+		expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
+		expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(true);
+		expect(f.database.work.laneParentAvailable("a")).toBe(false);
+	});
+
+	test("quarantining a settled candidate skips other repairs in the same lane", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+		);
+		const secondOpRef = "gw-work-store-b";
+		const secondStartedAt = "2026-09-08T00:00:20.000Z";
+		const secondSettledAt = "2026-09-08T00:00:30.000Z";
+		const secondRecord = appendAttempt(f.closed, {
+			opRef: secondOpRef,
+			sessionId: SESSION,
+			startedAt: secondStartedAt,
+		});
+		const secondRuntime: WorkAttemptRuntime = {
+			...f.runtime,
+			opRef: secondOpRef,
+			startedAt: secondStartedAt,
+			reportId: workAttemptReportId(f.database.instanceId, f.runtime.jobId, secondOpRef),
+			deliveryId: workAttemptDeliveryId(f.database.instanceId, f.runtime.jobId, secondOpRef),
+		};
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, secondRuntime, secondRecord));
+		const tornSettledRuntime: WorkAttemptRuntime = {
+			...secondRuntime,
+			terminal: { kind: "local", observedAt: secondSettledAt, reasonCode: "recovery_indeterminate" },
+			output: { ...secondRuntime.output, disposition: "unavailable" },
+			decision: "recovery_indeterminate",
+			settledAt: secondSettledAt,
+		};
+		f.raw
+			.query("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ?, version = version + 1 WHERE op_ref = ?")
+			.run(JSON.stringify(tornSettledRuntime), secondSettledAt, secondOpRef);
+		f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?").run(f.runtime.opRef);
+
+		expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
+		expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(true);
+		const first = f.raw.query("SELECT settled_at FROM work_attempt_runtime WHERE op_ref = ?").get(f.runtime.opRef) as {
+			settled_at: string | null;
+		};
+		expect(first.settled_at).toBeNull();
 	});
 
 	test("reconciliation preserves every repaired attempt in a shared lane history", async () => {
@@ -467,6 +529,65 @@ describe("work attempt boot reconciliation", () => {
 	});
 
 	for (const scenario of [
+		{ evidence: "output proof", disposition: "available", decision: "recovery_indeterminate" },
+		{ evidence: "known silence", disposition: "silent", decision: "suppressed" },
+	] as const) {
+		test(`reconciliation preserves ${scenario.evidence} with a linked wake report`, async () => {
+			const f = await fixture();
+			const wakeReportId = seedLinkedWakeReport(f, null);
+			const runtime = { ...f.runtime, parent: null, wakeReportId };
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
+			const proof = {
+				opRef: runtime.opRef,
+				sessionId: runtime.sessionId,
+				epoch: runtime.epoch,
+				observedAtMs: Date.parse(END),
+				source: "turn.result" as const,
+				attribution: "operation_ref" as const,
+				fullness: "original" as const,
+				clientRef: runtime.opRef,
+				repo: runtime.cwd,
+				terminalAt: Date.parse(END),
+				contentVersion: 1 as const,
+				byteLength: scenario.evidence === "known silence" ? 0 : 15,
+			};
+			const output =
+				scenario.evidence === "known silence"
+					? { ...runtime.output, disposition: "silent" as const, knownSilence: proof }
+					: { ...runtime.output, disposition: "available" as const, excerpt: "verified output", proof };
+			const updated = f.database.transaction((tx) =>
+				f.database.work.workAttemptUpdate(tx, runtime.opRef, 0, {
+					terminal: { kind: "local", observedAt: END, reasonCode: "end_turn" },
+					output,
+				}),
+			);
+			expect(updated).toBeDefined();
+			if (updated === undefined) throw new Error("durable output evidence was not saved");
+			f.database.transaction((tx) =>
+				f.database.work.putLaneJob(tx, {
+					...f.closed,
+					laneKey: runtime.laneKey,
+					json: JSON.stringify(f.closed),
+				}),
+			);
+
+			const reconciled = f.database.reconcileWorkAttempts(() => {});
+
+			expect(reconciled).toBe(1);
+			expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({
+				decision: scenario.decision,
+				settledAt: END,
+				output: { disposition: scenario.disposition },
+			});
+			expect(f.database.work.laneReportGet(wakeReportId)).toMatchObject({
+				state: "consumed",
+				consumed_op_ref: runtime.opRef,
+			});
+			expect(f.database.work.workAttemptOpen()).toEqual([]);
+		});
+	}
+
+	for (const scenario of [
 		{ state: "pending", parentHeld: false, root: null },
 		{
 			state: "fallback",
@@ -504,6 +625,119 @@ describe("work attempt boot reconciliation", () => {
 			expect(f.database.work.laneReportGet(wakeReportId)?.state).toBe(scenario.state);
 			expect(f.database.outbox.rows()).toEqual(deliveries);
 			expect(f.database.work.workAttemptOpen()).toEqual([]);
+		});
+	}
+
+	for (const scenario of [
+		{ state: "pending", reportState: "claimed", parentHeld: false, root: null },
+		{
+			state: "fallback",
+			reportState: "held",
+			parentHeld: true,
+			root: { originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN },
+		},
+		{ state: "undeliverable", reportState: "claimed", parentHeld: true, root: null },
+	] as const) {
+		test(`reconciliation settles a definitively rejected wake report in ${scenario.state}`, async () => {
+			const f = await fixture();
+			const wakeReportId = seedLinkedWakeReport(f, scenario.root);
+			const runtime = { ...f.runtime, parent: null, wakeReportId };
+			const record = scenario.parentHeld
+				? closeAttempt({ record: f.record, opRef: runtime.opRef, endState: "terminal_uncertain", endedAt: END })
+				: f.closed;
+			const settlement: WorkAttemptSettlement = {
+				terminal: { kind: "local", observedAt: END, reasonCode: "send_rejected" },
+				output: { ...runtime.output, disposition: "unavailable" },
+				decision: "wake_unaccepted",
+				settledAt: END,
+			};
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
+			f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, record, settlement));
+			f.raw
+				.query(
+					"UPDATE lane_reports SET state = ?, claim_kind = 'wake', claim_ref = ?, claim_target_op_ref = NULL, hold_reason = ?, consumed_op_ref = NULL WHERE report_id = ?",
+				)
+				.run(
+					scenario.reportState,
+					runtime.opRef,
+					scenario.reportState === "held" ? "wake_acceptance_uncertain" : null,
+					wakeReportId,
+				);
+			f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?").run(runtime.opRef);
+			if (scenario.state === "fallback") {
+				const delivery = f.database.outbox.rows()[0];
+				expect(delivery).toBeDefined();
+				if (!delivery) throw new Error("expected the settled fallback delivery");
+				f.raw.query("DELETE FROM deliveries WHERE delivery_id = ?").run(delivery.delivery_id);
+			}
+
+			const reconciled = f.database.reconcileWorkAttempts(() => {});
+
+			expect(reconciled).toBe(1);
+			expect(f.database.work.laneReportGet(wakeReportId)).toMatchObject({ state: scenario.state });
+			expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({
+				decision: "wake_unaccepted",
+				settledAt: END,
+			});
+			expect(f.database.outbox.rows()).toHaveLength(scenario.state === "fallback" ? 1 : 0);
+		});
+	}
+
+	for (const scenario of [
+		{ state: "pending", parentHeld: false, root: null },
+		{
+			state: "fallback",
+			parentHeld: true,
+			root: { originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN },
+		},
+	] as const) {
+		test(`reconciliation completes a rejected wake as ${scenario.state}`, async () => {
+			const f = await fixture();
+			const wakeReportId = seedLinkedWakeReport(f, scenario.root);
+			const openRuntime = { ...f.runtime, parent: null, wakeReportId };
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, openRuntime, f.record));
+			const history = scenario.parentHeld
+				? closeAttempt({
+						record: f.record,
+						opRef: openRuntime.opRef,
+						endState: "terminal_uncertain",
+						errorCode: "recovery_indeterminate",
+						endedAt: END,
+					})
+				: f.closed;
+			f.database.transaction((tx) =>
+				f.database.work.putLaneJob(tx, {
+					...history,
+					laneKey: openRuntime.laneKey,
+					json: JSON.stringify(history),
+				}),
+			);
+			const settledRuntime: WorkAttemptRuntime = {
+				...openRuntime,
+				terminal: { kind: "local", observedAt: END, reasonCode: "send_rejected" },
+				output: { ...openRuntime.output, disposition: "unavailable" },
+				decision: "wake_unaccepted",
+				settledAt: END,
+			};
+			f.raw
+				.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+				.run(JSON.stringify(settledRuntime), openRuntime.opRef);
+			expect(f.database.work.laneReportGet(wakeReportId)?.state).toBe("claimed");
+
+			const reconciled = f.database.reconcileWorkAttempts(() => {});
+
+			expect(reconciled).toBe(1);
+			expect(f.database.work.laneReportGet(wakeReportId)).toMatchObject({ state: scenario.state });
+			const deliveries = f.database.outbox.rows();
+			expect(deliveries).toHaveLength(scenario.state === "fallback" ? 1 : 0);
+			if (scenario.state === "fallback") {
+				const delivery = deliveries[0];
+				expect(delivery).toBeDefined();
+				if (delivery === undefined) throw new Error("reconciled wake fallback delivery is missing");
+				expect(JSON.parse(delivery.payload_json)).toMatchObject({ text: "[lane child] completed: child output" });
+			}
+			expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
+			expect(f.database.outbox.rows()).toEqual(deliveries);
 		});
 	}
 });
