@@ -466,8 +466,11 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 		code: "prompt_failed",
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
+
+	await manager!.tick(KEY);
 	await eventually(() => notices.length === 1, "post-start failure did not reach the lifecycle");
 	expect(notices[0]).toBe("[turn failed] prompt_failed: Agent run failed after execution started.");
+	expect(port.sends).toHaveLength(1);
 	// `prompt_failed` is not rebindable: a new session does not fix a runtime fault.
 	expect(notices[0]).not.toContain("/new");
 	const terminalLine = logs.find((line) => line.startsWith("terminal_failure "));
@@ -3055,6 +3058,7 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 class ContextUsagePort extends ScriptedSessionPort {
 	percent: number | undefined = 1;
 	readonly failing = new Set<string>();
+	autoComplete = true;
 	compactionStatus: SessionCompactionStatus = "succeeded";
 	/** How many sends had been made when each compaction ran. */
 	readonly compactedAfterSends: number[] = [];
@@ -3063,7 +3067,7 @@ class ContextUsagePort extends ScriptedSessionPort {
 		super({
 			onSend: (input, port) => {
 				if (this.failing.has(input.text)) port.fail(input.opRef, "post-start failure");
-				else port.complete(input.opRef, "ok");
+				else if (this.autoComplete) port.complete(input.opRef, "ok");
 			},
 		});
 	}
@@ -3179,6 +3183,32 @@ test("a failed turn makes the next send carry the persona preamble again", async
 	port.percent = 2;
 	expect(await sendTurn(port, "after failure")).toBe(PERSONA);
 	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+});
+
+test("a provider retry re-sends a preamble that the failed call may not have committed", async () => {
+	const port = new ContextUsagePort();
+	port.autoComplete = false;
+	port.percent = 5;
+	await preambleHarness(port, { persona: () => PERSONA });
+
+	enqueue("provider-preamble-retry", "retry with persona");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("initial preamble-bearing request was not dispatched");
+	expect(first.systemPreamble).toBe(PERSONA);
+	port.fail(first.opRef, "Provider unavailable", {
+		code: "provider_unavailable",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+	});
+
+	await new Promise((resolve) => setTimeout(resolve, 1_500));
+	await manager!.tick(KEY);
+	const retry = port.sends[1];
+	if (!retry) throw new Error("provider retry was not dispatched");
+	expect(retry.systemPreamble).toBe(PERSONA);
+	port.complete(retry.opRef, "completed after provider retry");
+	await manager!.tick(KEY);
+	await eventually(() => manager!.state(KEY) === "idle", "provider retry did not settle");
 });
 
 test("persona preamble is refreshed after the bounded number of sends without it", async () => {

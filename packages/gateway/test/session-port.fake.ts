@@ -674,6 +674,12 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
+	async emitPermissionRequest(sessionId: string): Promise<void> {
+		const tail = [...(this.#tails.get(sessionId) ?? [])].find((candidate) => candidate.running);
+		if (!tail) throw new Error(`no running scripted tail for ${sessionId}`);
+		await tail.emitPermissionRequest();
+	}
+
 	complete(opRef: string, text: string): void {
 		const operation = this.#operations.get(opRef);
 		if (!operation) throw new Error(`unknown scripted operation ${opRef}`);
@@ -1009,6 +1015,16 @@ export class ScriptedTailHandle implements TailHandle {
 	stall(elapsedMs: number): void {
 		if (!this.#closed)
 			void this.#input.onStall?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration, elapsedMs });
+	}
+
+	async emitPermissionRequest(): Promise<void> {
+		await this.#input.onReverseRequest?.({
+			id: `permission-${crypto.randomUUID()}`,
+			connectionId: "connection-scripted",
+			capability: "permission",
+			leaseId: "lease-scripted",
+			payload: { method: "permission.request", payload: {} },
+		});
 	}
 
 	/** Simulates the relay process dying under a running turn. */
