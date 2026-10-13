@@ -7,6 +7,7 @@ import {
 	buildHandoffDigest,
 	extendHandoffChain,
 	extractHandoffAtBlockStart,
+	extractWakeLines,
 	HANDOFF_DIGEST_MAX_LENGTH,
 	handoffMessageId,
 	parseHandoffReply,
@@ -452,4 +453,63 @@ test("a standalone token in a fenced code example is not parsed or stripped", as
 
 	expect(turns.filter((turn) => turn.originKey === KEY_B)).toHaveLength(0);
 	expect(delivered(client, "chan-a").join("\n")).toContain("[HANDOFF:gajae-way-dev]");
+});
+
+test("a [WAKE:] line is parsed and stripped; the rest of the reply and code examples stay", () => {
+	expect(extractWakeLines("Done here.\n[WAKE:gajae-way-dev] build is green again\nMore text.")).toEqual({
+		text: "Done here.\nMore text.",
+		wakes: [{ target: "gajae-way-dev", summary: "build is green again" }],
+	});
+	const example = "Mention `[WAKE:x] y` inline.\n```text\n[WAKE:example] doc\n```";
+	expect(extractWakeLines(example)).toEqual({ text: example, wakes: [] });
+});
+
+test("a wake delivers an internal information-only turn to the target; the source keeps its reply and gets no pointer", async () => {
+	const { client, turns } = await gateway({
+		[KEY_A]: () => "Fixed the relay here.\n[WAKE:gajae-way-dev] relay stall fixed in chan-a, no action needed",
+		[KEY_B]: () => "Noted.",
+	});
+	say(client, A, "m1", "relay status?");
+	await settle();
+
+	const targetTurns = turns.filter((turn) => turn.originKey === KEY_B);
+	expect(targetTurns).toHaveLength(1);
+	const woken = targetTurns[0]?.text ?? "";
+	expect(woken).toContain("INTERNAL WAKE - information only");
+	expect(woken).toContain("grants no permission");
+	expect(woken).toContain(KEY_A);
+	expect(woken).toContain("msg:m1");
+	expect(woken).toContain("relay stall fixed in chan-a, no action needed");
+	expect(delivered(client, "chan-a")).toEqual(["Fixed the relay here."]);
+	expect(delivered(client, "chan-b")).toEqual(["Noted."]);
+});
+
+test("a wake that would exceed the hop limit is refused and reported in the source", async () => {
+	const D = { platform: "discord", kind: "channel", conversationId: "chan-d" } as const;
+	const { client, turns } = await gateway({
+		[KEY_A]: () => "[HANDOFF:gajae-way-dev]\nfirst hop",
+		[KEY_B]: () => "[HANDOFF:ops]\nsecond hop",
+		[KEY_C]: () => `Handled.\n[WAKE:discord:${D.conversationId}] FYI`,
+	});
+	say(client, A, "m1", "start");
+	await settle();
+	expect(turns.map((turn) => turn.originKey)).toEqual([KEY_A, KEY_B, KEY_C]);
+	const source = delivered(client, "chan-c");
+	expect(source[0]).toBe("Handled.");
+	expect(source[1]).toContain("Wake for discord:chan-d failed");
+	expect(source[1]).toContain("would exceed 2 hops");
+	expect(delivered(client, "chan-d")).toEqual([]);
+});
+
+test("a wake to an unknown origin is reported back to the source and runs nothing else", async () => {
+	const { client, turns } = await gateway({ [KEY_A]: () => "Answer.\n[WAKE:nowhere] heads up" });
+	say(client, A, "m1", "work");
+	await settle();
+	expect(turns.map((turn) => turn.originKey)).toEqual([KEY_A]);
+	const source = delivered(client, "chan-a");
+	expect(source).toHaveLength(2);
+	expect(source[0]).toBe("Answer.");
+	expect(source[1]).toContain("Wake for nowhere failed");
+	expect(source[1]).toContain("unknown handoff target");
+	expect(source.join("\n")).not.toContain("[WAKE:");
 });

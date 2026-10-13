@@ -399,6 +399,8 @@ function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
 /** Resolve channel roots to a thread when a persona parent has a trigger message. */
 export function resolveLaneReportOrigin(parent: WorkParent | null, admissionOriginRefJson: string): string {
 	if (parent?.kind !== "persona" || !parent.triggerMessageId) return admissionOriginRefJson;
+	// Synthetic lane report ids are internal row ids, not platform messages or thread ids.
+	if (/^lane-report-[0-9a-f]{64}$/.test(parent.triggerMessageId)) return admissionOriginRefJson;
 	try {
 		const origin = JSON.parse(admissionOriginRefJson) as OriginRef;
 		if (origin.kind !== "channel") return admissionOriginRefJson;
@@ -410,6 +412,7 @@ export function resolveLaneReportOrigin(parent: WorkParent | null, admissionOrig
 			kind: "thread",
 			conversationId: parent.triggerMessageId,
 			parentId: origin.conversationId,
+			...(origin.platform === "discord" ? { threadVisibility: "public" as const } : {}),
 		};
 		validateOriginRef(threadOrigin);
 		return JSON.stringify(threadOrigin);
