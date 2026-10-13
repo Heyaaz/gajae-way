@@ -178,7 +178,7 @@ export interface RuntimeCycleSources {
 	readonly agentDisk: AgentDiskView | null;
 	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
 	readonly gjcVersion: string | undefined;
-	/** Newest settled monitor events that ended `failed_no_retry` before any success. */
+	/** Newest settled monitor events that ended `failed_no_retry` or `contract_unmet` before any success. */
 	readonly monitorTerminalStreak: number;
 	/** True while the shared broker's incarnation keeps changing (die/respawn churn). */
 	readonly brokerRespawnChurn: boolean;
