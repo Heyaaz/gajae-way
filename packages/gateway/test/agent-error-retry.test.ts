@@ -2,13 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PersonaSessionManager } from "../src/orchestrator/persona-session";
+import { PersonaSessionManager, type PersonaSessionManagerOptions } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 let manager: PersonaSessionManager | undefined;
 
 afterEach(async () => {
@@ -24,13 +24,15 @@ const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "person
 const KEY = "loopback/loopback/persona";
 
 function enqueue(messageId: string, body: string): void {
-	const accepted = database?.inboundEnqueue({
-		messageId,
-		originKey: KEY,
-		originRefJson: JSON.stringify(ORIGIN),
-		body,
-		source: "platform",
-	});
+	const accepted = database?.transaction((tx) =>
+		database!.inbox.enqueue(tx, {
+			messageId,
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body,
+			source: "platform",
+		}),
+	);
 	expect(accepted).toBe(true);
 }
 
@@ -43,15 +45,16 @@ async function eventually(predicate: () => boolean, message: string, timeoutMs =
 	expect(predicate(), message).toBe(true);
 }
 
-async function setupHarness(port: ScriptedSessionPort) {
+async function setupHarness(port: ScriptedSessionPort, options: Partial<PersonaSessionManagerOptions> = {}) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-agent-error-retry-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	manager = new PersonaSessionManager({
 		database,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
+		...options,
 	});
 }
 
@@ -76,7 +79,7 @@ test("provider_transport error retries successfully", async () => {
 	enqueue("provider-retry", "network error test");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0];
-	expect(first).toBeDefined();
+	if (!first) throw new Error("initial retryable request was not dispatched");
 
 	// Fail with provider_transport
 	port.fail(first.opRef, "Provider unavailable", {
@@ -99,7 +102,7 @@ test("provider_transport error retries successfully", async () => {
 	expect(failures).toHaveLength(0);
 });
 
-test("agent_runtime post_start error sends continuation prompt", async () => {
+test("agent_runtime post_start failures are not replayed", async () => {
 	const port = new ScriptedSessionPort();
 	const failures: string[] = [];
 
@@ -120,7 +123,7 @@ test("agent_runtime post_start error sends continuation prompt", async () => {
 	enqueue("agent-runtime-retry", "agent error test");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0];
-	expect(first).toBeDefined();
+	if (!first) throw new Error("initial runtime-failure request was not dispatched");
 
 	// Fail with agent_runtime post_start
 	port.fail(first.opRef, "Agent run failed after execution started.", {
@@ -128,23 +131,13 @@ test("agent_runtime post_start error sends continuation prompt", async () => {
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
 
-	// Wait for continuation retry to be scheduled
-	await new Promise((resolve) => setTimeout(resolve, 1500));
 	await manager.tick(KEY);
-
-	// Continuation should have been sent (not requeue)
-	const continuation = port.sends[1];
-	expect(continuation).toBeDefined();
-	expect(continuation?.text).toContain("error"); // Should mention error in continuation
-	expect(failures).toHaveLength(0);
-
-	// Succeed on retry
-	port.complete(continuation?.opRef ?? "", "recovered response");
-	await manager.tick(KEY);
-	expect(failures).toHaveLength(0);
+	await eventually(() => failures.length === 1, "runtime failure not delivered");
+	expect(failures[0]).toContain("prompt_failed");
+	expect(port.sends).toHaveLength(1);
 });
 
-test("non-retryable agent_error code fails immediately", async () => {
+test("agent_error quota failures are classified without retry", async () => {
 	const port = new ScriptedSessionPort();
 	const failures: string[] = [];
 
@@ -165,20 +158,20 @@ test("non-retryable agent_error code fails immediately", async () => {
 	enqueue("agent-error-code", "agent runtime error");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0];
-	expect(first).toBeDefined();
+	if (!first) throw new Error("initial quota-failure request was not dispatched");
+	port.setFailedTurnEvidence(first.sessionId, "provider_quota_exhausted");
 
-	// Fail with agent_error code (retryable)
+	// Issue #331 observed quota failures reported with this agent_runtime code.
 	port.fail(first.opRef, "Agent run failed after execution started.", {
 		code: "agent_error",
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
 
-	// Continuation should be sent (not immediate failure)
-	await new Promise((resolve) => setTimeout(resolve, 1500));
 	await manager.tick(KEY);
-	const continuation = port.sends[1];
-	expect(continuation).toBeDefined(); // Continuation sent, not immediate failure
-	expect(failures).toHaveLength(0); // No failure yet
+	await eventually(() => failures.length === 1, "quota failure not delivered");
+	expect(failures[0]).toContain("provider_quota_exhausted");
+	expect(failures[0]).toContain("HTTP 402");
+	expect(port.sends).toHaveLength(1);
 });
 
 test("non-retryable errors fail immediately without retry", async () => {
@@ -202,7 +195,7 @@ test("non-retryable errors fail immediately without retry", async () => {
 	enqueue("non-retryable", "quota exceeded");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0];
-	expect(first).toBeDefined();
+	if (!first) throw new Error("initial rejected request was not dispatched");
 
 	// Fail with non-retryable error
 	port.fail(first.opRef, "Quota exceeded", {
@@ -219,7 +212,7 @@ test("non-retryable errors fail immediately without retry", async () => {
 	expect(port.sends).toHaveLength(1); // No retry dispatched
 });
 
-test("continuation prompt content does not request re-running tools", async () => {
+test("provider failure after visible assistant output is not replayed", async () => {
 	const port = new ScriptedSessionPort();
 	const failures: string[] = [];
 
@@ -237,27 +230,183 @@ test("continuation prompt content does not request re-running tools", async () =
 		}),
 	});
 
-	enqueue("no-duplicate-tools", "agent error test");
+	enqueue("visible-output", "work that produced a partial answer");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0];
-	expect(first).toBeDefined();
+	if (!first) throw new Error("initial visible-output request was not dispatched");
 
-	// Fail with agent_runtime error
+	port.emitAssistant(first.sessionId, "partial answer", null, first.opRef);
+	await manager.tick(KEY);
 	port.fail(first.opRef, "Agent run failed after execution started.", {
-		code: "prompt_failed",
-		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
+		code: "provider_unavailable",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+	});
+	await manager.tick(KEY);
+	await eventually(() => failures.length === 1, "failure after visible output not delivered");
+	expect(port.sends).toHaveLength(1);
+});
+
+test("provider failure after completed tool activity is not replayed", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+
+	await setupHarness(port);
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
 	});
 
-	await new Promise((resolve) => setTimeout(resolve, 1500));
+	enqueue("completed-tool", "work that executed a tool");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("initial tool-activity request was not dispatched");
+	port.emitTool(first.sessionId, { toolName: "post_message" });
+	port.emitToolEnd(first.sessionId, "post_message");
 	await manager.tick(KEY);
 
-	const continuation = port.sends[1];
-	expect(continuation).toBeDefined();
+	port.fail(first.opRef, "Provider unavailable", {
+		code: "provider_unavailable",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+	});
+	await manager.tick(KEY);
+	await eventually(() => failures.length === 1, "failure after tool activity not delivered");
+	expect(port.sends).toHaveLength(1);
+});
 
-	// Verify continuation prompt explicitly warns against re-running tools
-	expect(continuation?.text).toContain("tool"); // Should mention tools
-	expect(continuation?.text).toContain("duplicate"); // Should warn about duplication
-	expect(failures).toHaveLength(0); // No failure yet
+test("provider failure after an accepted steer is not replayed", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+
+	await setupHarness(port);
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
+	});
+
+	enqueue("steered-trigger", "original request");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("initial steered request was not dispatched");
+	enqueue("accepted-correction", "important correction");
+	await manager.notifyInbound(KEY);
+	await eventually(() => port.steers.length === 1, "correction was not steered");
+	expect(database!.inbox.turnRows(first.opRef)).toEqual(
+		expect.arrayContaining([expect.objectContaining({ message_id: "accepted-correction", turn_role: "steer" })]),
+	);
+
+	port.fail(first.opRef, "Provider unavailable", {
+		code: "provider_unavailable",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+	});
+	await manager.tick(KEY);
+	await eventually(() => failures.length === 1, "failure after accepted steer not delivered");
+	expect(port.sends).toHaveLength(1);
+});
+
+test("provider quota evidence suppresses transport retry", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+
+	await setupHarness(port);
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
+	});
+
+	enqueue("provider-quota", "billing failure");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("initial provider-quota request was not dispatched");
+	port.setFailedTurnEvidence(first.sessionId, "provider_quota_exhausted");
+	port.fail(first.opRef, "Provider quota exhausted", {
+		code: "provider_unavailable",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+	});
+	await manager.tick(KEY);
+	await eventually(() => failures.length === 1, "quota failure not delivered");
+	expect(failures[0]).toContain("provider_quota_exhausted");
+	expect(port.sends).toHaveLength(1);
+});
+
+test("a queued retry cannot clear a turn created by reset", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const timers: { work: () => void; delayMs: number; canceled: boolean }[] = [];
+	let unblockDiscard!: () => void;
+	let signalDiscardStarted!: () => void;
+	const discardGate = new Promise<void>((resolve) => {
+		unblockDiscard = resolve;
+	});
+	const discardStarted = new Promise<void>((resolve) => {
+		signalDiscardStarted = resolve;
+	});
+
+	await setupHarness(port, {
+		setTimeout: (work, delayMs) => {
+			const timer = { work, delayMs, canceled: false };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeout: (timer) => {
+			const scheduled = timers.find((candidate) => candidate === timer);
+			if (scheduled) scheduled.canceled = true;
+		},
+		onInboundDiscard: async (messageIds) => {
+			if (messageIds.length === 0) return;
+			signalDiscardStarted();
+			await discardGate;
+		},
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+
+	enqueue("retry-before-reset", "old request");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("initial request was not dispatched");
+	port.fail(first.opRef, "Provider unavailable", {
+		code: "provider_unavailable",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+	});
+	await manager!.tick(KEY);
+	await eventually(() => timers.some((timer) => timer.delayMs === 1_000), "provider retry was not scheduled");
+
+	enqueue("discarded-during-reset", "stale request");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	const resetting = manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await discardStarted;
+	const retryTimer = timers.find((timer) => timer.delayMs === 1_000 && !timer.canceled);
+	if (!retryTimer) throw new Error("provider retry timer was not captured");
+	// The timer observes the old turn before reset finishes, then queues behind it.
+	retryTimer.work();
+	enqueue("replacement-after-reset", "replacement request");
+	unblockDiscard();
+	await resetting;
+	await manager!.tick(KEY);
+	await eventually(() => port.sends.length === 2, "reset replacement was not dispatched");
+	expect(port.sends.map((send) => send.text)).toEqual(["old request", "replacement request"]);
 });
 
 test("tool stalled/hung error is NOT retried", async () => {
@@ -281,7 +430,7 @@ test("tool stalled/hung error is NOT retried", async () => {
 	enqueue("tool-stalled", "tool hung test");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0];
-	expect(first).toBeDefined();
+	if (!first) throw new Error("initial stalled-tool request was not dispatched");
 
 	// Fail with tool_timeout error (non-retryable)
 	port.fail(first?.opRef ?? "", "Tool timed out", {
@@ -319,7 +468,7 @@ test("when both retries fail, failure message posted exactly once", async () => 
 	enqueue("exhausted-retries", "retry exhaustion test");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0];
-	expect(first).toBeDefined();
+	if (!first) throw new Error("initial exhaustion-test request was not dispatched");
 
 	// Fail with provider_transport error on first attempt
 	port.fail(first?.opRef ?? "", "Provider down", {

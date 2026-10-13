@@ -826,12 +826,16 @@ type BoundTurn = PersonaTurnIdentity & {
 	staleOutput?: { count: number; firstAt: number; lastAt: number };
 	/** Last assistant message the owned relay delivered for THIS turn (correlation-fenced by the handle). */
 	lastAssistantText?: string;
+	/** A tool ran during this turn; replaying its trigger could repeat external side effects. */
+	hadToolActivity: boolean;
 	/** A tool the tail saw start and not end: the prime suspect when the turn then fails (#210). */
 	openTool?: { readonly name: string; readonly startedAtMs: number };
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
-	/** Number of times this turn has been retried due to transient agent errors. */
+	/** Number of times this turn has been retried after a transient provider failure. */
 	retryAttempt: number;
+	/** A bounded provider retry is already scheduled for this failed turn. */
+	agentErrorRetryScheduled: boolean;
 };
 
 class OriginActor {
@@ -1389,7 +1393,7 @@ class OriginActor {
 		}
 		const dispatchedAtMs = this.#dispatchFloorMs(turn.opRef);
 		// Retrieve the actual retry attempt number from the database
-		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, turn.epoch, turn.triggerMessageId);
+		const retryAttempt = freshTurnAttempt(this.#manager.database, this.originKey, turn.epoch, turn.triggerMessageId);
 		const bound: BoundTurn = {
 			originKey: this.originKey,
 			epoch: turn.epoch,
@@ -1402,6 +1406,8 @@ class OriginActor {
 			detached,
 			tailTerminalObserved: false,
 			replyVisible: false,
+			hadToolActivity: true,
+			agentErrorRetryScheduled: false,
 			answerWanted: false,
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
@@ -1663,11 +1669,13 @@ class OriginActor {
 			detached: false,
 			tailTerminalObserved: false,
 			replyVisible: false,
+			hadToolActivity: false,
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
 			retryAttempt, // Already computed from freshTurnAttempt above
+			agentErrorRetryScheduled: false,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 		};
 		tail.beginTurn(opRef);
@@ -2050,91 +2058,41 @@ class OriginActor {
 		this.#dispatchRetry = timer;
 	}
 
-	/**
-	 * Schedules a continuation retry for a post_start agent_runtime error.
-	 * Sends a recovery message directly to the same session without replaying the original inbound,
-	 * to avoid re-running any side-effecting tools that may have already executed.
-	 */
-	#scheduleAgentRuntimeErrorRetry(bound: BoundTurn, delayMs: number): void {
-		const timer = this.#manager.schedule(() => {
-			this.#graceTimers.delete(timer);
-			if (this.#stopped || this.#manager.stopped) return;
-			if (this.#current !== bound) return; // Turn has been replaced
-			void this.enqueue(async () => {
-				const oldOpRef = bound.turn.opRef;
-				try {
-					// Get the text that was already delivered (if any)
-					const recoveredText = await this.#recoverFailedTurnAnswer(bound);
-					const nextAttempt = bound.retryAttempt + 1;
-
-					// Build continuation prompt that doesn't replay the original message
-					// This prevents re-execution of side-effecting tools (git push, posts, merges, etc.)
-					let continuationPrompt: string;
-					if (recoveredText) {
-						// Text was delivered: ask to continue from there without re-running tools
-						continuationPrompt = `Your previous response was interrupted due to an error after execution started:\n\n${recoveredText}\n\nPlease continue or complete this response. Do NOT repeat any tool actions that may have already been executed (git push, API posts, database writes, etc.). Only continue typing if more content is needed.`;
-					} else {
-						// No text delivered: ask agent to try the original task again from scratch
-						continuationPrompt =
-							"Your previous attempt encountered an error after it started executing. Please try again, being careful not to duplicate any tool actions that may have already executed.";
-					}
-
-					const newOpRef = personaTurnOpRef(
-						this.#manager.instanceId,
-						this.originKey,
-						bound.epoch,
-						bound.turn.triggerMessageId,
-						nextAttempt,
-					);
-
-					this.#manager.log(
-						`agent_runtime_continuation_retry origin=${this.originKey} epoch=${bound.epoch} oldOpRef=${oldOpRef} newOpRef=${newOpRef} attempt=${nextAttempt}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} hasRecoveredText=${!!recoveredText}`,
-						"warn",
-					);
-
-					// Send continuation prompt directly to the same session
-					const receipt = await this.#manager.port.send({
-						sessionId: bound.sessionId,
-						repo: this.#manager.repo,
-						text: continuationPrompt,
-						opRef: newOpRef,
-						relay: bound.tail,
-					});
-
-					// Update bound turn tracking and correlate new opRef
-					bound.retryAttempt = nextAttempt;
-					bound.tail?.correlate(newOpRef, receipt);
-				} catch (error) {
-					this.#manager.log(
-						`agent_runtime_continuation_retry_failed origin=${this.originKey} opRef=${oldOpRef} detail=${safeDiagnostic(error)}`,
-						"error",
-					);
-				}
-			}).catch(() => {});
-		}, delayMs);
-		this.#graceTimers.add(timer);
-	}
-
-	/**
-	 * Schedules a retry of a failed turn due to a transient agent error.
-	 * Increments the retry attempt counter and re-dispatches the turn with a new opRef.
-	 */
+	/** Schedules a bounded provider-transport retry after confirming the turn is safe to replay. */
 	#scheduleAgentErrorRetry(bound: BoundTurn, delayMs: number): void {
+		if (bound.agentErrorRetryScheduled) return;
+		bound.agentErrorRetryScheduled = true;
 		const timer = this.#manager.schedule(() => {
 			this.#graceTimers.delete(timer);
-			if (this.#stopped || this.#manager.stopped) return;
-			if (this.#current !== bound) return; // Turn has been replaced
+			if (this.#stopped || this.#manager.stopped) {
+				bound.agentErrorRetryScheduled = false;
+				return;
+			}
+			if (this.#current !== bound) {
+				bound.agentErrorRetryScheduled = false;
+				return;
+			}
 			void this.enqueue(async () => {
+				bound.agentErrorRetryScheduled = false;
+				// A reset may have retired this turn while its timer was queued behind
+				// the reset's asynchronous cleanup. Never requeue or clear a replacement.
+				if (this.#stopped || this.#manager.stopped || this.#current !== bound || bound.retired) return;
+				if (!this.#canRetryProviderTransport(bound)) {
+					await this.#reconcileBound(bound);
+					return;
+				}
 				const oldOpRef = bound.turn.opRef;
 				try {
+					await bound.tail?.close();
 					// Mark the turn as pending again and increment the attempt counter
-					const nextAttempt = this.#manager.database.inboundTurnRequeue(oldOpRef);
+					const nextAttempt = this.#manager.database.transaction((tx) =>
+						retryInboundTurn(this.#manager.database, tx, oldOpRef),
+					);
 					this.#manager.log(
 						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} oldOpRef=${oldOpRef} attempt=${nextAttempt}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS}`,
 						"warn",
 					);
-					// Close the tail and clear current turn
-					await bound.tail?.close();
+					// Clear current turn only after the old tail is closed and the row is requeued.
 					this.#current = undefined;
 					this.#state = "idle";
 					await this.#notifyReleased(bound);
@@ -2146,9 +2104,25 @@ class OriginActor {
 						"error",
 					);
 				}
-			}).catch(() => {});
+			}).catch(() => {
+				bound.agentErrorRetryScheduled = false;
+			});
 		}, delayMs);
 		this.#graceTimers.add(timer);
+	}
+
+	#canRetryProviderTransport(bound: BoundTurn): boolean {
+		if (
+			this.#current !== bound ||
+			bound.retired ||
+			bound.replyVisible ||
+			bound.lastAssistantText !== undefined ||
+			bound.hadToolActivity ||
+			bound.openTool ||
+			bound.tailEvidenceUnavailable
+		)
+			return false;
+		return !this.#manager.database.inbox.turnRows(bound.turn.opRef).some((row) => row.turn_role === "steer");
 	}
 
 	/**
@@ -2732,6 +2706,8 @@ class OriginActor {
 			if (frame.assistantText) this.#recordStaleOutput(bound);
 		} else {
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
+			if (frame.rawKind === "tool_execution_start" || frame.payload.toolCallStarted === true)
+				bound.hadToolActivity = true;
 			if (frame.rawKind === "tool_execution_start")
 				bound.openTool = {
 					name: typeof frame.payload.toolName === "string" ? frame.payload.toolName : "tool",
@@ -3038,6 +3014,7 @@ class OriginActor {
 			);
 		}
 		let failedTurnEvidence: FailedTurnEvidence | undefined;
+		let failedTurnEvidenceChecked = false;
 		try {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
 				// The owned relay is the live authority: its last assistant message
@@ -3116,36 +3093,34 @@ class OriginActor {
 					);
 				} else await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
+				if (bound.agentErrorRetryScheduled) return;
 				const openTool = bound.openTool && {
 					name: toolLabel(bound.openTool.name),
 					elapsedMs: Math.max(0, this.#manager.now() - bound.openTool.startedAtMs),
 				};
-				// Check if the error is retryable (transient provider failure or post_start agent_runtime)
-				if (
+				const retryEligible =
 					isRetryableError(report, !!bound.openTool) &&
 					bound.retryAttempt < MAX_AGENT_ERROR_RETRY_ATTEMPTS &&
-					!bound.retired &&
-					this.#current === bound
+					this.#canRetryProviderTransport(bound);
+				if (retryEligible) {
+					failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
+					failedTurnEvidenceChecked = true;
+				}
+				// A saved 402 transcript is a billing/quota failure, not a transient transport error.
+				if (
+					retryEligible &&
+					failedTurnEvidence?.reason !== "provider_quota_exhausted" &&
+					failedTurnEvidence?.reason !== "provider_rate_limited"
 				) {
-					const category = report.status.outcome?.category;
-					const code = report.status.outcome?.code ?? report.status.error?.code;
-					const isAgentRuntimeError =
-						category === "agent_runtime" && (code === "agent_error" || code === "prompt_failed");
 					const retryDelayMs = Math.min(
 						AGENT_ERROR_RETRY_MAX_MS,
 						AGENT_ERROR_RETRY_INITIAL_MS * 2 ** bound.retryAttempt,
 					);
 					this.#manager.log(
-						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} attempt=${bound.retryAttempt + 1}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} delayMs=${retryDelayMs} type=${isAgentRuntimeError ? "continuation" : "requeue"} error=${terminalFailureDiagnosis(report)}`,
+						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} attempt=${bound.retryAttempt + 1}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} delayMs=${retryDelayMs} type=provider_transport error=${terminalFailureDiagnosis(report)}`,
 						"warn",
 					);
-					if (isAgentRuntimeError) {
-						// Send continuation prompt into same session to avoid re-running side-effecting tools
-						this.#scheduleAgentRuntimeErrorRetry(bound, retryDelayMs);
-					} else {
-						// Requeue provider_transport errors (transient network failures)
-						this.#scheduleAgentErrorRetry(bound, retryDelayMs);
-					}
+					this.#scheduleAgentErrorRetry(bound, retryDelayMs);
 					return;
 				}
 				// Not retryable or retries exhausted: deliver the failure
@@ -3153,7 +3128,7 @@ class OriginActor {
 					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}${openTool ? ` open_tool=${openTool.name} open_tool_elapsed_ms=${openTool.elapsedMs}` : ""}`,
 					"error",
 				);
-				failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
+				if (!failedTurnEvidenceChecked) failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
 				if (this.#submissionRetryable(bound, report, failedTurnEvidence)) {
 					await this.#releaseForSubmissionRetry(bound);
 					return;
@@ -3957,34 +3932,18 @@ function safeDiagnostic(error: unknown): string {
 }
 
 /**
- * Whether the error code indicates a retryable transient failure.
- * Retryable:
- * 1. provider_transport errors (provider_down, provider_unavailable, etc.)
- * 2. post_start agent_runtime errors with specific codes (agent_error, prompt_failed)
- *
- * NOT retryable if a tool hung (bash call running for Ns).
+ * Whether the status is a provider-transport failure eligible for consideration.
+ * Replay safety is checked separately against visible output, tool activity, and accepted steers.
  */
 function isRetryableError(status: StatusReport, openTool?: boolean): boolean {
 	const outcome = status.status.outcome;
 	const category = outcome?.category;
-	const code = outcome?.code ?? status.status.error?.code;
 
 	// Don't retry if a hung tool was detected
 	if (openTool) return false;
 
-	// Retry provider_transport errors
-	if (category === "provider_transport") return true;
-
-	// Retry post_start agent_runtime failures with specific codes
-	if (
-		category === "agent_runtime" &&
-		outcome?.phase === "post_start" &&
-		(code === "agent_error" || code === "prompt_failed")
-	) {
-		return true;
-	}
-
-	return false;
+	// Replay only a transient provider failure; agent_runtime can follow completed side effects.
+	return category === "provider_transport";
 }
 
 /**
