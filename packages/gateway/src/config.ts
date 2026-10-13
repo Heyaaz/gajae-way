@@ -52,10 +52,14 @@ export const DEFAULT_SESSIONS_MAX_LIVE_HOSTS = 8;
 /** A persona host idle for this long is ended by the sweep; its session resumes with history on the next turn. */
 export const DEFAULT_SESSIONS_IDLE_RETIRE_MS = 6 * 60 * 60_000;
 const SESSIONS_MAX_LIVE_HOSTS_MAX = 256;
+const SESSIONS_IDLE_RESET_MIN_MS = 60_000;
+const SESSIONS_IDLE_RESET_MAX_MS = 30 * 24 * 60 * 60_000;
 
 export interface SessionHostConfig {
 	readonly maxLiveHosts?: number;
 	readonly idleRetireMs?: number;
+	/** Idle persona sessions rotate like `/new`; unset disables automatic reset. */
+	readonly idleResetMs?: number;
 }
 export type GjcServiceTier =
 	| "none"
@@ -120,7 +124,7 @@ export interface GatewayConfigFile {
 	readonly runtime?: RuntimeConfig;
 	/** Worker-lane governance: admission cap and idle retirement for `work.run` sessions. */
 	readonly work?: WorkLaneConfig;
-	/** Persona-host governance: live-host cap and idle retirement for conversation sessions. */
+	/** Persona-host governance: live-host cap, host retirement, and optional idle session reset. */
 	readonly sessions?: SessionHostConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
@@ -552,8 +556,8 @@ function parseWork(value: unknown): WorkLaneConfig {
 
 function parseSessions(value: unknown): SessionHostConfig {
 	const input = requireObject(value, "sessions");
-	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs"))
-		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts and idleRetireMs");
+	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs" && key !== "idleResetMs"))
+		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts, idleRetireMs, and idleResetMs");
 	if (
 		input.maxLiveHosts !== undefined &&
 		(!Number.isInteger(input.maxLiveHosts) ||
@@ -574,9 +578,20 @@ function parseSessions(value: unknown): SessionHostConfig {
 			"config_invalid",
 			`sessions.idleRetireMs must be an integer between ${WORK_IDLE_RETIRE_MIN_MS} and ${WORK_IDLE_RETIRE_MAX_MS}`,
 		);
+	if (
+		input.idleResetMs !== undefined &&
+		(!Number.isInteger(input.idleResetMs) ||
+			(input.idleResetMs as number) < SESSIONS_IDLE_RESET_MIN_MS ||
+			(input.idleResetMs as number) > SESSIONS_IDLE_RESET_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`sessions.idleResetMs must be an integer between ${SESSIONS_IDLE_RESET_MIN_MS} and ${SESSIONS_IDLE_RESET_MAX_MS}`,
+		);
 	return {
 		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
+		...(input.idleResetMs === undefined ? {} : { idleResetMs: input.idleResetMs as number }),
 	};
 }
 
@@ -779,8 +794,8 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
  * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
  * resolved per inbound message), `stallTimeoutMs` (tail liveness alarms) and
- * `sessions` (persona host cap and idle retirement, applied to the next bind and
- * sweep). Each applies to the next actor event.
+ * `sessions` (persona host cap, host retirement, and idle session reset, applied
+ * to the next bind and sweep). Each applies to the next actor event.
  */
 export const RELOADABLE_FIELDS = [
 	"mentionAllowlist",
