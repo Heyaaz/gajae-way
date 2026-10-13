@@ -314,7 +314,25 @@ export class WorkLaneManager {
 		worktree: { readonly repository: string; readonly path: string; readonly branch: string },
 	): void {
 		try {
-			removeCreatedWorktree(worktree.repository, worktree.path, worktree.branch);
+			const remove = Bun.spawnSync(["git", "worktree", "remove", "--force", worktree.path], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: worktree.repository,
+			});
+			const deleteBranch = Bun.spawnSync(["git", "branch", "-D", worktree.branch], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: worktree.repository,
+			});
+			const failures = [
+				remove.exitCode === 0
+					? undefined
+					: `git worktree remove failed: ${remove.stderr?.toString().trim() || "unknown error"}`,
+				deleteBranch.exitCode === 0
+					? undefined
+					: `git branch delete failed: ${deleteBranch.stderr?.toString().trim() || "unknown error"}`,
+			].filter((failure): failure is string => failure !== undefined);
+			if (failures.length > 0) throw new Error(failures.join("; "));
 		} catch (error) {
 			const reason = sanitizeDiagnostic(error instanceof Error ? error.message : String(error))
 				.replace(/\s+/gu, " ")
@@ -727,7 +745,8 @@ export class WorkLaneManager {
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
-		assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
+		if (input.cwd !== undefined)
+			assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);
@@ -2621,25 +2640,7 @@ function canonicalPathIncludingMissing(target: string): string {
 	}
 }
 
-function assertOutsideServiceDirectory(serviceDirectory: string, lanePath: string, name: string): void {
-	try {
-		const servicePath = canonicalPathIncludingMissing(serviceDirectory);
-		const candidatePath = canonicalPathIncludingMissing(lanePath);
-		const servicePrefix = servicePath.endsWith(sep) ? servicePath : `${servicePath}${sep}`;
-		if (candidatePath === servicePath || candidatePath.startsWith(servicePrefix)) {
-			throw new ProtocolError("invalid_params", "lane path cannot be inside service directory", {
-				reasonCode: "cwd_inside_service_dir",
-				name,
-			});
-		}
-	} catch (error) {
-		if (error instanceof ProtocolError) throw error;
-		throw new ProtocolError("invalid_params", `failed to validate lane cwd: ${error}`, {
-			reasonCode: "cwd_validation_failed",
-			name,
-		});
-	}
-}
+
 
 async function pathExists(path: string): Promise<boolean> {
 	const { lstat } = await import("node:fs/promises");

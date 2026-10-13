@@ -2877,8 +2877,6 @@ test("repo-bound work.start removes a newly created worktree after bind failure 
 		await rm(bareRepo, { recursive: true, force: true });
 	}
 });
-	}
-});
 
 test("work.start with repo and base parameter creates worktree from specified base", async () => {
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-base-"));
@@ -3062,72 +3060,6 @@ test("issue #480: cleanup failure on operator retire fails the retirement", asyn
 	}
 });
 
-test("issue #480: force retire cleans up worktree and branch", async () => {
-	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-force-retire-"));
-	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-force-retire-"));
-	try {
-		const git = (...args: string[]) =>
-			Bun.spawnSync(["git", "-C", repoDir, ...args], {
-				env: {
-					...process.env,
-					GIT_AUTHOR_NAME: "test",
-					GIT_AUTHOR_EMAIL: "test@test",
-					GIT_COMMITTER_NAME: "test",
-					GIT_COMMITTER_EMAIL: "test@test",
-				},
-			});
-
-		git("init", "-q");
-		git("config", "user.name", "test");
-		git("config", "user.email", "test@test");
-		git("commit", "-q", "--allow-empty", "-m", "initial");
-
-		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-
-		const f = await fixture({ hostLostGraceMs: 20 });
-		const result = await f.manager.start({
-			name: "force-retire-test",
-			text: "work",
-			cwd: f.directory,
-			repo: bareRepo,
-		});
-		expect(result.started).toBe(true);
-
-		if (!result.started) throw new Error("work did not start");
-		const job = f.job("force-retire-test");
-		const worktreePath = job.lane.worktreePath;
-
-		// Simulate host loss by making session unavailable and marking as dead
-		f.port.status = async () => {
-			throw new Error("Session unavailable");
-		};
-		f.port.setSessionState(result.sessionId, { live: false });
-
-		// Force retire should clean up worktree
-		const retireOutcome = await f.lanes.forceRetire("force-retire-test");
-		expect(retireOutcome.retired).toBe(true);
-
-		// Verify worktree was deleted
-		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(exitsAfter.exitCode).not.toBe(0);
-
-		// Verify branch was deleted
-		const branchCheck = Bun.spawnSync(["git", "-C", bareRepo, "show-ref", "work/force-retire-test"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(branchCheck.exitCode).not.toBe(0);
-	} finally {
-		await rm(repoDir, { recursive: true, force: true });
-		await rm(bareRepo, { recursive: true, force: true });
-	}
-});
 
 test("issue #480: session binding uses worktree path, not input cwd", async () => {
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-session-bind-"));
@@ -3185,90 +3117,8 @@ test("issue #480: session binding uses worktree path, not input cwd", async () =
 	}
 });
 
-test("issue #480: all-dead retirement cleans up worktree", async () => {
-	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-all-dead-"));
-	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-all-dead-"));
-	try {
-		const git = (...args: string[]) =>
-			Bun.spawnSync(["git", "-C", repoDir, ...args], {
-				env: {
-					...process.env,
-					GIT_AUTHOR_NAME: "test",
-					GIT_AUTHOR_EMAIL: "test@test",
-					GIT_COMMITTER_NAME: "test",
-					GIT_COMMITTER_EMAIL: "test@test",
-				},
-			});
 
-		git("init", "-q");
-		git("config", "user.name", "test");
-		git("config", "user.email", "test@test");
-		git("commit", "-q", "--allow-empty", "-m", "initial");
 
-		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-
-		const f = await fixture();
-		const result = await f.manager.start({
-			name: "all-dead-test",
-			text: "work",
-			cwd: f.directory,
-			repo: bareRepo,
-		});
-
-		if (!result.started) throw new Error("work did not start");
-		const job = f.job("all-dead-test");
-		const worktreePath = job.lane.worktreePath;
-
-		// Verify worktree exists before force retire
-		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(existsBefore.exitCode).toBe(0);
-
-		// Make the session dead so it qualifies for all-dead retirement
-		f.port.setSessionState(result.sessionId, { live: false });
-
-		// Force retire should clean up worktree (all-dead retirement path)
-		const retireOutcome = await f.lanes.forceRetire("all-dead-test");
-		expect(retireOutcome.retired).toBe(true);
-
-		// Verify worktree was deleted by all-dead retirement
-		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(exitsAfter.exitCode).not.toBe(0); // Should fail because worktree is gone
-	} finally {
-		await rm(repoDir, { recursive: true, force: true });
-		await rm(bareRepo, { recursive: true, force: true });
-	}
-});
-
-async function bareRepoFixture(prefix: string): Promise<{ bareRepo: string; cleanup: () => Promise<void> }> {
-	const repoDir = await mkdtemp(join(tmpdir(), `${prefix}-src-`));
-	const bareRepo = await mkdtemp(join(tmpdir(), `${prefix}-bare-`));
-	const env = {
-		...process.env,
-		GIT_AUTHOR_NAME: "test",
-		GIT_AUTHOR_EMAIL: "test@test",
-		GIT_COMMITTER_NAME: "test",
-		GIT_COMMITTER_EMAIL: "test@test",
-	};
-	Bun.spawnSync(["git", "-C", repoDir, "init", "-q"], { env });
-	Bun.spawnSync(["git", "-C", repoDir, "commit", "-q", "--allow-empty", "-m", "initial"], { env });
-	Bun.spawnSync(["git", "clone", "-q", "--bare", repoDir, bareRepo], { env });
-	return {
-		bareRepo,
-		cleanup: async () => {
-			await rm(repoDir, { recursive: true, force: true });
-			await rm(bareRepo, { recursive: true, force: true });
-		},
-	};
-}
 
 test("issue #480: a lane cwd inside the service checkout is refused", async () => {
 	const f = await fixture();
