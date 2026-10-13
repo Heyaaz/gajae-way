@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
@@ -2770,6 +2770,7 @@ test("issue #480: operator retire tolerates an externally removed worktree", asy
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job(name);
 		const repositoryPath = job.lane.repositoryPath!;
+		const canonicalWorktreePath = await realpath(job.lane.worktreePath);
 
 		f.port.complete(result.opRef, "test complete");
 		await until(() => f.db.work.workAttemptOpen().length === 0);
@@ -2783,7 +2784,7 @@ test("issue #480: operator retire tolerates an externally removed worktree", asy
 			stderr: "pipe",
 		});
 		expect(staleRegistration.exitCode).toBe(0);
-		expect(staleRegistration.stdout?.toString()).toContain(`worktree ${job.lane.worktreePath}`);
+		expect(staleRegistration.stdout?.toString()).toContain(`worktree ${canonicalWorktreePath}`);
 
 		const retired = await f.lanes.retire(name, "operator");
 		expect(retired.retired).toBe(true);
