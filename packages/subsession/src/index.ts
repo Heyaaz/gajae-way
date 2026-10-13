@@ -24,12 +24,15 @@ export {
 	verifyReady,
 } from "./cli";
 export {
+	type AwaitingChecks,
 	type AwaitingChecksInput,
 	acknowledgeHold,
 	appendAttempt,
 	applyReconciliation,
+	type ChecksSettlement,
 	type ContinuationPlan,
 	classifyWorkEvidence,
+	clearAwaitingChecks,
 	closeAttempt,
 	createLaneJobRecord,
 	hasNewCommit,
@@ -46,9 +49,9 @@ export {
 	projectAttemptOutcome,
 	type ReconciliationClass,
 	type RepositoryFacts,
+	recordChecksRetry,
+	settleAwaitingChecks,
 	transitionToAwaitingChecks,
-	transitionFromAwaitingChecksToDone,
-	transitionFromAwaitingChecksFailed,
 } from "./job";
 export {
 	isRuntimeSessionId,

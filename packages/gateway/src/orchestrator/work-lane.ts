@@ -16,9 +16,12 @@ import {
 	type WorkSteerResult,
 } from "@gajae-gateway/protocol";
 import {
+	type AwaitingChecks,
 	acknowledgeHold,
 	appendAttempt,
 	applyReconciliation,
+	type ChecksSettlement,
+	clearAwaitingChecks,
 	closeAttempt,
 	createLaneJobRecord,
 	envelopeErrorCode,
@@ -28,9 +31,9 @@ import {
 	newOpRef,
 	OpRefRejectedError,
 	parseLaneJobRecord,
+	recordChecksRetry,
+	settleAwaitingChecks,
 	transitionToAwaitingChecks,
-	transitionFromAwaitingChecksToDone,
-	transitionFromAwaitingChecksFailed,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
@@ -83,8 +86,10 @@ const reasons = new Set([
 /** Minimum spacing between streamed-frame activity writes for one attempt. */
 const ACTIVITY_TOUCH_MS = 1_000;
 const HOST_LOST_GRACE_MS = 30_000;
+/** Re-steers on red PR checks before the lane settles failed (#481). */
 const AWAITING_CHECKS_RETRY_LIMIT = 2;
-const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000; // 1 hour
+/** How long a lane may wait in awaiting_checks before it settles with a timeout. */
+const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000;
 const refusalCodes = new Set([
 	"busy",
 	"steer_refused",
@@ -218,11 +223,6 @@ export class WorkLaneManager {
 	readonly #failures = new Map<string, { failures: number; reason: string }>();
 	readonly #waiters = new Map<string, Set<Waiter>>();
 	readonly #detachedOwners = new WeakSet<object>();
-	/** Tracking awaiting_checks lanes: jobId -> { prNumber, recordedHead, enteredAt, retryCount } */
-	readonly #awaitingChecksLanes = new Map<
-		string,
-		{ prNumber: number; recordedHead: string; enteredAt: number; retryCount: number }
-	>();
 	#generationRecovery?: Promise<void>;
 	#recovery?: Promise<void>;
 	#stopped = false;
@@ -1369,11 +1369,18 @@ export class WorkLaneManager {
 					repository: { ...facts, observedAt: at },
 					classification: progressed ? "progressed" : endState === "completed" ? "held" : "stalled",
 				});
-				// If the work completed but the lane's PR has pending checks, transition to awaiting_checks
-				if (endState === "completed" && facts.checkStatus?.status === "pending") {
-					job = transitionToAwaitingChecks({ record: job, at });
-				}
+				// A completed attempt waits for its PR checks to conclude (#481). Red checks
+				// park it too while a checks cycle is open, so the poll counts the retry.
+				const checks = facts.checkStatus;
+				if (
+					endState === "completed" &&
+					facts.headSha &&
+					checks &&
+					(checks.status === "pending" || (checks.status === "red" && job.awaitingChecks !== undefined))
+				)
+					job = transitionToAwaitingChecks({ record: job, at, prNumber: checks.prNumber, headSha: facts.headSha });
 			}
+			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
 			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
@@ -1491,171 +1498,163 @@ export class WorkLaneManager {
 	#finishWaiters(opRef: string): void {
 		for (const waiter of [...(this.#waiters.get(opRef) ?? [])]) waiter.finish();
 	}
+	/**
+	 * Drives every awaiting_checks lane one step (#481): red re-steers the lane
+	 * (bounded), green settles it done, a third red settles it failed, and a
+	 * timeout, closed PR or moved HEAD settles it with that reason. Checks that
+	 * are temporarily unavailable keep it waiting.
+	 */
 	async #pollAwaitingChecks(): Promise<void> {
-		if (this.#stopped || !this.#options.checkStatusClient) return;
-		const now = this.#now();
+		const client = this.#options.checkStatusClient;
+		if (this.#stopped || !client) return;
 		for (const row of this.#db.work.laneJobRows()) {
-			if (row.state !== "awaiting_checks") continue;
-			if (!row.lane_key.startsWith("work-")) continue;
-			const name = row.lane_key.slice("work-".length);
-			const tracking = this.#awaitingChecksLanes.get(row.job_id);
-
-			// Check for timeout
-			if (tracking && now - tracking.enteredAt > AWAITING_CHECKS_TIMEOUT_MS) {
-				try {
-					const job = this.#job(name, true)!;
-					const updated = transitionFromAwaitingChecksFailed(job, this.#at(), "timeout");
-					this.#db.transaction((tx) => {
-						this.#db.work.putLaneJob(tx, {
-							jobId: updated.jobId,
-							laneKey: row.lane_key,
-							state: updated.state,
-							createdAt: updated.createdAt,
-							updatedAt: updated.updatedAt,
-							lane: updated.lane,
-							json: JSON.stringify(updated),
-						});
-					});
-					this.#awaitingChecksLanes.delete(row.job_id);
-					console.error(`awaiting_checks_timeout jobId=${row.job_id}`);
-				} catch (error) {
-					console.error(`awaiting_checks_timeout_settlement_failed jobId=${row.job_id} reason=${failureReason(error)}`);
-				}
-				continue;
-			}
-
-			// Re-read the PR checks
+			if (this.#stopped) return;
+			if (row.state !== "awaiting_checks" || !row.lane_key.startsWith("work-")) continue;
 			try {
-				const job = this.#job(name, true);
-				if (!job) continue;
-
-				const facts = await collectRepoFacts(job.lane.worktreePath, this.#options.checkStatusClient);
-				if (!facts?.checkStatus) continue;
-
-				const checks = facts.checkStatus;
-
-				// Initialize tracking if not already done
-				if (!tracking) {
-					this.#awaitingChecksLanes.set(row.job_id, {
-						prNumber: checks.prNumber,
-						recordedHead: facts.headSha || "",
-						enteredAt: now,
-						retryCount: 0,
-					});
-				}
-
-				// If head moved, settle failed
-				const trackedHead = this.#awaitingChecksLanes.get(row.job_id)?.recordedHead;
-				if (trackedHead && facts.headSha && facts.headSha !== trackedHead) {
-					const updated = transitionFromAwaitingChecksFailed(job, this.#at(), "head_moved");
-					this.#db.transaction((tx) => {
-						this.#db.work.putLaneJob(tx, {
-							jobId: updated.jobId,
-							laneKey: row.lane_key,
-							state: updated.state,
-							createdAt: updated.createdAt,
-							updatedAt: updated.updatedAt,
-							lane: updated.lane,
-							json: JSON.stringify(updated),
-						});
-					});
-					this.#awaitingChecksLanes.delete(row.job_id);
-					console.error(
-						`awaiting_checks_head_moved jobId=${row.job_id} from=${trackedHead.slice(0, 12)} to=${facts.headSha.slice(0, 12)}`,
-					);
-					continue;
-				}
-
-				if (checks.status === "green") {
-					// All checks passed, settle as done
-const updated = transitionFromAwaitingChecksToDone(job, this.#at());
-				this.#db.transaction((tx) => {
-					this.#db.work.putLaneJob(tx, {
-						jobId: updated.jobId,
-						laneKey: row.lane_key,
-						state: updated.state,
-						createdAt: updated.createdAt,
-						updatedAt: updated.updatedAt,
-						lane: updated.lane,
-						json: JSON.stringify(updated),
-					});
-				});
-				this.#awaitingChecksLanes.delete(row.job_id);
-				console.error(`awaiting_checks_passed jobId=${row.job_id} pr=${checks.prNumber}`);
-
-				} else if (checks.status === "red") {
-					// Checks failed, try to re-steer
-					const trackingNow = this.#awaitingChecksLanes.get(row.job_id)!;
-					if (trackingNow.retryCount < AWAITING_CHECKS_RETRY_LIMIT) {
-						// Re-steer the session with failing check names
-						const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
-						if (open) {
-							const runtime = this.#attemptByOpRef(open.opRef);
-							if (runtime && !runtime.terminal && this.#binding(runtime)) {
-								const checkStr =
-									checks.failingChecks.length > 0
-										? `checks failed: ${checks.failingChecks.join(", ")}`
-										: "checks failed";
-								const steerText = `PR #${checks.prNumber} ${checkStr}. Fix the issues and push again.`;
-								try {
-									const clientRef = newOpRef("awaiting-checks-steer");
-									await this.#port.steer({
-										sessionId: runtime.sessionId,
-										repo: job.lane.worktreePath,
-										text: steerText,
-										clientRef,
-									});
-									trackingNow.retryCount++;
-									console.error(
-										`awaiting_checks_re_steered jobId=${row.job_id} attempt=${trackingNow.retryCount}/${AWAITING_CHECKS_RETRY_LIMIT}`,
-									);
-								} catch (error) {
-									if (definitiveSteerRefusal(error)) {
-										// Session no longer available or steer refused, settle as failed
-										const updated = transitionFromAwaitingChecksFailed(job, this.#at(), "re_steer_failed");
-										this.#db.transaction((tx) => {
-											this.#db.work.putLaneJob(tx, {
-												jobId: updated.jobId,
-												laneKey: row.lane_key,
-												state: updated.state,
-												createdAt: updated.createdAt,
-												updatedAt: updated.updatedAt,
-												lane: updated.lane,
-												json: JSON.stringify(updated),
-											});
-										});
-										this.#awaitingChecksLanes.delete(row.job_id);
-										console.error(`awaiting_checks_re_steer_failed jobId=${row.job_id} reason=${safeRefusal(error)}`);
-									}
-								}
-							}
-						}
-					} else {
-						// Retry limit exceeded, settle as failed
-						const updated = transitionFromAwaitingChecksFailed(
-							job,
-							this.#at(),
-							`red_checks: ${checks.failingChecks.join(", ")}`,
-						);
-						this.#db.transaction((tx) => {
-							this.#db.work.putLaneJob(tx, {
-								jobId: updated.jobId,
-								laneKey: row.lane_key,
-								state: updated.state,
-								createdAt: updated.createdAt,
-								updatedAt: updated.updatedAt,
-								lane: updated.lane,
-								json: JSON.stringify(updated),
-							});
-						});
-						this.#awaitingChecksLanes.delete(row.job_id);
-						console.error(`awaiting_checks_failed jobId=${row.job_id} retries_exhausted=${trackingNow.retryCount}`);
-					}
-				}
+				await this.#pollLaneChecks(row.lane_key.slice("work-".length), client);
 			} catch (error) {
 				console.error(`awaiting_checks_poll_error jobId=${row.job_id} reason=${failureReason(error)}`);
 			}
 		}
+	}
+	async #pollLaneChecks(name: string, client: CheckStatusClient): Promise<void> {
+		const observed = this.#job(name);
+		const cycle = observed?.awaitingChecks;
+		if (observed?.state !== "awaiting_checks" || !cycle) return;
+		const facts = await collectRepoFacts(observed.lane.worktreePath, client);
+		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
+			if (this.#stopped) return undefined;
+			const job = this.#job(name);
+			// Another writer moved the lane on while the checks were read.
+			if (job?.state !== "awaiting_checks" || job.awaitingChecks?.since !== cycle.since) return undefined;
+			const outcome = checksOutcome(job.awaitingChecks, facts, this.#now());
+			if (outcome.kind === "wait") return undefined;
+			if (outcome.kind === "red") {
+				if (job.awaitingChecks.retries < AWAITING_CHECKS_RETRY_LIMIT) {
+					await this.#resteerRedChecks(name, job, outcome.failingChecks);
+					return undefined;
+				}
+				return this.#settleChecks(name, job, {
+					kind: "failed",
+					reason: `checks=red(${outcome.failingChecks.join(",")}) after ${job.awaitingChecks.retries} re-steers`,
+				});
+			}
+			return this.#settleChecks(name, job, outcome);
+		});
+		if (!effects) return;
+		if (effects.fallback) {
+			try {
+				this.#options.deliverFallback?.(effects.fallback);
+			} catch {
+				console.error(`work_fallback_delivery_failed deliveryId=${effects.fallback.deliveryId}`);
+			}
+		}
+		if (effects.persona) {
+			try {
+				this.#options.notifyPersona?.(effects.persona);
+			} catch {
+				console.error(`work_persona_nudge_failed origin=${effects.persona}`);
+			}
+		}
+		if (effects.laneParent) await this.#drainLaneReports(effects.laneParent);
+	}
+	/** Spends one retry, then continues the lane's session with the failing check names. */
+	async #resteerRedChecks(name: string, job: LaneJobRecord, failingChecks: readonly string[]): Promise<void> {
+		const cycle = job.awaitingChecks!;
+		const counted = recordChecksRetry(job, this.#at());
+		this.#putJob(name, counted);
+		const retries = counted.awaitingChecks!.retries;
+		const names = failingChecks.length > 0 ? failingChecks.join(", ") : "unnamed checks";
+		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).`;
+		const last = job.attempts.at(-1);
+		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		try {
+			await this.#startLocked({ name, text, cwd: job.lane.worktreePath, resume: false }, "start", { parent });
+			console.error(`awaiting_checks_resteered jobId=${job.jobId} pr=${cycle.prNumber} retry=${retries}`);
+		} catch (error) {
+			// The retry stays spent, so a lane that cannot be re-steered still reaches its bound.
+			console.error(`awaiting_checks_resteer_failed jobId=${job.jobId} reason=${failureReason(error)}`);
+		}
+	}
+	/** Settles the checks cycle and admits the outcome report to the lane's parent in one transaction. */
+	#settleChecks(name: string, job: LaneJobRecord, outcome: ChecksSettlement): ChecksReportEffects {
+		const cycle = job.awaitingChecks!;
+		const at = this.#at();
+		const settled = settleAwaitingChecks(job, at, outcome);
+		const last = job.attempts.at(-1);
+		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		const text = checksReportText(name, cycle, outcome);
+		const reportRef = newOpRef(`checks-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+		const reportId = workAttemptReportId(this.#db.instanceId, job.jobId, reportRef);
+		const deliveryId = workAttemptDeliveryId(this.#db.instanceId, job.jobId, reportRef);
+		const effects = this.#db.transaction((tx): ChecksReportEffects => {
+			this.#putJob(name, settled, tx);
+			if (parent?.kind === "persona") {
+				const refused =
+					Boolean(this.#options.personaHold?.(parent.originKey)) ||
+					this.#db.bindings.getSessionRecord(parent.originKey) === undefined;
+				if (!refused) {
+					workAssert(
+						this.#db.inbox.enqueue(tx, {
+							messageId: reportId,
+							originKey: parent.originKey,
+							originRefJson: resolveLaneReportOrigin(parent, JSON.stringify(parent.origin)),
+							body: text,
+							receivedAt: at,
+							source: "lane_report",
+						}),
+					);
+					return { persona: parent.originKey };
+				}
+				return { fallback: this.#enqueueFallback(tx, reportRef, parent.origin, text, deliveryId) };
+			}
+			if (parent?.kind === "lane") {
+				if (this.#db.work.laneParentAvailable(parent.name)) {
+					this.#db.work.laneReportInsert(
+						tx,
+						{
+							reportId,
+							parentName: parent.name,
+							childName: name,
+							childOpRef: reportRef,
+							body: text,
+							root: parent.root,
+						},
+						at,
+					);
+					return { laneParent: parent.name };
+				}
+				if (parent.root)
+					return { fallback: this.#enqueueFallback(tx, reportRef, parent.root.origin, text, deliveryId) };
+			}
+			return {};
+		});
+		console.error(
+			`awaiting_checks_settled jobId=${job.jobId} pr=${cycle.prNumber} outcome=${outcome.kind}${outcome.kind === "passed" ? "" : ` reason=${outcome.reason}`}`,
+		);
+		return effects;
+	}
+	#enqueueFallback(
+		tx: WriteTx,
+		turnId: string,
+		origin: OriginRef,
+		text: string,
+		deliveryId: string,
+	): ChatMessagePayload {
+		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId)!;
+		this.#db.outbox.enqueue(tx, {
+			deliveryId,
+			turnId,
+			originKey: originKey(origin),
+			payloadJson: JSON.stringify(payload),
+		});
+		return payload;
+	}
+	#putJob(name: string, job: LaneJobRecord, tx?: WriteTx): void {
+		const write = (inner: WriteTx) =>
+			this.#db.work.putLaneJob(inner, { ...job, laneKey: laneJobIdentity(name).laneKey, json: JSON.stringify(job) });
+		if (tx) write(tx);
+		else this.#db.transaction(write);
 	}
 	async #drainLaneReports(parentName: string): Promise<void> {
 		if (this.#stopped) return;
@@ -2595,6 +2594,48 @@ export function reportText(
 	if (Buffer.byteLength(text, "utf8") > 2048) throw new Error("lane report exceeded its UTF-8 byte budget");
 	return text;
 }
+type ChecksOutcome =
+	| { readonly kind: "wait" }
+	| { readonly kind: "red"; readonly failingChecks: readonly string[] }
+	| { readonly kind: "passed" }
+	| { readonly kind: "ended"; readonly reason: string };
+
+/** What one checks observation means for an awaiting_checks cycle; evidence beats the deadline. */
+function checksOutcome(
+	cycle: AwaitingChecks,
+	facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+	now: number,
+): ChecksOutcome {
+	if (facts?.headSha && facts.headSha !== cycle.headSha)
+		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.headSha.slice(0, 12)}` };
+	const checks = facts?.checkStatus;
+	// null: the branch has no open PR; a different number: the recorded PR is not the open one.
+	if (checks === null || (checks && checks.prNumber !== cycle.prNumber))
+		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
+	if (checks?.status === "green") return { kind: "passed" };
+	if (checks?.status === "red") return { kind: "red", failingChecks: checks.failingChecks };
+	// Pending, or unavailable (lookup failed): keep waiting until the deadline.
+	if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+		return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+	return { kind: "wait" };
+}
+
+interface ChecksReportEffects {
+	readonly fallback?: ChatMessagePayload;
+	readonly persona?: string;
+	readonly laneParent?: string;
+}
+
+/** The parent's report for a concluded checks cycle. */
+function checksReportText(name: string, cycle: AwaitingChecks, outcome: ChecksSettlement): string {
+	const facts = `head=${cycle.headSha.slice(0, 12)} pr=${cycle.prNumber}`;
+	const text =
+		outcome.kind === "passed"
+			? `[lane ${name}] checks passed: ${facts} checks=green`
+			: `[lane ${name}] ${outcome.kind === "failed" ? "failed" : "attempt_ended"}: awaiting_checks ${outcome.reason} ${facts}`;
+	return utf8Prefix(text, 2048);
+}
+
 async function collectRepoFacts(
 	worktreePath: string,
 	checkClient?: CheckStatusClient,
@@ -2604,7 +2645,8 @@ async function collectRepoFacts(
 			dirtyFiles: number;
 			branch?: string;
 			pushed?: boolean;
-			checkStatus?: CheckStatusSnapshot;
+			/** null: no open PR for the branch; absent: not pushed, no client, or the lookup failed. */
+			checkStatus?: CheckStatusSnapshot | null;
 	  }
 	| undefined
 > {
@@ -2642,7 +2684,7 @@ async function collectRepoFacts(
 			// Try to get PR number and check status via check client
 			if (result.pushed && checkClient) {
 				const checkStatus = await checkClient.getCheckStatus(branchName, worktreePath);
-				if (checkStatus) result.checkStatus = checkStatus;
+				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
 		}
 

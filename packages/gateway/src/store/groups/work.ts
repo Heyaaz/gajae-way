@@ -708,25 +708,8 @@ export class WorkGroup {
 		if (!this.#workCas(tx, current, next)) return undefined;
 		this.#workPutHistory(tx, next, record);
 		if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(tx, next);
-		if (next.decision === "reported" && admission?.kind === "lane") {
-			const report = admission.report;
-			const createdAt = next.settledAt!;
-			this.#db
-				.prepare(
-					"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
-				)
-				.run(
-					tx,
-					report.reportId,
-					report.parentName,
-					report.childName,
-					report.childOpRef,
-					report.body,
-					report.root === null ? null : JSON.stringify(report.root),
-					createdAt,
-					createdAt,
-				);
-		}
+		if (next.decision === "reported" && admission?.kind === "lane")
+			this.laneReportInsert(tx, admission.report, next.settledAt!);
 		if (fallbackPayload) {
 			const expectedOrigin =
 				admission?.kind === "persona"
@@ -791,6 +774,25 @@ export class WorkGroup {
 			...(childFallback ? { childFallback } : {}),
 			...(requeuedParent ? { requeuedParent } : {}),
 		};
+	}
+
+	/** Admits one pending child report for its parent lane. */
+	laneReportInsert(tx: WriteTx, report: WorkAttemptAdmissionLane["report"], createdAt: string): void {
+		this.#db
+			.prepare(
+				"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
+			)
+			.run(
+				tx,
+				report.reportId,
+				report.parentName,
+				report.childName,
+				report.childOpRef,
+				report.body,
+				report.root === null ? null : JSON.stringify(report.root),
+				createdAt,
+				createdAt,
+			);
 	}
 
 	laneParentAvailable(name: string): boolean {
