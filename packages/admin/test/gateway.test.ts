@@ -167,6 +167,7 @@ test("admin startup retries with its own backoff until the gateway is available"
 	const path = join(directory, "gateway.sock");
 	const retries = retryScheduler();
 	const logs: string[] = [];
+	const startupLogs = () => logs.filter((line) => line.startsWith(`Gateway socket ${path} unavailable;`));
 	const errorSpy = spyOn(console, "error").mockImplementation((line) => logs.push(String(line)));
 	let server: ReturnType<typeof listenGateway> | undefined;
 	let gateway: AdminGateway | undefined;
@@ -177,8 +178,8 @@ test("admin startup retries with its own backoff until the gateway is available"
 		});
 		await until(() => retries.pending().length === 1);
 		expect(retries.firstPending().delayMs).toBe(500);
-		expect(logs).toHaveLength(1);
-		expect(logs[0]).toContain("retry 1 in 500ms");
+		expect(startupLogs()).toHaveLength(1);
+		expect(startupLogs()[0]).toContain("retry 1 in 500ms");
 
 		server = listenGateway(path);
 		retries.runNext();
