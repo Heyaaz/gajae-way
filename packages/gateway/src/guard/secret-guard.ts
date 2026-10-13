@@ -183,10 +183,27 @@ export class SecretGuard {
 			const text = this.#field(payload.text, counts);
 			const voiceText = payload.voiceText === undefined ? undefined : this.#field(payload.voiceText, counts);
 			const askUserPanel = payload.askUserPanel ? this.#redactAskUserPanel(payload.askUserPanel, counts) : undefined;
-			const approvalPanel = payload.approvalPanel ? this.#redactApprovalPanel(payload.approvalPanel, counts) : undefined;
-			if (text === payload.text && voiceText === payload.voiceText && askUserPanel === payload.askUserPanel && approvalPanel === payload.approvalPanel) return frame;
+			const approvalPanel = payload.approvalPanel
+				? this.#redactApprovalPanel(payload.approvalPanel, counts)
+				: undefined;
+			if (
+				text === payload.text &&
+				voiceText === payload.voiceText &&
+				askUserPanel === payload.askUserPanel &&
+				approvalPanel === payload.approvalPanel
+			)
+				return frame;
 			if (Object.keys(counts).length > 0) this.#log(redactionLine(frame.event, counts));
-			return { ...frame, payload: { ...payload, text, ...(voiceText === undefined ? {} : { voiceText }), ...(askUserPanel === undefined ? {} : { askUserPanel }), ...(approvalPanel === undefined ? {} : { approvalPanel }) } };
+			return {
+				...frame,
+				payload: {
+					...payload,
+					text,
+					...(voiceText === undefined ? {} : { voiceText }),
+					...(askUserPanel === undefined ? {} : { askUserPanel }),
+					...(approvalPanel === undefined ? {} : { approvalPanel }),
+				},
+			};
 		}
 		if (frame.event === "chat.progress") {
 			const payload = frame.payload as ChatProgressPayload;
@@ -205,7 +222,10 @@ export class SecretGuard {
 		return frame;
 	}
 
-	#redactAskUserPanel(panel: ChatMessagePayload["askUserPanel"], counts: Record<string, number>): ChatMessagePayload["askUserPanel"] | undefined {
+	#redactAskUserPanel(
+		panel: ChatMessagePayload["askUserPanel"],
+		counts: Record<string, number>,
+	): ChatMessagePayload["askUserPanel"] | undefined {
 		if (!panel) return undefined;
 		const question = this.#field(panel.question, counts);
 		const options = panel.options.map((option) => {
@@ -216,7 +236,10 @@ export class SecretGuard {
 		return question === panel.question && !optionsChanged ? panel : { ...panel, question, options };
 	}
 
-	#redactApprovalPanel(panel: ChatMessagePayload["approvalPanel"], counts: Record<string, number>): ChatMessagePayload["approvalPanel"] | undefined {
+	#redactApprovalPanel(
+		panel: ChatMessagePayload["approvalPanel"],
+		counts: Record<string, number>,
+	): ChatMessagePayload["approvalPanel"] | undefined {
 		if (!panel) return undefined;
 		const message = this.#field(panel.message, counts);
 		const options = panel.options
@@ -226,7 +249,9 @@ export class SecretGuard {
 				})
 			: undefined;
 		const optionsChanged = options && options.some((option, i) => option !== (panel.options?.[i] ?? undefined));
-		return message === panel.message && !optionsChanged ? panel : { ...panel, message, ...(options === undefined ? {} : { options }) };
+		return message === panel.message && !optionsChanged
+			? panel
+			: { ...panel, message, ...(options === undefined ? {} : { options }) };
 	}
 
 	#field(value: string, counts: Record<string, number>): string {
