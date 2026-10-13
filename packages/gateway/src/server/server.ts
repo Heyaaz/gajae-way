@@ -57,6 +57,7 @@ import {
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
+import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
 import { initializeMemory, memoryRoot } from "../memory/doctrine";
@@ -262,6 +263,8 @@ export interface GatewayServerOptions {
 	readonly deliverySweepIntervalMs?: number;
 	/** Mid-work speech gating configuration (issue #71). */
 	readonly interimSpeech?: { readonly maxPerTurn?: number; readonly minGapMs?: number };
+	/** Test seam: outbound secret redaction; production reads its sources from the process env and the broker agent dir. */
+	readonly secretGuard?: SecretGuard;
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -440,6 +443,8 @@ interface Runtime {
 	readonly lanes: LaneGovernor;
 	readonly work: WorkLaneManager;
 	readonly permissionPanels: PermissionPanels;
+	/** Redacts secrets from every chat-bound frame at the connection writer; not configurable from chat or config.json. */
+	readonly secretGuard: SecretGuard;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -515,7 +520,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				const connection: Connection = {
 					decoder: new FrameDecoder(),
 					negotiated: false,
-					write: (frame) => writer.write(frame),
+					write: (frame) => writer.write(runtime.secretGuard.guardFrame(frame)),
 					close: () => writer.close(),
 					settle: () => writer.settled(),
 				};
@@ -570,7 +575,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	const connection: Connection = {
 		decoder: new FrameDecoder(),
 		negotiated: false,
-		write: (frame) => process.stdout.write(encodeFrame(frame)),
+		write: (frame) => process.stdout.write(encodeFrame(runtime.secretGuard.guardFrame(frame))),
 		close: () => process.stdin.pause(),
 		settle: async () => {},
 	};
@@ -1011,6 +1016,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		permissionPanels,
 		memoryOps: new Map(),
 		memoryOperationTasks: new Set(),
+		secretGuard:
+			options.secretGuard ??
+			new SecretGuard(secretSourcesFromEnv(process.env, options.broker?.agentDir, options.config.home)),
 	};
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
@@ -2615,6 +2623,7 @@ async function createInboundTurnLifecycle(
 		currentConversationNotice(origin),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
+		SECRET_GUARD_SYSTEM_NOTICE,
 	].join("\n\n");
 	const modelOverride = options.database.bindings.modelGet(key)?.selection;
 	const effectiveModel = modelOverride ?? runtime.config.model;
