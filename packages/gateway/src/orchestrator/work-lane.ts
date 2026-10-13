@@ -1568,20 +1568,21 @@ export class WorkLaneManager {
 
 				if (checks.status === "green") {
 					// All checks passed, settle as done
-					const updated = transitionFromAwaitingChecksToDone(job, this.#at());
-					this.#db.transaction((tx) => {
-						this.#db.work.putLaneJob(tx, {
-							jobId: updated.jobId,
-							laneKey: row.lane_key,
-							state: updated.state,
-							createdAt: updated.createdAt,
-							updatedAt: updated.updatedAt,
-							lane: updated.lane,
-							json: JSON.stringify(updated),
-						});
+const updated = transitionFromAwaitingChecksToDone(job, this.#at());
+				this.#db.transaction((tx) => {
+					this.#db.work.putLaneJob(tx, {
+						jobId: updated.jobId,
+						laneKey: row.lane_key,
+						state: updated.state,
+						createdAt: updated.createdAt,
+						updatedAt: updated.updatedAt,
+						lane: updated.lane,
+						json: JSON.stringify(updated),
 					});
-					this.#awaitingChecksLanes.delete(row.job_id);
-					console.error(`awaiting_checks_passed jobId=${row.job_id} pr=${checks.prNumber}`);
+				});
+				this.#awaitingChecksLanes.delete(row.job_id);
+				console.error(`awaiting_checks_passed jobId=${row.job_id} pr=${checks.prNumber}`);
+
 				} else if (checks.status === "red") {
 					// Checks failed, try to re-steer
 					const trackingNow = this.#awaitingChecksLanes.get(row.job_id)!;
