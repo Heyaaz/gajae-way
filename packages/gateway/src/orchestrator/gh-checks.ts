@@ -1,4 +1,4 @@
-import { sanitizeDiagnostic } from "./rebind";
+import { StreamingDiagnosticTail } from "./rebind";
 import type { CheckStatusClient, CheckStatusSnapshot } from "./work-lane";
 
 /** One entry of `gh pr list --json statusCheckRollup`: a CheckRun or a commit StatusContext. */
@@ -137,18 +137,43 @@ async function readFailedLogTail(
 			["gh", "run", "view", target.runId, ...(target.jobId ? ["--job", target.jobId] : []), "--log-failed"],
 			{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
 		);
-		const [log, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-		if (exitCode !== 0 || log.length === 0) return undefined;
-		return sanitizedFailureLogTail(log);
+		const result = await sanitizedFailureLogStreamTail(child.stdout);
+		if (result.overflowed) {
+			child.kill("SIGKILL");
+			await child.exited;
+			return undefined;
+		}
+		const exitCode = await child.exited;
+		return exitCode === 0 ? result.tail : undefined;
 	} catch {
 		return undefined;
 	}
 }
 
-/** Redact while full line/key context is present, then retain only the diagnostic tail. */
-export function sanitizedFailureLogTail(log: string): string | undefined {
-	const sanitized = sanitizeDiagnostic(log);
-	return utf8Suffix(sanitized, FAILED_LOG_TAIL_LIMIT_BYTES).trim() || undefined;
+/** Sanitizes bounded lines incrementally, including multiline credential arrays, retaining only a tail. */
+export async function sanitizedFailureLogStreamTail(
+	stream: ReadableStream<Uint8Array>,
+): Promise<{ readonly tail?: string; readonly overflowed: boolean }> {
+	const tail = new StreamingDiagnosticTail(FAILED_LOG_TAIL_LIMIT_BYTES);
+	const decoder = new TextDecoder();
+	const reader = stream.getReader();
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) {
+			tail.push(decoder.decode());
+			const result = tail.finish();
+			return { ...(result ? { tail: result } : {}), overflowed: tail.overflowed };
+		}
+		if (!value) continue;
+		for (let offset = 0; offset < value.byteLength; offset += 16 * 1024) {
+			const chunk = value.subarray(offset, Math.min(value.byteLength, offset + 16 * 1024));
+			tail.push(decoder.decode(chunk, { stream: true }));
+			if (tail.overflowed) {
+				await reader.cancel();
+				return { overflowed: true };
+			}
+		}
+	}
 }
 
 function utf8Suffix(text: string, byteLimit: number): string {

@@ -13,7 +13,11 @@ import {
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
-import { classifyCheckRollup, failedCheckLogTargets, sanitizedFailureLogTail } from "../src/orchestrator/gh-checks";
+import {
+	classifyCheckRollup,
+	failedCheckLogTargets,
+	sanitizedFailureLogStreamTail,
+} from "../src/orchestrator/gh-checks";
 import {
 	LaneGovernor,
 	laneJobIdentity,
@@ -1746,12 +1750,36 @@ test("repository and PR head facts survive a large completion excerpt", () => {
 	expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(2048);
 });
 
-test("failed CI log secrets are redacted before the bounded tail is taken", () => {
+test("failed CI logs are redacted incrementally before retaining a bounded tail", async () => {
 	const secret = "z".repeat(4_000);
-	const tail = sanitizedFailureLogTail(`${"x".repeat(4_000)} secret=${secret}`);
-	expect(tail).toContain("secret=[redacted]");
-	expect(tail).not.toContain(secret);
-	expect(Buffer.byteLength(tail ?? "", "utf8")).toBeLessThanOrEqual(3_200);
+	const arraySecret = "array-value-that-must-not-escape";
+	const splitArraySecret = "control-split-array-value";
+	const log = `${"x".repeat(4_000)} secret=${secret}\n{"secrets": [\n  "${arraySecret}",\n  "another-value"\n]}\n{"secr\0ets": [\n  "${splitArraySecret}"\n]}\n`;
+	const bytes = Buffer.from(log, "utf8");
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			for (let offset = 0; offset < bytes.length; offset += 113)
+				controller.enqueue(bytes.subarray(offset, Math.min(offset + 113, bytes.length)));
+			controller.close();
+		},
+	});
+	const result = await sanitizedFailureLogStreamTail(stream);
+	expect(result.overflowed).toBe(false);
+	expect(result.tail).toContain("secret=[redacted]");
+	expect(result.tail).toContain('"secrets": [redacted]');
+	expect(result.tail).not.toContain(secret);
+	expect(result.tail).not.toContain(arraySecret);
+	expect(result.tail).not.toContain(splitArraySecret);
+	expect(Buffer.byteLength(result.tail ?? "", "utf8")).toBeLessThanOrEqual(3_200);
+	const oversized = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(Buffer.from(`${"x".repeat(70 * 1024)} secret=${secret}`));
+			controller.close();
+		},
+	});
+	const bounded = await sanitizedFailureLogStreamTail(oversized);
+	expect(bounded.overflowed).toBe(true);
+	expect(bounded.tail).toBeUndefined();
 });
 
 test("AC-K notice names persona parent", () => {
@@ -2522,7 +2550,7 @@ async function settledReport(f: Awaited<ReturnType<typeof fixture>>, label = "co
 	return f.notices.find((notice) => notice.text.includes(`[lane a] ${label}`))?.text ?? "";
 }
 
-test("#481 settled report of an unpushed lane carries its head and pushed=false without a PR lookup", async () => {
+test("#481 settled report of an unpushed lane carries its head and pushed=false when no PR is found", async () => {
 	const { calls, client } = recordingCheckClient(null);
 	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
 	const head = await laneRepo(f.directory, "fix/unpushed", false);
@@ -2530,7 +2558,7 @@ test("#481 settled report of an unpushed lane carries its head and pushed=false 
 	expect(text).toContain(`head=${head.slice(0, 12)}`);
 	expect(text).toContain("pushed=false");
 	expect(text).not.toContain("pr=");
-	expect(calls).toHaveLength(0);
+	expect(calls).toEqual([{ branch: "fix/unpushed", cwd: f.directory }]);
 });
 
 test("#481 settled report of a pushed lane without an open PR says pushed=true and no checks", async () => {
@@ -2959,7 +2987,7 @@ test("#481 a lane whose HEAD is unpushed never waits for checks", async () => {
 	await until(() => checksNotice(f, "[lane a] completed") !== undefined);
 	expect(f.job().state).toBe("attempt_ended");
 	expect(checksNotice(f, "[lane a] completed")).toContain("pushed=false");
-	expect(checks.calls).toHaveLength(0);
+	expect(checks.calls).toEqual([{ branch: "fix/unpushed-head", cwd: f.directory }]);
 });
 
 test("#481 completed lane with already-green checks settles done and reports the checked head", async () => {
@@ -3169,6 +3197,52 @@ test("#481 a merged PR settles successfully even when its source branch was dele
 	expect(checksNotice(f, "[lane a] checks passed")).toContain("pr=502");
 });
 
+test("#481 initial settlement discovers a merged PR whose source branch was already deleted", async () => {
+	const checks = scriptedChecks({
+		prNumber: 504,
+		status: "pending",
+		failingChecks: [],
+		prState: "closed",
+		merged: true,
+	});
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const branch = "fix/deleted-before-settle";
+	const head = await laneRepo(f.directory, branch, true);
+	const result = await started(f, "a", origin);
+	expect(Bun.spawnSync(["git", "-C", f.directory, "push", "-q", "origin", "--delete", branch]).exitCode).toBe(0);
+	f.port.complete(result.opRef, "merged deliverable");
+	await pollUntil(f, () => f.job().state === "done");
+	expect(f.job().attempts[0]?.opRef).toBe(result.opRef);
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(`head=${head.slice(0, 12)} pr=504`);
+});
+
+test("#481 an exact merged PR snapshot settles before later source-branch movement", async () => {
+	const checks = scriptedChecks({ prNumber: 503, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const branch = "fix/merged-source-advanced";
+	const { head } = await awaitingLane(f, branch);
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const advanced = Bun.spawnSync(
+		["git", "-C", f.directory, "commit", "-q", "--allow-empty", "-m", "reuse merged branch"],
+		{ env, stdout: "pipe", stderr: "pipe" },
+	);
+	expect(advanced.exitCode).toBe(0);
+	const advancedHead = Bun.spawnSync(["git", "-C", f.directory, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(Bun.spawnSync(["git", "-C", f.directory, "push", "-q", "origin", branch]).exitCode).toBe(0);
+	expect(Bun.spawnSync(["git", "-C", f.directory, "reset", "-q", "--hard", head]).exitCode).toBe(0);
+	checks.set({ prNumber: 503, headSha: head, status: "pending", failingChecks: [], prState: "closed", merged: true });
+	await pollUntil(f, () => f.job().state === "done");
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(
+		`pr=503 checks=green prHead=${head.slice(0, 12)} remoteHead=${advancedHead.slice(0, 12)}`,
+	);
+});
+
 test("#481 green checks cannot settle after the remote branch advances beyond the local head", async () => {
 	const checks = scriptedChecks({ prNumber: 499, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
@@ -3196,6 +3270,9 @@ test("#481 green checks cannot settle after the remote branch advances beyond th
 	expect(f.job().state).toBe("attempt_ended");
 	expect(f.job().escalations.at(-1)).toContain(
 		`awaiting_checks ended: head_moved from=${head.slice(0, 12)} to=${remoteHead.slice(0, 12)}`,
+	);
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks head_moved")).toContain(
+		`prHead=${head.slice(0, 12)} remoteHead=${remoteHead.slice(0, 12)}`,
 	);
 });
 

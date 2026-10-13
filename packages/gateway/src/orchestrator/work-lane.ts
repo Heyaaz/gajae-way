@@ -1534,12 +1534,7 @@ export class WorkLaneManager {
 						prNumber: checks.prNumber,
 						headSha: facts.headSha,
 					});
-				} else if (
-					facts?.headSha &&
-					checks === undefined &&
-					facts.pushed !== false &&
-					this.#options.checkStatusClient
-				) {
+				} else if (facts?.headSha && checks === undefined && this.#options.checkStatusClient) {
 					job = transitionToAwaitingChecks({ record: job, at, prNumber: null, headSha: facts.headSha });
 				}
 			}
@@ -1724,12 +1719,17 @@ export class WorkLaneManager {
 					await this.#resteerRedChecks(name, job, outcome.failingChecks, outcome.failureLogTail);
 					return undefined;
 				}
-				return this.#settleChecks(name, job, {
-					kind: "failed",
-					reason: `checks=red(${outcome.failingChecks.join(",")}) after ${activeCycle.retries} re-steers`,
-				});
+				return this.#settleChecks(
+					name,
+					job,
+					{
+						kind: "failed",
+						reason: `checks=red(${outcome.failingChecks.join(",")}) after ${activeCycle.retries} re-steers`,
+					},
+					facts,
+				);
 			}
-			return this.#settleChecks(name, job, outcome);
+			return this.#settleChecks(name, job, outcome, facts);
 		});
 		if (!effects) return;
 		if (effects.fallback) {
@@ -1777,13 +1777,18 @@ export class WorkLaneManager {
 		}
 	}
 	/** Settles the checks cycle and admits the outcome report to the lane's parent in one transaction. */
-	#settleChecks(name: string, job: LaneJobRecord, outcome: ChecksSettlement): ChecksReportEffects {
+	#settleChecks(
+		name: string,
+		job: LaneJobRecord,
+		outcome: ChecksSettlement,
+		facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+	): ChecksReportEffects {
 		const cycle = job.awaitingChecks!;
 		const at = this.#at();
 		const settled = settleAwaitingChecks(job, at, outcome);
 		const last = job.attempts.at(-1);
 		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
-		const text = checksReportText(name, cycle, outcome);
+		const text = checksReportText(name, cycle, outcome, facts);
 		const reportRef = newOpRef(`checks-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
 		const reportId = workAttemptReportId(this.#db.instanceId, job.jobId, reportRef);
 		const deliveryId = workAttemptDeliveryId(this.#db.instanceId, job.jobId, reportRef);
@@ -2860,16 +2865,22 @@ function checksOutcome(
 ): ChecksOutcome {
 	if (facts?.headSha && facts.headSha !== cycle.headSha)
 		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.headSha.slice(0, 12)}` };
+	const checks = facts?.checkStatus;
+	if (
+		checks?.prState === "closed" &&
+		checks.merged &&
+		checks.headSha === cycle.headSha &&
+		(cycle.prNumber === null || checks.prNumber === cycle.prNumber)
+	)
+		return { kind: "passed" };
 	if (facts?.remoteHeadSha && facts.remoteHeadSha !== cycle.headSha)
 		return {
 			kind: "ended",
 			reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.remoteHeadSha.slice(0, 12)}`,
 		};
-	const checks = facts?.checkStatus;
 	if (cycle.prNumber === null) {
 		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
 		if (checks?.prState === "closed") {
-			if (checks.merged && checks.headSha === cycle.headSha) return { kind: "passed" };
 			if (checks.merged)
 				return {
 					kind: "ended",
@@ -2898,7 +2909,6 @@ function checksOutcome(
 	if (checks === null || (checks && checks.prNumber !== cycle.prNumber))
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	if (checks?.prState === "closed") {
-		if (checks.merged && checks.headSha === cycle.headSha) return { kind: "passed" };
 		if (checks.merged)
 			return {
 				kind: "ended",
@@ -2947,14 +2957,24 @@ interface ChecksReportEffects {
 }
 
 /** The parent's report for a concluded checks cycle. */
-function checksReportText(name: string, cycle: AwaitingChecks, outcome: ChecksSettlement): string {
+function checksReportText(
+	name: string,
+	cycle: AwaitingChecks,
+	outcome: ChecksSettlement,
+	facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+): string {
 	const lead =
 		outcome.kind === "passed"
 			? `[lane ${name}] checks passed:`
 			: `[lane ${name}] ${outcome.kind === "failed" ? "failed" : "attempt_ended"}: awaiting_checks ${outcome.reason}`;
 	const checks = outcome.kind === "passed" ? " checks=green" : "";
-	const facts = `head=${cycle.headSha.slice(0, 12)} pr=${cycle.prNumber ?? "unknown"}${checks} prHead=${cycle.headSha.slice(0, 12)}`;
-	const suffix = ` ${facts}`;
+	const observedFacts = [
+		`head=${cycle.headSha.slice(0, 12)}`,
+		`pr=${cycle.prNumber ?? "unknown"}${checks}`,
+		`prHead=${facts?.checkStatus?.headSha.slice(0, 12) ?? "unknown"}`,
+		...(facts?.remoteHeadSha ? [`remoteHead=${facts.remoteHeadSha.slice(0, 12)}`] : []),
+	].join(" ");
+	const suffix = ` ${observedFacts}`;
 	return utf8Prefix(lead, 2048 - Buffer.byteLength(suffix, "utf8")) + suffix;
 }
 
@@ -3030,11 +3050,12 @@ async function collectRepoFacts(
 				}
 			}
 
-			// Try to get PR number and check status via check client
-			if (checkWhenUnpushed && checkClient) {
-				if (checksBeforeRemoteProbe !== undefined) result.checkStatus = checksBeforeRemoteProbe;
-			} else if (result.pushed !== false && checkClient) {
-				const checkStatus = await checkClient.getCheckStatus(branchName, worktreePath);
+			// Query even when the source ref is absent: GitHub retains merged PRs after branch deletion.
+			if (checkClient) {
+				const checkStatus =
+					checksBeforeRemoteProbe !== undefined
+						? checksBeforeRemoteProbe
+						: await checkClient.getCheckStatus(branchName, worktreePath);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
 		}
