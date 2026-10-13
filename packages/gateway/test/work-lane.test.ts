@@ -2398,6 +2398,110 @@ test("#481 repo-backed bare clones detect pushed branches without remote-trackin
 	}
 });
 
+test("#481 a local checkout lane pushes to its configured origin push URL", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("checkout-push-target");
+	const { calls, client } = recordingCheckClient({ prNumber: 485, status: "green", failingChecks: [] });
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const fetchUrl = "https://github.com/example/project.git";
+		git(repoDir, "remote", "add", "origin", fetchUrl);
+		git(repoDir, "remote", "set-url", "--push", "origin", bareRepo);
+
+		const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+		const name = "checkout-push";
+		const result = await f.manager.start({ name, text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const branch = `work/${name}`;
+		expect(git(job.lane.worktreePath, "remote", "get-url", "origin")).toBe(fetchUrl);
+		expect(git(job.lane.worktreePath, "remote", "get-url", "--push", "origin")).toBe(bareRepo);
+		git(job.lane.worktreePath, "push", "-u", "origin", branch);
+		git(bareRepo, "show-ref", "--verify", `refs/heads/${branch}`);
+		const accidentalLocalPush = Bun.spawnSync(["git", "-C", repoDir, "show-ref", "--verify", `refs/heads/${branch}`], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(accidentalLocalPush.exitCode).not.toBe(0);
+
+		f.port.complete(result.opRef, "pushed upstream");
+		await until(() => f.notices.some((notice) => notice.text.includes("[lane checkout-push] completed")));
+		const report = f.notices.find((notice) => notice.text.includes("[lane checkout-push] completed"))?.text ?? "";
+		expect(report).toContain("pushed=true");
+		expect(report).toContain("pr=485");
+		expect(report).toContain("checks=green");
+		expect(calls).toEqual([{ branch, cwd: job.lane.worktreePath }]);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("#481 remote push probes are asynchronous and bounded", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("bounded-remote-probe");
+	const f = await fixture({ ownerTarget: () => origin });
+	let remoteRequests = 0;
+	const slowRemote = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch() {
+			remoteRequests++;
+			await Bun.sleep(250);
+			return new Response("remote unavailable", { status: 503 });
+		},
+	});
+	try {
+		const name = "slow-remote";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const setPushUrl = Bun.spawnSync(
+			[
+				"git",
+				"-C",
+				f.job(name).lane.worktreePath,
+				"remote",
+				"set-url",
+				"--push",
+				"origin",
+				`http://127.0.0.1:${slowRemote.port}/repo.git`,
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(setPushUrl.exitCode).toBe(0);
+		let timerFired = false;
+		const timer = setTimeout(() => {
+			timerFired = true;
+		}, 50);
+		const start = Date.now();
+		f.port.complete(result.opRef, "remote probe");
+		const completionCallMs = Date.now() - start;
+		await Bun.sleep(100);
+		clearTimeout(timer);
+		expect(completionCallMs).toBeLessThan(100);
+		expect(timerFired).toBe(true);
+		await until(() => remoteRequests > 0);
+
+		let report: string | undefined;
+		for (let attempt = 0; attempt < 1_400 && report === undefined; attempt++) {
+			report = f.notices.find((notice) => notice.text.includes("[lane slow-remote] completed"))?.text;
+			if (report === undefined) await Bun.sleep(5);
+		}
+		expect(report).toContain("pushed=false");
+	} finally {
+		await slowRemote.stop(true);
+		await cleanup();
+	}
+});
+
 test("#481 settled report of a pushed lane with a red PR names the PR and failing checks", async () => {
 	const { client } = recordingCheckClient({ prNumber: 484, status: "red", failingChecks: ["lint", "test"] });
 	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
@@ -2512,7 +2616,7 @@ test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a 
 		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
 			stdout: "pipe",
 		});
-		expect(originUrl.stdout?.toString().trim()).toBe(bareRepo);
+		expect(originUrl.stdout?.toString().trim()).toBe(repoDir);
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
@@ -2540,6 +2644,23 @@ test("work.start with invalid repo throws invalid_params with git stderr", async
 	// Verify no worktree was created
 	const job = f.db.work.laneJobJson(laneJobIdentity("bad-repo").jobId);
 	expect(job).toBeUndefined();
+});
+
+test("work.start removes reserved paths when Git rejects the lane branch", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("invalid-lane-branch");
+	try {
+		const f = await fixture();
+		const name = "bad..name";
+		await expect(f.manager.start({ name, text: "work", repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "repo_worktree_failed" },
+		});
+		expect(await Bun.file(join(f.gajaewayHome, "lanes", name)).exists()).toBe(false);
+		expect(await Bun.file(join(managedLaneRepositoryPath(f.gajaewayHome, name), "HEAD")).exists()).toBe(false);
+		expect(f.db.work.laneJobJson(laneJobIdentity(name).jobId)).toBeUndefined();
+	} finally {
+		await cleanup();
+	}
 });
 
 test("work.start with repo and base parameter creates worktree from specified base", async () => {
@@ -2675,6 +2796,57 @@ test("#439 relay non-transport failure is not caught as transport failure", asyn
 	expect(relayErrorThrown).toBe(true);
 	expect(fallbackCalled).toBe(false);
 	expect(f.port.statusReads.filter((read) => read.opRef === result.opRef).every((read) => read.relayUsed)).toBe(true);
+});
+
+test("work.start resolves origin bases from local remote-tracking refs", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("remote-tracking-base");
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repoDir, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const defaultBranch = git("branch", "--show-current");
+		git("remote", "add", "origin", bareRepo);
+		git("push", "-q", "-u", "origin", defaultBranch);
+		git("checkout", "-q", "-b", "dev");
+		git("commit", "-q", "--allow-empty", "-m", "remote-only dev commit");
+		git("push", "-q", "-u", "origin", "dev");
+		const remoteDevSha = git("rev-parse", "refs/remotes/origin/dev");
+		git("checkout", "-q", defaultBranch);
+		git("branch", "-D", "dev");
+		const localDevBranch = Bun.spawnSync(["git", "-C", repoDir, "show-ref", "--verify", "refs/heads/dev"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(localDevBranch.exitCode).not.toBe(0);
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "remote-tracking-base",
+			text: "work",
+			repo: repoDir,
+			base: "origin/dev",
+		});
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("remote-tracking-base");
+		expect(job.baselineSha).toBe(remoteDevSha);
+		expect(git("rev-parse", "refs/remotes/origin/dev")).toBe(remoteDevSha);
+		const worktreeHead = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(worktreeHead.stdout?.toString().trim()).toBe(remoteDevSha);
+	} finally {
+		await cleanup();
+	}
 });
 
 test("issue #480: operator retire cleans up worktree and branch", async () => {
@@ -3099,7 +3271,9 @@ test("issue #480: all-dead retirement preserves the worktree", async () => {
 	}
 });
 
-async function bareRepoFixture(prefix: string): Promise<{ bareRepo: string; cleanup: () => Promise<void> }> {
+async function bareRepoFixture(
+	prefix: string,
+): Promise<{ repoDir: string; bareRepo: string; cleanup: () => Promise<void> }> {
 	const repoDir = await mkdtemp(join(tmpdir(), `${prefix}-src-`));
 	const bareRepo = await mkdtemp(join(tmpdir(), `${prefix}-bare-`));
 	const env = {
@@ -3113,6 +3287,7 @@ async function bareRepoFixture(prefix: string): Promise<{ bareRepo: string; clea
 	Bun.spawnSync(["git", "-C", repoDir, "commit", "-q", "--allow-empty", "-m", "initial"], { env });
 	Bun.spawnSync(["git", "clone", "-q", "--bare", repoDir, bareRepo], { env });
 	return {
+		repoDir,
 		bareRepo,
 		cleanup: async () => {
 			await rm(repoDir, { recursive: true, force: true });

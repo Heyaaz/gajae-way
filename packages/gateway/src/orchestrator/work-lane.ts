@@ -65,6 +65,7 @@ const owners = new WeakSet<Store>();
 const FAILURES_PER_READOPTION = 8;
 /** Ceiling for the failure backoff between reconciliation polls. */
 const MAX_FAILURE_BACKOFF_MS = 30_000;
+const REMOTE_REF_PROBE_TIMEOUT_MS = 5_000;
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
@@ -762,7 +763,7 @@ export class WorkLaneManager {
 				repositoryPath = createdWorktree.repositoryPath;
 			}
 			if (worktreePath === undefined) throw new Error("work lane path was not resolved");
-			const facts = await collectRepoFacts(worktreePath);
+			const facts = await collectRepoFacts(worktreePath, undefined, false);
 			job = createLaneJobRecord({
 				jobId,
 				branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
@@ -2457,6 +2458,7 @@ export function reportText(
 async function collectRepoFacts(
 	worktreePath: string,
 	checkClient?: CheckStatusClient,
+	includePushStatus = true,
 ): Promise<
 	| {
 			headSha?: string;
@@ -2490,17 +2492,20 @@ async function collectRepoFacts(
 			branch: branchName,
 		};
 
-		// Bare clones do not create remote-tracking refs, so verify the remote branch directly.
-		if (branchName && branchName !== "HEAD") {
-			const upstream = Bun.spawnSync(
-				["git", "-C", worktreePath, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${branchName}`],
-				{
-					stdout: "pipe",
-					stderr: "pipe",
-				},
+		// Bare clones do not create remote-tracking refs, so verify every configured push URL directly.
+		if (includePushStatus && branchName && branchName !== "HEAD") {
+			const pushUrlsResult = Bun.spawnSync(
+				["git", "-C", worktreePath, "remote", "get-url", "--push", "--all", "origin"],
+				{ stdout: "pipe", stderr: "pipe" },
 			);
-			const [upstreamSha, upstreamRef] = upstream.stdout.toString().trim().split(/\s+/, 2);
-			result.pushed = upstream.exitCode === 0 && upstreamSha === headSha && upstreamRef === `refs/heads/${branchName}`;
+			const pushUrls = pushUrlsResult.stdout
+				.toString()
+				.split(/\r?\n/)
+				.map((url) => url.trim())
+				.filter(Boolean);
+			const upstreamShas =
+				pushUrlsResult.exitCode === 0 ? await Promise.all(pushUrls.map((url) => remoteBranchSha(url, branchName))) : [];
+			result.pushed = pushUrls.length > 0 && upstreamShas.every((sha) => sha === headSha);
 
 			// Try to get PR number and check status via check client
 			if (result.pushed && checkClient) {
@@ -2512,6 +2517,22 @@ async function collectRepoFacts(
 		return result;
 	} catch {
 		return undefined;
+	}
+}
+
+async function remoteBranchSha(remoteUrl: string, branchName: string): Promise<string | null> {
+	try {
+		const child = Bun.spawn(["git", "ls-remote", "--exit-code", "--heads", remoteUrl, `refs/heads/${branchName}`], {
+			stdout: "pipe",
+			stderr: "ignore",
+			signal: AbortSignal.timeout(REMOTE_REF_PROBE_TIMEOUT_MS),
+		});
+		const [exitCode, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+		const [sha, ref] = output.trim().split(/\s+/, 2);
+		if (exitCode === 0 && ref === `refs/heads/${branchName}` && /^[0-9a-f]{40}$/.test(sha ?? "")) return sha ?? null;
+		return null;
+	} catch {
+		return null;
 	}
 }
 
@@ -2601,14 +2622,19 @@ async function createWorktreeFromRepo(
 	const repositoryPath = managedLaneRepositoryPath(absoluteLaneRoot, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, worktreePath, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, repositoryPath, laneName);
-	const { mkdir, rm, rmdir } = await import("node:fs/promises");
+	const { mkdir, rm } = await import("node:fs/promises");
 	let ownsRepositoryPath = false;
 	let ownsWorktreePath = false;
+	let worktreeAddAttempted = false;
 	let defaultRef: string | undefined;
 
 	try {
 		await mkdir(lanesDir, { recursive: true });
-		if (await pathExists(worktreePath)) {
+		try {
+			await mkdir(worktreePath);
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+			if (code !== "EEXIST") throw error;
 			throw new ProtocolError("invalid_params", "lane worktree path already exists", {
 				reasonCode: "lane_worktree_path_exists",
 				name: laneName,
@@ -2673,6 +2699,57 @@ async function createWorktreeFromRepo(
 				repo,
 			});
 		}
+		if (!isRemote) {
+			// Cloning a local checkout makes that path origin; retain its configured upstream URLs instead.
+			const sourceFetchUrls = Bun.spawnSync(["git", "-C", repo, "remote", "get-url", "--all", "origin"], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (sourceFetchUrls.exitCode === 0) {
+				const fetchUrls = sourceFetchUrls.stdout
+					.toString()
+					.split(/\r?\n/)
+					.map((url) => url.trim())
+					.filter(Boolean);
+				for (const [index, fetchUrl] of fetchUrls.entries()) {
+					const setFetchUrl = Bun.spawnSync(
+						index === 0
+							? ["git", "remote", "set-url", "origin", fetchUrl]
+							: ["git", "remote", "set-url", "--add", "origin", fetchUrl],
+						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+					);
+					if (setFetchUrl.exitCode !== 0) {
+						throw new ProtocolError("invalid_params", "failed to preserve repository fetch remote", {
+							reasonCode: "repo_fetch_remote_failed",
+							repo,
+						});
+					}
+				}
+			}
+			const sourcePushUrls = Bun.spawnSync(["git", "-C", repo, "remote", "get-url", "--push", "--all", "origin"], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (sourcePushUrls.exitCode === 0) {
+				for (const pushUrl of sourcePushUrls.stdout
+					.toString()
+					.split(/\r?\n/)
+					.map((url) => url.trim())
+					.filter(Boolean)) {
+					const setPushUrl = Bun.spawnSync(["git", "remote", "set-url", "--add", "--push", "origin", pushUrl], {
+						stdout: "pipe",
+						stderr: "pipe",
+						cwd: repositoryPath,
+					});
+					if (setPushUrl.exitCode !== 0) {
+						throw new ProtocolError("invalid_params", "failed to preserve repository push remote", {
+							reasonCode: "repo_push_remote_failed",
+							repo,
+						});
+					}
+				}
+			}
+		}
 		if (defaultRef) {
 			const symbolicHead = Bun.spawnSync(["git", "symbolic-ref", "HEAD", `refs/heads/${defaultRef}`], {
 				cwd: repositoryPath,
@@ -2699,12 +2776,41 @@ async function createWorktreeFromRepo(
 		}
 		if (baseRef.startsWith("origin/")) {
 			const localBranch = `refs/heads/${baseRef.slice("origin/".length)}`;
-			const branchCheck = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `${localBranch}^{commit}`], {
-				stdout: "ignore",
-				stderr: "ignore",
-				cwd: repositoryPath,
-			});
-			if (branchCheck.exitCode === 0) baseRef = localBranch;
+			let fetchedRemoteTrackingBase = false;
+			if (!isRemote) {
+				const sourceRef = `refs/remotes/${baseRef}`;
+				const sourceRefCheck = Bun.spawnSync(
+					["git", "-C", repo, "rev-parse", "--verify", "--quiet", `${sourceRef}^{commit}`],
+					{ stdout: "ignore", stderr: "ignore" },
+				);
+				if (sourceRefCheck.exitCode === 0) {
+					const fetch = Bun.spawnSync(["git", "fetch", "--no-tags", "--", repo, `+${sourceRef}:${localBranch}`], {
+						stdout: "pipe",
+						stderr: "pipe",
+						cwd: repositoryPath,
+					});
+					if (fetch.exitCode !== 0) {
+						throw new ProtocolError(
+							"invalid_params",
+							"base remote-tracking ref could not be copied to the lane repository",
+							{
+								reasonCode: "repo_base_not_found",
+								repo,
+							},
+						);
+					}
+					baseRef = localBranch;
+					fetchedRemoteTrackingBase = true;
+				}
+			}
+			if (!fetchedRemoteTrackingBase) {
+				const branchCheck = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `${localBranch}^{commit}`], {
+					stdout: "ignore",
+					stderr: "ignore",
+					cwd: repositoryPath,
+				});
+				if (branchCheck.exitCode === 0) baseRef = localBranch;
+			}
 		}
 		if (baseRef.startsWith("-")) {
 			throw new ProtocolError("invalid_params", "base must be a branch, tag, or commit ref", {
@@ -2726,6 +2832,7 @@ async function createWorktreeFromRepo(
 			});
 		}
 
+		worktreeAddAttempted = true;
 		const addResult = Bun.spawnSync(
 			["git", "worktree", "add", "-b", `work/${laneName.toLowerCase()}`, worktreePath, baseSha],
 			{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
@@ -2743,13 +2850,70 @@ async function createWorktreeFromRepo(
 			baseSha,
 		};
 	} catch (error) {
-		if (ownsRepositoryPath && repositoryPath !== undefined) await rm(repositoryPath, { recursive: true, force: true });
+		let partialWorktreeCleanupFailed = false;
 		if (ownsWorktreePath) {
-			try {
-				await rmdir(worktreePath);
-			} catch {
-				// A failed worktree add may leave no directory; never recursively remove a path we did not create.
+			if (worktreeAddAttempted && ownsRepositoryPath) {
+				Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
+					cwd: repositoryPath,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				try {
+					if (await pathExists(worktreePath)) await rm(worktreePath, { recursive: true, force: true });
+				} catch {
+					partialWorktreeCleanupFailed = true;
+				}
+				if (!partialWorktreeCleanupFailed) {
+					const prune = Bun.spawnSync(["git", "worktree", "prune"], {
+						cwd: repositoryPath,
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					const list = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+						cwd: repositoryPath,
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					if (prune.exitCode !== 0 || list.exitCode !== 0) {
+						partialWorktreeCleanupFailed = true;
+					} else {
+						const expectedWorktreePath = canonicalPathIncludingMissing(worktreePath);
+						partialWorktreeCleanupFailed = list.stdout
+							.toString()
+							.split(/\r?\n/)
+							.some((line) => {
+								if (!line.startsWith("worktree ")) return false;
+								try {
+									return canonicalPathIncludingMissing(line.slice("worktree ".length)) === expectedWorktreePath;
+								} catch {
+									return true;
+								}
+							});
+					}
+				}
+			} else {
+				try {
+					await rm(worktreePath, { recursive: true, force: true });
+				} catch {
+					partialWorktreeCleanupFailed = true;
+				}
 			}
+		}
+		if (ownsRepositoryPath && !partialWorktreeCleanupFailed)
+			try {
+				await rm(repositoryPath, { recursive: true, force: true });
+			} catch {
+				partialWorktreeCleanupFailed = true;
+			}
+		if (partialWorktreeCleanupFailed) {
+			throw new ProtocolError(
+				"invalid_params",
+				"failed to clean up partial lane worktree; managed repository was retained",
+				{
+					reasonCode: "repo_worktree_cleanup_failed",
+					repo,
+				},
+			);
 		}
 		if (error instanceof ProtocolError) throw error;
 		const message = error instanceof Error ? error.message : String(error);
