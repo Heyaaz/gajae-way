@@ -4060,15 +4060,43 @@ function isRetryableError(status: StatusReport, openTool?: boolean): boolean {
  * then to resume the original request. #167 still closes the steer window the
  * moment that reply is consumer-visible, so the next message starts its own
  * turn instead of piling onto this one.
+ *
+ * In a group room, though, every message of the conversation is steered into
+ * the running turn, including people talking to each other. An unconditional
+ * "answer this now" took the [SILENT] choice a fresh turn has away from the
+ * model, and it answered a remark one human made to another (live, 2026-10-13).
+ * A steer that did not address the persona (`directed: false`) is therefore
+ * framed as conversation it may answer only when it is meant for it, with the
+ * same [SILENT] convention as a normal turn; otherwise the model just continues.
+ * The token is offered only as the WHOLE reply: delivery drops any part that
+ * contains it, so [SILENT] next to real progress text would swallow that text.
+ * The header stays one bracketed line followed by the body in both shapes.
  */
-export function renderSteer(body: string): string {
+export function renderSteer(body: string, directed = true): string {
+	if (!directed)
+		return `[Another message in this conversation, received while you were still working on the previous request. It may not be meant for you: people here also talk to each other. If it is meant for you, answer it now in its own reply, then continue the previous request from where you left off; do not fold it into your final answer. If it is not meant for you (people talking among themselves, or addressed to someone else), do not answer it and do not mention it: just continue the previous request, and if you have nothing else to say, reply with exactly [SILENT] and nothing else. Do not restart or repeat what you already said.]\n${body}`;
 	return `[Additional message from the user, received while you were still working on their previous request. Answer this message now, in its own reply, then continue the previous request from where you left off. Do not wait until the end and do not fold it into your final answer. Do not restart or repeat what you already said.]\n${body}`;
+}
+
+/**
+ * Whether a steered chat message addressed the persona: a DM, an explicit
+ * mention, or a reply to one of its own messages. A row without engagement
+ * metadata (loopback, non-chat sources) is the operator talking to it.
+ */
+export function steerDirectedAtPersona(row: InboundMessageRow): boolean {
+	if (!row.engagement_json) return true;
+	const engagement = JSON.parse(row.engagement_json) as {
+		readonly group?: boolean;
+		readonly mentioned?: boolean;
+		readonly replyTo?: { readonly fromSelf?: boolean };
+	};
+	return engagement.group !== true || engagement.mentioned === true || engagement.replyTo?.fromSelf === true;
 }
 
 function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {
 	if (row.source === "lane_report")
 		return `[Internal report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n${row.body}`;
-	return renderSteer(lifecycle?.renderSteer?.(row) ?? row.body);
+	return renderSteer(lifecycle?.renderSteer?.(row) ?? row.body, steerDirectedAtPersona(row));
 }
 
 /**
