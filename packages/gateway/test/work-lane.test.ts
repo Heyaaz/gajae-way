@@ -1953,6 +1953,48 @@ test("child reports fall back when a nested parent is parked or done", async () 
 	}
 });
 
+test("#481 check-settlement reports fall back when a nested parent was aborted", async () => {
+	const checks = scriptedChecks({ prNumber: 510, status: "pending", failingChecks: [] });
+	const f = await fixture({
+		allowNested: () => true,
+		checkStatusClient: checks.client,
+		ownerTarget: () => origin,
+	});
+	f.setOwnerTarget(origin);
+	await laneRepo(f.directory, "fix/parent-aborted", true);
+	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
+	if (!parent.started) throw new Error("parent did not start");
+	const child = await f.manager.start({
+		name: "child",
+		text: "child work",
+		cwd: f.directory,
+		callerSessionId: parent.sessionId,
+	});
+	if (!child.started) throw new Error("child did not start");
+	f.port.complete(parent.opRef, "parent result");
+	await until(() => f.job("parent").state === "awaiting_checks");
+	f.port.complete(child.opRef, "child result");
+	await until(() => f.job("child").state === "awaiting_checks");
+	const { awaitingChecks: _, ...parentWithoutChecks } = f.job("parent");
+	const abortedParent = {
+		...parentWithoutChecks,
+		state: "aborted" as const,
+		updatedAt: new Date().toISOString(),
+	};
+	f.db.transaction((tx) =>
+		f.db.work.putLaneJob(tx, {
+			...abortedParent,
+			laneKey: laneJobIdentity("parent").laneKey,
+			json: JSON.stringify(abortedParent),
+		}),
+	);
+	checks.set({ prNumber: 510, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job("child").state === "done");
+	expect(f.job("parent").state).toBe("aborted");
+	expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+	expect(f.notices.some((notice) => notice.text.startsWith("[lane child] checks passed:"))).toBe(true);
+});
+
 test("torn nested steer replays with the same clientRef after restart and consumes once", async () => {
 	const f = await fixture({ allowNested: () => true });
 	f.setOwnerTarget(origin);
@@ -3274,6 +3316,30 @@ test("#481 an exact merged PR snapshot settles before later source-branch moveme
 	expect(checksNotice(f, "[lane a] checks passed")).toContain(
 		`pr=503 checks=green prHead=${head.slice(0, 12)} remoteHead=${advancedHead.slice(0, 12)}`,
 	);
+});
+
+test("#481 an exact merged PR snapshot wins over later local HEAD movement", async () => {
+	const checks = scriptedChecks({ prNumber: 505, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const branch = "fix/merged-local-advanced";
+	const { head } = await awaitingLane(f, branch);
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const advanced = Bun.spawnSync(
+		["git", "-C", f.directory, "commit", "-q", "--allow-empty", "-m", "unrelated local commit"],
+		{ env, stdout: "pipe", stderr: "pipe" },
+	);
+	expect(advanced.exitCode).toBe(0);
+	const advancedHead = Bun.spawnSync(["git", "-C", f.directory, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(advancedHead).not.toBe(head);
+	checks.set({ prNumber: 505, headSha: head, status: "pending", failingChecks: [], prState: "closed", merged: true });
+	await pollUntil(f, () => f.job().state === "done");
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(`head=${head.slice(0, 12)} pr=505`);
 });
 
 test("#481 green checks cannot settle after the remote branch advances beyond the local head", async () => {

@@ -1121,6 +1121,7 @@ export class WorkGroup {
 			const parent = parseLaneJobRecord(json);
 			return (
 				parent.jobId === jobId &&
+				parent.state !== "aborted" &&
 				parent.state !== "awaiting_checks" &&
 				parent.state !== "awaiting_operator" &&
 				parent.state !== "stalled" &&

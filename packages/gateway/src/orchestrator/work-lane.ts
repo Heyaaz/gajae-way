@@ -1941,6 +1941,10 @@ export class WorkLaneManager {
 					continue;
 				}
 				if (row.state !== "pending") continue;
+				if (job.state === "aborted") {
+					this.#fallbackLaneReport(row, "parent_aborted");
+					continue;
+				}
 				const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
 				if (open) {
 					const runtime = this.#attemptByOpRef(open.opRef);
@@ -2875,8 +2879,6 @@ function checksOutcome(
 	facts: Awaited<ReturnType<typeof collectRepoFacts>>,
 	now: number,
 ): ChecksOutcome {
-	if (facts?.headSha && facts.headSha !== cycle.headSha)
-		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.headSha.slice(0, 12)}` };
 	const checks = facts?.checkStatus;
 	if (
 		checks?.prState === "closed" &&
@@ -2885,6 +2887,8 @@ function checksOutcome(
 		(cycle.prNumber === null || checks.prNumber === cycle.prNumber)
 	)
 		return { kind: "passed" };
+	if (facts?.headSha && facts.headSha !== cycle.headSha)
+		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.headSha.slice(0, 12)}` };
 	if (facts?.remoteHeadSha && facts.remoteHeadSha !== cycle.headSha)
 		return {
 			kind: "ended",
