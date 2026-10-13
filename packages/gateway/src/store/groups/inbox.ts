@@ -128,6 +128,17 @@ export class InboxGroup {
 			n: number;
 		}>;
 	}
+
+	unquarantinedOrigins(): string[] {
+		return (
+			this.#db
+				.prepare(
+					"SELECT DISTINCT origin_key FROM inbound_messages i WHERE NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = i.message_id)",
+				)
+				.all() as Array<{ origin_key: string }>
+		).map((row) => row.origin_key);
+	}
+
 	openCount(): number {
 		return (
 			(
