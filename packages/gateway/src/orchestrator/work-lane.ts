@@ -49,7 +49,13 @@ import {
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
 import { readFailedTransportCause } from "./failed-turn-evidence";
-import { type LaneForceRetireReason, type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
+import {
+	type LaneForceRetireReason,
+	type LaneGovernor,
+	laneJobIdentity,
+	managedLaneRepositoryPath,
+	workSessionKey,
+} from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import { isSessionUnavailable, type SessionPort } from "./session-port";
 import { isRelayTransportFailure, type TailHandle } from "./tail-runner";
@@ -718,7 +724,7 @@ export class WorkLaneManager {
 		assertOutsideServiceDirectory(this.#options.serviceDirectory, candidateWorktreePath, input.name);
 		const candidateRepositoryPath =
 			job?.lane.repositoryPath ??
-			(!job && input.repo !== undefined ? join(laneRoot, "repositories", input.name.toLowerCase()) : undefined);
+			(!job && input.repo !== undefined ? managedLaneRepositoryPath(laneRoot, input.name) : undefined);
 		if (candidateRepositoryPath !== undefined)
 			assertOutsideServiceDirectory(this.#options.serviceDirectory, candidateRepositoryPath, input.name);
 		const open = job?.attempts.find((attempt) => attempt.endedAt === undefined);
@@ -2484,13 +2490,17 @@ async function collectRepoFacts(
 			branch: branchName,
 		};
 
-		// Check if HEAD is pushed to origin/<branch>
+		// Bare clones do not create remote-tracking refs, so verify the remote branch directly.
 		if (branchName && branchName !== "HEAD") {
-			const upstream = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", `origin/${branchName}`], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			result.pushed = upstream.exitCode === 0 && upstream.stdout.toString().trim() === headSha;
+			const upstream = Bun.spawnSync(
+				["git", "-C", worktreePath, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${branchName}`],
+				{
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const [upstreamSha, upstreamRef] = upstream.stdout.toString().trim().split(/\s+/, 2);
+			result.pushed = upstream.exitCode === 0 && upstreamSha === headSha && upstreamRef === `refs/heads/${branchName}`;
 
 			// Try to get PR number and check status via check client
 			if (result.pushed && checkClient) {
@@ -2588,7 +2598,7 @@ async function createWorktreeFromRepo(
 	const lanesDir = join(absoluteLaneRoot, "lanes");
 	const worktreePath = join(lanesDir, laneName);
 	const isRemote = isGitRemoteUrl(repo);
-	const repositoryPath = join(absoluteLaneRoot, "repositories", laneName.toLowerCase());
+	const repositoryPath = managedLaneRepositoryPath(absoluteLaneRoot, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, worktreePath, laneName);
 	assertOutsideServiceDirectory(serviceDirectory, repositoryPath, laneName);
 	const { mkdir, rm, rmdir } = await import("node:fs/promises");

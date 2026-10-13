@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
@@ -12,7 +12,12 @@ import {
 } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { classifyCheckRollup } from "../src/orchestrator/gh-checks";
-import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
+import {
+	LaneGovernor,
+	laneJobIdentity,
+	managedLaneRepositoryPath,
+	workSessionKey,
+} from "../src/orchestrator/lane-governor";
 import {
 	parseWorkerOutputResponse,
 	type SessionBindInput,
@@ -39,6 +44,13 @@ afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 const origin: OriginRef = { platform: "discord", kind: "channel", conversationId: "work-results" };
+
+test("managed repository paths preserve exact lane-name identity", () => {
+	const root = "/tmp/gajaeway";
+	expect(managedLaneRepositoryPath(root, "Foo")).not.toBe(managedLaneRepositoryPath(root, "foo"));
+	expect(managedLaneRepositoryPath(root, "Foo")).toBe(join(root, "repositories", Buffer.from("Foo").toString("hex")));
+});
+
 async function until(predicate: () => boolean): Promise<void> {
 	for (let i = 0; i < 600 && !predicate(); i++) await Bun.sleep(5);
 	expect(predicate()).toBe(true);
@@ -71,7 +83,7 @@ async function fixture(
 		},
 	});
 	const notices: ChatMessagePayload[] = [];
-	const lanes = new LaneGovernor({ database: db, sessionPort: port, maxLanes: 2 });
+	const lanes = new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome, maxLanes: 2 });
 	let implicitOwner: OriginRef | undefined;
 	const ownerTarget = options.ownerTarget ?? (() => implicitOwner);
 	let manager = new WorkLaneManager({
@@ -1143,7 +1155,7 @@ test("issue #480: an existing managed repository path is not removed on collisio
 	const { bareRepo, cleanup } = await bareRepoFixture("repository-path-collision");
 	try {
 		const f = await fixture();
-		const repositoryPath = join(f.gajaewayHome, "repositories", "occupied");
+		const repositoryPath = managedLaneRepositoryPath(f.gajaewayHome, "occupied");
 		await mkdir(repositoryPath, { recursive: true });
 		const sentinelPath = join(repositoryPath, "keep.txt");
 		await Bun.write(sentinelPath, "preserve");
@@ -1193,7 +1205,7 @@ test("issue #480: repo URL creates a cwd-independent worktree with the bound pus
 		const job = f.job("remote-binding");
 		expect(job.lane.worktreePath).toBe(join(f.gajaewayHome, "lanes", "remote-binding"));
 		expect(job.lane.repository).toBe(repositoryUrl);
-		expect(job.lane.repositoryPath).toBe(join(f.gajaewayHome, "repositories", "remote-binding"));
+		expect(job.lane.repositoryPath).toBe(managedLaneRepositoryPath(f.gajaewayHome, "remote-binding"));
 		expect(job.baselineSha).toMatch(/^[0-9a-f]{40}$/);
 		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
 			stdout: "pipe",
@@ -1482,7 +1494,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 	let manager = new WorkLaneManager({
 		database: db,
 		port,
-		lanes: new LaneGovernor({ database: db, sessionPort: port }),
+		lanes: new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome }),
 		gajaewayHome,
 		serviceDirectory: gajaewayHome,
 		ownerTarget: () => origin,
@@ -1502,7 +1514,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 	manager = new WorkLaneManager({
 		database: db,
 		port,
-		lanes: new LaneGovernor({ database: db, sessionPort: port }),
+		lanes: new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome }),
 		gajaewayHome,
 		serviceDirectory: gajaewayHome,
 		pollMs: 5,
@@ -2352,6 +2364,40 @@ test("#481 settled report of a pushed lane without an open PR says pushed=true a
 	expect(calls).toEqual([{ branch: "fix/no-pr", cwd: f.directory }]);
 });
 
+test("#481 repo-backed bare clones detect pushed branches without remote-tracking refs", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("bare-clone-push-check");
+	const { calls, client } = recordingCheckClient({ prNumber: 484, status: "green", failingChecks: [] });
+	try {
+		const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+		const name = "bare-push";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const branch = `work/${name}`;
+		const trackingRef = Bun.spawnSync(
+			["git", "-C", job.lane.repositoryPath!, "show-ref", "--verify", `refs/remotes/origin/${branch}`],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(trackingRef.exitCode).not.toBe(0);
+
+		const push = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "push", "-u", "origin", branch], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(push.exitCode).toBe(0);
+
+		f.port.complete(result.opRef, "pushed");
+		await until(() => f.notices.some((notice) => notice.text.includes("[lane bare-push] completed")));
+		const report = f.notices.find((notice) => notice.text.includes("[lane bare-push] completed"))?.text ?? "";
+		expect(report).toContain("pushed=true");
+		expect(report).toContain("pr=484");
+		expect(report).toContain("checks=green");
+		expect(calls).toEqual([{ branch, cwd: job.lane.worktreePath }]);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("#481 settled report of a pushed lane with a red PR names the PR and failing checks", async () => {
 	const { client } = recordingCheckClient({ prNumber: 484, status: "red", failingChecks: ["lint", "test"] });
 	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
@@ -2454,7 +2500,7 @@ test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a 
 		expect(job.lane.worktreePath).toContain("lanes/worktree-test");
 		expect(job.lane.worktreePath.startsWith(join(laneRoot, "lanes"))).toBe(true);
 		expect(job.lane.repository).toBe(bareRepo);
-		expect(job.lane.repositoryPath).toBe(join(laneRoot, "repositories", "worktree-test"));
+		expect(job.lane.repositoryPath).toBe(managedLaneRepositoryPath(laneRoot, "worktree-test"));
 
 		// Verify worktree was created with proper branch
 		const branchResult = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
@@ -2761,6 +2807,46 @@ test("issue #480: cleanup failure on operator retire fails the retirement", asyn
 	}
 });
 
+test("issue #480: operator retire refuses a persisted repository path outside its managed lane directory", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("repository-path-corruption");
+	try {
+		const f = await fixture();
+		const name = "corrupt-repository-path";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const managedRepositoryPath = f.job(name).lane.repositoryPath!;
+		const unrelatedDirectory = join(f.directory, "unrelated-repository");
+		await mkdir(unrelatedDirectory);
+		const sentinelPath = join(unrelatedDirectory, "keep.txt");
+		await Bun.write(sentinelPath, "preserve");
+
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		const job = f.job(name);
+		const corrupted = { ...job, lane: { ...job.lane, repositoryPath: unrelatedDirectory } };
+		f.db.transaction((tx) =>
+			f.db.work.putLaneJob(tx, {
+				jobId: corrupted.jobId,
+				laneKey: `work-${name}`,
+				state: corrupted.state,
+				createdAt: corrupted.createdAt,
+				updatedAt: corrupted.updatedAt,
+				lane: { branch: corrupted.lane.branch, worktreePath: corrupted.lane.worktreePath },
+				json: JSON.stringify(corrupted),
+			}),
+		);
+
+		const retired = await f.lanes.retire(name, "operator");
+		expect(retired.retired).toBe(false);
+		if (!retired.retired) expect(retired.reason).toContain("worktree cleanup failed");
+		expect(await Bun.file(sentinelPath).text()).toBe("preserve");
+		expect(await Bun.file(join(managedRepositoryPath, "HEAD")).exists()).toBe(true);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("issue #480: operator retire tolerates an externally removed worktree", async () => {
 	const { bareRepo, cleanup } = await bareRepoFixture("external-worktree-removal");
 	try {
@@ -2770,7 +2856,6 @@ test("issue #480: operator retire tolerates an externally removed worktree", asy
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job(name);
 		const repositoryPath = job.lane.repositoryPath!;
-		const canonicalWorktreePath = await realpath(job.lane.worktreePath);
 
 		f.port.complete(result.opRef, "test complete");
 		await until(() => f.db.work.workAttemptOpen().length === 0);
@@ -2784,7 +2869,12 @@ test("issue #480: operator retire tolerates an externally removed worktree", asy
 			stderr: "pipe",
 		});
 		expect(staleRegistration.exitCode).toBe(0);
-		expect(staleRegistration.stdout?.toString()).toContain(`worktree ${canonicalWorktreePath}`);
+		const registeredPaths = staleRegistration.stdout
+			?.toString()
+			.split(/\r?\n/)
+			.filter((line) => line.startsWith("worktree "))
+			.map((line) => line.slice("worktree ".length).replace(/\\/g, "/"));
+		expect(registeredPaths?.some((path) => path.endsWith(`/lanes/${name}`))).toBe(true);
 
 		const retired = await f.lanes.retire(name, "operator");
 		expect(retired.retired).toBe(true);
@@ -3054,7 +3144,7 @@ test("issue #480: a generated worktree inside the service checkout is refused", 
 			code: "invalid_params",
 			detail: { reasonCode: "cwd_inside_service_dir" },
 		});
-		expect(await Bun.file(join(f.serviceDirectory, "lanes-root", "repositories", "a")).exists()).toBe(false);
+		expect(await Bun.file(managedLaneRepositoryPath(join(f.serviceDirectory, "lanes-root"), "a")).exists()).toBe(false);
 	} finally {
 		await cleanup();
 	}
