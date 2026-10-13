@@ -221,12 +221,12 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	const attachOnlyEnv = `${GJC_ATTACH_ONLY_ENV}=0`;
 	const output = [
 		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
-		`300 401 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
-		`300 402 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir}2 ${attachOnlyEnv}`,
-		`300 403 Mon Oct 13 03:20:00 2026 bun ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
-		`300 404 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} --extra HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
-		`300 405 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} other ${attachOnlyEnv}`,
-		`300 406 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} OTHER=value ${attachOnlyEnv}`,
+		`300 401 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`300 402 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir}2`,
+		`300 403 Mon Oct 13 03:20:00 2026 bun ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`300 404 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} --extra HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`300 405 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir} other`,
+		`300 406 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir} OTHER=value`,
 		`300 407 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv} ${attachOnlyEnv}`,
 	].join("\n");
 	const table = parseUnixProcessTable(output, spacedAgentDir);
@@ -265,10 +265,10 @@ test("Unix ps parser preserves spaced gateway and Bun launcher paths", () => {
 	const output = [
 		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
 		`300 501 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedSource} daemon`,
-		`501 601 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
+		`501 601 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
 		`300 502 Mon Oct 13 03:20:00 2026 ${spacedGateway} daemon`,
-		`502 602 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
-		`300 603 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
+		`502 602 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`300 603 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
 	].join("\n");
 	const table = parseUnixProcessTable(output, spacedAgentDir, { gjcPath: spacedGjc, gjcPrefix: spacedPrefix });
 

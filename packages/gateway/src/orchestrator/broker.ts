@@ -361,8 +361,8 @@ export class GlobalGjcClient {
 		this.discoveryPath = join(this.agentDir, "sdk", "broker.json");
 		this.#env = {
 			...trusted,
-			GJC_CODING_AGENT_DIR: this.agentDir,
 			[GJC_ATTACH_ONLY_ENV]: "0",
+			GJC_CODING_AGENT_DIR: this.agentDir,
 		};
 		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
 		this.#timeout = integer(options.healthProbeTimeoutMs, COMMAND_TIMEOUT_MS, 1);
