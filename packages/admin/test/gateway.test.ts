@@ -7,7 +7,7 @@ import { AdminGateway, type AdminGatewayRetryOptions } from "../src/gateway";
 
 type Peer = { end(): void; write(data: string): unknown };
 type Frame = { type: string; id?: string; verb?: string };
-type RetryTask = { callback: () => void; delayMs: number; cancelled: boolean; ran: boolean };
+type RetryTask = { callback: () => void; delayMs: number; dueAt: number; cancelled: boolean; ran: boolean };
 
 type FixtureOptions = {
 	negotiate?: boolean;
@@ -110,9 +110,10 @@ async function until(predicate: () => boolean): Promise<void> {
 
 function retryScheduler() {
 	const tasks: RetryTask[] = [];
+	let now = 0;
 	const options: AdminGatewayRetryOptions = {
 		setTimeout: ((callback: () => void, delayMs: number) => {
-			const task = { callback, delayMs, cancelled: false, ran: false };
+			const task = { callback, delayMs, dueAt: now + delayMs, cancelled: false, ran: false };
 			tasks.push(task);
 			return task as unknown as ReturnType<typeof setTimeout>;
 		}) as typeof setTimeout,
@@ -120,8 +121,23 @@ function retryScheduler() {
 			(timer as unknown as RetryTask).cancelled = true;
 		},
 	};
+	const advanceBy = (delayMs: number) => {
+		const deadline = now + delayMs;
+		for (;;) {
+			const task = tasks
+				.filter((item) => !item.cancelled && !item.ran && item.dueAt <= deadline)
+				.sort((left, right) => left.dueAt - right.dueAt)[0];
+			if (!task) break;
+			now = task.dueAt;
+			task.ran = true;
+			task.callback();
+		}
+		now = deadline;
+	};
 	return {
 		options,
+		now: () => now,
+		advanceBy,
 		pending: () => tasks.filter((task) => !task.cancelled && !task.ran),
 		firstPending: () => {
 			const task = tasks.find((item) => !item.cancelled && !item.ran);
@@ -140,8 +156,7 @@ function retryScheduler() {
 		runNext: () => {
 			const task = tasks.find((item) => !item.cancelled && !item.ran);
 			if (!task) throw new Error("no scheduled retry");
-			task.ran = true;
-			task.callback();
+			advanceBy(Math.max(0, task.dueAt - now));
 			return task;
 		},
 	};
@@ -152,6 +167,7 @@ test("admin startup retries with its own backoff until the gateway is available"
 	const path = join(directory, "gateway.sock");
 	const retries = retryScheduler();
 	const logs: string[] = [];
+	const startupLogs = () => logs.filter((line) => line.startsWith(`Gateway socket ${path} unavailable;`));
 	const errorSpy = spyOn(console, "error").mockImplementation((line) => logs.push(String(line)));
 	let server: ReturnType<typeof listenGateway> | undefined;
 	let gateway: AdminGateway | undefined;
@@ -162,8 +178,8 @@ test("admin startup retries with its own backoff until the gateway is available"
 		});
 		await until(() => retries.pending().length === 1);
 		expect(retries.firstPending().delayMs).toBe(500);
-		expect(logs).toHaveLength(1);
-		expect(logs[0]).toContain("retry 1 in 500ms");
+		expect(startupLogs()).toHaveLength(1);
+		expect(startupLogs()[0]).toContain("retry 1 in 500ms");
 
 		server = listenGateway(path);
 		retries.runNext();
@@ -258,6 +274,7 @@ test("reconnect backoff escalates through crash loops and resets only after stab
 	let gateway: AdminGateway | undefined;
 	const retries = retryScheduler();
 	const logs: string[] = [];
+	const gatewayLogs = () => logs.filter((line) => line.startsWith("Admin gateway "));
 	let random = 0.999;
 	const errorSpy = spyOn(console, "error").mockImplementation((line) => logs.push(String(line)));
 	try {
@@ -276,14 +293,18 @@ test("reconnect backoff escalates through crash loops and resets only after stab
 			retries.runNext();
 			await until(() => retries.pending().length === 1);
 		}
-		expect(logs).toEqual(["Admin gateway disconnected; reconnecting."]);
+		expect(gatewayLogs()).toEqual(["Admin gateway disconnected; reconnecting."]);
 
 		replacement = listenGateway(path);
 		await until(() => retries.pending().length === 1);
 		expect(retries.pending()[0]?.delayMs).toBe(30_000);
 		retries.runNext();
 		await until(() => gateway?.connected === true);
-		expect(logs).toEqual(["Admin gateway disconnected; reconnecting.", "Admin gateway reconnected."]);
+		expect(gatewayLogs()).toEqual(["Admin gateway disconnected; reconnecting.", "Admin gateway reconnected."]);
+		const unstableStabilityTimer = retries.lastPending();
+		retries.advanceBy(unstableStabilityTimer.delayMs - 1);
+		expect(retries.now()).toBe(unstableStabilityTimer.dueAt - 1);
+		expect(unstableStabilityTimer.ran).toBe(false);
 
 		replacement.stop();
 		await until(() => gateway?.connected === false);
@@ -295,13 +316,14 @@ test("reconnect backoff escalates through crash loops and resets only after stab
 		await until(() => gateway?.connected === true);
 		const stabilityTimer = retries.lastPending();
 		expect(stabilityTimer.delayMs).toBe(30_000);
-		retries.run(stabilityTimer);
+		retries.advanceBy(stabilityTimer.delayMs);
+		expect(stabilityTimer.ran).toBe(true);
 		random = 0;
 		replacement.stop();
 		await until(() => gateway?.connected === false);
 		await until(() => retries.pending().length === 1);
 		expect(retries.pending()[0]?.delayMs).toBe(500);
-		expect(logs).toEqual([
+		expect(gatewayLogs()).toEqual([
 			"Admin gateway disconnected; reconnecting.",
 			"Admin gateway reconnected.",
 			"Admin gateway disconnected; reconnecting.",
