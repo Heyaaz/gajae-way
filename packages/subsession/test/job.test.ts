@@ -627,6 +627,30 @@ describe("awaiting_checks cycle (#481)", () => {
 		expect(reparked.awaitingChecks?.retries).toBe(1);
 	});
 
+	test("a lookup-pending cycle can bind its PR later without resetting the deadline", () => {
+		const closed = closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		const startedAt = NOW.toISOString();
+		const discovering = transitionToAwaitingChecks({
+			record: closed,
+			at: startedAt,
+			prNumber: null,
+			headSha: HEAD,
+		});
+		const discovered = transitionToAwaitingChecks({
+			record: discovering,
+			at: new Date(NOW.getTime() + 60_000).toISOString(),
+			prNumber: 7,
+			headSha: HEAD,
+		});
+		expect(parseLaneJobRecord(JSON.stringify(discovering))).toEqual(discovering);
+		expect(discovered.awaitingChecks).toEqual({ prNumber: 7, headSha: HEAD, since: startedAt, retries: 0 });
+	});
+
 	test("settling closes the cycle: passed is done, failed holds for an operator, ended is continuable", () => {
 		const at = NOW.toISOString();
 		expect(settleAwaitingChecks(awaiting(), at, { kind: "passed" })).toMatchObject({ state: "done" });

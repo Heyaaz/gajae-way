@@ -11,6 +11,7 @@ interface RollupEntry {
 }
 
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
+const SUCCESS_CONCLUSIONS = new Set(["SUCCESS"]);
 const FAILED_STATES = new Set(["FAILURE", "ERROR"]);
 
 /**
@@ -38,7 +39,9 @@ export function classifyCheckRollup(
 			pending = true;
 			continue;
 		}
-		if (FAILED_CONCLUSIONS.has(entry.conclusion?.toUpperCase() ?? "")) failingChecks.push(label);
+		const conclusion = entry.conclusion?.toUpperCase() ?? "";
+		if (FAILED_CONCLUSIONS.has(conclusion)) failingChecks.push(label);
+		else if (!SUCCESS_CONCLUSIONS.has(conclusion)) pending = true;
 	}
 	const status = failingChecks.length > 0 ? "red" : pending ? "pending" : "green";
 	return { prNumber, headSha, status, failingChecks: [...new Set(failingChecks)] };
@@ -61,7 +64,7 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 						"--limit",
 						"1",
 						"--json",
-						"number,commits,statusCheckRollup",
+						"number,headRefOid,statusCheckRollup",
 					],
 					{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
 				);
@@ -69,12 +72,12 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 				if (exitCode !== 0) return undefined;
 				const prs = JSON.parse(stdout) as Array<{
 					number: number;
-					commits: Array<{ oid: string }>;
+					headRefOid: string;
 					statusCheckRollup?: RollupEntry[] | null;
 				}>;
 				const pr = prs[0];
 				if (!pr) return null;
-				const headSha = pr.commits.at(-1)?.oid;
+				const headSha = pr.headRefOid;
 				if (!headSha) return undefined;
 				return classifyCheckRollup(pr.number, headSha, pr.statusCheckRollup ?? []);
 			} catch {

@@ -118,7 +118,8 @@ export type JobCheckpoint = {
 
 /** A lane's PR-checks cycle; persisted so retries and the deadline survive restarts. */
 export type AwaitingChecks = {
-	readonly prNumber: number;
+	/** Null until the first successful GitHub lookup discovers an open PR. */
+	readonly prNumber: number | null;
 	/** The pushed HEAD the checks run against; any other HEAD ends the wait. */
 	readonly headSha: string;
 	/** When the current wait began; the timeout is measured from here. */
@@ -337,7 +338,7 @@ function parseAwaitingChecks(value: unknown): AwaitingChecks {
 		throw new LaneJobError("awaitingChecks must be an object");
 	}
 	const block = value as Record<string, unknown>;
-	const prNumber = parseCounter(block.prNumber, "awaitingChecks.prNumber");
+	const prNumber = block.prNumber === null ? null : parseCounter(block.prNumber, "awaitingChecks.prNumber");
 	if (prNumber === 0) throw new LaneJobError("awaitingChecks.prNumber must be positive");
 	return Object.freeze({
 		prNumber,
@@ -756,7 +757,7 @@ export function closeAttempt(input: CloseAttemptInput): LaneJobRecord {
 export type AwaitingChecksInput = {
 	readonly record: LaneJobRecord;
 	readonly at: string;
-	readonly prNumber: number;
+	readonly prNumber: number | null;
 	/** The pushed HEAD the PR checks run against. */
 	readonly headSha: string;
 };
@@ -768,6 +769,15 @@ export type AwaitingChecksInput = {
  * carry over, so a re-steered attempt cannot reset the bound.
  */
 export function transitionToAwaitingChecks(input: AwaitingChecksInput): LaneJobRecord {
+	if (input.record.state === "awaiting_checks") {
+		const cycle = input.record.awaitingChecks;
+		if (!cycle || cycle.prNumber !== null || input.prNumber === null) return input.record;
+		return Object.freeze({
+			...input.record,
+			awaitingChecks: Object.freeze({ ...cycle, prNumber: input.prNumber }),
+			updatedAt: input.at,
+		});
+	}
 	if (input.record.state !== "attempt_ended") {
 		return input.record;
 	}

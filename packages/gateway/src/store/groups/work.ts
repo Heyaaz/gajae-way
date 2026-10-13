@@ -984,7 +984,7 @@ export class WorkGroup {
 		const reportQuarantine =
 			scope === "all"
 				? "1 = 1"
-				: `${scope === "quarantined" ? "EXISTS" : "NOT EXISTS"} (SELECT 1 FROM work_attempt_runtime r JOIN broker_quarantine q ON q.kind = 'work' AND q.subject_id = r.job_id WHERE r.op_ref = lane_reports.child_op_ref)`;
+				: `${scope === "quarantined" ? "EXISTS" : "NOT EXISTS"} (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = 'lanejob-' || lower(hex(lane_reports.child_name)))`;
 		const read = <T>(sql: string): T[] => {
 			try {
 				return this.#db.prepare(sql).all() as T[];
@@ -1001,7 +1001,7 @@ export class WorkGroup {
 				`SELECT op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json, (SELECT cutover_id FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) AS cutover_id FROM work_attempt_runtime WHERE ${quarantine("work_attempt_runtime", "job_id")} ORDER BY op_ref`,
 			),
 			laneReports: read<OpenWorkRows["laneReports"][number]>(
-				`SELECT report_id, parent_name, child_name, state, body, (SELECT q.cutover_id FROM work_attempt_runtime r JOIN broker_quarantine q ON q.kind = 'work' AND q.subject_id = r.job_id WHERE r.op_ref = lane_reports.child_op_ref LIMIT 1) AS cutover_id FROM lane_reports WHERE state IN ('pending','claimed') AND ${reportQuarantine} ORDER BY report_id`,
+				`SELECT report_id, parent_name, child_name, state, body, (SELECT q.cutover_id FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = 'lanejob-' || lower(hex(lane_reports.child_name)) LIMIT 1) AS cutover_id FROM lane_reports WHERE state IN ('pending','claimed') AND ${reportQuarantine} ORDER BY report_id`,
 			),
 		};
 	}

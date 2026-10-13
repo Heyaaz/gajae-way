@@ -964,6 +964,16 @@ DELETE FROM schema_migrations WHERE version > 34;
 			f.raw.query("UPDATE lane_jobs SET updated_at = ? WHERE job_id = ?").run(END, f.record.jobId),
 		).toThrow();
 		expect(() => f.raw.query("DELETE FROM lane_jobs WHERE job_id = ?").run(f.record.jobId)).toThrow();
+		const syntheticOpRef = "gw-checks-a-abababababab";
+		f.raw
+			.query(
+				"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
+			)
+			.run(`lane-report-${"a".repeat(64)}`, "parent", "a", syntheticOpRef, "checks passed", END, END);
+		expect(migrated.work.readOpenWorkRows("replayable").laneReports).toEqual([]);
+		expect(migrated.work.readOpenWorkRows("quarantined").laneReports).toMatchObject([
+			{ child_name: "a", cutover_id: "cutover-v35", state: "pending" },
+		]);
 		f.raw
 			.query(
 				"INSERT INTO lane_jobs (job_id, lane_key, branch, worktree_path, state, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

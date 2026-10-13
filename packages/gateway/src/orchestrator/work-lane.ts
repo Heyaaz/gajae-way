@@ -100,6 +100,8 @@ const HOST_LOST_GRACE_MS = 30_000;
 const AWAITING_CHECKS_RETRY_LIMIT = 2;
 /** How long a lane may wait in awaiting_checks before it settles with a timeout. */
 const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000;
+/** Bound concurrent GitHub/remote probes so one slow lane does not serialize recovery. */
+const AWAITING_CHECKS_POLL_CONCURRENCY = 16;
 const refusalCodes = new Set([
 	"busy",
 	"steer_refused",
@@ -513,6 +515,7 @@ export class WorkLaneManager {
 			errorCode,
 			endedAt,
 		});
+		const settledRecord = clearAwaitingChecks(closed);
 		const text = reportText(name, endState, terminal.reasonCode, opRef, output);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
@@ -562,7 +565,7 @@ export class WorkLaneManager {
 		const settled = this.#settleAttempt(
 			opRef,
 			runtime.version,
-			closed,
+			settledRecord,
 			{ decision, settledAt: endedAt, terminal, ...(output !== runtime.output ? { output } : {}) },
 			admission,
 		);
@@ -812,6 +815,14 @@ export class WorkLaneManager {
 				jobId,
 				state: job.state,
 				reason: "the lane is awaiting PR checks; wait for check polling to settle it",
+			};
+		if (job?.state === "done")
+			return {
+				started: false,
+				held: true,
+				jobId,
+				state: job.state,
+				reason: "the lane is complete; retire it before creating another lane with this name",
 			};
 		if (job && (job.state === "awaiting_operator" || job.state === "stalled")) {
 			if (!input.resume)
@@ -1501,23 +1512,25 @@ export class WorkLaneManager {
 					classification: progressed ? "progressed" : endState === "completed" ? "held" : "stalled",
 				});
 			}
-			if (endState === "completed" && facts?.headSha) {
-				const checks = facts.checkStatus;
+			if (endState === "completed") {
+				const checks = facts?.checkStatus;
 				const previousCycle = job.awaitingChecks;
 				if (previousCycle !== undefined) {
 					job = transitionToAwaitingChecks({
 						record: job,
 						at,
-						prNumber: previousCycle.prNumber,
-						headSha: facts.headSha,
+						prNumber: previousCycle.prNumber ?? (facts?.pushed === true ? (checks?.prNumber ?? null) : null),
+						headSha: facts?.pushed === true && facts.headSha !== undefined ? facts.headSha : previousCycle.headSha,
 					});
-				} else if (checks && (checks.status === "pending" || checks.status === "green")) {
+				} else if (facts?.headSha && checks) {
 					job = transitionToAwaitingChecks({
 						record: job,
 						at,
 						prNumber: checks.prNumber,
 						headSha: facts.headSha,
 					});
+				} else if (facts?.headSha && checks === undefined && facts.pushed === true && this.#options.checkStatusClient) {
+					job = transitionToAwaitingChecks({ record: job, at, prNumber: null, headSha: facts.headSha });
 				}
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
@@ -1647,24 +1660,30 @@ export class WorkLaneManager {
 	async #pollAwaitingChecks(): Promise<void> {
 		const client = this.#options.checkStatusClient;
 		if (this.#stopped || !client) return;
-		for (const row of this.#db.work.laneJobRows()) {
-			if (this.#stopped) return;
-			if (row.state !== "awaiting_checks" || !row.lane_key.startsWith("work-")) continue;
-			try {
-				await this.#pollLaneChecks(row.lane_key.slice("work-".length), client);
-			} catch (error) {
-				console.error(`awaiting_checks_poll_error jobId=${row.job_id} reason=${failureReason(error)}`);
-			}
+		const rows = this.#db.work
+			.laneJobRows()
+			.filter((row) => row.state === "awaiting_checks" && row.lane_key.startsWith("work-"));
+		for (let offset = 0; offset < rows.length && !this.#stopped; offset += AWAITING_CHECKS_POLL_CONCURRENCY) {
+			const batch = rows.slice(offset, offset + AWAITING_CHECKS_POLL_CONCURRENCY);
+			await Promise.all(
+				batch.map(async (row) => {
+					try {
+						await this.#pollLaneChecks(row.lane_key.slice("work-".length), client);
+					} catch (error) {
+						console.error(`awaiting_checks_poll_error jobId=${row.job_id} reason=${failureReason(error)}`);
+					}
+				}),
+			);
 		}
 	}
 	async #pollLaneChecks(name: string, client: CheckStatusClient): Promise<void> {
 		const observed = this.#job(name);
 		const cycle = observed?.awaitingChecks;
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
-		const facts = await collectRepoFacts(observed.lane.worktreePath, client);
+		const facts = await collectRepoFacts(observed.lane.worktreePath, client, true, true);
 		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
 			if (this.#stopped) return undefined;
-			const job = this.#job(name);
+			let job = this.#job(name);
 			// Another writer moved the lane on while the checks were read.
 			const currentCycle = job?.awaitingChecks;
 			if (
@@ -1677,16 +1696,27 @@ export class WorkLaneManager {
 				currentCycle.retries !== cycle.retries
 			)
 				return undefined;
-			const outcome = checksOutcome(currentCycle, facts, this.#now());
+			if (currentCycle.prNumber === null && facts?.checkStatus) {
+				job = transitionToAwaitingChecks({
+					record: job,
+					at: this.#at(),
+					prNumber: facts.checkStatus.prNumber,
+					headSha: currentCycle.headSha,
+				});
+				this.#putJob(name, job);
+			}
+			const activeCycle = job.awaitingChecks!;
+			const outcome = checksOutcome(activeCycle, facts, this.#now());
 			if (outcome.kind === "wait") return undefined;
 			if (outcome.kind === "red") {
-				if (currentCycle.retries < AWAITING_CHECKS_RETRY_LIMIT) {
+				if (activeCycle.prNumber === null) return undefined;
+				if (activeCycle.retries < AWAITING_CHECKS_RETRY_LIMIT) {
 					await this.#resteerRedChecks(name, job, outcome.failingChecks);
 					return undefined;
 				}
 				return this.#settleChecks(name, job, {
 					kind: "failed",
-					reason: `checks=red(${outcome.failingChecks.join(",")}) after ${currentCycle.retries} re-steers`,
+					reason: `checks=red(${outcome.failingChecks.join(",")}) after ${activeCycle.retries} re-steers`,
 				});
 			}
 			return this.#settleChecks(name, job, outcome);
@@ -1711,6 +1741,7 @@ export class WorkLaneManager {
 	/** Spends one retry, then continues the lane's session with the failing check names. */
 	async #resteerRedChecks(name: string, job: LaneJobRecord, failingChecks: readonly string[]): Promise<void> {
 		const cycle = job.awaitingChecks!;
+		if (cycle.prNumber === null) throw new Error("cannot re-steer before discovering the open PR");
 		const counted = recordChecksRetry(job, this.#at());
 		this.#putJob(name, counted);
 		const retries = counted.awaitingChecks!.retries;
@@ -2782,6 +2813,19 @@ function checksOutcome(
 	if (facts?.headSha && facts.headSha !== cycle.headSha)
 		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.headSha.slice(0, 12)}` };
 	const checks = facts?.checkStatus;
+	if (cycle.prNumber === null) {
+		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
+		if (checks && checks.headSha !== cycle.headSha)
+			return {
+				kind: "ended",
+				reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}`,
+			};
+		if (checks?.status === "green") return { kind: "passed" };
+		if (checks?.status === "red") return { kind: "red", failingChecks: checks.failingChecks };
+		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+		return { kind: "wait" };
+	}
 	// null: the branch has no open PR; a different number: the recorded PR is not the open one.
 	if (checks === null || (checks && checks.prNumber !== cycle.prNumber))
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
@@ -2803,7 +2847,7 @@ interface ChecksReportEffects {
 
 /** The parent's report for a concluded checks cycle. */
 function checksReportText(name: string, cycle: AwaitingChecks, outcome: ChecksSettlement): string {
-	const facts = `head=${cycle.headSha.slice(0, 12)} pr=${cycle.prNumber}`;
+	const facts = `head=${cycle.headSha.slice(0, 12)} pr=${cycle.prNumber ?? "unknown"}`;
 	const text =
 		outcome.kind === "passed"
 			? `[lane ${name}] checks passed: ${facts} checks=green`
@@ -2815,6 +2859,7 @@ async function collectRepoFacts(
 	worktreePath: string,
 	checkClient?: CheckStatusClient,
 	includePushStatus = true,
+	checkWhenUnpushed = false,
 ): Promise<
 	| {
 			headSha?: string;
@@ -2865,7 +2910,7 @@ async function collectRepoFacts(
 			result.pushed = pushUrls.length > 0 && upstreamShas.every((sha) => sha === headSha);
 
 			// Try to get PR number and check status via check client
-			if (result.pushed && checkClient) {
+			if ((result.pushed || checkWhenUnpushed) && checkClient) {
 				const checkStatus = await checkClient.getCheckStatus(branchName, worktreePath);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
