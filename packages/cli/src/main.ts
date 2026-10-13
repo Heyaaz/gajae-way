@@ -3,6 +3,7 @@
 import { isAbsolute } from "node:path";
 
 import type {
+	MonitorEventOperatorResult,
 	MonitorEventRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
@@ -84,7 +85,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -225,6 +226,13 @@ interface ParsedMonitorTestArgs {
 
 const MONITOR_TEST_USAGE = "usage: gajaeway monitors test <id> [--type T] [--payload J] [--wait[=SECONDS]]";
 const MONITOR_WAIT_ERROR = `${MONITOR_TEST_USAGE}\n--wait expects a finite non-negative integer up to 86400`;
+const MONITOR_OPERATOR_USAGE = "usage: gajaeway monitors settle <eventId>|retry <eventId>";
+
+function parseMonitorEventOperatorArgs(args: readonly string[]): string {
+	const eventId = args[0];
+	if (args.length !== 1 || !eventId?.trim() || eventId.startsWith("--")) throw new Error(MONITOR_OPERATOR_USAGE);
+	return eventId;
+}
 
 function parseMonitorTestArgs(args: readonly string[]): ParsedMonitorTestArgs {
 	const [monitorId, ...flags] = args;
@@ -265,7 +273,7 @@ function parseMonitorTestArgs(args: readonly string[]): ParsedMonitorTestArgs {
 	};
 }
 
-const TERMINAL_MONITOR_STAGES = new Set(["delivered", "authored_no_delivery", "failed", "failed_no_retry"]);
+const TERMINAL_MONITOR_STAGES = new Set(["delivered", "authored_no_delivery", "failed", "failed_no_retry", "skipped"]);
 
 function waitForMonitorStage(client: GajaewayClient, eventId: string, timeoutSeconds: number): Promise<string> {
 	return new Promise((resolve) => {
@@ -833,6 +841,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const listOptions = command === "list" ? parseListOptions(args, MONITOR_COLUMNS) : undefined;
 				const update = command === "update" ? parseMonitorUpdateArgs(args) : undefined;
 				const monitorTest = command === "test" ? parseMonitorTestArgs(args) : undefined;
+				const operatorEventId =
+					command === "settle" || command === "retry" ? parseMonitorEventOperatorArgs(args) : undefined;
 				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					if (command === "add" && args[0] === "--json" && args[1])
@@ -870,9 +880,15 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							const stage = await waitForMonitorStage(client, result.eventId, monitorTest.waitSeconds);
 							console.log(JSON.stringify({ eventId: result.eventId, stage }));
 						}
+					} else if ((command === "settle" || command === "retry") && operatorEventId !== undefined) {
+						const result = await client.request<MonitorEventOperatorResult>(`monitor.${command}`, {
+							eventId: operatorEventId,
+						});
+						console.log(JSON.stringify(result));
+						if (!result.done) process.exitCode = 1;
 					} else
 						throw new Error(
-							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J] [--wait[=SECONDS]]`,
+							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]]`,
 						);
 				} finally {
 					await client.close();

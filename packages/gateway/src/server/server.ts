@@ -16,6 +16,7 @@ import {
 	isPlatformMessageId,
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
+	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	type MonitorScheduleProjection,
@@ -1661,6 +1662,16 @@ async function handleRequest(
 				params.payload ?? {},
 			);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { eventId } });
+			return;
+		}
+		case "monitor.settle":
+		case "monitor.retry": {
+			const eventId = (request.params as { eventId?: unknown } | undefined)?.eventId;
+			if (typeof eventId !== "string" || eventId.trim().length === 0)
+				throw new ProtocolError("invalid_params", `${request.verb} requires a non-empty eventId`);
+			const result: MonitorEventOperatorResult =
+				request.verb === "monitor.settle" ? runtime.monitors.settle(eventId) : runtime.monitors.retry(eventId);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
 		case "monitor.remove": {

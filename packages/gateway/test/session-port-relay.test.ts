@@ -7,8 +7,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliResult, type CliRunner, TranscriptIncompleteError } from "@gajae-gateway/subsession";
-import { BrokerSessionPort } from "../src/orchestrator/session-port";
-import { TailRunner } from "../src/orchestrator/tail-runner";
+import type { SessionRelayStream } from "../src/orchestrator/broker";
+import {
+	BrokerSessionPort,
+	LastAssistantUnreadableError,
+	SESSION_REQUEST_STEPS,
+	sessionRequestStep,
+} from "../src/orchestrator/session-port";
+import { RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
 import {
 	createOwnedSessionFixture,
@@ -298,4 +304,133 @@ test("session.last_assistant over the relay rejects an incomplete page without a
 	expect(error).toBeInstanceOf(TranscriptIncompleteError);
 	expect(f.cli).toEqual([]);
 	await f.handle.close();
+});
+
+test("session request exposes the exact closed diagnostic step vocabulary", () => {
+	expect(SESSION_REQUEST_STEPS).toEqual(["authority", "attach", "send", "status", "last_assistant", "close"]);
+});
+
+test("session request tags a failed send and a failed status probe independently", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: () => ({ ok: true, result: {} }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const sendFailure = Object.freeze(new Error("private send detail"));
+	const statusFailure = Object.freeze(new Error("private status detail"));
+	f.port.send = async () => {
+		throw sendFailure;
+	};
+	f.port.status = async () => {
+		throw statusFailure;
+	};
+	const observed = await f.port
+		.request({ sessionId: "sdk-1", repo: f.repo, text: "request", opRef: "gw-step-send-status" })
+		.catch((error: unknown) => error);
+	expect(observed).toBe(sendFailure);
+	expect(Object.isFrozen(sendFailure)).toBe(true);
+	expect(Object.isFrozen(statusFailure)).toBe(true);
+	expect(sessionRequestStep(sendFailure)).toBe("send");
+	expect(sessionRequestStep(statusFailure)).toBe("status");
+	await f.handle.close();
+});
+
+test("session request wraps primitive send rejections with a safe message and original cause", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => {
+			if (request.operation === "turn.result")
+				return { ok: true, result: { kind: "prompt", status: "unknown", clientRef: request.input.clientRef } };
+			return { ok: true, result: {} };
+		},
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const primitive = "private send failure detail";
+	f.port.send = async () => {
+		throw primitive;
+	};
+	const observed = await f.port
+		.request({ sessionId: "sdk-1", repo: f.repo, text: "request", opRef: "gw-step-primitive" })
+		.catch((error: unknown) => error);
+	expect(observed).toBeInstanceOf(Error);
+	expect((observed as Error).message).not.toContain(primitive);
+	expect((observed as Error).cause).toBe(primitive);
+	expect(sessionRequestStep(observed)).toBe("send");
+	await f.handle.close();
+});
+
+test("session request tags status and last_assistant failures at their own stages", async () => {
+	const status = await fixture({
+		mode: "answer",
+		relayReply: (request) => {
+			if (request.operation === "turn.result")
+				return { ok: false, error: { code: "invalid_params", message: "status refused" } };
+			return { ok: true, result: {} };
+		},
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const statusError = await status.port
+		.request({ sessionId: "sdk-1", repo: status.repo, text: "request", opRef: "gw-step-status" })
+		.catch((error: unknown) => error);
+	expect(sessionRequestStep(statusError)).toBe("status");
+	await status.handle.close();
+
+	const lastAssistant = await fixture({
+		mode: "answer",
+		relayReply: (request) => {
+			if (request.operation === "turn.result")
+				return { ok: true, result: { kind: "prompt", status: "terminal_ok", clientRef: request.input.clientRef } };
+			if (request.operation === "session.last_assistant") return { ok: true, page: { items: [null], complete: true } };
+			return { ok: true, result: {} };
+		},
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const lastAssistantError = await lastAssistant.port
+		.request({ sessionId: "sdk-1", repo: lastAssistant.repo, text: "request", opRef: "gw-step-last-assistant" })
+		.catch((error: unknown) => error);
+	expect(lastAssistantError).toBeInstanceOf(LastAssistantUnreadableError);
+	expect((lastAssistantError as LastAssistantUnreadableError).code).toBe("last_assistant_null_item");
+	expect(sessionRequestStep(lastAssistantError)).toBe("last_assistant");
+	await lastAssistant.handle.close();
+});
+
+test("a pre-send hello timeout is classified as relay_hello_missing", async () => {
+	let finishLines!: () => void;
+	const ended = new Promise<void>((resolve) => {
+		finishLines = resolve;
+	});
+	const lines: AsyncIterable<string> = {
+		[Symbol.asyncIterator](): AsyncIterator<string> {
+			let endedStream = false;
+			return {
+				async next(): Promise<IteratorResult<string>> {
+					if (endedStream) return { done: true, value: undefined };
+					await ended;
+					endedStream = true;
+					return { done: true, value: undefined };
+				},
+			};
+		},
+	};
+	const stream: SessionRelayStream = {
+		lines,
+		write: () => {},
+		close: () => finishLines(),
+	};
+	const runner = new TailRunner({ stream: () => stream, repo: "/tmp", helloTimeoutMs: 5 });
+	const error = await runner
+		.attach({ sessionId: "sdk-hello", brokerGeneration: 0, repo: "/tmp" })
+		.catch((failure: unknown) => failure);
+	expect(error).toBeInstanceOf(RelayHelloError);
+	expect((error as RelayHelloError).code).toBe("relay_hello_missing");
+	expect((error as RelayHelloError).childState).toBe("stream_open");
+	expect((error as RelayHelloError).elapsedMs).toBeGreaterThanOrEqual(0);
 });

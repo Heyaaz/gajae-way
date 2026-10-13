@@ -331,6 +331,52 @@ export interface SessionRequestInput extends SessionSendInput {
 	readonly pollMs?: number;
 }
 
+export const SESSION_REQUEST_STEPS = ["authority", "attach", "send", "status", "last_assistant", "close"] as const;
+export type SessionRequestStep = (typeof SESSION_REQUEST_STEPS)[number];
+
+const SESSION_REQUEST_ERROR_STEPS = new WeakMap<object, SessionRequestStep>();
+
+class SessionRequestStepError extends Error {
+	constructor(step: SessionRequestStep, cause: unknown) {
+		super(`session request failed during ${step}`, { cause });
+		this.name = "SessionRequestStepError";
+	}
+}
+
+function markSessionRequestStep(error: unknown, step: SessionRequestStep): unknown {
+	if ((typeof error === "object" && error !== null) || typeof error === "function") {
+		if (!SESSION_REQUEST_ERROR_STEPS.has(error)) SESSION_REQUEST_ERROR_STEPS.set(error, step);
+		return error;
+	}
+	const wrapped = new SessionRequestStepError(step, error);
+	SESSION_REQUEST_ERROR_STEPS.set(wrapped, step);
+	return wrapped;
+}
+
+/** Returns the request stage associated with an error without mutating it. */
+export function sessionRequestStep(error: unknown): SessionRequestStep | undefined {
+	if ((typeof error !== "object" || error === null) && typeof error !== "function") return undefined;
+	return SESSION_REQUEST_ERROR_STEPS.get(error);
+}
+
+export type LastAssistantUnreadableCode =
+	| "last_assistant_not_json"
+	| "last_assistant_no_page"
+	| "last_assistant_no_items"
+	| "last_assistant_null_item"
+	| "last_assistant_non_text_item";
+
+/** A protocol-safe diagnosis for an invalid `session.last_assistant` page. */
+export class LastAssistantUnreadableError extends Error {
+	readonly code: LastAssistantUnreadableCode;
+
+	constructor(code: LastAssistantUnreadableCode) {
+		super(`session.last_assistant response is unreadable (${code})`);
+		this.name = "LastAssistantUnreadableError";
+		this.code = code;
+	}
+}
+
 export interface SessionRequestResult {
 	readonly receipt: SendReceipt;
 	readonly status: StatusReport;
@@ -1288,24 +1334,31 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
-		this.#assertOwned(input);
+		try {
+			this.#assertOwned(input);
+		} catch (error) {
+			throw markSessionRequestStep(error, "authority");
+		}
 		// One relay owns the whole request: the send, the terminal wait, and the
 		// final read. Monitor/batch authoring consumes no mid-turn content, so
 		// the handle's frames only feed the stall alarm and the activity lease.
 		let lastActivityAt = this.#now();
-		const relay = await this.attachTail({
-			sessionId: input.sessionId,
-			brokerGeneration: 0,
-			repo: input.repo,
-			...(input.originKey ? { originKey: input.originKey } : {}),
-			onFrame: () => {
-				lastActivityAt = this.#now();
-			},
-			onStall: ({ elapsedMs }) =>
-				console.warn(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
-		});
-		relay.beginTurn(input.opRef);
-		relay.setTurnRunning(true);
+		let relay: TailHandle;
+		try {
+			relay = await this.attachTail({
+				sessionId: input.sessionId,
+				brokerGeneration: 0,
+				repo: input.repo,
+				...(input.originKey ? { originKey: input.originKey } : {}),
+				onFrame: () => {
+					lastActivityAt = this.#now();
+				},
+				onStall: ({ elapsedMs }) =>
+					console.warn(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
+			});
+		} catch (error) {
+			throw markSessionRequestStep(error, error instanceof BrokerAuthorityError ? "authority" : "attach");
+		}
 		// `turn.result` on the relay while it is up; on the CLI (the authoritative
 		// recovery transport) when the relay tore. A torn relay is never a verdict
 		// about the operation: the accepted op keeps being observed under the SAME
@@ -1315,30 +1368,45 @@ export class BrokerSessionPort implements SessionPort {
 			try {
 				return await this.status({ ...target, relay });
 			} catch (error) {
-				if (!isRelayTransportFailure(error)) throw error;
+				if (!isRelayTransportFailure(error)) throw markSessionRequestStep(error, "status");
 				console.error(`status_relay_unavailable session=${input.sessionId} opRef=${input.opRef}`);
-				return await this.status(target);
+				try {
+					return await this.status(target);
+				} catch (fallbackError) {
+					throw markSessionRequestStep(fallbackError, "status");
+				}
 			}
 		};
+		let result: SessionRequestResult | undefined;
+		let requestFailed = false;
+		let requestError: unknown;
 		try {
+			try {
+				relay.beginTurn(input.opRef);
+				relay.setTurnRunning(true);
+			} catch (error) {
+				throw markSessionRequestStep(error, "attach");
+			}
 			let receipt: SendReceipt;
 			let status: StatusReport | undefined;
 			try {
 				receipt = await this.send({ ...input, relay });
 				relay.correlate(input.opRef, receipt);
 			} catch (sendError) {
-				if (sendError instanceof BrokerAuthorityError) throw sendError;
+				if (sendError instanceof BrokerAuthorityError) throw markSessionRequestStep(sendError, "authority");
+				const taggedSendError = markSessionRequestStep(sendError, "send");
 				// A transport/control failure may occur after the runtime accepted the
 				// prompt. Query the SAME clientRef before retrying; monitor authoring
 				// otherwise ran the event, produced a final answer, then executed it
 				// again because the torn send was treated as definitive failure.
 				try {
 					status = await readStatus();
-				} catch (error) {
-					if (error instanceof BrokerAuthorityError) throw error;
-					throw sendError;
+				} catch (statusError) {
+					const taggedStatusError = markSessionRequestStep(statusError, "status");
+					if (statusError instanceof BrokerAuthorityError) throw taggedStatusError;
+					throw taggedSendError;
 				}
-				if (status.status.status === "unknown") throw sendError;
+				if (status.status.status === "unknown") throw taggedSendError;
 				receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
 			}
 			// The wait leases on the turn's own activity: every frame the relay
@@ -1354,17 +1422,42 @@ export class BrokerSessionPort implements SessionPort {
 				status = await readStatus();
 			}
 			if (!isTerminalStatus(status.status.status))
-				throw new SessionRequestTimeoutError(input.sessionId, input.opRef, status);
-			if (status.status.status !== "terminal_ok") throw new SessionTerminalError(status);
-			return {
+				throw markSessionRequestStep(new SessionRequestTimeoutError(input.sessionId, input.opRef, status), "status");
+			if (status.status.status !== "terminal_ok")
+				throw markSessionRequestStep(new SessionTerminalError(status), "status");
+			result = {
 				receipt,
 				status,
-				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }),
+				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }).catch(
+					(error: unknown) => {
+						throw markSessionRequestStep(error, "last_assistant");
+					},
+				),
 			};
-		} finally {
-			relay.setTurnRunning(false);
-			await relay.close();
+		} catch (error) {
+			requestFailed = true;
+			requestError = error;
 		}
+		let cleanupFailed = false;
+		let cleanupError: unknown;
+		try {
+			relay.setTurnRunning(false);
+		} catch (error) {
+			cleanupFailed = true;
+			cleanupError = error;
+		}
+		try {
+			await relay.close();
+		} catch (error) {
+			if (!cleanupFailed) {
+				cleanupFailed = true;
+				cleanupError = error;
+			}
+		}
+		if (requestFailed) throw requestError;
+		if (cleanupFailed) throw markSessionRequestStep(cleanupError, "close");
+		if (result === undefined) throw new Error("session request completed without a result");
+		return result;
 	}
 
 	#assertOwned(input: { sessionId: string; repo: string }): void {
@@ -1658,21 +1751,25 @@ function parseLastAssistantPage(result: CliResult): LastAssistantPage {
 	let envelope: Record<string, unknown>;
 	try {
 		const parsed: unknown = JSON.parse(result.stdout);
-		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+			throw new LastAssistantUnreadableError("last_assistant_no_page");
 		envelope = parsed as Record<string, unknown>;
-	} catch {
-		throw new Error("session.last_assistant did not print a JSON query response");
+	} catch (error) {
+		if (error instanceof LastAssistantUnreadableError) throw error;
+		throw new LastAssistantUnreadableError("last_assistant_not_json");
 	}
-	if (envelope.ok !== true) {
+	if (envelope.ok === false) {
 		parseEnvelope<unknown>(result, "session raw query session.last_assistant");
-		throw new Error("unreachable failed session.last_assistant query response");
 	}
+	if (envelope.ok !== true) throw new LastAssistantUnreadableError("last_assistant_no_page");
 	const page = envelope.page;
 	if (typeof page !== "object" || page === null || Array.isArray(page))
-		throw new Error("session.last_assistant succeeded without a query page");
+		throw new LastAssistantUnreadableError("last_assistant_no_page");
 	const items = (page as Record<string, unknown>).items;
-	if (!Array.isArray(items) || items.some((item) => typeof item !== "string"))
-		throw new Error("session.last_assistant query page contained non-text items");
+	if (!Array.isArray(items)) throw new LastAssistantUnreadableError("last_assistant_no_items");
+	if (items.some((item) => item === null)) throw new LastAssistantUnreadableError("last_assistant_null_item");
+	if (items.some((item) => typeof item !== "string"))
+		throw new LastAssistantUnreadableError("last_assistant_non_text_item");
 	// gjc hosts grant `continuationCursor`; older CLI prints carried `cursor`.
 	const record = page as Record<string, unknown>;
 	const cursor = typeof record.continuationCursor === "string" ? record.continuationCursor : record.cursor;

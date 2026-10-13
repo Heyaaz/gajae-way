@@ -3,6 +3,7 @@ import {
 	type ChatMessagePayload,
 	eventTypeOrigin,
 	isSilentOutput,
+	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	monitorSessionOrigin,
@@ -14,10 +15,19 @@ import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
-import { isSessionBusy, type SessionPort } from "../orchestrator/session-port";
-import type { Store } from "../store";
+import {
+	isSessionBusy,
+	LastAssistantUnreadableError,
+	type SessionPort,
+	SessionRequestTimeoutError,
+	SessionTerminalError,
+	sessionRequestStep,
+} from "../orchestrator/session-port";
+import { RelayClosedError, RelayHelloError, RelayRefusedError } from "../orchestrator/tail-runner";
+import { BrokerAuthorityError, type Store } from "../store";
 import {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
+	MONITOR_EVENT_MAX_OPEN_AGE_MS,
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
 	type MonitorEventDbRow,
 	RECONCILABLE_STAGES,
@@ -87,6 +97,9 @@ type DispatchFailureCode =
 	// re-dispatches instead of waiting for the lease to expire, and the failure
 	// row names the session whose host may have outlived the gateway.
 	| "gateway_shutdown"
+	| "session_host_unavailable"
+	| "authoring_result_unreadable"
+	| "broker_authority_refused"
 	| "event_type_invalid"
 	| "monitor_invalid"
 	| "internal_error";
@@ -97,7 +110,11 @@ type DispatchFailureCode =
  * attempt to a fresh session), `gateway_shutdown` was this process's own stop
  * (#225: the next boot re-dispatches at once). Both still consume the budget.
  */
-const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode>(["session_busy", "gateway_shutdown"]);
+const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode>([
+	"session_busy",
+	"gateway_shutdown",
+	"session_host_unavailable",
+]);
 
 /**
  * How long shutdown waits for in-flight authoring turns before marking them
@@ -518,6 +535,7 @@ export class MonitorPropagator {
 	 * than five consecutive sweeps (#179); BACKOFF_EXEMPT_FAILURES retry at once.
 	 */
 	async reconcile(): Promise<void> {
+		this.reapStale();
 		if (this.#reconciling) {
 			// Yield once so a caller racing the first sweep observes its claimed work
 			// rather than an artificial pre-bind microtask gap in the shared port.
@@ -651,6 +669,39 @@ export class MonitorPropagator {
 			this.#reconciling = false;
 		}
 	}
+
+	/** End one recoverable event without discarding its saved authoring-turn pointer. */
+	settle(eventId: string): MonitorEventOperatorResult {
+		const result = this.#database.transaction((tx) =>
+			this.#database.monitors.eventOperatorSettle(tx, eventId, this.#now()),
+		);
+		if (!result.settled) return { eventId, done: false, reason: result.reason };
+		const row = this.#database.monitors.eventGet(eventId);
+		if (row) this.#emitStage(row, "failed_no_retry");
+		return { eventId, done: true, previousStage: result.previousStage };
+	}
+
+	/** Reset a failed event's reclaim budget and immediately run reconciliation. */
+	retry(eventId: string): MonitorEventOperatorResult {
+		const result = this.#database.transaction((tx) =>
+			this.#database.monitors.eventOperatorRetry(tx, eventId, this.#now()),
+		);
+		if (!result.retried) return { eventId, done: false, reason: result.reason };
+		const row = this.#database.monitors.eventGet(eventId);
+		if (row) this.#emitStage(row, "failed");
+		void this.reconcile().catch(() => console.error(`monitor retry reconcile failed: event ${eventId}`));
+		return { eventId, done: true, previousStage: result.previousStage };
+	}
+
+	/** Reap stale open events while retaining any #508 authoring-turn pointer for recovery. */
+	reapStale(): number {
+		const now = this.#now();
+		const cutoff = new Date(now - MONITOR_EVENT_MAX_OPEN_AGE_MS).toISOString();
+		const rows = this.#database.transaction((tx) => this.#database.monitors.eventReapStale(tx, cutoff, now));
+		for (const row of rows) this.#emitStage(row, "failed_no_retry");
+		return rows.length;
+	}
+
 	/** Only an explicitly failed operation can be discarded; completed output is resumed under its original op-ref. */
 	async #exhaustedTurnDisposition(row: MonitorEventDbRow): Promise<ExhaustedTurnDisposition> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
@@ -1182,7 +1233,10 @@ export class MonitorPropagator {
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
-				const failureClass = classifyAuthoringFailure(error);
+				const failureClass =
+					error instanceof LastAssistantUnreadableError || sessionRequestStep(error) === "last_assistant"
+						? "executor"
+						: classifyAuthoringFailure(error);
 				const protocolFailure =
 					protocolValidationActive && failureClass === "protocol" && protocolResponseByteLength !== undefined
 						? {
@@ -1355,6 +1409,16 @@ export class MonitorPropagator {
 				state.stalledSessionId = sessionId;
 				console.error(
 					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_busy_stalled busy_failures=${state.busyFailures}/${MONITOR_BUSY_FAILURE_ROLL_THRESHOLD} session=${sessionId ?? "none"} turns=${state.turns}`,
+				);
+			}
+			return;
+		}
+		if (isSessionHostUnavailable(error)) {
+			state.busyFailures = 0;
+			if (currentEpoch && !state.pendingRoll) {
+				state.pendingRoll = "session_host_unavailable";
+				console.error(
+					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_host_unavailable session=${sessionId ?? "none"} turns=${state.turns}`,
 				);
 			}
 			return;
@@ -1558,6 +1622,12 @@ export class MonitorPropagator {
 }
 
 function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase: string): DispatchFailureCode {
+	const step = phase === "request" ? sessionRequestStep(error) : undefined;
+	if (error instanceof LastAssistantUnreadableError || step === "last_assistant") return "authoring_result_unreadable";
+	if (isSessionHostUnavailable(error)) return "session_host_unavailable";
+	if (error instanceof BrokerAuthorityError) return "broker_authority_refused";
+	if (error instanceof SessionTerminalError || error instanceof SessionRequestTimeoutError)
+		return "authoring_turn_failed";
 	// Context exhaustion outranks the phase codes: it is the one class the safety
 	// net acts on, and an operator must be able to see it in the event row.
 	if (failureClass === "context") return "authoring_context_exhausted";
@@ -1586,7 +1656,16 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	if (message.includes("session send") || message.includes("SessionPort")) return "authoring_turn_failed";
 	if (message.includes("session bind")) return "session_bind_failed";
 	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
+	if (step !== undefined) return "authoring_turn_failed";
 	return "internal_error";
+}
+
+/** Only positive evidence that the prompt was not sent can justify rolling a session. */
+function isSessionHostUnavailable(error: unknown): boolean {
+	if (error instanceof RelayHelloError) return true;
+	const step = sessionRequestStep(error);
+	if (error instanceof RelayRefusedError) return step === "attach" && error.code === "session_unavailable";
+	return error instanceof RelayClosedError && step === "attach";
 }
 
 /**
@@ -1704,8 +1783,20 @@ function failureDetail(error: unknown): string {
 		"SessionTerminalError",
 		"SessionRequestTimeoutError",
 		"RebindCapExceededError",
+		"RelayHelloError",
+		"RelayRefusedError",
+		"RelayClosedError",
+		"RelayRequestTimeoutError",
+		"TailCapacityError",
+		"TranscriptIncompleteError",
+		"OpRefError",
+		"OpRefRejectedError",
+		"GjcCliUnavailableError",
+		"LastAssistantUnreadableError",
+		"BrokerAuthorityError",
 	]);
 	const allowedCodes = new Set([
+		"broker_unavailable",
 		"session_not_found",
 		"session_closed",
 		"session_expired",
@@ -1725,6 +1816,20 @@ function failureDetail(error: unknown): string {
 		"invalid_request",
 		"resource_gone",
 		"usage",
+		"relay_hello_missing",
+		"relay_closed",
+		"relay_timeout",
+		"cutover_required",
+		"authority_mismatch",
+		"unowned_session",
+		"old_work_open",
+		"quarantined",
+		"invalid_authority",
+		"last_assistant_not_json",
+		"last_assistant_no_page",
+		"last_assistant_no_items",
+		"last_assistant_null_item",
+		"last_assistant_non_text_item",
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
@@ -1775,8 +1880,10 @@ function failureDetail(error: unknown): string {
 		error instanceof Error && error.stack
 			? frameNames.find((candidate) => error.stack?.split("\n").some((line) => line.includes(candidate)))
 			: undefined;
+	const step = sessionRequestStep(error);
 	return JSON.stringify({
 		class: name,
+		...(step ? { step } : {}),
 		...(code ? { code } : {}),
 		...(transport ? { transport } : {}),
 		...(typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255
