@@ -587,6 +587,55 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, eventId)).toBe("failed_no_retry");
 	});
 
+	test("exhausted invalidation does not overwrite an event authored during status lookup", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-exhausted-invalid-race-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "test-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.event"],
+		});
+		const eventId = crypto.randomUUID();
+		const sessionId = "s1";
+		const opRef = crypto.randomUUID();
+		createEvent(db, {
+			eventId,
+			monitorId: monitor.monitorId,
+			eventType: "test.event",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+		for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
+			updateEvent(db, eventId, "failed");
+			db.transaction((tx) => db.monitors.eventIncrementAttempts(tx, eventId));
+		}
+		db.transaction((_tx) =>
+			db.core.metaSet(`monitor_authoring_turn:${eventId}`, JSON.stringify({ sessionId, opRef, eventIds: [eventId] })),
+		);
+		const sessionPort = fakeSessionPort(async () => "[]");
+		sessionPort.seedOperation(opRef, sessionId, "terminal_ok", "");
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+		db.transaction((tx) => db.monitors.delete(tx, monitor.monitorId));
+
+		const reconciling = propagator.reconcile();
+		createOutput(db, eventId, "completed response");
+		updateEvent(db, eventId, "authored");
+		await reconciling;
+
+		expect(stage(db, eventId)).toBe("authored");
+		expect(db.monitors.failure(eventId)).toBeUndefined();
+	});
+
 	test("authored + confirmed delivery → delivered; failure keeps it authored", async () => {
 		const { monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),

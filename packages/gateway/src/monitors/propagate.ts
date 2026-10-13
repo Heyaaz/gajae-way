@@ -126,7 +126,7 @@ type ExhaustedTurnDisposition =
 	| { readonly kind: "terminal"; readonly raw: string | undefined }
 	| { readonly kind: "hold" }
 	| { readonly kind: "resume"; readonly turn: AuthoringTurnPointer }
-	| { readonly kind: "monitor_invalid" };
+	| { readonly kind: "monitor_invalid"; readonly raw: string };
 
 export interface MonitorDispatchFailure {
 	readonly eventId: string;
@@ -591,15 +591,30 @@ export class MonitorPropagator {
 							continue;
 						}
 						if (disposition.kind === "monitor_invalid") {
-							const failed = this.#database.transaction((tx) =>
-								this.#database.monitors.eventTerminalFail(
-									tx,
-									row.event_id,
-									"monitor_invalid",
-									"dispatch setup failed (monitor_invalid)",
-								),
-							);
-							if (failed) this.#emitStage(row, "failed_no_retry");
+							const failedRow = this.#database.transaction((tx) => {
+								const current = this.#database.monitors.eventGet(row.event_id);
+								if (
+									!current ||
+									this.#database.core.metaGet(authoringTurnKey(row.event_id)) !== disposition.raw ||
+									current.dispatch_attempts !== row.dispatch_attempts ||
+									current.dispatch_attempts < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS ||
+									(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
+									this.#database.monitors.authoredOutput(row.event_id) !== undefined ||
+									this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())
+								)
+									return undefined;
+								if (
+									!this.#database.monitors.eventTerminalFail(
+										tx,
+										row.event_id,
+										"monitor_invalid",
+										"dispatch setup failed (monitor_invalid)",
+									)
+								)
+									return undefined;
+								return current;
+							});
+							if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
 							continue;
 						}
 						const expectedRaw = disposition.kind === "terminal" ? disposition.raw : undefined;
@@ -656,7 +671,7 @@ export class MonitorPropagator {
 		if (state === "failed") return { kind: "terminal", raw };
 		if (state !== "terminal_ok") return { kind: "hold" };
 		// The turn has ended. If the monitor is gone, the events are now unrecoverable.
-		if (!monitor) return { kind: "monitor_invalid" };
+		if (!monitor) return { kind: "monitor_invalid", raw };
 		for (const eventId of turn.eventIds) {
 			const related = this.#database.monitors.eventGet(eventId);
 			if (
