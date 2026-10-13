@@ -388,20 +388,19 @@ function findUnixAgentDir(
 		return match ? { index: match.index, value: match[1] || undefined } : undefined;
 	}
 
-	const token = `GJC_CODING_AGENT_DIR=${expectedAgentDir}`;
+	const key = "GJC_CODING_AGENT_DIR=";
 	for (
-		let index = commandAndEnvironment.indexOf(token);
+		let index = commandAndEnvironment.indexOf(key);
 		index >= 0;
-		index = commandAndEnvironment.indexOf(token, index + 1)
+		index = commandAndEnvironment.indexOf(key, index + key.length)
 	) {
 		const before = index === 0 || /\s/.test(commandAndEnvironment[index - 1] ?? "");
-		const end = index + token.length;
-		const followingEnvironment = commandAndEnvironment.slice(end);
+		if (!before) continue;
+		const value = commandAndEnvironment.slice(index + key.length);
 		// ps flattens environment values into the command field, so no whitespace or marker
 		// suffix can prove where a path containing spaces ends. broker.ts orders the agent dir
 		// last; accept only an exact end-of-field match and skip ambiguous older layouts.
-		const after = followingEnvironment === "";
-		if (before && after) return { index, value: expectedAgentDir };
+		return value === expectedAgentDir ? { index, value: expectedAgentDir } : undefined;
 	}
 	return undefined;
 }

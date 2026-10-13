@@ -227,11 +227,12 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 		`300 404 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} --extra HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
 		`300 405 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir} other`,
 		`300 406 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=${spacedAgentDir} OTHER=value`,
-		`300 407 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv} ${attachOnlyEnv}`,
+		`300 407 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} ${attachOnlyEnv}`,
+		`300 408 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin ${attachOnlyEnv} GJC_CODING_AGENT_DIR=/other GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
 	].join("\n");
 	const table = parseUnixProcessTable(output, spacedAgentDir);
 
-	expect(table).toHaveLength(8);
+	expect(table).toHaveLength(9);
 	expect(table[1]).toEqual({
 		pid: 401,
 		ppid: 300,
@@ -244,6 +245,7 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	expect(table[5]?.agentDir).toBeUndefined();
 	expect(table[6]?.agentDir).toBeUndefined();
 	expect(table[7]?.agentDir).toBeUndefined();
+	expect(table[8]?.agentDir).toBeUndefined();
 	expect(
 		select(table, {
 			gjcPath: spacedCurrentGjc,
