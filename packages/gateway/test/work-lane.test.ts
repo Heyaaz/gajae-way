@@ -2371,6 +2371,34 @@ test("#481 a lane whose HEAD is unpushed reports unpushed and does not transitio
 	expect(calls).toHaveLength(0);
 });
 
+test("#481 awaiting_checks: pending checks transition to done when they all pass", async () => {
+	let checkStatus: CheckStatusSnapshot | null = { prNumber: 485, status: "pending", failingChecks: [] };
+	const f = await fixture({
+		checkStatusClient: {
+			async getCheckStatus() {
+				return checkStatus;
+			},
+		},
+		ownerTarget: () => origin,
+	});
+	await laneRepo(f.directory, "fix/pending-to-green", true);
+	const result = await started(f, "e", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.work.laneJobRows().some((row) => row.state === "awaiting_checks"));
+	const jobId = laneJobIdentity("e").jobId;
+	let record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+	// Now simulate checks turning green
+	checkStatus = { prNumber: 485, status: "green", failingChecks: [] };
+	await f.manager.recover();
+	await until(() => {
+		const job = f.db.work.laneJobJson(jobId);
+		return job ? parseLaneJobRecord(job).state === "done" : false;
+	});
+	record = parseLaneJobRecord(f.db.work.laneJobJson(jobId)!);
+	expect(record.state).toBe("done");
+});
+
 test("#407: laneLastCommits reads each distinct worktree once, concurrently, null for non-repos", async () => {
 	const repo = await mkdtemp(join(tmpdir(), "lane-commit-"));
 	const missing = join(repo, "does-not-exist");

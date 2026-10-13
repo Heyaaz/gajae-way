@@ -47,6 +47,8 @@ export {
 	type ReconciliationClass,
 	type RepositoryFacts,
 	transitionToAwaitingChecks,
+	transitionFromAwaitingChecksToDone,
+	transitionFromAwaitingChecksFailed,
 } from "./job";
 export {
 	isRuntimeSessionId,

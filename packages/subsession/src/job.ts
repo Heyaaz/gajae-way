@@ -716,6 +716,35 @@ export function transitionToAwaitingChecks(input: AwaitingChecksInput): LaneJobR
 	});
 }
 
+/**
+ * Transitions a lane job from awaiting_checks to done when checks pass.
+ */
+export function transitionFromAwaitingChecksToDone(record: LaneJobRecord, at: string): LaneJobRecord {
+	if (record.state !== "awaiting_checks") {
+		return record;
+	}
+	return Object.freeze({
+		...record,
+		state: "done",
+		updatedAt: at,
+	});
+}
+
+/**
+ * Transitions a lane job from awaiting_checks to attempt_ended when checks fail or timeout.
+ */
+export function transitionFromAwaitingChecksFailed(record: LaneJobRecord, at: string, reason: string): LaneJobRecord {
+	if (record.state !== "awaiting_checks") {
+		return record;
+	}
+	return Object.freeze({
+		...record,
+		state: "attempt_ended",
+		updatedAt: at,
+		escalations: Object.freeze([...record.escalations, `${at} awaiting_checks ended: ${reason}`]),
+	});
+}
+
 export function planContinuation(input: PlanContinuationInput): ContinuationPlan {
 	if (input.record.state === "aborted") {
 		return { action: "hold_for_operator", reason: "the job was aborted by an operator; never auto-resumed" };

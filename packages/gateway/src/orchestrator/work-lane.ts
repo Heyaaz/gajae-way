@@ -29,6 +29,8 @@ import {
 	OpRefRejectedError,
 	parseLaneJobRecord,
 	transitionToAwaitingChecks,
+	transitionFromAwaitingChecksToDone,
+	transitionFromAwaitingChecksFailed,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
@@ -81,6 +83,8 @@ const reasons = new Set([
 /** Minimum spacing between streamed-frame activity writes for one attempt. */
 const ACTIVITY_TOUCH_MS = 1_000;
 const HOST_LOST_GRACE_MS = 30_000;
+const AWAITING_CHECKS_RETRY_LIMIT = 2;
+const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000; // 1 hour
 const refusalCodes = new Set([
 	"busy",
 	"steer_refused",
@@ -214,6 +218,11 @@ export class WorkLaneManager {
 	readonly #failures = new Map<string, { failures: number; reason: string }>();
 	readonly #waiters = new Map<string, Set<Waiter>>();
 	readonly #detachedOwners = new WeakSet<object>();
+	/** Tracking awaiting_checks lanes: jobId -> { prNumber, recordedHead, enteredAt, retryCount } */
+	readonly #awaitingChecksLanes = new Map<
+		string,
+		{ prNumber: number; recordedHead: string; enteredAt: number; retryCount: number }
+	>();
 	#generationRecovery?: Promise<void>;
 	#recovery?: Promise<void>;
 	#stopped = false;
@@ -1482,6 +1491,171 @@ export class WorkLaneManager {
 	#finishWaiters(opRef: string): void {
 		for (const waiter of [...(this.#waiters.get(opRef) ?? [])]) waiter.finish();
 	}
+	async #pollAwaitingChecks(): Promise<void> {
+		if (this.#stopped || !this.#options.checkStatusClient) return;
+		const now = this.#now();
+		for (const row of this.#db.work.laneJobRows()) {
+			if (row.state !== "awaiting_checks") continue;
+			if (!row.lane_key.startsWith("work-")) continue;
+			const name = row.lane_key.slice("work-".length);
+			const tracking = this.#awaitingChecksLanes.get(row.job_id);
+
+			// Check for timeout
+			if (tracking && now - tracking.enteredAt > AWAITING_CHECKS_TIMEOUT_MS) {
+				try {
+					const job = this.#job(name, true)!;
+					const updated = transitionFromAwaitingChecksFailed(job, this.#at(), "timeout");
+					this.#db.transaction((tx) => {
+						this.#db.work.putLaneJob(tx, {
+							jobId: updated.jobId,
+							laneKey: row.lane_key,
+							state: updated.state,
+							createdAt: updated.createdAt,
+							updatedAt: updated.updatedAt,
+							lane: updated.lane,
+							json: JSON.stringify(updated),
+						});
+					});
+					this.#awaitingChecksLanes.delete(row.job_id);
+					console.error(`awaiting_checks_timeout jobId=${row.job_id}`);
+				} catch (error) {
+					console.error(`awaiting_checks_timeout_settlement_failed jobId=${row.job_id} reason=${failureReason(error)}`);
+				}
+				continue;
+			}
+
+			// Re-read the PR checks
+			try {
+				const job = this.#job(name, true);
+				if (!job) continue;
+
+				const facts = await collectRepoFacts(job.lane.worktreePath, this.#options.checkStatusClient);
+				if (!facts?.checkStatus) continue;
+
+				const checks = facts.checkStatus;
+
+				// Initialize tracking if not already done
+				if (!tracking) {
+					this.#awaitingChecksLanes.set(row.job_id, {
+						prNumber: checks.prNumber,
+						recordedHead: facts.headSha || "",
+						enteredAt: now,
+						retryCount: 0,
+					});
+				}
+
+				// If head moved, settle failed
+				const trackedHead = this.#awaitingChecksLanes.get(row.job_id)?.recordedHead;
+				if (trackedHead && facts.headSha && facts.headSha !== trackedHead) {
+					const updated = transitionFromAwaitingChecksFailed(job, this.#at(), "head_moved");
+					this.#db.transaction((tx) => {
+						this.#db.work.putLaneJob(tx, {
+							jobId: updated.jobId,
+							laneKey: row.lane_key,
+							state: updated.state,
+							createdAt: updated.createdAt,
+							updatedAt: updated.updatedAt,
+							lane: updated.lane,
+							json: JSON.stringify(updated),
+						});
+					});
+					this.#awaitingChecksLanes.delete(row.job_id);
+					console.error(
+						`awaiting_checks_head_moved jobId=${row.job_id} from=${trackedHead.slice(0, 12)} to=${facts.headSha.slice(0, 12)}`,
+					);
+					continue;
+				}
+
+				if (checks.status === "green") {
+					// All checks passed, settle as done
+					const updated = transitionFromAwaitingChecksToDone(job, this.#at());
+					this.#db.transaction((tx) => {
+						this.#db.work.putLaneJob(tx, {
+							jobId: updated.jobId,
+							laneKey: row.lane_key,
+							state: updated.state,
+							createdAt: updated.createdAt,
+							updatedAt: updated.updatedAt,
+							lane: updated.lane,
+							json: JSON.stringify(updated),
+						});
+					});
+					this.#awaitingChecksLanes.delete(row.job_id);
+					console.error(`awaiting_checks_passed jobId=${row.job_id} pr=${checks.prNumber}`);
+				} else if (checks.status === "red") {
+					// Checks failed, try to re-steer
+					const trackingNow = this.#awaitingChecksLanes.get(row.job_id)!;
+					if (trackingNow.retryCount < AWAITING_CHECKS_RETRY_LIMIT) {
+						// Re-steer the session with failing check names
+						const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
+						if (open) {
+							const runtime = this.#attemptByOpRef(open.opRef);
+							if (runtime && !runtime.terminal && this.#binding(runtime)) {
+								const checkStr =
+									checks.failingChecks.length > 0
+										? `checks failed: ${checks.failingChecks.join(", ")}`
+										: "checks failed";
+								const steerText = `PR #${checks.prNumber} ${checkStr}. Fix the issues and push again.`;
+								try {
+									const clientRef = newOpRef("awaiting-checks-steer");
+									await this.#port.steer({
+										sessionId: runtime.sessionId,
+										repo: job.lane.worktreePath,
+										text: steerText,
+										clientRef,
+									});
+									trackingNow.retryCount++;
+									console.error(
+										`awaiting_checks_re_steered jobId=${row.job_id} attempt=${trackingNow.retryCount}/${AWAITING_CHECKS_RETRY_LIMIT}`,
+									);
+								} catch (error) {
+									if (definitiveSteerRefusal(error)) {
+										// Session no longer available or steer refused, settle as failed
+										const updated = transitionFromAwaitingChecksFailed(job, this.#at(), "re_steer_failed");
+										this.#db.transaction((tx) => {
+											this.#db.work.putLaneJob(tx, {
+												jobId: updated.jobId,
+												laneKey: row.lane_key,
+												state: updated.state,
+												createdAt: updated.createdAt,
+												updatedAt: updated.updatedAt,
+												lane: updated.lane,
+												json: JSON.stringify(updated),
+											});
+										});
+										this.#awaitingChecksLanes.delete(row.job_id);
+										console.error(`awaiting_checks_re_steer_failed jobId=${row.job_id} reason=${safeRefusal(error)}`);
+									}
+								}
+							}
+						}
+					} else {
+						// Retry limit exceeded, settle as failed
+						const updated = transitionFromAwaitingChecksFailed(
+							job,
+							this.#at(),
+							`red_checks: ${checks.failingChecks.join(", ")}`,
+						);
+						this.#db.transaction((tx) => {
+							this.#db.work.putLaneJob(tx, {
+								jobId: updated.jobId,
+								laneKey: row.lane_key,
+								state: updated.state,
+								createdAt: updated.createdAt,
+								updatedAt: updated.updatedAt,
+								lane: updated.lane,
+								json: JSON.stringify(updated),
+							});
+						});
+						this.#awaitingChecksLanes.delete(row.job_id);
+						console.error(`awaiting_checks_failed jobId=${row.job_id} retries_exhausted=${trackingNow.retryCount}`);
+					}
+				}
+			} catch (error) {
+				console.error(`awaiting_checks_poll_error jobId=${row.job_id} reason=${failureReason(error)}`);
+			}
+		}
+	}
 	async #drainLaneReports(parentName: string): Promise<void> {
 		if (this.#stopped) return;
 		await this.#port.runExclusive(workSessionKey(parentName), async () => {
@@ -1890,6 +2064,7 @@ export class WorkLaneManager {
 			if (this.#stopped) return;
 			await this.#drainLaneReports(parentName);
 		}
+		if (!this.#stopped) await this.#pollAwaitingChecks();
 	}
 	onBrokerGeneration(): Promise<void> {
 		if (this.#generationRecovery) return this.#generationRecovery;
