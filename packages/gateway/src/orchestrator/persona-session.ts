@@ -3932,7 +3932,7 @@ function safeDiagnostic(error: unknown): string {
 }
 
 /**
- * Whether the status is a provider-transport failure eligible for consideration.
+ * Whether the status is a post-start provider-transport failure eligible for consideration.
  * Replay safety is checked separately against visible output, tool activity, and accepted steers.
  */
 function isRetryableError(status: StatusReport, openTool?: boolean): boolean {
@@ -3943,7 +3943,7 @@ function isRetryableError(status: StatusReport, openTool?: boolean): boolean {
 	if (openTool) return false;
 
 	// Replay only a transient provider failure; agent_runtime can follow completed side effects.
-	return category === "provider_transport";
+	return category === "provider_transport" && outcome?.phase === "post_start";
 }
 
 /**
