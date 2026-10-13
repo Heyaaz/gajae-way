@@ -108,6 +108,34 @@ describe("origin normalization", () => {
 		expect(key).toBe("discord/thread/111/parent=222");
 	});
 
+	test("Discord thread visibility is validated metadata, not part of origin identity", () => {
+		const publicThread = {
+			platform: "discord",
+			kind: "thread",
+			conversationId: "111",
+			parentId: "222",
+			threadVisibility: "public",
+		} as const;
+		const privateThread = { ...publicThread, threadVisibility: "private" } as const;
+		expect(validateOriginRef(publicThread)).toEqual(publicThread);
+		expect(validateOriginRef(privateThread)).toEqual(privateThread);
+		expect(originKey(publicThread)).toBe(originKey(privateThread));
+		expect(() =>
+			validateOriginRef({ ...publicThread, platform: "slack", threadVisibility: "private" } as never),
+		).toThrow(/Discord thread origins/);
+		expect(() =>
+			validateOriginRef({
+				platform: "discord",
+				kind: "channel",
+				conversationId: "111",
+				threadVisibility: "private",
+			} as never),
+		).toThrow(/Discord thread origins/);
+		expect(() => validateOriginRef({ ...publicThread, threadVisibility: "unknown" } as never)).toThrow(
+			/invalid Discord thread visibility/,
+		);
+	});
+
 	test("dm requires peerId; channel forbids it", () => {
 		expect(() => validateOriginRef({ platform: "discord", kind: "dm", conversationId: "c1" })).toThrow();
 		expect(() =>

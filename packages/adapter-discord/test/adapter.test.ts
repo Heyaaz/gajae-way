@@ -132,6 +132,18 @@ test("maps guild channels, threads, and DMs to canonical Discord origins", () =>
 		conversationId: "thread-1",
 		parentId: "channel-1",
 	});
+	expect(
+		discordMessageOrigin({ author, channel: { id: "public-thread", parentId: "channel-1", type: 11 } }),
+	).toMatchObject({
+		kind: "thread",
+		threadVisibility: "public",
+	});
+	expect(
+		discordMessageOrigin({ author, channel: { id: "private-thread", parentId: "channel-1", type: 12 } }),
+	).toMatchObject({
+		kind: "thread",
+		threadVisibility: "private",
+	});
 	expect(discordMessageOrigin({ author, channel: { id: "dm-1", isDMBased: () => true } })).toEqual({
 		platform: "discord",
 		kind: "dm",
@@ -413,7 +425,13 @@ test("prefixes ambiguous redelivery and records failed settlement", async () => 
 
 const threadDelivery = (text: string): ChatMessagePayload => ({
 	...delivery(text),
-	origin: { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" },
+	origin: {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "channel-1",
+		threadVisibility: "public",
+	},
 });
 
 test("an archived thread is unarchived before delivery and the reply lands in the thread", async () => {
@@ -470,6 +488,103 @@ test("an archived thread that cannot be unarchived falls back to its parent chan
 		"Discord delivery delivery-1: thread thread-1 is archived and could not be unarchived (Missing Permissions); delivered to parent channel channel-1 instead.",
 	]);
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a missing public thread falls back to its parent channel and drops the thread reply reference", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const fetched: string[] = [];
+	const sent: Array<[string, unknown]> = [];
+	const errors: string[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => {
+				fetched.push(id);
+				if (id === "thread-1") throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
+				return { send: async (payload: unknown) => void sent.push([id, payload]) };
+			},
+		},
+	};
+	const original = console.error;
+	console.error = (line: string) => void errors.push(line);
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, {
+			...threadDelivery("reply text"),
+			replyToMessageId: "message-in-thread",
+		});
+	} finally {
+		console.error = original;
+	}
+	expect(fetched).toEqual(["thread-1", "channel-1"]);
+	expect(sent).toEqual([["channel-1", "[thread <#thread-1> does not exist; posting here instead]\nreply text"]]);
+	expect(errors).toEqual([
+		"Discord delivery delivery-1: thread thread-1 does not exist; delivered to parent channel channel-1 instead.",
+	]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("missing private or unclassified threads never leak replies into the parent channel", async () => {
+	const origins: Array<ChatMessagePayload["origin"]> = [
+		{
+			platform: "discord",
+			kind: "thread",
+			conversationId: "thread-1",
+			parentId: "channel-1",
+			threadVisibility: "private",
+		},
+		{ platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" },
+	];
+	for (const origin of origins) {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const fetched: string[] = [];
+		const sent: Array<[string, unknown]> = [];
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async (id: string) => {
+					fetched.push(id);
+					if (id === "thread-1") throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
+					return { send: async (payload: unknown) => void sent.push([id, payload]) };
+				},
+			},
+		};
+		await settleDiscordDelivery(mockGateway(requests), discord, { ...delivery("private reply"), origin });
+		expect(fetched).toEqual(["thread-1"]);
+		expect(sent).toEqual([]);
+		expect(requests).toEqual([
+			{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Unknown Channel", ambiguous: false } },
+		]);
+	}
+});
+
+test("an archived private thread that cannot be reopened never falls back to its parent", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const fetched: string[] = [];
+	const sent: Array<[string, unknown]> = [];
+	const privateThread = {
+		archived: true,
+		setArchived: async () => Promise.reject(Object.assign(new Error("Missing Permissions"), { code: 50013 })),
+		send: async (payload: unknown) => void sent.push(["thread-1", payload]),
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => {
+				fetched.push(id);
+				return id === "thread-1" ? privateThread : { send: async (payload: unknown) => void sent.push([id, payload]) };
+			},
+		},
+	};
+	const privateDelivery: ChatMessagePayload = {
+		...threadDelivery("private reply"),
+		origin: { ...threadDelivery("private reply").origin, threadVisibility: "private" },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, privateDelivery);
+	expect(fetched).toEqual(["thread-1"]);
+	expect(sent).toEqual([]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "Missing Permissions", ambiguous: false },
+		},
+	]);
 });
 
 test("an active thread and a plain channel deliver exactly as before", async () => {
@@ -1590,6 +1705,7 @@ test("channel mention with default policy (unset threadOnMention) creates thread
 	expect(result.kind).toBe("thread");
 	expect(result.conversationId).toBe("thread-new-1");
 	expect(result.parentId).toBe("channel-1");
+	expect(result.threadVisibility).toBe("public");
 });
 
 test("channel mention with threadOnMention: true creates thread", async () => {
@@ -1618,6 +1734,7 @@ test("channel mention with threadOnMention: true creates thread", async () => {
 	expect(result.kind).toBe("thread");
 	expect(result.conversationId).toBe("thread-new-2");
 	expect(result.parentId).toBe("channel-2");
+	expect(result.threadVisibility).toBe("public");
 });
 
 test("channel mention with threadOnMention: false skips thread creation", async () => {

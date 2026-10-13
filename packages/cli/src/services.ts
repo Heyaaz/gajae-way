@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
@@ -26,6 +26,13 @@ export interface ResolvePathOptions {
 
 /** Service managers this CLI can write definitions for. */
 export type ServicePlatform = "darwin" | "linux";
+export interface ServiceCommandOptions {
+	readonly allowFailure?: boolean;
+}
+export type ServiceCommandRunner = (
+	command: readonly string[],
+	options?: ServiceCommandOptions,
+) => number | PromiseLike<number>;
 
 export interface InstallServicesOptions {
 	readonly binDir: string;
@@ -296,6 +303,55 @@ export function launchAgentPlistPath(spec: ServiceSpec, launchAgentsDir: string)
 /** Gets the path where a service's systemd unit file is stored on linux. */
 export function systemdUnitPath(spec: ServiceSpec, unitDir: string): string {
 	return join(unitDir, systemdUnitName(spec));
+}
+
+export interface RemoveStaleServicesOptions extends Pick<InstallServicesOptions, "launchAgentsDir" | "unitDir"> {
+	readonly binDir: string;
+	readonly platform: ServicePlatform;
+	readonly uid?: number;
+	readonly env?: NodeJS.ProcessEnv;
+	readonly reloadSystemd?: boolean;
+	readonly run: ServiceCommandRunner;
+}
+
+/** Stops and removes service definitions whose executable is no longer installed. */
+export async function removeStaleServices(options: RemoveStaleServicesOptions): Promise<void> {
+	const env = options.env ?? process.env;
+	const userHome = env.HOME || homedir();
+	const definitionDir =
+		options.platform === "darwin"
+			? (options.launchAgentsDir ?? join(userHome, "Library", "LaunchAgents"))
+			: (options.unitDir ?? systemdUnitDir(env, userHome));
+	const expandedDefinitionDir = expandHome(definitionDir, userHome);
+	const staleDefinitions: Array<{ readonly label: string; readonly path: string; readonly unitName: string }> = [];
+	for (const spec of SERVICE_SPECS) {
+		if (await Bun.file(join(options.binDir, spec.binary)).exists()) continue;
+		const path =
+			options.platform === "darwin"
+				? launchAgentPlistPath(spec, expandedDefinitionDir)
+				: systemdUnitPath(spec, expandedDefinitionDir);
+		if (await Bun.file(path).exists())
+			staleDefinitions.push({ label: spec.label, path, unitName: systemdUnitName(spec) });
+	}
+	const execute = async (command: readonly string[], allowFailure = false): Promise<number> => {
+		const exitCode = await options.run(command, allowFailure ? { allowFailure: true } : undefined);
+		if (exitCode !== 0 && !allowFailure) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
+		return exitCode;
+	};
+	if (options.platform === "linux") {
+		if (staleDefinitions.length === 0) return;
+		await execute(["systemctl", "--user", "disable", "--now", ...staleDefinitions.map(({ unitName }) => unitName)]);
+		for (const { path } of staleDefinitions) await rm(path, { force: true });
+		if (options.reloadSystemd ?? true) await execute(["systemctl", "--user", "daemon-reload"]);
+		return;
+	}
+	const target = `gui/${options.uid ?? process.getuid?.() ?? 0}`;
+	for (const { label, path } of staleDefinitions) {
+		const serviceTarget = `${target}/${label}`;
+		if ((await execute(["launchctl", "print", serviceTarget], true)) === 0)
+			await execute(["launchctl", "bootout", serviceTarget]);
+		await rm(path, { force: true });
+	}
 }
 
 /**

@@ -388,6 +388,7 @@ export async function maybeCreateThreadOnMention(
 			kind: "thread",
 			conversationId: thread.id,
 			parentId: origin.conversationId,
+			threadVisibility: "public",
 		};
 	} catch (error) {
 		// Thread creation failed (permissions, rate limits, etc.); continue with channel origin.
@@ -1001,6 +1002,14 @@ function isArchivedThread(value: unknown): value is ArchivableThreadLike {
 	);
 }
 
+function isChannelNotFoundError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
+	return (
+		candidate.code === 10_003 || candidate.code === "10003" || candidate.status === 404 || candidate.httpStatus === 404
+	);
+}
+
 /** Posts with the adapter's own bot: it keeps its Discord session while the gateway is the thing that is down. */
 function gatewayDownAlarm(discord: DiscordClientLike, alert: GatewayDownAlertConfig): GatewayDownAlarm {
 	return new GatewayDownAlarm(alert, {
@@ -1026,19 +1035,40 @@ async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise
  * so an archived thread is explicitly unarchived first. When that fails the
  * reply goes to the parent channel with a visible notice and a log line: a
  * monitor result that silently vanishes behind an archived thread is the worst
- * outcome, because its schedule still looks healthy.
+ * outcome, because its schedule still looks healthy. Only explicitly public
+ * threads may fall back to their parent; private or unknown threads must never
+ * leak their replies into a channel they were not intended for.
  */
 async function resolveDeliveryChannel(
 	discord: DiscordClientLike,
 	origin: ChatMessagePayload["origin"],
 	deliveryId: string,
 ): Promise<{ readonly channel: DiscordTextChannelLike; readonly notice?: string }> {
-	const channel = await fetchTextChannel(discord, origin.conversationId);
+	let channel: DiscordTextChannelLike;
+	try {
+		channel = await fetchTextChannel(discord, origin.conversationId);
+	} catch (error) {
+		if (
+			origin.kind !== "thread" ||
+			origin.threadVisibility !== "public" ||
+			!origin.parentId ||
+			!isChannelNotFoundError(error)
+		)
+			throw error;
+		const reason = `thread ${origin.conversationId} does not exist`;
+		const parent = await fetchTextChannel(discord, origin.parentId);
+		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
+		return {
+			channel: parent,
+			notice: `[thread <#${origin.conversationId}> does not exist; posting here instead]`,
+		};
+	}
 	if (origin.kind !== "thread" || !origin.parentId || !isArchivedThread(channel)) return { channel };
 	try {
 		await channel.setArchived(false);
 		return { channel };
 	} catch (error) {
+		if (origin.threadVisibility !== "public") throw error;
 		const reason = `thread ${origin.conversationId} is archived and could not be unarchived (${errorMessage(error)})`;
 		const parent = await fetchTextChannel(discord, origin.parentId);
 		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);

@@ -7,7 +7,7 @@ import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { workAttemptDeliveryId } from "../src/store/groups/work";
+import { resolveLaneReportOrigin, workAttemptDeliveryId } from "../src/store/groups/work";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const rootOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "parent-channel" };
@@ -684,9 +684,8 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 	f.port.complete(persona.opRef, "ack");
 });
 
-// A Discord channel root has no thread on the trigger message (a mention-started thread arrives
-// as a thread origin); naming one from the message id made the report undeliverable (10003).
-test("AC-435 Discord channel root trigger keeps the lane report at the channel root", async () => {
+// A channel message id is not a Discord thread id; public visibility makes a missing-thread fallback safe.
+test("AC-435 Discord channel root trigger routes the lane report through a public-thread fallback", async () => {
 	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-435" };
 	const f = await fixture({
 		ownerTarget: discordChannelOrigin,
@@ -705,6 +704,25 @@ test("AC-435 Discord channel root trigger keeps the lane report at the channel r
 	);
 	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
 	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
-	expect(laneReportOrigin).toEqual(discordChannelOrigin);
+	expect(laneReportOrigin.kind).toBe("thread");
+	expect(laneReportOrigin.platform).toBe("discord");
+	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
+	expect(laneReportOrigin.parentId).toBe(discordChannelOrigin.conversationId);
+	expect(laneReportOrigin.threadVisibility).toBe("public");
 	f.port.complete(persona.opRef, "ack");
+});
+
+test("AC-455 synthetic lane-report trigger ids stay on the Discord channel origin", () => {
+	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-455" };
+	const syntheticTriggerMessageId = `lane-report-${"0123456789abcdef".repeat(4)}`;
+	const resolvedOriginRefJson = resolveLaneReportOrigin(
+		{
+			kind: "persona",
+			originKey: originKey(discordChannelOrigin),
+			origin: discordChannelOrigin,
+			triggerMessageId: syntheticTriggerMessageId,
+		},
+		JSON.stringify(discordChannelOrigin),
+	);
+	expect(JSON.parse(resolvedOriginRefJson)).toEqual(discordChannelOrigin);
 });

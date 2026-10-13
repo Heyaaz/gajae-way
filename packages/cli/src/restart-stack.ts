@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, readlink, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
 	acquireLease,
 	homeLayout,
@@ -17,6 +17,7 @@ import {
 	BROKER_UNIT,
 	currentPlatform,
 	launchAgentPlistPath,
+	removeStaleServices,
 	restartOrder,
 	restartStackCommands,
 	type ServicePlatform,
@@ -296,7 +297,26 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 	const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 	const timeoutMs = options.verifyTimeoutMs ?? VERIFY_TIMEOUT_MS;
 	const pollMs = options.pollMs ?? POLL_MS;
-	const binDir = options.binDir ?? process.env.GAJAEWAY_BIN_DIR ?? dirname(process.execPath);
+	const env = options.env ?? process.env;
+	const deployedExecutable = await realpath(process.execPath).catch(() => undefined);
+	const installedBinDir =
+		options.binDir ??
+		env.GAJAEWAY_BIN_DIR ??
+		(deployedExecutable !== undefined && basename(deployedExecutable).startsWith("gajaeway")
+			? dirname(deployedExecutable)
+			: undefined);
+	const binDir = installedBinDir ?? dirname(process.execPath);
+	if (installedBinDir !== undefined) {
+		await removeStaleServices({
+			binDir: installedBinDir,
+			platform,
+			uid: options.uid,
+			env,
+			...(options.launchAgentsDir === undefined ? {} : { launchAgentsDir: options.launchAgentsDir }),
+			...(options.unitDir === undefined ? {} : { unitDir: options.unitDir }),
+			run: runner,
+		});
+	}
 
 	const originalPids = new Map<string, number | undefined>();
 	for (const spec of restartOrder()) {
