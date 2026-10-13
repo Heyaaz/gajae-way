@@ -14,6 +14,7 @@ import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { classifyCheckRollup } from "../src/orchestrator/gh-checks";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
+import { RelayClosedError } from "../src/orchestrator/tail-runner";
 import {
 	type CheckStatusClient,
 	type CheckStatusSnapshot,
@@ -2478,4 +2479,87 @@ test("work.start with repo and base parameter creates worktree from specified ba
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
 	}
+});
+test("#439 work-lane status reads use relay when tail is attached to avoid CLI spawns", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	for (let i = 0; i < 5; i++) {
+		const readsBefore = f.port.statusReads.filter((read) => read.opRef === result.opRef).length;
+		f.port.emitTool(result.sessionId, { toolName: "bash" });
+		await until(() => f.port.statusReads.filter((read) => read.opRef === result.opRef).length > readsBefore);
+	}
+	const statusReads = f.port.statusReads.filter((r) => r.opRef === result.opRef);
+	expect(statusReads.length).toBeGreaterThanOrEqual(5);
+	expect(statusReads.every((read) => read.relayUsed)).toBe(true);
+});
+
+test("#439 explicit work.status reads use the active observer relay", async () => {
+	const f = await fixture({ pollMs: 60_000 });
+	const result = await started(f);
+	await until(() => f.port.statusReads.some((read) => read.opRef === result.opRef && read.relayUsed));
+	const readsBefore = f.port.statusReads.length;
+	const status = await f.manager.status({ name: "a" });
+	expect(status.attempt?.opRef).toBe(result.opRef);
+	const statusReads = f.port.statusReads.slice(readsBefore).filter((read) => read.opRef === result.opRef);
+	expect(statusReads).toHaveLength(1);
+	expect(statusReads[0]?.relayUsed).toBe(true);
+});
+
+test("#439 relay transport failure triggers exactly one CLI fallback per status call", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	const originalStatus = f.port.status.bind(f.port);
+	// Track call sequence for specific opRef
+	let relayCalls = 0;
+	let fallbackCalls = 0;
+	// Inject relay transport failure on first relay attempt
+	f.port.status = async (input) => {
+		const isRelay = input.relay !== undefined;
+		if (input.opRef === result.opRef) {
+			if (isRelay && relayCalls++ === 0) {
+				throw new RelayClosedError(input.sessionId, "test relay failure");
+			}
+			if (!isRelay) {
+				fallbackCalls++;
+			}
+		}
+		return originalStatus(input);
+	};
+	// Trigger one status poll cycle
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	await until(() => fallbackCalls > 0);
+	// With relay failure, should have triggered both relay attempt and CLI fallback
+	expect(relayCalls).toBeGreaterThanOrEqual(1);
+	expect(fallbackCalls).toBe(1);
+});
+
+test("#439 relay non-transport failure is not caught as transport failure", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	const originalStatus = f.port.status.bind(f.port);
+	// Track whether relay was called and if fallback was attempted
+	let relayErrorThrown = false;
+	let fallbackCalled = false;
+	// Inject a non-transport error (regular Error, not RelayClosedError)
+	f.port.status = async (input) => {
+		const isRelay = input.relay !== undefined;
+		if (input.opRef === result.opRef) {
+			if (isRelay && !relayErrorThrown) {
+				relayErrorThrown = true;
+				// This error is NOT a transport failure (not RelayClosedError)
+				throw new Error("non-transport relay error");
+			}
+			if (!isRelay) {
+				fallbackCalled = true;
+			}
+		}
+		return originalStatus(input);
+	};
+	// Trigger one status poll cycle
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	await until(() => f.port.statusReads.some((read) => read.opRef === result.opRef));
+	// Non-transport error should not trigger fallback
+	expect(relayErrorThrown).toBe(true);
+	expect(fallbackCalled).toBe(false);
+	expect(f.port.statusReads.filter((read) => read.opRef === result.opRef).every((read) => read.relayUsed)).toBe(true);
 });
