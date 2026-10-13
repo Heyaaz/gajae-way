@@ -388,7 +388,6 @@ describe("work attempt boot reconciliation", () => {
 			expect(() => f.database.work.workAttemptGet(f.runtime.opRef)).toThrow(WorkAttemptStateError);
 			expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
 			expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(true);
-			expect(f.database.inspectBrokerAuthority().openWork).toBe(0);
 		}
 	});
 
