@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireLease, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { detectHermes, readHermes } from "./migrate/hermes";
@@ -127,7 +128,20 @@ async function migrateUnlocked(options: MigrateOptions, targetHome: string): Pro
 	for (const file of extract.files) {
 		const filePath = join(targetHome, file.target);
 		await mkdir(join(filePath, ".."), { recursive: true });
-		await writeFile(filePath, file.content);
+		if (file.secret) {
+			// Atomic 0600 write for secrets
+			const temporary = `${filePath}.${randomUUID()}.tmp`;
+			try {
+				await writeFile(temporary, file.content, { mode: 0o600 });
+				await chmod(temporary, 0o600);
+				await rename(temporary, filePath);
+			} catch (error) {
+				await rm(temporary, { force: true });
+				throw error;
+			}
+		} else {
+			await writeFile(filePath, file.content);
+		}
 	}
 
 	// Write merged JSON files

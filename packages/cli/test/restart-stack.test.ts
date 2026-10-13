@@ -450,6 +450,25 @@ test("an unfinished receipt is interrupted when its update lease is gone", async
 	}
 });
 
+test("a supervisor that cannot start fails the receipt instead of leaving it queued", async () => {
+	const { home, cleanup } = await tempHome();
+	try {
+		// A container has no systemd-run: the spawn itself fails.
+		await expect(
+			launchRestartStack({ home, platform: "linux", env: { PATH: join(home, "no-such-bin") } }),
+		).rejects.toThrow(/restart-stack .*: failed: supervisor systemd-run could not be started/);
+		const receipt = await readRestartReceipt(home);
+		expect(receipt?.state).toBe("failed");
+		expect(receipt?.finishedAt).toBeDefined();
+		expect(receipt?.steps.every((step) => step.result === "skipped")).toBe(true);
+		const rendered = renderRestartReceipt(receipt!);
+		expect(rendered[0]).toMatch(/: failed$/);
+		expect(rendered).toContainEqual(expect.stringContaining("detail: supervisor systemd-run could not be started"));
+	} finally {
+		await cleanup();
+	}
+});
+
 test("an uninstalled service is skipped and does not abort the remaining stack", async () => {
 	const { home, cleanup } = await tempHome();
 	const unitDir = await mkdtemp(join(tmpdir(), "gajaeway-restart-units-"));

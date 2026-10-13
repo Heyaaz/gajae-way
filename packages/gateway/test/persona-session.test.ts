@@ -404,6 +404,47 @@ test("a message admitted while a persistent turn is running becomes an operator-
 	);
 });
 
+test("a held turn in recovery_hold must not absorb new inbound as steers; new inbound remains pending for a fresh trigger", async () => {
+	// Regression test for the bug where held ops absorbed all new inbound as steers,
+	// preventing mentions and new messages from ever reaching the user (2026-10-05).
+	const port = new GhostSendPort();
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+
+	enqueue("first-msg", "initial message");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sendAttempts.length === 1, "first send attempt did not start");
+	const firstOpRef = port.sendAttempts[0]!.opRef;
+
+	// The first send failed with ambiguous error (timeout)
+	expect(port.sends).toHaveLength(0);
+	await manager!.tick(KEY);
+
+	// Wait for recovery_hold to be logged with operation_state_unknown
+	await eventually(
+		() => logs.some((line) => line.includes("recovery_hold") && line.includes("operation_state_unknown")),
+		"turn did not enter recovery_hold",
+	);
+
+	// New message arrives while the turn is held
+	enqueue("second-msg", "mentioned message");
+	await manager?.notifyInbound(KEY);
+
+	// With the fix: the second message should NOT be absorbed as a steer.
+	// It remains pending so it can start a fresh trigger later.
+	await Bun.sleep(50);
+
+	// Verify: no steers (the message was not absorbed into the held turn)
+	expect(port.steers).toHaveLength(0);
+	// Only the first failed attempt, no new send yet
+	expect(port.sends).toHaveLength(0);
+	// The second message should still be pending in the database
+	const pending = database?.inboundPendingOldest(KEY);
+	expect(pending?.message_id).toBe("second-msg");
+	// It should not have been associated with the first turn
+	expect(pending?.turn_op_ref).toBeNull();
+});
+
 // gajae-code redacts a post-start failure's message to one fixed sentence, so
 // the runtime code is the entire diagnosis. Six lost turns on one host produced
 // six identical code-free lines (#244); the code is what tells them apart.
@@ -428,6 +469,8 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 		"code=prompt_failed provider_code=prompt_failed phase=post_start category=agent_runtime provenance=agent_failed",
 	);
 	expect(terminalLine).toContain("cause=Agent run failed after execution started");
+	// The redacted cause joins gajae-code's local `SDK invocation failed` record only by these ids.
+	expect(terminalLine).toContain(`command=command-${first.opRef} turn=turn-${first.opRef}`);
 });
 
 // #210: a bash call blocked on an interactive auth prompt (`op whoami`) timed
@@ -683,6 +726,44 @@ test("provider quota exhaustion gives a safe notice and does not reset or rebind
 	]);
 	expect(notices.join("\n")).not.toContain("Grok Build");
 	expect(logs).toContain(`failed_turn_classified origin=${KEY} opRef=${first.opRef} reason=provider_quota_exhausted`);
+	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
+	expect(port.sends).toHaveLength(1);
+	expect(activeDatabase.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+	expect(activeDatabase.inbox.turnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+});
+
+test("a provider rate limit names its reset instant and is neither resent nor reset, even at submission", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	enqueue("provider-rate-limit", "work");
+	await activeManager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("rate-limited turn was not dispatched");
+	port.setFailedTurnEvidence(first.sessionId, "provider_rate_limited", 7_501_000);
+	const before = Date.now();
+	// A submission-phase failure is otherwise resent once; a rate limit would only fail again.
+	port.fail(first.opRef, '429 {"type":"error","error":{"type":"rate_limit_error"}}', {
+		code: "error",
+		outcome: { code: "error", phase: "submission", category: "provider_transport", provenance: "agent_failed" },
+	});
+	const after = Date.now();
+	await eventually(() => activeManager.state(KEY) === "idle", "rate-limit failure did not settle");
+
+	expect(notices).toHaveLength(1);
+	const match = /^\[turn failed\] provider_rate_limited: model provider rate limit reached; retry after (\S+)$/.exec(
+		notices[0] ?? "",
+	);
+	expect(match).not.toBeNull();
+	const retryAt = Date.parse(match?.[1] ?? "");
+	expect(retryAt).toBeGreaterThanOrEqual(before + 7_501_000);
+	expect(retryAt).toBeLessThanOrEqual(after + 7_501_000);
+	expect(notices.join("\n")).not.toContain("rate_limit_error");
+	expect(logs).toContain(`failed_turn_classified origin=${KEY} opRef=${first.opRef} reason=provider_rate_limited`);
 	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
 	expect(port.sends).toHaveLength(1);
 	expect(activeDatabase.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });

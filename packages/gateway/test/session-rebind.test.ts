@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import {
 	extractRuntimeError,
+	formatFailureChatNotice,
 	formatFailureNotice,
 	GjcRuntimeError,
 	isRebindableCode,
@@ -94,6 +95,34 @@ test("bind diagnostics preserve codes while redacting credential-bearing details
 	expect(redactSecrets('{"secrets":["first","second"]}')).toBe('{"secrets":[redacted]}');
 });
 
+test("the chat notice says nothing was answered and what to do, keeping the redacted diagnosis last", () => {
+	// The live redacted pre-start failure (2026-10-12): code and message carry no cause.
+	const submission = new GjcRuntimeError("internal: Prompt submission failed.", {
+		code: "internal",
+		message: "Prompt submission failed.",
+	});
+	expect(formatFailureChatNotice(submission)).toBe(
+		"[turn failed] This message was not answered. Please send it again in a moment.\n(diagnosis: internal: Prompt submission failed.)",
+	);
+	// The operator log line is unchanged.
+	expect(formatFailureNotice(submission)).toBe("[turn failed] internal: Prompt submission failed.");
+	const rebindable = new GjcRuntimeError("wrapped", { code: "spawn_failed", message: "SDK startup did not complete" });
+	expect(formatFailureChatNotice(rebindable)).toBe(
+		"[turn failed] This message was not answered. Send /new to start a fresh conversation, then send it again.\n(diagnosis: spawn_failed: SDK startup did not complete)",
+	);
+	const quota = new GjcRuntimeError("wrapped", {
+		code: "provider_quota_exhausted",
+		message: "model provider quota/billing is exhausted (HTTP 402); switch the model preset",
+	});
+	expect(formatFailureChatNotice(quota)).toBe(
+		"[turn failed] This message was not answered.\n(diagnosis: provider_quota_exhausted: model provider quota/billing is exhausted (HTTP 402); switch the model preset)",
+	);
+	const secret = "sk-live-0123456789abcdef";
+	const leaky = formatFailureChatNotice(
+		new GjcRuntimeError("wrapped", { code: "internal", message: `api_key=${secret}` }),
+	);
+	expect(leaky).not.toContain(secret);
+});
 test("missing recovery evidence holds a bound turn instead of replaying it", async () => {
 	const db = await openDatabase();
 	const port = new ScriptedSessionPort();

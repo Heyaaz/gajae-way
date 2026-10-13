@@ -32,8 +32,10 @@ export interface WebSocketLike {
 	onmessage: ((event: { readonly data: unknown }) => void) | null;
 	onclose: ((event: { readonly code?: number; readonly reason?: string }) => void) | null;
 	onerror: ((event: unknown) => void) | null;
-	/** Send a ping frame; returns true if sent, false if unsupported or failed. */
-	ping?(): boolean;
+	/** Bun's client socket raises protocol ping/pong as events; a seam without them relies on frames alone. */
+	addEventListener?(type: "ping" | "pong", listener: (event: unknown) => void): void;
+	/** Client-initiated keepalive probe; a healthy peer answers with a pong. */
+	ping?(data?: string): void;
 }
 
 export interface SocketModeHandlers {
@@ -48,9 +50,27 @@ export interface SocketModeOptions {
 	readonly sleep?: (ms: number) => Promise<void>;
 	readonly log?: Pick<Console, "log" | "error">;
 	readonly random?: () => number;
-	/** Liveness check interval in ms. Injects a ping every N ms; no response within 2x triggers reconnect. Default 30s. */
-	readonly livenessIntervalMs?: number;
+	/**
+	 * Force-close a socket that has carried no frame, ping, or pong for this long so
+	 * the reconnect loop replaces it. Slack pings roughly every 10s and the adapter
+	 * probes at half the window itself, so a healthy link never trips it.
+	 */
+	readonly livenessTimeoutMs?: number;
+	readonly now?: () => number;
+	readonly setInterval?: (work: () => void, ms: number) => unknown;
+	readonly clearInterval?: (timer: unknown) => void;
 }
+
+/**
+ * A half-open TCP connection stays ESTABLISHED forever after a network blip:
+ * no close frame arrives, Slack's periodic `disconnect` never does either,
+ * and the adapter sits silent (live, 2026-10: 30+ hours with zero events).
+ * Fifteen minutes is far beyond Slack's ~10s ping cadence yet short enough
+ * that an outage is noticed within one planning horizon.
+ */
+export const DEFAULT_SOCKET_LIVENESS_TIMEOUT_MS = 15 * 60_000;
+export const MIN_SOCKET_LIVENESS_TIMEOUT_MS = 30_000;
+const LIVENESS_CHECK_MAX_MS = 60_000;
 
 export class SlackSocketMode {
 	private ready?: Promise<void>;
@@ -62,12 +82,14 @@ export class SlackSocketMode {
 	private opened = 0;
 	private readonly seen = new Map<string, string | undefined>();
 	private retryTimer?: ReturnType<typeof setTimeout>;
-	private livenessTimer?: ReturnType<typeof setTimeout>;
 	private readonly factory: (url: string) => WebSocketLike;
 	private readonly sleep: (ms: number) => Promise<void>;
 	private readonly log: Pick<Console, "log" | "error">;
 	private readonly random: () => number;
-	private readonly livenessIntervalMs: number;
+	private readonly livenessTimeoutMs: number;
+	private readonly now: () => number;
+	private readonly setInterval: (work: () => void, ms: number) => unknown;
+	private readonly clearInterval: (timer: unknown) => void;
 
 	constructor(
 		private readonly openConnection: () => Promise<{ readonly url: string }>,
@@ -76,7 +98,6 @@ export class SlackSocketMode {
 	) {
 		// The DOM WebSocket's handler signatures are contravariant in the event type, so the
 		// structural cast is the honest way to say "a real socket satisfies the seam".
-		// Bun's WebSocket includes ping() for liveness detection.
 		this.factory = options.factory ?? ((url) => new WebSocket(url) as unknown as WebSocketLike);
 		this.sleep =
 			options.sleep ??
@@ -86,7 +107,10 @@ export class SlackSocketMode {
 				}));
 		this.log = options.log ?? console;
 		this.random = options.random ?? Math.random;
-		this.livenessIntervalMs = options.livenessIntervalMs ?? 30_000;
+		this.livenessTimeoutMs = options.livenessTimeoutMs ?? DEFAULT_SOCKET_LIVENESS_TIMEOUT_MS;
+		this.now = options.now ?? Date.now;
+		this.setInterval = options.setInterval ?? ((work, ms) => setInterval(work, ms));
+		this.clearInterval = options.clearInterval ?? ((timer) => clearInterval(timer as ReturnType<typeof setInterval>));
 	}
 
 	get connected(): boolean {
@@ -114,7 +138,6 @@ export class SlackSocketMode {
 		++this.generation;
 		this.cancel?.();
 		clearTimeout(this.retryTimer);
-		clearTimeout(this.livenessTimer);
 		this.retire?.("Slack socket stopped");
 		this.ready = undefined;
 		this.isConnected = false;
@@ -131,13 +154,41 @@ export class SlackSocketMode {
 					new Promise<void>((resolve) => {
 						let retired = false;
 						let opened = false;
+						let lastActivityAt = this.now();
+						let probed = false;
+						const touch = () => {
+							lastActivityAt = this.now();
+							probed = false;
+						};
+						const watchdog = this.setInterval(
+							() => {
+								const quiet = this.now() - lastActivityAt;
+								if (quiet >= this.livenessTimeoutMs) {
+									this.log.log(
+										`Slack socket stale: nothing received for ${Math.round(quiet / 1000)}s; forcing reconnect.`,
+									);
+									retire("Slack socket stale");
+									return;
+								}
+								// A quiet workspace is not a dead link: ask before concluding anything.
+								if (quiet >= this.livenessTimeoutMs / 2 && !probed && typeof socket.ping === "function") {
+									probed = true;
+									try {
+										socket.ping();
+									} catch {
+										this.log.error("Slack socket ping failed");
+									}
+								}
+							},
+							Math.max(1_000, Math.min(LIVENESS_CHECK_MAX_MS, Math.floor(this.livenessTimeoutMs / 4))),
+						);
 						const retire = (reason: string) => {
 							if (retired) return;
 							retired = true;
+							this.clearInterval(watchdog);
 							socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
 							this.isConnected = false;
 							this.retire = undefined;
-							clearTimeout(this.livenessTimer);
 							try {
 								socket.close();
 							} catch {
@@ -151,43 +202,24 @@ export class SlackSocketMode {
 							resolve();
 						};
 						this.retire = retire;
-						let lastInboundMs = Date.now();
-						const scheduleLiveness = () => {
-							clearTimeout(this.livenessTimer);
-							this.livenessTimer = setTimeout(() => {
-								if (retired || !opened) return;
-								const nowMs = Date.now();
-								const elapsedMs = nowMs - lastInboundMs;
-								const timeoutMs = this.livenessIntervalMs * 2;
-								if (elapsedMs > timeoutMs) {
-									retire(`Slack socket liveness timeout (no frame for ${elapsedMs}ms)`);
-								} else {
-									// Attempt a ping; if unsupported, rely on incoming frames
-									if (socket.ping?.()) {
-										// Ping sent; reschedule for next interval
-										scheduleLiveness();
-									} else {
-										// Ping not supported; reschedule to check again
-										scheduleLiveness();
-									}
-								}
-							}, this.livenessIntervalMs);
-						};
 						socket.onopen = () => {
+							touch();
 							if (!opened) {
 								opened = true;
 								++this.opened;
 							}
-							lastInboundMs = Date.now();
-							scheduleLiveness();
 							ready();
 						};
 						socket.onclose = (event) => retire(event.reason || `Slack socket closed (${event.code ?? 0})`);
 						socket.onerror = () => retire("Slack socket error");
 						socket.onmessage = (event) => {
-							lastInboundMs = Date.now();
+							touch();
 							void this.receive(socket, event.data, retire);
 						};
+						if (typeof socket.addEventListener === "function") {
+							socket.addEventListener("ping", touch);
+							socket.addEventListener("pong", touch);
+						}
 					}),
 					cancelled,
 				]);

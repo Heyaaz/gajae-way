@@ -32,6 +32,8 @@ export interface DiscordReactableMessageLike {
 export interface DiscordReactionChannelLike {
 	readonly guild?: DiscordGuildLike | null;
 	readonly messages: { fetch(id: string): Promise<unknown> };
+	/** Thread channels only: the parent-channel message the thread was opened from. */
+	fetchStarterMessage?(): Promise<unknown>;
 }
 
 /**
@@ -232,11 +234,24 @@ export async function settleDiscordReaction(
 		if (!isDiscordReactionChannel(channel)) {
 			throw Object.assign(new Error(`Discord channel ${conversationId} cannot receive reactions`), { code: 10003 });
 		}
-		const target = await channel.messages.fetch(targetMessageId);
+		// A thread's id is its starter message's id, but that message lives in the
+		// parent channel: fetching it through the thread answers Unknown Message.
+		const target =
+			targetMessageId === conversationId && channel.fetchStarterMessage
+				? await channel.fetchStarterMessage()
+				: await channel.messages.fetch(targetMessageId);
 		if (!isReactableMessage(target)) {
 			throw Object.assign(new Error(`Discord message ${targetMessageId} cannot be reacted to`), { code: 10008 });
 		}
 		const spelling = resolver.resolve(channel.guild, emojiName, emoji);
+		// For custom emoji (emoji is empty string), if resolution failed, spelling will also be empty.
+		// This is a definitive failure: the guild doesn't have this custom emoji.
+		if (!emoji && !spelling) {
+			throw Object.assign(
+				new Error(`Custom emoji '${emojiName}' not found in this Discord server`),
+				{ code: 50035 }, // Invalid Form Body — permanent validation error
+			);
+		}
 		if (action === "remove") {
 			// Remove the reaction. Discord treats removing a non-existent reaction as idempotent success.
 			const bot = typeof discord === "object" && discord !== null && "user" in discord ? discord.user : undefined;

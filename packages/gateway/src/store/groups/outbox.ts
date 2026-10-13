@@ -342,7 +342,7 @@ export class OutboxGroup {
 	): Array<{ created_at: string; payload_json: string }> {
 		return this.#db
 			.prepare(
-				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
+				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM conversation_context WHERE conversation_context.message_id = 'post/' || deliveries.delivery_id) ORDER BY created_at DESC LIMIT ?",
 			)
 			.all(conversationId, floorAt, limit) as Array<{ created_at: string; payload_json: string }>;
 	}

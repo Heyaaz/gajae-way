@@ -8,6 +8,7 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
 import type { SessionRelayStream } from "../src/orchestrator/broker";
+import type { FailedTurnEvidence } from "../src/orchestrator/failed-turn-evidence";
 import type {
 	RunningHostJob,
 	SessionBindInput,
@@ -319,10 +320,7 @@ export class ScriptedSessionPort implements SessionPort {
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
 	omitStartedAt = false;
 
-	readonly failureEvidence = new Map<
-		string,
-		{ reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted" }
-	>();
+	readonly failureEvidence = new Map<string, FailedTurnEvidence>();
 	readonly failureEvidenceProbes: Array<{
 		sessionId: string;
 		repo: string;
@@ -342,11 +340,8 @@ export class ScriptedSessionPort implements SessionPort {
 		}
 	>();
 
-	setFailedTurnEvidence(
-		sessionId: string,
-		reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted",
-	): void {
-		this.failureEvidence.set(sessionId, { reason });
+	setFailedTurnEvidence(sessionId: string, reason: FailedTurnEvidence["reason"], retryAfterMs?: number): void {
+		this.failureEvidence.set(sessionId, retryAfterMs === undefined ? { reason } : { reason, retryAfterMs });
 	}
 
 	setFailedTransportCause(
@@ -397,6 +392,8 @@ export class ScriptedSessionPort implements SessionPort {
 						? {
 								status: "failed",
 								...startedAt,
+								commandId: operation.commandId,
+								turnId: operation.turnId,
 								terminalAt: operation.terminalAt,
 								error: {
 									...(operation.errorCode ? { code: operation.errorCode } : {}),

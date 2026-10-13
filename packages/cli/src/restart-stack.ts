@@ -62,6 +62,8 @@ export interface RestartReceipt {
 	readonly requestedAt: string;
 	supervisorPid?: number;
 	finishedAt?: string;
+	/** Why the sequence never ran, e.g. the supervisor could not be started. */
+	detail?: string;
 	readonly steps: RestartStep[];
 }
 
@@ -509,17 +511,32 @@ export async function launchRestartStack(
 	const receipt = newReceipt(randomUUID(), platform, options.uid, Date.now(), options.trigger ?? "manual");
 	await writeReceipt(options.home, receipt);
 	const worker = [...(options.worker ?? [...cliCommand(), "ops", "restart-stack"]), "--run", receipt.id];
-	const child = Bun.spawn(supervisorArgv(platform, worker, options.home, receipt.id, options.binDir), {
-		detached: true,
-		stdin: "ignore",
-		stdout: "ignore",
-		stderr: "ignore",
-		env: {
-			...(options.env ?? process.env),
-			GAJAEWAY_HOME: options.home,
-			...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
-		},
-	});
+	const argv = supervisorArgv(platform, worker, options.home, receipt.id, options.binDir);
+	let child: Bun.Subprocess;
+	try {
+		child = Bun.spawn(argv, {
+			detached: true,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			env: {
+				...(options.env ?? process.env),
+				GAJAEWAY_HOME: options.home,
+				...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
+			},
+		});
+	} catch (error) {
+		// Nothing will ever pick this receipt up: leaving it `queued` reads as a
+		// restart still on its way. A host without a systemd user manager (a
+		// container) has no `systemd-run`, and its restart belongs to whatever
+		// supervises that host.
+		receipt.state = "failed";
+		receipt.finishedAt = new Date().toISOString();
+		receipt.detail = `supervisor ${argv[0]} could not be started (${error instanceof Error ? error.message : String(error)}); without a service manager here, restart through the host's own supervisor`;
+		for (const step of receipt.steps) step.result = "skipped";
+		await writeReceipt(options.home, receipt);
+		throw new Error(`restart-stack ${receipt.id}: failed: ${receipt.detail}`);
+	}
 	child.unref();
 	return { receipt, supervisorPid: child.pid };
 }
@@ -571,6 +588,7 @@ export function renderRestartReceipt(
 		`restart-stack ${receipt.id}: ${state}`,
 		`requestedAt: ${receipt.requestedAt}`,
 		`finishedAt: ${receipt.finishedAt ?? "-"}`,
+		...(receipt.detail === undefined ? [] : [`detail: ${receipt.detail}`]),
 	];
 	for (const step of receipt.steps) {
 		const facts = [

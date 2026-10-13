@@ -607,18 +607,49 @@ export class InboxGroup {
 		);
 	}
 
+	/**
+	 * Recent INBOUND messages only, oldest first, for judging one message against
+	 * what people said around it. Deliberately excludes the persona's own replies:
+	 * they are long, and including them cost 5 of 14 real owner messages a false
+	 * skip (#243). A [POST:] from another conversation (`post/` row) is the
+	 * persona's own words too. Read-only - it consumes nothing and sets no floor.
+	 */
 	recentInbound(
 		originKey: string,
 		limit: number,
 		sinceIso: string,
 	): Array<{ id: string; at: string; author: string; body: string }> {
+		return this.#recentContextRows(originKey, limit, sinceIso, false);
+	}
+
+	/**
+	 * Recent conversation rows for a fresh session: the last `limit` context rows
+	 * (consumed or not, oldest first) INCLUDING the persona's own `post/` rows, so
+	 * a [POST:] from another conversation appears once as its context row and not
+	 * also as a delivery. Read-only - it consumes nothing and sets no floor.
+	 */
+	recentContext(
+		originKey: string,
+		limit: number,
+		sinceIso: string,
+	): Array<{ id: string; at: string; author: string; body: string }> {
+		return this.#recentContextRows(originKey, limit, sinceIso, true);
+	}
+
+	#recentContextRows(
+		originKey: string,
+		limit: number,
+		sinceIso: string,
+		includePosts: boolean,
+	): Array<{ id: string; at: string; author: string; body: string }> {
 		const state = this.#db
 			.prepare("SELECT floor_at, floor_row_id FROM conversation_context_state WHERE origin_key = ?")
 			.get(originKey) as { floor_at: string | null; floor_row_id: number | null } | null;
 		const floorAt = [state?.floor_at ?? "", sinceIso].sort().at(-1) ?? sinceIso;
+		const postsFilter = includePosts ? "" : " AND message_id NOT LIKE 'post/%'";
 		return this.#db
 			.prepare(
-				"SELECT message_id, author_name, author_id, body, received_at FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%' AND received_at >= ? AND rowid > ? ORDER BY received_at DESC LIMIT ?",
+				`SELECT message_id, author_name, author_id, body, received_at FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%'${postsFilter} AND received_at >= ? AND rowid > ? ORDER BY received_at DESC LIMIT ?`,
 			)
 			.all(originKey, floorAt, state?.floor_row_id ?? 0, limit)
 			.map((value) => {

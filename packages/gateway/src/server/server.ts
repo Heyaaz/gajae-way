@@ -25,6 +25,7 @@ import {
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
+	parseOriginKey,
 	parseReactionReply,
 	platformSupportsReaction,
 	REACTIONS_PER_MESSAGE_CAP,
@@ -46,6 +47,7 @@ import {
 	BotAudienceTurnGuard,
 	decideEngagement,
 	resolveBotAudienceLimits,
+	resolveChannelPolicy,
 	threadFollowUpEngaged,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
@@ -76,9 +78,14 @@ import {
 	type PersonaTurnSettledInput,
 	type PersonaTurnStartInput,
 } from "../orchestrator/persona-session";
-import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
+import { formatFailureChatNotice, formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
-import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
+import {
+	deterministicHeldPostDeliveryId,
+	deterministicInterimDeliveryId,
+	deterministicPostDeliveryId,
+	deterministicTerminalDeliveryId,
+} from "../orchestrator/tail-runner";
 import { laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
@@ -285,6 +292,7 @@ async function applyConfigReload(
 	}
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
+	runtime.personaSessions.setHostLimits(result.config.sessions);
 	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
@@ -565,6 +573,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		brokerAgentDir: options.broker?.agentDir,
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
+		maxLiveHosts: options.config.sessions?.maxLiveHosts,
+		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
@@ -688,6 +698,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		void monitors.reconcile();
 		void personaSessions
 			.recover()
+			.then(async () => {
+				await personaSessions.sweepIdleHosts();
+			})
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
 		void work
 			.recover()
@@ -849,6 +862,13 @@ function settleMonitorBatch(database: Store, deliveryId: string, stage: MonitorE
 	});
 }
 
+/**
+ * Recent conversation for a fresh session: the last `limit` context rows
+ * (consumed or not) plus the persona's own confirmed replies, oldest first. A
+ * reply posted here from another conversation ([POST:]) appears once, as its
+ * `post/<delivery id>` context row, not also as a confirmed delivery - so this
+ * reads context rows WITH posts (the judge path uses recentInbound instead).
+ */
 function recentConversation(
 	store: Store,
 	originKey: string,
@@ -856,7 +876,7 @@ function recentConversation(
 	limit: number,
 	sinceIso: string,
 ): Array<{ id?: string; at: string; author: string; body: string }> {
-	const inbound = store.inbox.recentInbound(originKey, limit, sinceIso);
+	const inbound = store.inbox.recentContext(originKey, limit, sinceIso);
 	const floorAt = [store.inbox.contextFloorAt(originKey) ?? "", sinceIso].sort().at(-1) ?? sinceIso;
 	const replies = store.outbox
 		.confirmedConversation(conversationId, floorAt, limit)
@@ -1346,7 +1366,7 @@ async function handleRequest(
 			rows.sort((a, b) => b.score - a.score || b.at.localeCompare(a.at));
 			const snippets = rows
 				.slice(0, limit)
-				.map((r) => ({ origin: JSON.parse(r.origin_ref_json), text: r.text.slice(0, 500), at: r.at }));
+				.map((r) => ({ origin: JSON.parse(r.origin_ref_json), text: clipByCodePoints(r.text, 500), at: r.at }));
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { snippets } });
 			return;
 		}
@@ -1520,6 +1540,12 @@ async function handleRequest(
 				throw new ProtocolError(
 					"invalid_params",
 					`emoji ${JSON.stringify(params.emoji)} is outside the reaction allowlist: ${reactionAllowlistDescription(origin.platform)}`,
+				);
+			// Personas cannot request custom emoji: the protocol only knows the allowlisted emoji.
+			if (resolved.isCustom === true)
+				throw new ProtocolError(
+					"invalid_params",
+					`custom emoji ${resolved.name} are not supported in the persona protocol; use: ${reactionAllowlistDescription(origin.platform)}`,
 				);
 			// Allowlisted is not the same as deliverable: Telegram accepts only its own
 			// reaction set, so asking for one it cannot express would be a guaranteed dead
@@ -2312,7 +2338,6 @@ async function createInboundTurnLifecycle(
 			.map(
 				(entry) => `- [${entry.at}] ${entry.author}: ${clipContextBody(redactHistoricalAttachments(entry.body), 500)}`,
 			);
-
 		const recentBlock = recentLines.length
 			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";
@@ -2469,7 +2494,13 @@ async function createInboundTurnLifecycle(
 		}
 		deliverTerminalLine(renderHandoffPointer(handoff.target));
 	};
-	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
+	/** [POST:] parts seen in mid-work speech, keyed `<target key>\n<body>`, posted at the turn's end. */
+	const heldPosts = new Map<string, { body: string; post: NonNullable<PlannedPart["post"]> }>();
+	/** [POST:] parts the final answer itself carried; a held copy of one is not posted twice. */
+	const terminalPosts = new Set<string>();
+	/** A refused [POST:] part is logged once, not on every pass over the same text. */
+	const postRefusalsLogged = new Set<string>();
+	const deliverTurnText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		const handoff = parseHandoffReply(rawMessage);
 		if (handoff) {
@@ -2584,21 +2615,44 @@ async function createInboundTurnLifecycle(
 					: origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
 						? engagement.replyTo.messageId
 						: undefined;
-		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
-		for (const part of parts) {
+		const planned: PlannedPart[] = [];
+		for (const rawPart of parts) {
 			if (planned.length >= maxTurnParts) break;
+			// Cross-room post: a part opening with [POST:<origin key>] goes to that
+			// configured channel instead of this conversation. A refused target keeps
+			// the part here (token stripped) so its content is never lost.
+			let part = rawPart;
+			let post: PlannedPart["post"];
+			const postMatch = rawPart.match(POST_TOKEN);
+			if (postMatch) {
+				part = rawPart.slice(postMatch[0].length);
+				const resolved = resolvePostTarget(postMatch[1] ?? "", origin, runtime.config);
+				if (resolved.ok) post = { origin: resolved.target, key: resolved.key };
+				else if (resolved.reason !== "current_conversation" && !postRefusalsLogged.has(rawPart)) {
+					postRefusalsLogged.add(rawPart);
+					console.error(
+						`gateway post target refused origin=${key} target=${JSON.stringify(sanitizeDiagnostic(postMatch[1] ?? "").slice(0, 160))} reason=${resolved.reason}; delivering the part here`,
+					);
+				}
+			}
 			// Reply-threading: a part may open with [REPLY:<platform message id>] to
 			// answer a specific message; mentions are plain <@author id> in the text.
+			// A reply target belongs to this conversation, so a post ignores it.
 			const replyMatch = part.match(/\[REPLY:([^\]\s]+)\]/);
 			const body = (replyMatch ? part.replace(/\s*\[REPLY:[^\]\s]+\]\s*/g, " ") : part)
 				.replace(/\s*\[BREAK\]\s*/g, " ")
 				.trim();
 			if (!body) continue;
+			if (post) {
+				planned.push({ body, post });
+				continue;
+			}
 			const replyTo = replyMatch?.[1] || inboundThreadRoot;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
+		const local = planned.filter((step) => step.post === undefined);
 		const spoken = spokenReply(
-			planned.map((step) => step.body),
+			local.map((step) => step.body),
 			voiceTurn,
 		);
 		for (let index = 0; index < planned.length; index++) {
@@ -2606,7 +2660,24 @@ async function createInboundTurnLifecycle(
 			// answer always records its claim: with an ungated stream a chatty turn
 			// could otherwise exhaust the budget on interims and lose its final.
 			if (source === "interim" && deliveredParts.length >= maxTurnParts) return;
-			const step = planned[index] as { body: string; replyTo?: string };
+			const step = planned[index] as PlannedPart;
+			if (step.post) {
+				// A post leaves this conversation, so it is sent once, from the
+				// finished answer: mid-work speech only holds it for the turn's end.
+				const postKey = `${step.post.key}\n${step.body}`;
+				if (source === "interim") {
+					heldPosts.set(postKey, { body: step.body, post: step.post });
+					continue;
+				}
+				terminalPosts.add(postKey);
+				const postId = deterministicPostDeliveryId(key, step.post.key, input.turn.triggerMessageId, index);
+				const claimed = options.database.transaction((tx) =>
+					options.database.inbox.claimTerminal(tx, input.turn.opRef, index, postId),
+				);
+				if (claimed !== postId) continue;
+				postElsewhere(step.body, step.post, postId);
+				continue;
+			}
 			// Interim parts are keyed on (trigger, text, part): distinct findings get
 			// distinct rows, a replayed finding (stream backfill, id-less frame after
 			// restart) collides. The terminal reply owns ONE slot per part keyed on
@@ -2642,8 +2713,55 @@ async function createInboundTurnLifecycle(
 			deliveredParts.push(step.body);
 			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
-			const isLast = index === planned.length - 1;
+			const isLast = step === local.at(-1);
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
+		}
+	};
+	/**
+	 * Sends one [POST:] part to its target conversation through the ordinary
+	 * ledger, and records it there as the persona's own words: a context row the
+	 * target session reads as unread (and, fresh, as recent history) plus the
+	 * target's daily memory. `final: false` - the post must not end a working
+	 * status that belongs to a turn running in the target room.
+	 */
+	const postElsewhere = (body: string, post: NonNullable<PlannedPart["post"]>, deliveryId: string) => {
+		const payload = runtime.delivery.prepare(crypto.randomUUID(), post.origin, body, undefined, deliveryId, false);
+		if (!payload) return;
+		options.database.transaction((tx) =>
+			options.database.inbox.contextRecord(tx, {
+				messageId: `post/${deliveryId}`,
+				originKey: post.key,
+				authorName: `you (posted here from ${place})`,
+				body,
+			}),
+		);
+		runtime.memory.enqueue({
+			kind: "daily_capture",
+			originRefJson: JSON.stringify(post.origin),
+			userText: `(posted here from ${place})`,
+			replyText: body,
+		});
+		console.error(`gateway post origin=${key} target=${post.key} delivery=${deliveryId}`);
+		deliveredParts.push(`[posted to ${post.key}] ${body}`);
+		deliveredIds.push(deliveryId);
+		assistantDeliveryStarted = true;
+		broadcastDelivery(runtime, payload);
+	};
+	/**
+	 * The turn's text passes: mid-work speech holds its [POST:] parts; the
+	 * terminal pass posts its own and then any held one the final answer did not
+	 * repeat (text-keyed id, so a second terminal pass cannot post it again).
+	 */
+	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
+		await deliverTurnText(rawMessage, source);
+		if (source !== "terminal" || !nonLoopback) return;
+		for (const [postKey, held] of heldPosts) {
+			if (terminalPosts.has(postKey)) continue;
+			postElsewhere(
+				held.body,
+				held.post,
+				deterministicHeldPostDeliveryId(key, held.post.key, input.turn.triggerMessageId, held.body),
+			);
 		}
 	};
 
@@ -2803,7 +2921,7 @@ async function createInboundTurnLifecycle(
 					tx,
 					key,
 					JSON.stringify(origin),
-					`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
+					`user: ${clipByCodePoints(userText, 500)}\nassistant: ${clipByCodePoints(replyText, 500)}`,
 				);
 			});
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
@@ -2884,7 +3002,7 @@ async function createInboundTurnLifecycle(
 				const notice = runtime.delivery.prepare(
 					turnId,
 					origin,
-					failureNotice,
+					formatFailureChatNotice(error),
 					undefined,
 					deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0),
 				);
@@ -3103,7 +3221,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
 		if (!isPlatformMessageId(targetMessageId)) return;
 		const eyes = resolveReactionEmoji("👀");
-		if (!eyes || !platformSupportsReaction(origin.platform, eyes.name)) return;
+		if (!eyes || eyes.isCustom === true || !platformSupportsReaction(origin.platform, eyes.name)) return;
 		const key = originKey(origin);
 		const rejection = runtime.reactions.claim({
 			...(turnId ? { turnId } : {}),
@@ -3177,13 +3295,15 @@ function reportDeliveryExpired(
  */
 export function clipContextBody(body: string, maxChars: number): string {
 	if (body.length <= maxChars) return body;
-	const clipped = body.slice(0, maxChars);
-	const totalChars = body.length;
+	const points = Array.from(body);
+	if (points.length <= maxChars) return body;
+	const clipped = points.slice(0, maxChars).join("");
+	const totalChars = points.length;
 	return `${clipped}\u2026[clipped: first ${maxChars} of ${totalChars} chars shown; the message itself is complete]`;
 }
 
 function safeDiagnosticField(value: string): string {
-	return sanitizeDiagnostic(value).slice(0, 160).replace(/\s+/g, "_") || "unknown_error";
+	return clipByCodePoints(sanitizeDiagnostic(value), 160).replace(/\s+/g, "_") || "unknown_error";
 }
 
 function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
@@ -3192,6 +3312,50 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 
 function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string): string {
 	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|bind_hold`).digest("hex").slice(0, 32)}`;
+}
+
+/** One deliverable part of a persona answer: here (optionally threaded) or posted to another conversation. */
+interface PlannedPart {
+	readonly body: string;
+	readonly replyTo?: string;
+	readonly post?: { readonly origin: OriginRef; readonly key: string };
+}
+
+/** A part that opens with `[POST:<origin key>]` is meant for that conversation. */
+const POST_TOKEN = /^\[POST:([^\]]*)\]\s*/;
+
+export type PostTargetResolution =
+	| { readonly ok: true; readonly target: OriginRef; readonly key: string }
+	| {
+			readonly ok: false;
+			readonly reason:
+				| "invalid_origin_key"
+				| "current_conversation"
+				| "other_platform"
+				| "not_a_channel"
+				| "unconfigured_channel";
+	  };
+
+/**
+ * Where a [POST:] part may go: a canonical origin key (the protocol parser,
+ * nothing looser) naming a `channel` on the current platform that the gateway
+ * configuration lists. DMs, threads, other platforms and unlisted rooms are
+ * refused so a persona cannot write into a conversation nobody configured.
+ */
+export function resolvePostTarget(raw: string, origin: OriginRef, config: GatewayConfig): PostTargetResolution {
+	let target: OriginRef;
+	try {
+		target = parseOriginKey(raw.trim());
+	} catch {
+		return { ok: false, reason: "invalid_origin_key" };
+	}
+	const key = originKey(target);
+	if (key === originKey(origin)) return { ok: false, reason: "current_conversation" };
+	if (target.platform !== origin.platform || !isChatPlatform(target.platform))
+		return { ok: false, reason: "other_platform" };
+	if (target.kind !== "channel") return { ok: false, reason: "not_a_channel" };
+	if (!resolveChannelPolicy(target, config)) return { ok: false, reason: "unconfigured_channel" };
+	return { ok: true, target, key };
 }
 
 /**
@@ -3227,6 +3391,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
+					`Posting to another room: start a reply part with [POST:<origin key>] (for example [POST:${origin.platform}/channel/<channel id>]) to send that part to another channel instead of this conversation; the token never appears in the delivered text. Only ${origin.platform} channels configured in the gateway are allowed - never a DM or a thread, never another platform - and a refused target is posted here with the token removed. A post is sent once, when your answer is final, and a reply-threading token in the same part is ignored. In Discord and Slack text, a channel link is <#channel id>.`,
 				]
 			: []),
 		...(isChatPlatform(origin.platform)
@@ -3238,7 +3403,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// guidance because the persona chooses between exactly these three shapes.
 		...(isChatPlatform(origin.platform)
 			? [
-					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. Remove a reaction you added earlier with [UNREACT:<emoji>@<message id>]; removal frees up your reaction budget and allows you to add a different emoji to the same message (e.g. change 🔥 to ❤). With nothing after the tokens you acknowledge with a reaction and say nothing; text after the tokens is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. Remove a reaction you added earlier with [UNREACT:<emoji>@<message id>]; removal frees up your reaction budget and allows you to add a different emoji to the same message (e.g. change 🔥 to ❤). With nothing after the tokens you acknowledge with a reaction and say nothing; text after the tokens is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. Custom emoji names (Slack-valid: lowercase, digits, underscores, hyphens, 2-80 chars) are also accepted on Slack and Discord and will be validated server-side. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]
 			: []),
 		// Live 2026-09-25: the persona held turns open for 13 minutes in a
@@ -3276,6 +3441,15 @@ function ingestOrReportDrop<T>(originKey: string, messageId: string, engaged: bo
 
 function diagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+}
+
+/**
+ * Safely clips a string to a maximum number of code points, never leaving a lone UTF-16 surrogate.
+ * Uses Array.from to iterate over code points (not code units), ensuring the result is always well-formed.
+ */
+function clipByCodePoints(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	return Array.from(text).slice(0, limit).join("");
 }
 
 function writeError(connection: Connection, error: unknown, id?: string): void {

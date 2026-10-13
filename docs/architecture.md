@@ -110,7 +110,14 @@ Inbound messages enter a durable per-origin mailbox actor that applies one rule:
 [turn failed] spawn_failed: SDK startup did not complete before readiness cutoff. Send /new to rebind this conversation.
 ```
 
-The same string goes to the daemon log, so a channel transcript is enough to triage without shell access. The `/new` hint appears only when a rebind is plausibly the remedy.
+That string goes to the daemon log. The room gets the same diagnosis behind a line a person can act on, so a channel transcript is still enough to triage without shell access:
+
+```text
+[turn failed] This message was not answered. Send /new to start a fresh conversation, then send it again.
+(diagnosis: spawn_failed: SDK startup did not complete before readiness cutoff.)
+```
+
+The `/new` remedy appears only when a rebind is plausibly the remedy; otherwise the room is asked to resend. The `terminal_failure` log line also carries the SDK `command=`/`turn=` ids, the only key that joins a redacted `internal: Prompt submission failed.` to gajae-code's local `SDK invocation failed` record holding the real cause.
 
 `/model` applies `model.set` to the existing session through that mailbox; it neither changes the epoch nor truncates the transcript, and each subsequent persona turn logs its effective model. `/new` is the explicit recovery boundary: it atomically advances the epoch, fences stale output, and discards only pending messages not yet in a turn - the one path that completes an inbound row without answering it. Accepted prior-epoch turns retain their bound session identity as durable recovery holds, so a restarted actor can reattach status/tail until terminal reconciliation; the gateway never invents a replacement operation reference or aborts a running SDK turn.
 

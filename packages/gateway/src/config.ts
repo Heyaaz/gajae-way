@@ -38,6 +38,24 @@ export interface WorkLaneConfig {
 	readonly idleRetireMs?: number;
 	readonly allowNested?: boolean;
 }
+
+/**
+ * Upper bound on concurrently live persona session hosts (one
+ * `gjc sdk session-host-internal` process, ~360 MB, per bound origin). Past
+ * it, the least-recently-active idle host is retired before a new origin binds;
+ * when every host is busy the new turn is held, not spawned (live, 2026-10: 81
+ * open channels spawned 16 hosts, exhausted an 8 GB VM, and the broker answered
+ * `broker_unavailable` to everything).
+ */
+export const DEFAULT_SESSIONS_MAX_LIVE_HOSTS = 8;
+/** A persona host idle for this long is ended by the sweep; its session resumes with history on the next turn. */
+export const DEFAULT_SESSIONS_IDLE_RETIRE_MS = 6 * 60 * 60_000;
+const SESSIONS_MAX_LIVE_HOSTS_MAX = 256;
+
+export interface SessionHostConfig {
+	readonly maxLiveHosts?: number;
+	readonly idleRetireMs?: number;
+}
 export type GjcServiceTier =
 	| "none"
 	| "auto"
@@ -99,6 +117,8 @@ export interface GatewayConfigFile {
 	readonly runtime?: RuntimeConfig;
 	/** Worker-lane governance: admission cap and idle retirement for `work.run` sessions. */
 	readonly work?: WorkLaneConfig;
+	/** Persona-host governance: live-host cap and idle retirement for conversation sessions. */
+	readonly sessions?: SessionHostConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
 	/** Mid-work speech limits (issue #71); unset means every non-narration mid-work message ships. */
@@ -519,6 +539,36 @@ function parseWork(value: unknown): WorkLaneConfig {
 	};
 }
 
+function parseSessions(value: unknown): SessionHostConfig {
+	const input = requireObject(value, "sessions");
+	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs"))
+		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts and idleRetireMs");
+	if (
+		input.maxLiveHosts !== undefined &&
+		(!Number.isInteger(input.maxLiveHosts) ||
+			(input.maxLiveHosts as number) < 1 ||
+			(input.maxLiveHosts as number) > SESSIONS_MAX_LIVE_HOSTS_MAX)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`sessions.maxLiveHosts must be an integer between 1 and ${SESSIONS_MAX_LIVE_HOSTS_MAX}`,
+		);
+	if (
+		input.idleRetireMs !== undefined &&
+		(!Number.isInteger(input.idleRetireMs) ||
+			(input.idleRetireMs as number) < WORK_IDLE_RETIRE_MIN_MS ||
+			(input.idleRetireMs as number) > WORK_IDLE_RETIRE_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`sessions.idleRetireMs must be an integer between ${WORK_IDLE_RETIRE_MIN_MS} and ${WORK_IDLE_RETIRE_MAX_MS}`,
+		);
+	return {
+		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
+		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
+	};
+}
+
 function parseDmPolicy(value: unknown): DmPolicy {
 	if (typeof value !== "string" || !DM_POLICIES.includes(value as DmPolicy))
 		throw new ConfigError("config_invalid", `dmPolicy must be one of ${DM_POLICIES.join(", ")}`);
@@ -585,6 +635,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
+		...(input.sessions === undefined ? {} : { sessions: parseSessions(input.sessions) }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
 		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 		...(input.monitorContextFailureRollThreshold === undefined
@@ -695,8 +746,9 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 /**
  * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
  * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
- * resolved per inbound message) and `stallTimeoutMs` (tail liveness alarms). Each
- * applies to the next actor event.
+ * resolved per inbound message), `stallTimeoutMs` (tail liveness alarms) and
+ * `sessions` (persona host cap and idle retirement, applied to the next bind and
+ * sweep). Each applies to the next actor event.
  */
 export const RELOADABLE_FIELDS = [
 	"mentionAllowlist",
@@ -705,6 +757,7 @@ export const RELOADABLE_FIELDS = [
 	"dmPolicy",
 	"botAudience",
 	"handoffTargets",
+	"sessions",
 ] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */

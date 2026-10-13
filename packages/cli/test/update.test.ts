@@ -26,7 +26,7 @@ import {
 	type UpdateDeps,
 } from "../src/update";
 
-const PINNED_GJC = "0.18.9";
+const PINNED_GJC = "0.18.11";
 
 async function homeWithConfig(): Promise<string> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-update-home-"));
@@ -545,7 +545,7 @@ describe("runUpdate", () => {
 					args: { check: false, force: false, noRestart: true },
 					home: "/tmp/gajaeway-home",
 					deps: {
-						fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
+						fetchLatestRelease: async () => release("v0.3.0", [DARWIN_ASSET]),
 						downloadAsset: noBytes,
 						extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` }))),
 						platform: "darwin",

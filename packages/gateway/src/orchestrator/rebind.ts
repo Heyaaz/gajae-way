@@ -486,6 +486,25 @@ export function formatFailureNotice(error: unknown): string {
 export type RebindStore = Pick<Store, "bindings" | "core" | "transaction">;
 
 /**
+ * The notice a person reads in the room. The runtime diagnosis is usually a
+ * redacted fixed sentence (`internal: Prompt submission failed.`) that tells the
+ * owner neither that nothing was answered nor what to do, so the chat line leads
+ * with both and keeps the diagnosis after them for triage (#14). The prefix stays
+ * `[turn failed]`: admin turn views classify the row by it.
+ */
+export function formatFailureChatNotice(error: unknown): string {
+	const described = describeFailure(error);
+	const remediable = isRebindableCode(described.code) || described.code === "rebind_cap_exceeded";
+	// A quota diagnosis is already the instruction; resending cannot help it.
+	const remedy = remediable
+		? " Send /new to start a fresh conversation, then send it again."
+		: described.code === "provider_quota_exhausted"
+			? ""
+			: " Please send it again in a moment.";
+	return `[turn failed] This message was not answered.${remedy}\n(diagnosis: ${described.text})`;
+}
+
+/**
  * Owns the epoch-bump budget for rebindable failures. One instance per
  * SessionPort keeps counters across attempts for each session/origin rather than resetting per call.
  *

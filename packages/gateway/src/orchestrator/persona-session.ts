@@ -13,7 +13,13 @@ import {
 	projectOpState,
 	type StatusReport,
 } from "@gajae-gateway/subsession";
-import type { GjcModelSelection, GjcServiceTier } from "../config";
+import {
+	DEFAULT_SESSIONS_IDLE_RETIRE_MS,
+	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	type GjcModelSelection,
+	type GjcServiceTier,
+	type SessionHostConfig,
+} from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
 import { type InboundMessageRow, type InboundTurn, terminalDeliveryIds } from "../store/groups/inbox";
 import type { WriteTx } from "../store/tx";
@@ -21,7 +27,7 @@ import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold 
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
-import type { SessionBinding, SessionPort } from "./session-port";
+import type { SessionBinding, SessionPort, TerminateHostOutcome } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
@@ -169,6 +175,10 @@ export function resetFailedTurn(
 	return store.bindings.rotateEpoch(tx, input.originKey);
 }
 export const BIND_WEDGE_PROBE_STRIKES = 5;
+/** A turn held for host capacity re-checks at this cadence even if no host frees in between. */
+const HOST_CAPACITY_RETRY_MS = 5_000;
+export type HostRetireReason = "host_capacity" | "host_idle";
+export type HostAdmission = { readonly admitted: true } | { readonly admitted: false; readonly live: number };
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
 
@@ -324,6 +334,10 @@ export interface PersonaSessionManagerOptions {
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
 	/** Records a failed persona bind in the durable SLO journal. */
 	readonly onSloEvent?: (code: "persona_bind_failed", at: number) => void;
+	/** Cap on concurrently live persona session hosts; default DEFAULT_SESSIONS_MAX_LIVE_HOSTS. */
+	readonly maxLiveHosts?: number;
+	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
+	readonly hostIdleRetireMs?: number;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -371,6 +385,8 @@ export class PersonaSessionManager {
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
+	#maxLiveHosts: number;
+	#hostIdleRetireMs: number;
 	#stopped = false;
 
 	constructor(options: PersonaSessionManagerOptions) {
@@ -396,6 +412,12 @@ export class PersonaSessionManager {
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
 		this.#onReverseRequest = options.onReverseRequest;
+		this.#maxLiveHosts = positiveInteger(options.maxLiveHosts, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, "maxLiveHosts");
+		this.#hostIdleRetireMs = positiveInteger(
+			options.hostIdleRetireMs,
+			DEFAULT_SESSIONS_IDLE_RETIRE_MS,
+			"hostIdleRetireMs",
+		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
 	}
@@ -437,6 +459,73 @@ export class PersonaSessionManager {
 		if (this.#stopped) return;
 		this.#stallTimeoutMs = positiveInteger(timeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 		this.#port.setStallTimeoutMs(this.#stallTimeoutMs);
+	}
+
+	/** Live-reloaded `sessions` policy; a lowered cap takes effect at the next bind and sweep, never by killing busy hosts. */
+	setHostLimits(config: SessionHostConfig | undefined): void {
+		if (this.#stopped) return;
+		this.#maxLiveHosts = positiveInteger(config?.maxLiveHosts, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, "maxLiveHosts");
+		this.#hostIdleRetireMs = positiveInteger(config?.idleRetireMs, DEFAULT_SESSIONS_IDLE_RETIRE_MS, "hostIdleRetireMs");
+	}
+
+	get maxLiveHosts(): number {
+		return this.#maxLiveHosts;
+	}
+
+	get hostIdleRetireMs(): number {
+		return this.#hostIdleRetireMs;
+	}
+
+	/** Origins this gateway currently counts as holding a live session host. */
+	liveHostCount(): number {
+		let live = 0;
+		for (const actor of this.#actors.values()) if (actor.hostLive) live++;
+		return live;
+	}
+
+	/**
+	 * Admission for an origin about to bind a host. Under the cap it proceeds;
+	 * at the cap the least-recently-active idle host is retired first (its
+	 * session resumes with history on its next turn); with every host busy the
+	 * caller holds its trigger instead of spawning a process the machine
+	 * cannot afford.
+	 */
+	async admitHost(requester: OriginActor): Promise<HostAdmission> {
+		const live = [...this.#actors.values()].filter((actor) => actor !== requester && actor.hostLive);
+		if (live.length < this.#maxLiveHosts) return { admitted: true };
+		const idle = live.filter((actor) => actor.hostIdle).sort((a, b) => a.hostLastActiveAt - b.hostLastActiveAt);
+		for (const candidate of idle) {
+			// Retirement runs on the candidate's own mailbox so it cannot race a
+			// turn that is being dispatched there at the same moment.
+			const retired = await candidate.enqueue(async () => await candidate.retireIdleHost("host_capacity"));
+			if (retired) return { admitted: true };
+		}
+		return { admitted: false, live: live.length };
+	}
+
+	/** A host slot opened: wake the longest-waiting capacity hold, if any. */
+	hostFreed(): void {
+		if (this.#stopped) return;
+		let oldest: OriginActor | undefined;
+		for (const actor of this.#actors.values()) {
+			if (actor.hostHeldSince === undefined) continue;
+			if (oldest === undefined || actor.hostHeldSince < (oldest.hostHeldSince ?? Number.POSITIVE_INFINITY))
+				oldest = actor;
+		}
+		oldest?.releaseHostHold();
+	}
+
+	/** Ends hosts that have sat idle past `hostIdleRetireMs`; returns how many were ended. */
+	async sweepIdleHosts(now = this.#now()): Promise<number> {
+		if (this.#stopped) return 0;
+		const stale = [...this.#actors.values()].filter(
+			(actor) => actor.hostIdle && now - actor.hostLastActiveAt >= this.#hostIdleRetireMs,
+		);
+		let retired = 0;
+		for (const actor of stale) {
+			if (await actor.enqueue(async () => await actor.retireIdleHost("host_idle"))) retired++;
+		}
+		return retired;
 	}
 
 	/**
@@ -693,10 +782,125 @@ class OriginActor {
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
+	/** The session whose host this origin counts as holding; cleared when that host is ended. */
+	#hostSessionId: string | undefined;
+	#hostLastActiveAt = 0;
+	/** Set while the oldest pending trigger waits for a host slot. */
+	#hostHeldSince: number | undefined;
 
 	constructor(manager: PersonaSessionManager, originKey: string) {
 		this.#manager = manager;
 		this.originKey = originKey;
+	}
+
+	/** True while this origin holds a host: a tracked idle binding, or any turn (live or retired) still bound. */
+	get hostLive(): boolean {
+		return this.#hostSessionId !== undefined || this.#current !== undefined || this.#retired.size > 0;
+	}
+
+	/** A live host with no turn in flight, nothing retired, and nothing about to dispatch. */
+	get hostIdle(): boolean {
+		return (
+			this.#hostSessionId !== undefined &&
+			this.#state === "idle" &&
+			this.#current === undefined &&
+			this.#retired.size === 0 &&
+			!this.#stopped
+		);
+	}
+
+	get hostLastActiveAt(): number {
+		return this.#hostLastActiveAt;
+	}
+
+	get hostHeldSince(): number | undefined {
+		return this.#hostHeldSince;
+	}
+
+	#touchHost(sessionId?: string): void {
+		if (sessionId !== undefined) this.#hostSessionId = sessionId;
+		this.#hostLastActiveAt = this.#manager.now();
+	}
+
+	/**
+	 * Ends this origin's idle host process. The durable binding is kept: the
+	 * next dispatch finds the session saved-but-dead and takes #ensureSession's
+	 * `session.resume` branch, so conversation history survives. A host with
+	 * background jobs is left alone; ending it would lose them.
+	 */
+	async retireIdleHost(reason: HostRetireReason): Promise<boolean> {
+		if (!this.hostIdle || this.#manager.stopped) return false;
+		const sessionId = this.#hostSessionId;
+		if (sessionId === undefined) return false;
+		if (this.#manager.database.inbox.pendingOldest(this.originKey)) return false;
+		const port = this.#manager.port;
+		if (!port.terminateHost) return false;
+		if (port.runningJobs) {
+			try {
+				const running = await port.runningJobs({ sessionId, repo: this.#manager.repo });
+				if (running.length > 0) {
+					this.#manager.log(
+						`persona_host_retire_skipped origin=${this.originKey} session=${sessionId} reason=${reason} jobs=${running.length}`,
+					);
+					return false;
+				}
+			} catch {
+				// An unanswerable host is not proof of work in progress; terminateHost re-proves liveness itself.
+			}
+		}
+		let result: TerminateHostOutcome;
+		try {
+			result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
+		} catch (error) {
+			this.#manager.log(
+				`persona_host_retired origin=${this.originKey} session=${sessionId} reason=${reason} outcome=error detail=${safeDiagnostic(error)}`,
+				"error",
+			);
+			return false;
+		}
+		const ended = result.outcome === "terminated" || result.outcome === "already_gone";
+		this.#manager.log(
+			`persona_host_retired origin=${this.originKey} session=${sessionId} reason=${reason} outcome=${result.outcome}${
+				"pid" in result ? ` pid=${result.pid}` : ""
+			}${result.outcome === "refused" ? ` detail=${result.reason}` : ""}`,
+			ended ? "info" : "warn",
+		);
+		if (!ended) return false;
+		this.#hostSessionId = undefined;
+		this.#manager.hostFreed();
+		return true;
+	}
+
+	/** A slot opened while this origin's trigger was held: dispatch now instead of at the next retry tick. */
+	releaseHostHold(): void {
+		if (this.#hostHeldSince === undefined || this.#stopped || this.#manager.stopped) return;
+		this.#hostHeldSince = undefined;
+		if (this.#dispatchRetry) {
+			this.#manager.cancel(this.#dispatchRetry);
+			this.#graceTimers.delete(this.#dispatchRetry);
+			this.#dispatchRetry = undefined;
+		}
+		void this.enqueue(async () => await this.#dispatchNext()).catch(() => {});
+	}
+
+	async #holdForHostCapacity(trigger: InboundMessageRow, epoch: number, live: number): Promise<void> {
+		const max = this.#manager.maxLiveHosts;
+		this.#manager.log(
+			`persona_bind_hold origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} reason=host_capacity live=${live} max=${max}`,
+			"warn",
+		);
+		this.#hostHeldSince ??= this.#manager.now();
+		if (this.#lastBindHoldReason !== "host_capacity") {
+			this.#lastBindHoldReason = "host_capacity";
+			await this.#manager.emitBindHold({
+				originKey: this.originKey,
+				trigger,
+				reason: "host_capacity",
+				notice: `[turn held] session hosts at capacity (${live}/${max} busy). Starting as soon as one frees.`,
+				verdict: undefined,
+			});
+		}
+		this.#scheduleDispatchRetry(HOST_CAPACITY_RETRY_MS);
 	}
 
 	admissionHold(): string | undefined {
@@ -797,6 +1001,7 @@ class OriginActor {
 	/** Mailbox-serialized live rebind. The caller supplies a verified concrete selection. */
 	async rebindModel(selection: GjcModelSelection): Promise<void> {
 		const binding = await this.#ensureSession(this.#epoch());
+		this.#touchHost(binding.sessionId);
 		const receipt = await this.#manager.port.setModel({
 			sessionId: binding.sessionId,
 			repo: this.#manager.repo,
@@ -1237,10 +1442,19 @@ class OriginActor {
 		const epoch = this.#epoch();
 		const retryAttempt = freshTurnAttempt(this.#manager.database, this.originKey, epoch, trigger.message_id);
 		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
+		if (!this.hostLive) {
+			const admission = await this.#manager.admitHost(this);
+			if (!admission.admitted) {
+				await this.#holdForHostCapacity(trigger, epoch, admission.live);
+				return;
+			}
+		}
 		let binding: SessionBinding;
 		try {
 			binding = await this.#ensureSession(epoch);
 			this.#clearBindWedgeProbe();
+			this.#hostHeldSince = undefined;
+			this.#touchHost(binding.sessionId);
 		} catch (error) {
 			await this.#noteBindFailure(trigger, epoch, error);
 			return;
@@ -1718,6 +1932,11 @@ class OriginActor {
 		const current = this.#current;
 		if (!current || current.retired || current.replyVisible || this.#state !== "turn-running") return;
 		if (this.#deferredSteerOpRef === current.turn.opRef) return;
+		// A turn in recovery_hold (operation_state_unknown or past stall threshold)
+		// must not absorb new inbound as steers; new inbound must remain pending so it
+		// can start a fresh trigger turn. This ensures mentions and other new messages
+		// always get a reply, not silently absorbed into a dead op (fix for #405).
+		if (this.#holdSweeps.has(current.turn.opRef)) return;
 		// Steers whose transport tore before an answer are resolved first, on
 		// the same clientRef, before any new row is issued behind them.
 		for (const held of this.#manager.database.inbox.steersHeld(current.turn.opRef))
@@ -2167,6 +2386,12 @@ class OriginActor {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`, "warn");
+		// If turn is in recovery_hold and not already retired, retire it so pending inbound
+		// can start a fresh trigger turn in the next epoch.
+		const inRecoveryHold = !bound.retired && !retired && this.#holdSweeps.has(bound.turn.opRef);
+		if (inRecoveryHold) {
+			bound.retired = true;
+		}
 		if (!bound.retired && !retired) await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
 		if (retired || bound.retired) {
 			this.#flushStaleOutput(bound, "stall");
@@ -2186,6 +2411,16 @@ class OriginActor {
 				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
 				"warn",
 			);
+			this.#holdSweeps.delete(bound.turn.opRef);
+			// If we just retired a turn in recovery_hold, dispatch pending inbound as a new trigger turn.
+			if (inRecoveryHold) {
+				// Clear the current turn if this is the bound turn, and set state to idle for dispatch.
+				if (this.#current === bound) {
+					this.#current = undefined;
+					this.#state = "idle";
+				}
+				await this.#dispatchNext();
+			}
 			await this.#reconcileBound(bound);
 		}
 	}
@@ -2474,7 +2709,7 @@ class OriginActor {
 				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
 				await bound.lifecycle.onFailure?.({
 					...bound,
-					error: terminalError(report, openTool, failedTurnEvidence?.reason),
+					error: terminalError(report, openTool, failedTurnEvidence),
 					status: report,
 					...(recoveredText ? { recoveredText } : {}),
 				});
@@ -2604,7 +2839,9 @@ class OriginActor {
 		if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
+			this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
+			if (this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
@@ -2617,6 +2854,7 @@ class OriginActor {
 		return (
 			report.status.outcome?.phase === "submission" &&
 			evidence?.reason !== "provider_quota_exhausted" &&
+			evidence?.reason !== "provider_rate_limited" &&
 			!bound.retired &&
 			this.#current === bound &&
 			!bound.replyVisible &&
@@ -2750,7 +2988,9 @@ class OriginActor {
 		} else if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
+			this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
+			if (this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
@@ -2872,6 +3112,7 @@ class OriginActor {
 		if (this.#manager.database.bindings.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
 		for (const other of this.#retired.values()) if (other !== except && other.sessionId === sessionId) return;
 		if (except) except.retiredHostTerminationAttempted = true;
+		if (this.#hostSessionId === sessionId) this.#hostSessionId = undefined;
 		let jobs: string | undefined;
 		if (port.runningJobs) {
 			try {
@@ -2964,7 +3205,7 @@ class OriginActor {
 		}
 	}
 
-	/** Exact context/request failures and repeated submission failures reset only the next binding. */
+	/** Exact context/request failures and repeated submission failures reset only the next binding. Quota and rate-limit failures never reset. */
 	#resetFailedTurn(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
 		if (evidence)
 			this.#manager.log(
@@ -2998,7 +3239,7 @@ class OriginActor {
 			turnFloor + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
 			return false;
-		if (evidence?.reason === "provider_quota_exhausted") {
+		if (evidence?.reason === "provider_quota_exhausted" || evidence?.reason === "provider_rate_limited") {
 			this.#submissionFailures.delete(bound.sessionId);
 			return false;
 		}
@@ -3055,9 +3296,19 @@ class OriginActor {
 function terminalError(
 	status: StatusReport,
 	openTool?: { readonly name: string; readonly elapsedMs: number },
-	evidenceReason?: FailedTurnEvidence["reason"],
+	evidence?: FailedTurnEvidence,
 ): GjcRuntimeError {
-	if (evidenceReason === "provider_quota_exhausted") {
+	if (evidence?.reason === "provider_rate_limited") {
+		// The reset instant rides the line so the owner is told when resending can work.
+		const terminalAt = status.status.terminalAt;
+		const retryAt =
+			evidence.retryAfterMs !== undefined && typeof terminalAt === "number" && Number.isFinite(terminalAt)
+				? new Date(terminalAt + evidence.retryAfterMs).toISOString()
+				: undefined;
+		const message = `model provider rate limit reached${retryAt ? `; retry after ${retryAt}` : ""}`;
+		return new GjcRuntimeError(`provider_rate_limited: ${message}`, { code: "provider_rate_limited", message });
+	}
+	if (evidence?.reason === "provider_quota_exhausted") {
 		const message = "model provider quota/billing is exhausted (HTTP 402); switch the model preset";
 		return new GjcRuntimeError(`provider_quota_exhausted: ${message}`, {
 			code: "provider_quota_exhausted",
@@ -3096,9 +3347,20 @@ function terminalFailureDiagnosis(status: StatusReport): string {
 		["provenance", outcome?.provenance],
 		["cause", outcome?.failureCauseDiagnostic ?? failure?.message ?? outcome?.message],
 	];
-	return fields
-		.map(([name, value]) => `${name}=${(value === undefined ? "" : sanitizeDiagnostic(value)) || "unknown"}`)
-		.join(" ");
+	// gajae-code keeps the real failure text only in its local log, keyed by
+	// commandId/turnId (`SDK invocation failed`). Without them a redacted
+	// `internal: Prompt submission failed.` cannot be joined to its cause.
+	const correlation: [string, string | undefined][] = [
+		["command", status.status.commandId],
+		["turn", status.status.turnId],
+	];
+	return [
+		...fields.map(([name, value]) => `${name}=${(value === undefined ? "" : sanitizeDiagnostic(value)) || "unknown"}`),
+		...correlation.flatMap(([name, value]) => {
+			const token = value?.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 64);
+			return token ? [`${name}=${token}`] : [];
+		}),
+	].join(" ");
 }
 
 /** A tool name bound for a log field and a chat notice: one token, bounded. */
