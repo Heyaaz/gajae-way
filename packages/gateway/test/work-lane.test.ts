@@ -2321,6 +2321,56 @@ test("#481 check rollup: any failure is red, unfinished is pending, all success 
 	).toEqual(["ci/x"]);
 });
 
+test("#481 a lane whose pushed PR has pending checks transitions to awaiting_checks, not completed", async () => {
+	const { calls, client } = recordingCheckClient({ prNumber: 485, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/pending", true);
+	const result = await started(f, "b", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.work.laneJobRows().some((row) => row.state === "awaiting_checks"));
+	const record = parseLaneJobRecord(f.db.work.laneJobJson(laneJobIdentity("b").jobId)!);
+	expect(record.state).toBe("awaiting_checks");
+	// The notice should still be sent even in awaiting_checks state
+	const notices = f.notices.filter((n) => n.text.includes("[lane b]"));
+	expect(notices.length).toBeGreaterThan(0);
+	const notice = notices[0];
+	expect(notice.text).toContain("head=");
+	expect(notice.text).toContain("pr=485");
+	expect(notice.text).toContain("checks=pending");
+});
+
+test("#481 a lane whose pushed PR has red checks settles normally with red checks in report", async () => {
+	const { client } = recordingCheckClient({ prNumber: 486, status: "red", failingChecks: ["test"] });
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/red-pr", true);
+	const result = await started(f, "c", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.work.laneJobRows().some((row) => row.state === "attempt_ended"));
+	const record = parseLaneJobRecord(f.db.work.laneJobJson(laneJobIdentity("c").jobId)!);
+	// Red checks should result in attempt_ended, not awaiting_checks
+	// (awaiting_checks is only for pending checks)
+	expect(record.state).toBe("attempt_ended");
+	const notice = f.notices.find((n) => n.text.includes("[lane c]"));
+	expect(notice?.text).toContain("pr=486");
+	expect(notice?.text).toContain("checks=red(test)");
+});
+
+test("#481 a lane whose HEAD is unpushed reports unpushed and does not transition to awaiting_checks", async () => {
+	const { calls, client } = recordingCheckClient(null);
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/unpushed-head", false);
+	const result = await started(f, "d", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.work.laneJobRows().some((row) => row.state === "attempt_ended"));
+	const record = parseLaneJobRecord(f.db.work.laneJobJson(laneJobIdentity("d").jobId)!);
+	expect(record.state).toBe("attempt_ended");
+	const notice = f.notices.find((n) => n.text.includes("[lane d]"));
+	expect(notice?.text).toContain("pushed=false");
+	expect(notice?.text).not.toContain("pr=");
+	// No PR check client call should be made for unpushed branches
+	expect(calls).toHaveLength(0);
+});
+
 test("#407: laneLastCommits reads each distinct worktree once, concurrently, null for non-repos", async () => {
 	const repo = await mkdtemp(join(tmpdir(), "lane-commit-"));
 	const missing = join(repo, "does-not-exist");

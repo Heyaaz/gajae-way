@@ -70,16 +70,26 @@ export type WorkEvidenceClass = "work_committed_report_lost" | "work_in_progress
  *                  working/continuable; reconcile before continuing
  *  - awaiting_operator terminal_uncertainty holds for a human; automation must
  *                  neither resend nor recreate
+ *  - awaiting_checks a pushed branch's open PR has pending checks; wait until
+ *                  checks finish, then settle based on their outcome
  *  - stalled       continuations stopped producing HEAD moves; escalation only
  *  - done          the deliverable landed (e.g. merged / confirmed complete)
  *  - aborted       operator-cancelled; never auto-resumed
  */
-export type LaneJobState = "running" | "attempt_ended" | "awaiting_operator" | "stalled" | "done" | "aborted";
+export type LaneJobState =
+	| "running"
+	| "attempt_ended"
+	| "awaiting_operator"
+	| "awaiting_checks"
+	| "stalled"
+	| "done"
+	| "aborted";
 
 const LANE_JOB_STATES = new Set<LaneJobState>([
 	"running",
 	"attempt_ended",
 	"awaiting_operator",
+	"awaiting_checks",
 	"stalled",
 	"done",
 	"aborted",
@@ -682,6 +692,27 @@ export function closeAttempt(input: CloseAttemptInput): LaneJobRecord {
 				])
 			: input.record.escalations,
 		updatedAt: input.endedAt,
+	});
+}
+
+export type AwaitingChecksInput = {
+	readonly record: LaneJobRecord;
+	readonly at: string;
+};
+
+/**
+ * Transitions a lane job to awaiting_checks state when the lane's pushed branch
+ * has an open PR with pending checks. Only transitions from attempt_ended state.
+ * Returns the record unchanged if not in attempt_ended state.
+ */
+export function transitionToAwaitingChecks(input: AwaitingChecksInput): LaneJobRecord {
+	if (input.record.state !== "attempt_ended") {
+		return input.record;
+	}
+	return Object.freeze({
+		...input.record,
+		state: "awaiting_checks",
+		updatedAt: input.at,
 	});
 }
 

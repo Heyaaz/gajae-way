@@ -24,6 +24,7 @@ export {
 	verifyReady,
 } from "./cli";
 export {
+	type AwaitingChecksInput,
 	acknowledgeHold,
 	appendAttempt,
 	applyReconciliation,
@@ -45,6 +46,7 @@ export {
 	projectAttemptOutcome,
 	type ReconciliationClass,
 	type RepositoryFacts,
+	transitionToAwaitingChecks,
 } from "./job";
 export {
 	isRuntimeSessionId,

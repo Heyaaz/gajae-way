@@ -1,6 +1,5 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type OriginRef, originKey, validateOriginRef } from "@gajae-gateway/protocol";
-import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DatabaseStartupError } from "./errors";
 import type { WorkAttemptRuntime, WorkParent } from "./groups/work";
 import { validateWorkRuntime, workAssert, workAttemptReportId } from "./groups/work";
@@ -9,7 +8,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 32;
+export const LATEST_SCHEMA_VERSION = 33;
 
 export interface MigrationHost {
 	readonly database: {
@@ -684,6 +683,30 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(32, new Date().toISOString());
+		});
+	}
+	if (current < 33) {
+		// Issue #481: Add 'awaiting_checks' state to lane_jobs for when a lane's PR has pending checks.
+		host.withTransaction(() => {
+			// SQLite doesn't support modifying CHECK constraints, so we recreate the table
+			host.database.execute(`
+				CREATE TABLE lane_jobs_v33 (
+					job_id TEXT PRIMARY KEY,
+					lane_key TEXT NOT NULL UNIQUE,
+					branch TEXT NOT NULL,
+					worktree_path TEXT NOT NULL,
+					state TEXT NOT NULL CHECK(state IN ('running','attempt_ended','awaiting_operator','awaiting_checks','stalled','done','aborted')),
+					record_json TEXT NOT NULL,
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL
+				);
+				INSERT INTO lane_jobs_v33 SELECT * FROM lane_jobs;
+				DROP TABLE lane_jobs;
+				ALTER TABLE lane_jobs_v33 RENAME TO lane_jobs;
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(33, new Date().toISOString());
 		});
 	}
 }

@@ -28,6 +28,7 @@ import {
 	newOpRef,
 	OpRefRejectedError,
 	parseLaneJobRecord,
+	transitionToAwaitingChecks,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
@@ -1359,6 +1360,10 @@ export class WorkLaneManager {
 					repository: { ...facts, observedAt: at },
 					classification: progressed ? "progressed" : endState === "completed" ? "held" : "stalled",
 				});
+				// If the work completed but the lane's PR has pending checks, transition to awaiting_checks
+				if (endState === "completed" && facts.checkStatus?.status === "pending") {
+					job = transitionToAwaitingChecks({ record: job, at });
+				}
 			}
 
 			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
