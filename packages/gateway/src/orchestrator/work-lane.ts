@@ -145,6 +145,7 @@ interface Observer {
 	wakeRequested?: boolean;
 	text?: string;
 	touchedAt?: number;
+	turnEndObservedAt?: string;
 	/** First of an unbroken run of host-gone verdicts; any other observation resets it. */
 	goneSince?: number;
 }
@@ -1114,6 +1115,7 @@ export class WorkLaneManager {
 			generation: this.#options.brokerGeneration?.() ?? 0,
 			abort: new AbortController(),
 			binding: binding ? { sessionId: binding.sessionId, epoch: binding.epoch } : undefined,
+			...(runtime.turnEndObservedAt ? { turnEndObservedAt: runtime.turnEndObservedAt } : {}),
 		};
 		this.#observers.set(runtime.opRef, observer);
 		return observer;
@@ -1228,8 +1230,22 @@ export class WorkLaneManager {
 				brokerGeneration: observer.generation,
 				repo: runtime.cwd,
 				originKey: runtime.sessionKey,
-				onFrame: () => {
+				onFrame: (frame) => {
 					if (!this.#writeCurrent(observer)) return;
+					if (
+						(frame.kind === "agent_end" || frame.kind === "agent_failed") &&
+						(frame.commandId !== undefined || frame.turnId !== undefined)
+					) {
+						observer.turnEndObservedAt ??= this.#at();
+						const current = this.#db.work.workAttemptGet(runtime.opRef);
+						if (current && current.settledAt === null && current.turnEndObservedAt === undefined)
+							this.#updateAttempt(current.opRef, current.version, {
+								turnEndObservedAt: observer.turnEndObservedAt,
+							});
+						observer.tail?.setTurnRunning(false);
+					} else if (frame.kind === "agent_start") {
+						observer.tail?.setTurnRunning(true);
+					}
 					this.#schedule(observer, 0);
 					this.#touch(observer);
 				},
@@ -1242,7 +1258,7 @@ export class WorkLaneManager {
 			await tail.ready;
 			if (this.#writeCurrent(observer) && this.#db.work.workAttemptGet(runtime.opRef)?.settledAt === null) {
 				tail.beginTurn(runtime.opRef);
-				tail.setTurnRunning(true);
+				tail.setTurnRunning(observer.turnEndObservedAt === undefined);
 			}
 		})()
 			.catch(async () => {
@@ -1288,8 +1304,12 @@ export class WorkLaneManager {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
-		if (!runtime.terminal) {
+		if (
+			!runtime.terminal ||
+			(runtime.terminal.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined)
+		)
 			this.#attach(observer);
+		if (!runtime.terminal) {
 			let status: PromptStatusBody | undefined;
 			try {
 				status = await this.#query(runtime, observer.tail);
@@ -1310,6 +1330,13 @@ export class WorkLaneManager {
 			const terminal = status
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
+			if (
+				terminal?.reasonCode === "terminal_missing_receipt" &&
+				runtime.turnEndObservedAt === undefined &&
+				observer.turnEndObservedAt === undefined
+			)
+				return;
+			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
 			runtime =
 				this.#updateAttempt(runtime.opRef, runtime.version, {
 					...(status && provesAcceptance(status)
@@ -1318,9 +1345,19 @@ export class WorkLaneManager {
 								sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
 							}
 						: {}),
+					...(turnEndObservedAt && runtime.turnEndObservedAt === undefined ? { turnEndObservedAt } : {}),
 					...(terminal ? { terminal } : {}),
 				}) ?? runtime;
 			if (!runtime.terminal) return;
+		}
+		if (runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined) {
+			const turnEndObservedAt = observer.turnEndObservedAt;
+			if (!turnEndObservedAt) return;
+			runtime =
+				this.#updateAttempt(runtime.opRef, runtime.version, { turnEndObservedAt }) ??
+				this.#db.work.workAttemptGet(runtime.opRef) ??
+				runtime;
+			if (runtime.turnEndObservedAt === undefined) return;
 		}
 		if (runtime.output.disposition === "pending" && runtime.output.knownSilence) {
 			const silent = this.#updateAttempt(runtime.opRef, runtime.version, {
@@ -2119,7 +2156,9 @@ export class WorkLaneManager {
 				}
 				if (!this.#current(observer)) continue;
 				const terminal = status && terminalEvidence(status, this.#at());
-				if (terminal && this.#writeCurrent(observer)) {
+				const terminalStillRunning =
+					terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+				if (terminal && !terminalStillRunning && this.#writeCurrent(observer)) {
 					this.#updateAttempt(runtime.opRef, runtime.version, {
 						...(provesAcceptance(status!)
 							? {
@@ -2140,6 +2179,11 @@ export class WorkLaneManager {
 				}
 				if (!this.#current(observer)) continue;
 				if (live.live === true && !live.disowned && this.#binding(runtime)) {
+					this.#attach(observer);
+					this.#schedule(observer, 0);
+					continue;
+				}
+				if (terminalStillRunning && live.live === undefined && !live.disowned && this.#binding(runtime)) {
 					this.#attach(observer);
 					this.#schedule(observer, 0);
 					continue;

@@ -1370,6 +1370,60 @@ test("late receipt after a missing-receipt terminal is reconciled once, without 
 	expect(f.port.resumes).toHaveLength(0);
 });
 
+test("#562 a missing receipt stays open during turn activity and recovery until lifecycle end", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now });
+	let statusReads = 0;
+	let outputReads = 0;
+	const result = await started(f, "a", origin);
+	f.port.status = async (input) => {
+		statusReads++;
+		return {
+			operationRef: input.opRef,
+			status: { status: "terminal_ok", receiptState: "missing", outcome: { reason: "end_turn" } },
+			summaryCompleted: true,
+		};
+	};
+	f.port.fetchWorkerOutput = async () => {
+		outputReads++;
+		return { status: "absent", code: "output_pending" };
+	};
+	await until(() => statusReads > 0);
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	await until(() => statusReads > 1);
+	await Bun.sleep(30);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+		settledAt: null,
+		terminal: null,
+		output: { reads: 0, disposition: "pending" },
+	});
+	expect(outputReads).toBe(0);
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.notices).toEqual([]);
+
+	await f.restart();
+	await until(() => f.port.tailsOf(result.sessionId).some((tail) => tail.opRef === result.opRef && tail.running));
+	await Bun.sleep(30);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ settledAt: null, terminal: null });
+	expect(outputReads).toBe(0);
+	expect(f.notices).toEqual([]);
+
+	// Only the turn lifecycle end begins the bounded missing-receipt retrieval budget.
+	f.port.emitTurnEnd(result.sessionId, result.opRef, "agent_end");
+	await until(() => outputReads === 1);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+		turnEndObservedAt: expect.any(String),
+		terminal: { reasonCode: "terminal_missing_receipt" },
+		settledAt: null,
+	});
+	now += 1000;
+	await until(() => outputReads === 2);
+	now += 5000;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(outputReads).toBe(3);
+	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
+});
+
 test("a receipt still missing after the output budget stays held with a non-loss diagnostic (#248)", async () => {
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
@@ -1608,6 +1662,8 @@ for (const status of ["terminal_ok", "failed"] as const) {
 				else
 					expect(response).toMatchObject({ code: "verb_failed", detail: { reasonCode: "send_acceptance_uncertain" } });
 				const opRef = f.job().attempts[0]!.opRef;
+				if (receiptState === "missing")
+					f.port.emitTurnEnd(f.job().attempts[0]!.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
 				await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
 				const runtime = f.db.work.workAttemptGet(opRef)!;
 				expect(runtime.sendPhase).toBe(receiptState === "present" ? "accepted" : "uncertain");
@@ -2298,6 +2354,7 @@ test("transport failure ECONNRESET without errorStatus yields transport cause in
 		summaryCompleted: true,
 	});
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	f.port.fail(result.opRef, "private failure", { code: "sdk_failed" });
 	// Mock the transport failure
 	f.port.setFailedTransportCause(result.sessionId, {
 		kind: "transport",
@@ -2334,6 +2391,7 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 		summaryCompleted: true,
 	});
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	f.port.fail(result.opRef, "private failure", { code: "sdk_failed" });
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	const attempt = f.db.work.workAttemptGet(result.opRef);
 	const notice = f.notices[0]?.text ?? "";
