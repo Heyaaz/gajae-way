@@ -2857,7 +2857,7 @@ test("repo-bound work.start removes a newly created worktree after bind failure 
 			code: "verb_failed",
 			detail: { reasonCode: "bind_failed", cause: "broker_unavailable" },
 		});
-		const worktreePath = join(f.gajaewayHome, "lanes", "bind-retry");
+		const worktreePath = join(f.gajaewayHome, "lanes", Buffer.from("bind-retry", "utf8").toString("hex"));
 		const branch = Bun.spawnSync(
 			["git", "-C", bareRepo, "show-ref", "--verify", "--quiet", "refs/heads/work/bind-retry"],
 			{ stdout: "ignore", stderr: "ignore" },
@@ -3037,16 +3037,14 @@ test("issue #480: cleanup failure on operator retire fails the retirement", asyn
 
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job("cleanup-fail");
-		const repository = job.lane.repository;
+		const repository = job.lane.repositoryPath;
 
 		// Complete the work
 		f.port.complete(result.opRef, "test complete");
 		await until(() => f.db.work.workAttemptOpen().length === 0);
 
-		// Corrupt the repository to cause cleanup to fail
-		if (repository) {
-			await rm(join(repository, "objects"), { recursive: true, force: true });
-		}
+		// Remove the managed bare repository so git cannot unlink its registered worktree.
+		if (repository) await rm(repository, { recursive: true, force: true });
 
 		// Attempt to retire should fail due to cleanup failure
 		const retireOutcome = await f.lanes.retire("cleanup-fail", "operator");
@@ -3158,7 +3156,7 @@ test("issue #480: re-starting a repo-bound lane is matched by repository, not by
 		// A different repository for the same lane name is a mismatch.
 		await expect(
 			f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: `${bareRepo}-other` }),
-		).rejects.toMatchObject({ detail: { reasonCode: "lane_cwd_mismatch" } });
+		).rejects.toMatchObject({ detail: { reasonCode: "lane_repository_mismatch" } });
 	} finally {
 		await cleanup();
 	}
