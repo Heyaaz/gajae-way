@@ -25,7 +25,10 @@ const SLACK_FILE_ID = /^F[A-Z0-9]{6,}$/;
 export function describeSlackFile(file: SlackFileLike): string {
 	const mime = nonBlank(file.mimetype)?.toLowerCase() ?? "";
 	const kind = ["image", "video", "audio"].find((kind) => mime.startsWith(`${kind}/`)) ?? "file";
-	const id = typeof file.id === "string" && SLACK_FILE_ID.test(file.id) ? `id ${file.id}` : undefined;
+	const id =
+		typeof file.id === "string" && file.id.trim() === file.id && SLACK_FILE_ID.test(file.id)
+			? `id ${file.id}`
+			: undefined;
 	const parts = [
 		kind,
 		nonBlank(file.name) ?? nonBlank(file.title),

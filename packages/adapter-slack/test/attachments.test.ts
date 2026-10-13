@@ -25,7 +25,15 @@ test("Slack files name their file id so same-named attachments stay distinct", (
 	expect(a).toBe("[image · image.png · id F0C8P71RK54 · 2 KB]");
 	expect(b).toBe("[image · image.png · id F0C8PPGAV7G · 2 KB]");
 	// Only a well-formed Slack file id is rendered: it sits inside the message text.
-	for (const id of ["", "U0C8P71RK54", "F0c8p71", "F0C8P71RK54] [image", "F1"])
+	for (const id of [
+		"",
+		"U0C8P71RK54",
+		"F0c8p71",
+		"F0C8P71RK54] [image",
+		"F0C8P71RK54\n",
+		"F0C8P71RK54/../../secret",
+		"F1",
+	])
 		expect(describeSlackFile({ id, name: "image.png" })).toBe("[file · image.png]");
 });
 
