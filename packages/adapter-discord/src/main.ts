@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -22,13 +23,15 @@ import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author"
 import {
 	adapterHome,
 	type DiscordChannelPolicy,
+	type GatewayDownAlertConfig,
 	type LoadedDiscordAdapterConfig,
 	type LoadedDiscordVoiceConfig,
 	loadDiscordAdapterConfig,
 	type StatusReactionsMode,
 } from "./config";
-import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
+import { GatewayDownAlarm, lastLogLine } from "./down-alert";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
+import { loadDiscordMedia, parseDiscordMedia } from "./outgoing-attachments";
 import {
 	type DiscordInboundReaction,
 	type DiscordReactingUser,
@@ -41,6 +44,7 @@ import {
 	classifyRecoveryFailure,
 	clearAttempt,
 	recoveryCursorPath as defaultRecoveryCursorPath,
+	isPermanentDiscordUnreadable,
 	loadRecoveryCursors,
 	pruneKnownDms,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
@@ -152,7 +156,12 @@ export interface DiscordTextChannelLike {
 			| string
 			| { content: string; reply?: { messageReference: string; failIfNotExists?: boolean } }
 			// A voice message carries no content: only the attachment and the flag.
-			| { files: readonly unknown[]; flags: number },
+			| { files: readonly unknown[]; flags: number }
+			| {
+					files: readonly unknown[];
+					content?: string;
+					reply?: { messageReference: string; failIfNotExists?: boolean };
+			  },
 	): Promise<unknown>;
 }
 
@@ -180,6 +189,7 @@ export interface TypingPort {
 }
 
 export interface DiscordClientLike {
+	user?: { id: string | number } | null;
 	channels: { fetch(id: string): Promise<unknown> };
 }
 
@@ -343,7 +353,8 @@ export function describeMessageEdit(
  * When a mentioned message arrives in a channel (not DM, not thread), create a thread on that message.
  * Returns the thread's origin if thread creation succeeds, or the original origin if not or if conditions don't apply.
  * Implements Hermes-like contract: channel mention → auto-thread + new session.
- * A channel whose policy sets `threadOnMention: false` is answered in place.
+ * A channel whose policy sets `threadOnMention: false` is answered in place; a channel
+ * without its own setting follows the adapter-wide default (true when unset).
  * The thread is named after the message; a bare mention leaves the fallback
  * name, and the thread is renamed from the first message that says something.
  */
@@ -353,10 +364,11 @@ export async function maybeCreateThreadOnMention(
 	origin: OriginRef,
 	policy: DiscordChannelPolicy | undefined,
 	unnamed: UnnamedThreads,
+	defaultThreadOnMention = true,
 ): Promise<OriginRef> {
 	// Only thread channel mentions: not DMs, not already in a thread, and bot must be mentioned.
 	if (origin.kind !== "channel" || !engagement.mentioned) return origin;
-	if (policy?.threadOnMention === false) return origin;
+	if (!(policy?.threadOnMention ?? defaultThreadOnMention)) return origin;
 
 	try {
 		const name = deriveThreadName(message.content);
@@ -885,6 +897,7 @@ export async function settleDiscordDelivery(
 	status?: WorkingStatus,
 	reactions: DiscordReactionPorts = createReactionPorts(),
 	speech?: DiscordSpeechPorts,
+	mediaDirectories: readonly string[] = [],
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
@@ -899,20 +912,42 @@ export async function settleDiscordDelivery(
 	}
 	try {
 		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
-		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+		const parsed = parseDiscordMedia(message.text);
+		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
 		const text = notice ? `${notice}\n${body}` : body;
-		const chunks = chunkDiscordMessage(text);
-		for (let index = 0; index < chunks.length; index++) {
-			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-			// deleted target from failing the whole delivery.
-			const chunk = chunks[index] as string;
-			// A reply reference points into the thread, so it is dropped on parent fallback.
-			if (index === 0 && message.replyToMessageId && !notice)
-				await channel.send({
-					content: chunk,
-					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-				});
-			else await channel.send(chunk);
+		const chunks = text === "" ? [] : chunkDiscordMessage(text);
+		const files = await loadDiscordMedia(parsed.paths, mediaDirectories);
+		if (files.length > 0 && chunks.length === 0) {
+			const reply =
+				message.replyToMessageId && !notice
+					? { messageReference: message.replyToMessageId, failIfNotExists: false }
+					: undefined;
+			await channel.send({
+				files,
+				content: chunks[0] ?? "",
+				...(reply ? { reply } : {}),
+			});
+		} else {
+			for (let index = 0; index < chunks.length; index++) {
+				// Reply-threading applies to the first chunk only; failIfNotExists keeps a
+				// deleted target from failing the whole delivery.
+				const chunk = chunks[index] as string;
+				// A reply reference points into the thread, so it is dropped on parent fallback.
+				if (index === 0 && files.length > 0)
+					await channel.send({
+						content: chunk,
+						files,
+						...(message.replyToMessageId && !notice
+							? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
+							: {}),
+					});
+				else if (index === 0 && message.replyToMessageId && !notice)
+					await channel.send({
+						content: chunk,
+						reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+					});
+				else await channel.send(chunk);
+			}
 		}
 		// Voice rides AFTER the text, and only after the text actually landed:
 		// pairing them is for a readable history, so the readable half must be
@@ -965,6 +1000,18 @@ function isArchivedThread(value: unknown): value is ArchivableThreadLike {
 		"setArchived" in value &&
 		typeof value.setArchived === "function"
 	);
+}
+
+/** Posts with the adapter's own bot: it keeps its Discord session while the gateway is the thing that is down. */
+function gatewayDownAlarm(discord: DiscordClientLike, alert: GatewayDownAlertConfig): GatewayDownAlarm {
+	return new GatewayDownAlarm(alert, {
+		now: Date.now,
+		post: async (text) => {
+			await (await fetchTextChannel(discord, alert.channelId)).send(text);
+		},
+		lastError: async () => (alert.logFile ? lastLogLine(alert.logFile) : undefined),
+		log: console,
+	});
 }
 
 async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise<DiscordTextChannelLike> {
@@ -1036,15 +1083,17 @@ export function subscribeDiscordDeliveries(
 	status?: WorkingStatus,
 	log: Pick<Console, "error"> = console,
 	speech?: DiscordSpeechPorts,
+	mediaDirectories: readonly string[] = [],
 ): () => void {
 	// One reaction port pair per subscription: the emoji cache and the throttle are
 	// only useful across deliveries, and a live adapter has exactly one subscription.
 	const reactions = createReactionPorts();
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech).catch((error) =>
-			log.error(
-				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
-			),
+		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech, mediaDirectories).catch(
+			(error) =>
+				log.error(
+					`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
 		);
 	});
 }
@@ -1156,6 +1205,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		undefined,
 		undefined,
 		discordSpeechPorts(config.voice),
+		config.gatewayDownAlert ? gatewayDownAlarm(discord, config.gatewayDownAlert) : undefined,
 	);
 	// Transcription makes ingress asynchronous, and two messages in one
 	// conversation must not overtake each other while one waits on the network.
@@ -1184,6 +1234,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				origin,
 				config.channels?.[origin.conversationId],
 				unnamedThreads,
+				config.threadOnMention,
 			);
 			// A voice message carries no text at all, so without a transcript the
 			// history shows a url and nothing about what was said. Doing this in the
@@ -1241,7 +1292,8 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		void gateway.recoverMissedMessages();
 	});
 	console.log("Discord adapter starting.");
-	await gateway.connect();
+	await gateway.connectInitial();
+
 	await discord.login(config.token);
 }
 
@@ -1457,6 +1509,7 @@ export class ReconnectingGateway {
 		/** Injectable only so tests do not pay real recovery backoff. */
 		readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 		readonly speech?: DiscordSpeechPorts,
+		readonly downAlarm?: GatewayDownAlarm,
 	) {
 		this.#client = initialClient;
 		void this.ensureCursors();
@@ -1466,14 +1519,33 @@ export class ReconnectingGateway {
 	adoptClient(client: GajaewayClient): void {
 		this.#client = client;
 		this.#attempt = 0;
+		void this.downAlarm?.up();
 		void this.#flushEdits();
 	}
 
 	async connect(): Promise<void> {
+		await this.#connect(false);
+	}
+
+	async connectInitial(): Promise<void> {
+		await this.#connect(true);
+	}
+
+	async #connect(initial: boolean): Promise<void> {
 		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath, { clientName: "adapter-discord" });
+			const options = {
+				clientName: "adapter-discord",
+				onRetry: (attempt: number, delayMs: number, error: unknown) =>
+					console.warn(
+						`gateway_socket_waiting client=adapter-discord path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
+					),
+			};
+			const client = initial
+				? await GajaewayClient.connectSocketWithBackoff(this.socketPath, options)
+				: await GajaewayClient.connectSocket(this.socketPath, options);
 			this.#client = client;
 			this.#attempt = 0;
+			void this.downAlarm?.up();
 			this.#deliveryOff?.();
 			this.#deliveryOff = subscribeDiscordDeliveries(
 				client,
@@ -1482,6 +1554,7 @@ export class ReconnectingGateway {
 				this.status,
 				console,
 				this.speech,
+				this.config.mediaDirectories,
 			);
 			this.#progressOff?.();
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status, console, this.typing) : undefined;
@@ -1631,7 +1704,6 @@ export class ReconnectingGateway {
 				threadIds: [],
 			};
 		}
-		this.clearUnreadableRecoveryTarget(channelId);
 		const threadIds = discoverThreads ? await discoverRecoveryThreadIds(fetched, channelId, Date.now()) : [];
 
 		const cursors = this.#cursors;
@@ -1707,6 +1779,11 @@ export class ReconnectingGateway {
 		// id, so the replay cannot double-count a discard.
 		this.advanceRecovered(channelId, outcome.advancedTo);
 		if (outcome.fetchError) {
+			// A conversation the bot cannot read must not drive the 60s pass loop forever:
+			// quarantine it under the same bound the channel-fetch path uses, so healthy
+			// conversations can complete and the dead one is probed again on reconnect.
+			if (outcome.fetchErrorPermanent)
+				return { incomplete: this.noteUnreadableRecoveryTarget(channelId, outcome.fetchError), threadIds };
 			console.error(
 				`Discord recovery could not read history for channel ${channelId}: ${outcome.fetchError}; other channels continue, retrying with backoff.`,
 			);
@@ -1737,6 +1814,10 @@ export class ReconnectingGateway {
 				`Discord recovery backfilled ${outcome.delivered} fresh message(s), found ${outcome.duplicates} duplicate(s), skipped ${outcome.skipped}, and discarded ${outcome.discarded} for channel ${channelId}.`,
 			);
 		}
+		// A conversation is re-admitted only once a pass read it end to end: the counter that
+		// quarantines an unreadable conversation has to survive a pass whose fetch or history
+		// read failed, or the bound would never be reached.
+		this.clearUnreadableRecoveryTarget(channelId);
 		return { incomplete: false, threadIds };
 	}
 
@@ -2125,6 +2206,7 @@ export class ReconnectingGateway {
 		this.#reconnecting = true;
 		this.#client = undefined;
 		this.#deliveryOff?.();
+		void this.downAlarm?.down();
 		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
 		const jitter = Math.floor(Math.random() * Math.max(1, delay / 4));
 		console.log(`Discord adapter gateway reconnecting in ${delay + jitter}ms.`);
@@ -2157,19 +2239,6 @@ function isRecoverableChannel(value: unknown): value is RecoverableChannel {
 		value !== null &&
 		"messages" in value &&
 		typeof (value as { messages?: { fetch?: unknown } }).messages?.fetch === "function"
-	);
-}
-
-function isPermanentDiscordUnreadable(error: unknown): boolean {
-	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
-	return (
-		candidate?.code === 10_003 ||
-		candidate?.code === 50_001 ||
-		candidate?.code === 50_013 ||
-		candidate?.status === 403 ||
-		candidate?.status === 404 ||
-		candidate?.httpStatus === 403 ||
-		candidate?.httpStatus === 404
 	);
 }
 
@@ -2254,6 +2323,25 @@ function threadActivityTimestamp(thread: RecoveryThreadLike): number {
 		return Number((BigInt(thread.lastMessageId) >> 22n) + 1_420_070_400_000n);
 	return 0;
 }
+export async function runDiscordAdapterWithLease<T>(home: string, start: (lease: Lease) => Promise<T>): Promise<T> {
+	let lease: Lease;
+	try {
+		lease = await acquireLease(home, "adapter-discord");
+		console.info(`lease_acquired name=adapter-discord pid=${process.pid}`);
+	} catch (error) {
+		if (!(error instanceof LeaseHeldError))
+			console.error(
+				`lease_failed name=adapter-discord detail=${error instanceof Error ? error.message : String(error)}`,
+			);
+		throw error;
+	}
+	try {
+		return await start(lease);
+	} finally {
+		await lease.release();
+	}
+}
+
 export const DISCORD_USAGE = [
 	"usage: gajaeway-discord [--help] [--version]",
 	"",
@@ -2295,25 +2383,33 @@ if (import.meta.main) {
 		const disposeLogging = installStructuredLogging({
 			path: join(adapterHome(), "adapter-discord.log"),
 		});
-		// The lock is taken before the config is even read: refusing early keeps a
-		// stray start from touching the resident instance's gateway session.
-		AdapterLock.acquire(adapterHome())
-			.then(async (lock) => {
-				// Registering a signal handler suppresses the default terminate, so
-				// the lock is dropped and the exit is then performed by hand.
-				const release = (): void =>
-					void lock.release().finally(() => {
+		void runDiscordAdapterWithLease(adapterHome(), async (lease) => {
+			const shutdown = (): void => {
+				void lease.release().then(
+					() => {
 						disposeLogging();
 						process.exit(0);
-					});
-				process.once("SIGINT", release);
-				process.once("SIGTERM", release);
-				await startDiscordAdapter(await loadDiscordAdapterConfig());
-			})
-			.catch((error) => {
-				console.error(error instanceof Error ? error.message : String(error));
-				disposeLogging();
-				process.exitCode = error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1;
-			});
+					},
+					(error) => {
+						console.error(
+							`Discord adapter lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+						);
+						disposeLogging();
+						process.exit(1);
+					},
+				);
+			};
+			process.once("SIGINT", shutdown);
+			process.once("SIGTERM", shutdown);
+			await startDiscordAdapter(await loadDiscordAdapterConfig());
+			await new Promise<void>(() => {});
+		}).catch((error) => {
+			if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
+			console.error(error instanceof Error ? error.message : String(error));
+			disposeLogging();
+			// Startup may already own recovery/monitor timers. Exit now so the service
+			// manager can retry login rather than keeping a permanently offline process.
+			process.exit(1);
+		});
 	}
 }

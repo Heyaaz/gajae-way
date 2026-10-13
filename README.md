@@ -1,3 +1,7 @@
+# gajae-way
+
+**Put your GJC coding agent in Discord/Slack/Telegram: it answers, remembers, and runs real coding work from chat.**
+
 <p align="center">
   <img src="assets/logo-horizontal.png" alt="gajae-way" width="640">
 </p>
@@ -40,6 +44,7 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 - Send `/new` when you want a fresh start in that conversation. It confirms that a fresh session has started.
 - When the gateway accepts a DM or an addressed group turn (a real mention or native reply), Discord and Slack both show a reaction-gradient presence — phase markers, an advancing clock, and an effort digit (tool calls, falling back to output tokens) reacted directly onto the message it is answering; Discord also shows the platform's native typing indicator, and Slack also drives Slack's native assistant status line (`<app> <status>`, via `assistant.threads.setStatus`) under the reply thread. Slack additionally promotes messages in an adapter-configured `open` channel to addressed; Discord does not treat `open`-channel messages as addressed without a real mention. The reaction-gradient markers themselves are never a posted or edited message. Presence stays up through mid-work messages while the turn keeps working and comes off only when the turn ends. In a channel it merely overhears, nothing is shown until it actually replies.
 - Replies are protected by a durable delivery record. After a crash, a send whose outcome was uncertain may be reissued; when it was, it is visibly labeled as a duplicate rather than silently pretending it was not.
+- Discord replies can attach local files when the response contains a standalone `MEDIA:/absolute/path/to/file` line. The adapter removes the directive from the visible text and sends the file natively with its caption; uploads are limited to 10 files and 25 MiB total per message.
 - Conversations and useful monitor output are captured under your own `$GAJAEWAY_HOME/memory` directory as readable Markdown, not hidden in a proprietary store.
 
 ## Packages
@@ -60,35 +65,53 @@ The Bun workspace under `packages/` is divided by responsibility:
 
 For how memory, monitors, and the gateway work end to end, see [the documentation](docs/).
 
-## Start in five steps
+## Quick Start
 
-1. Build the standalone programs on a machine with Bun:
+**Option 1: Docker Compose (recommended for first-time users)**
 
-   ```sh
-   bun run build
-   ```
+```sh
+# Clone and enter the repository
+git clone https://github.com/Yeachan-Heo/gajae-way.git
+cd gajae-way
 
-   This creates `dist/gajaeway-gateway`, `dist/gajaeway-discord`, `dist/gajaeway-telegram`, `dist/gajaeway-slack`, `dist/gajaeway-admin`, and `dist/gajaeway`.
+# Run interactive setup (choose your platform: Discord, Slack, or Telegram)
+docker compose run --rm -it setup gajaeway setup
 
-2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the complete layout and examples.
+# Start the gateway and adapters
+docker compose up
+```
 
-3. Create `$GAJAEWAY_HOME/adapter-discord.json` with its own `tokenFile` reference for Discord. Create the analogous Telegram adapter configuration when using Telegram, or `adapter-slack.json` with `botTokenFile` and `appTokenFile` references when using Slack.
+Then send your bot a DM on Discord/Slack/Telegram and start chatting.
 
-4. Run the gateway as a long-lived daemon under your service manager:
+**Option 2: Local installation with build**
 
-   ```sh
-   dist/gajaeway-gateway daemon
-   ```
+Requirements: Bun ≥1.4.0, `gjc` ≥0.16.0 on your PATH.
 
-   The host also needs the external `gjc` executable, either resolvable on `PATH` or pinned with an absolute `GJC_EXECUTABLE`; it supplies the AI runtime for every turn.
+```sh
+# Build the binaries
+bun install
+bun run build
 
-5. Start the Discord adapter, then send your bot a DM:
+# Run one-command setup and start
+GAJAEWAY_HOME=~/.gajaeway ./dist/gajaeway up
+```
 
-   ```sh
-   dist/gajaeway-discord
-   ```
+The `up` command will prompt you for credentials, then report next steps. For production deployment, see [Deployment Guide](docs/deployment.md).
 
-   Start `dist/gajaeway-telegram` or `dist/gajaeway-slack` separately when using Telegram or Slack.
+## Getting a Discord Bot Token
+
+When you run `gajaeway setup` and select Discord, you'll see step-by-step guidance for getting your bot token:
+
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
+2. Click **New Application**, name it (e.g., "My gajae-way agent")
+3. Go to **Bot** → **Add Bot**
+4. Under **TOKEN**, click **Reset Token** → **Yes, do it!**
+5. Click **Copy** to copy your bot token
+6. **Important**: Scroll down to **GATEWAY INTENTS** and enable **MESSAGE CONTENT INTENT** (lets the bot read messages, not just user names)
+7. Click **Save Changes**
+8. Paste the token when prompted
+
+After validation, you'll receive a ready-to-click **invite link** that you can share with others or click yourself to add the bot to your Discord server. The link includes the required permissions automatically.
 
 ## Make it yours
 

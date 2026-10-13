@@ -63,6 +63,8 @@ export interface ReactionRef {
 	readonly emoji: string;
 	/** Allowlist short name, so an adapter can prefer a same-named custom guild emoji. */
 	readonly emojiName: string;
+	/** Add or remove the reaction. Defaults to add. */
+	readonly action?: ReactionAction;
 }
 
 const BY_UNICODE = new Map(REACTION_ALLOWLIST.map((entry) => [entry.unicode, entry]));
@@ -73,17 +75,41 @@ const BY_NAME = new Map(REACTION_ALLOWLIST.map((entry) => [entry.name, entry]));
 const VARIATION_SELECTOR = /\uFE0F/g;
 
 /**
+ * Slack emoji naming rules: lowercase/digits/_/-/'+, 2-80 chars, no prototype keys.
+ * Per https://api.slack.com/reference/surface-to-action/block-kit-block-extensions#emoji-picker-block
+ */
+const SLACK_EMOJI_NAME = /^[a-z0-9_\-'+]{2,80}$/;
+const PROTOTYPE_KEYS = new Set(["constructor", "__proto__", "prototype", "toString", "valueOf"]);
+
+/**
  * Resolves any accepted spelling (`👍`, `👍️`, `thumbsup`, `:thumbsup:`) to its
  * allowlist entry. Returns undefined for everything else — the caller decides
  * whether that is a protocol error or a fall-back-to-text situation.
+ *
+ * Custom emoji names (outside the allowlist, but valid Slack names) are also
+ * resolved and marked with `isCustom: true`. They are validated strictly against
+ * Slack naming rules (lowercase, digits, _, -, ', +) and prototype pollution.
+ * Uppercase input is rejected for custom emoji, though allowlist lookups are
+ * case-insensitive for compatibility.
  */
-export function resolveReactionEmoji(input: string): ReactionEmoji | undefined {
+export function resolveReactionEmoji(
+	input: string,
+): (ReactionEmoji & { readonly isCustom?: false }) | { readonly name: string; readonly isCustom: true } | undefined {
 	const trimmed = input.trim();
 	if (!trimmed) return undefined;
 	const unicode = BY_UNICODE.get(trimmed.replace(VARIATION_SELECTOR, ""));
 	if (unicode) return unicode;
-	const name = trimmed.startsWith(":") && trimmed.endsWith(":") && trimmed.length > 2 ? trimmed.slice(1, -1) : trimmed;
-	return BY_NAME.get(name.toLowerCase());
+	const nameCandidate =
+		trimmed.startsWith(":") && trimmed.endsWith(":") && trimmed.length > 2 ? trimmed.slice(1, -1) : trimmed;
+	const name = nameCandidate.toLowerCase();
+	const fromAllowlist = BY_NAME.get(name);
+	if (fromAllowlist) return fromAllowlist;
+
+	// Custom emoji: strict validation. For custom emoji, the input itself (before lowercasing)
+	// must match Slack rules, not just the lowercased version. This ensures the input is
+	// already lowercase, which is required for Slack emoji names.
+	if (!SLACK_EMOJI_NAME.test(nameCandidate) || PROTOTYPE_KEYS.has(nameCandidate)) return undefined;
+	return { name: nameCandidate, isCustom: true };
 }
 
 /**
@@ -91,16 +117,17 @@ export function resolveReactionEmoji(input: string): ReactionEmoji | undefined {
  *
  * The allowlist says what a persona may ASK for; this says what a platform can
  * actually deliver. Telegram's Bot API accepts only its own server-provided
- * reaction set, so three allowlist entries are unreachable there and asking for
- * one is a guaranteed dead delivery — the persona would believe it acknowledged
- * while the human saw nothing. The Telegram adapter owns the authoritative
- * 73-emoji set and its tests assert that this list is exactly the set of
- * allowlist entries that set rejects, so the two cannot drift apart silently.
+ * reaction set, so custom emoji and three allowlist entries are unreachable
+ * there. Asking for one is a guaranteed dead delivery — the persona would
+ * believe it acknowledged while the human saw nothing. The Telegram adapter
+ * owns the authoritative 73-emoji set and its tests assert that this list is
+ * exactly the set of allowlist entries that set rejects, so the two cannot
+ * drift apart silently.
  */
 const TELEGRAM_INCAPABLE = new Set(["check", "cross", "lobster"]);
 
 export function platformSupportsReaction(platform: OriginPlatform, emojiName: string): boolean {
-	return platform === "telegram" ? !TELEGRAM_INCAPABLE.has(emojiName) : true;
+	return platform === "telegram" ? BY_NAME.has(emojiName) && !TELEGRAM_INCAPABLE.has(emojiName) : true;
 }
 
 /** The allowlist a specific platform can actually deliver. */
@@ -127,23 +154,31 @@ export function reactionAllowlistDescription(platform: OriginPlatform): string {
 /**
  * The reaction reply mode (third mode next to text and the silence token).
  *
- * A reply may open with one or more `[REACT:<emoji-or-name>]` tokens, optionally
- * targeting a specific message with `@<message id>`:
+ * A reply may open with one or more `[REACT:<emoji-or-name>]` or `[UNREACT:<emoji-or-name>]`
+ * tokens, optionally targeting a specific message with `@<message id>`:
  *
  *   [REACT:👍]                      react to the message that triggered the turn
  *   [REACT:thumbsup@123456789]      react to one named message
+ *   [UNREACT:👍@123456789]           remove a reaction you added earlier from that message
  *   [REACT:👀] still looking into it  react AND say something
  *
  * With nothing left after the tokens, the turn acknowledges with a reaction and
  * sends no message at all. Parsing is all-or-nothing: a malformed or
  * non-allowlisted token makes the whole reply plain text, so a bad token can
  * only ever cost the reaction, never the reply.
+ *
+ * Custom emoji names are allowed: they must follow Slack naming rules (lowercase,
+ * digits, _, -, ', +, 2-80 chars), and the adapter is responsible for validating
+ * that the emoji actually exists in the target workspace.
  */
 export interface ReactionReply {
 	readonly reactions: readonly {
 		readonly emoji: string;
 		readonly emojiName: string;
 		readonly targetMessageId?: string;
+		/** Add (default) or remove the reaction. */
+		readonly action?: ReactionAction;
+		readonly isCustom?: boolean;
 	}[];
 	/** Reply text after the tokens; empty means reaction-only (no message). */
 	readonly body: string;
@@ -163,7 +198,7 @@ export function isPlatformMessageId(value: string): boolean {
 	return PLATFORM_MESSAGE_ID.test(value);
 }
 
-const REACT_TOKEN = /^\s*\[REACT:([^\]\n]*)\]/;
+const REACT_TOKEN = /^\s*\[(REACT|UNREACT):([^\]\n]*)\]/;
 
 /**
  * Parses leading reaction tokens. Returns undefined when the reply carries no
@@ -172,20 +207,35 @@ const REACT_TOKEN = /^\s*\[REACT:([^\]\n]*)\]/;
  */
 export function parseReactionReply(text: string): ReactionReply | undefined {
 	let rest = text;
-	const reactions: { emoji: string; emojiName: string; targetMessageId?: string }[] = [];
+	const reactions: {
+		emoji: string;
+		emojiName: string;
+		targetMessageId?: string;
+		action?: ReactionAction;
+		isCustom?: boolean;
+	}[] = [];
 	for (let match = rest.match(REACT_TOKEN); match; match = rest.match(REACT_TOKEN)) {
-		const [token, argument = ""] = match;
+		const [token, action = "REACT", argument = ""] = match;
 		const at = argument.lastIndexOf("@");
 		const emojiPart = at === -1 ? argument : argument.slice(0, at);
 		const targetMessageId = at === -1 ? undefined : argument.slice(at + 1).trim();
 		const resolved = resolveReactionEmoji(emojiPart);
-		// Malformed: unknown emoji, an explicit `@` with no target id after it, or a
-		// target that cannot be a platform message id.
-		if (!resolved || (at !== -1 && !isPlatformMessageId(targetMessageId ?? ""))) return undefined;
+		const reactionAction: ReactionAction = action.toLowerCase() === "unreact" ? "remove" : "add";
+		// Malformed: unknown emoji, an explicit `@` with no target id after it, a
+		// target that cannot be a platform message id, or UNREACT without a target.
+		if (
+			!resolved ||
+			(at !== -1 && !isPlatformMessageId(targetMessageId ?? "")) ||
+			(reactionAction === "remove" && !targetMessageId)
+		)
+			return undefined;
+		const isCustom = resolved.isCustom === true;
 		reactions.push({
-			emoji: resolved.unicode,
+			emoji: isCustom ? "" : (resolved as ReactionEmoji).unicode,
 			emojiName: resolved.name,
 			...(targetMessageId ? { targetMessageId } : {}),
+			...(reactionAction === "remove" ? { action: "remove" } : {}),
+			...(isCustom ? { isCustom: true } : {}),
 		});
 		rest = rest.slice(token.length);
 	}

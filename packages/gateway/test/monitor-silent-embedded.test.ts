@@ -5,13 +5,12 @@ import { join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import type { SessionPortResponder } from "./session-port.fake";
 import { sessionPortFromScript } from "./session-port.fake";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 let propagators: MonitorPropagator[] = [];
 
 afterEach(async () => {
@@ -34,7 +33,7 @@ async function harness(
 	} = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-silent-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const monitor = registry.add({
 		name: "test",
@@ -49,7 +48,7 @@ async function harness(
 		registry,
 		sessionPort,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-		delivery: new DeliveryService(new DeliveryLedger(database)),
+		delivery: new DeliveryService(database),
 		emit: () => {},
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
 	});
@@ -63,10 +62,10 @@ function eventsFromPrompt(text: string): Array<{ eventId: string }> {
 	return JSON.parse(match[0]) as Array<{ eventId: string }>;
 }
 
-const stage = (db: GatewayDatabase, id: string) => db.monitorEventRows().find((row) => row.event_id === id)?.stage;
+const stage = (db: Store, id: string) => db.monitors.eventRows().find((row) => row.event_id === id)?.stage;
 
-describe("isSilentOutput integration (issue #338: propagate.ts must use embedded marker grammar)", () => {
-	test("note starting with [SILENT] plus narration is NOT delivered", async () => {
+describe("isSilentOutput integration (issue #338: propagate.ts must use the closing-marker grammar)", () => {
+	test("note with a reasoning preamble closed by [SILENT] is NOT delivered", async () => {
 		const {
 			propagator,
 			monitor,
@@ -74,19 +73,20 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 		} = await harness(
 			async (_id, text) =>
 				JSON.stringify(
-					eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "[SILENT] This is a status update" })),
+					eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "Nothing new since last sweep.\n\n[SILENT]" })),
 				),
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.authoredOutput(eventId)).toBe("[SILENT] This is a status update");
+		expect(db!.monitors.authoredOutput(eventId)).toBe("Nothing new since last sweep.\n\n[SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.deliveryRows()).toHaveLength(0);
+		expect(db!.outbox.rows()).toHaveLength(0);
 	});
 
-	test("note with [SILENT] mid-text is also NOT delivered (grammar: anywhere silences)", async () => {
+	test("note that merely mentions [SILENT] mid-text IS delivered (a mention is not a directive)", async () => {
 		const {
 			propagator,
 			monitor,
@@ -102,12 +102,12 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
-		// [SILENT] anywhere silences (per containsSilenceToken grammar)
-		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.deliveryRows()).toHaveLength(0);
+		expect(db!.monitors.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
+		expect(stage(db!, eventId)).not.toBe("authored_no_delivery");
+		expect(db!.outbox.rows()).toHaveLength(1);
 	});
 
 	test("only [SILENT] token (exact match) is also silent", async () => {
@@ -120,10 +120,11 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.authoredOutput(eventId)).toBe("[SILENT]");
+		expect(db!.monitors.authoredOutput(eventId)).toBe("[SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.deliveryRows()).toHaveLength(0);
+		expect(db!.outbox.rows()).toHaveLength(0);
 	});
 });

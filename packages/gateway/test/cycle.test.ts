@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,8 +9,10 @@ import {
 	MONITOR_TERMINAL_STREAK_THRESHOLD,
 	observeAgentDisk,
 	projectRuntimeCycle,
+	RuntimeCycleProjector,
 	type RuntimeCycleSources,
 } from "../src/ops/cycle";
+import { Store } from "../src/store";
 
 const generatedAt = "2026-08-26T00:00:00.000Z";
 
@@ -35,6 +38,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		unknownDeliveryStates: [],
 		unsettledByOrigin: new Map(),
 		memoryIntents: new Map(),
+		memoryGitIndexLock: null,
 		monitorStages: new Map(),
 		monitorAuthoringLost: [],
 		memoryClosing: false,
@@ -42,10 +46,15 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		activeLanes: 0,
 		maxLanes: 8,
 		settledWorkOrigins: new Set(),
+		latestCutoverAt: null,
+		addressedSinceCutover: new Set(),
 		agentDisk: null,
 		gjcVersion: undefined,
 		monitorTerminalStreak: 0,
 		brokerRespawnChurn: false,
+		brokerExitRecord: undefined,
+		brokerAgent: null,
+		slo: { days: [], windows: [], ok: false },
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -78,6 +87,29 @@ describe("runtime cycle projection", () => {
 		expect(projectRuntimeCycle(sources({ gjcVersion: undefined }), generatedAt).gates).not.toContain(
 			"gjc_unverified_version",
 		);
+	});
+	test("broker-agent drift is reported without gating, while missing authority blocks the cycle", () => {
+		const agent = (
+			status: "provisioned" | "unprovisioned" | "interrupted",
+			state: "source_changed" | "missing_copy",
+		) => ({
+			status,
+			provisionedAt: status === "provisioned" ? "2026-09-01T00:00:00.000Z" : null,
+			genId: status === "provisioned" ? "generation-1" : null,
+			source: status === "provisioned" ? "/operator/.gjc/agent" : null,
+			entries: [{ name: "agent.db" as const, kind: "credentials", state }],
+		});
+		const changed = projectRuntimeCycle(sources({ brokerAgent: agent("provisioned", "source_changed") }), generatedAt);
+		expect(changed.brokerAgent?.entries[0]?.state).toBe("source_changed");
+		expect(changed.gates).not.toContain("broker_agent_unprovisioned");
+		for (const status of ["unprovisioned", "interrupted"] as const) {
+			expect(projectRuntimeCycle(sources({ brokerAgent: agent(status, "missing_copy") }), generatedAt).gates).toContain(
+				"broker_agent_unprovisioned",
+			);
+		}
+		expect(
+			projectRuntimeCycle(sources({ brokerAgent: agent("provisioned", "missing_copy") }), generatedAt).gates,
+		).toContain("broker_agent_unprovisioned");
 	});
 
 	// Issue #15: the GJC agent directory grew to 70+ GB with no reaper; the
@@ -172,6 +204,103 @@ describe("runtime cycle projection", () => {
 		expect(churn.phase).toBe("degraded");
 	});
 
+	test("broker index lock exit records gate matching causes but ignore ordinary and unknown records", () => {
+		const startupLock = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "startup-lock-blocked", extra: { ignored: true } } }),
+			generatedAt,
+		);
+		expect(startupLock.gates).toEqual(["broker_index_lock_blocked"]);
+		expect(startupLock.phase).toBe("degraded");
+
+		const retainedRemoval = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "startup-error", detail: "retained removal transition detected" } }),
+			generatedAt,
+		);
+		expect(retainedRemoval.gates).toEqual(["broker_index_lock_blocked"]);
+		expect(retainedRemoval.phase).toBe("degraded");
+
+		const heartbeatLock = projectRuntimeCycle(
+			sources({
+				brokerExitRecord: {
+					reason: "heartbeat-renewal-blocked",
+					blockingLockPath: "/agent/sessions/index.jsonl.lock.removing",
+				},
+			}),
+			generatedAt,
+		);
+		expect(heartbeatLock.gates).toEqual(["broker_index_lock_blocked"]);
+
+		const blockingPathOnly = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "startup-error", blockingLockPath: "/agent/x.lock.removing" } }),
+			generatedAt,
+		);
+		expect(blockingPathOnly.gates).toEqual(["broker_index_lock_blocked"]);
+
+		const retainedRemovalReason = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "RETAINED REMOVAL TRANSITION refused" } }),
+			generatedAt,
+		);
+		expect(retainedRemovalReason.gates).toEqual(["broker_index_lock_blocked"]);
+
+		const ordinary = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "normal-exit", detail: "clean shutdown" } }),
+			generatedAt,
+		);
+		expect(ordinary.gates).toEqual([]);
+
+		for (const brokerExitRecord of [
+			undefined,
+			null,
+			"unknown record",
+			[],
+			{ reason: { toString: "startup-lock-blocked" }, detail: { includes: "retained removal transition" } },
+		]) {
+			const unknown = projectRuntimeCycle(sources({ brokerExitRecord }), generatedAt);
+			expect(unknown.gates).not.toContain("broker_index_lock_blocked");
+		}
+	});
+
+	test("runtime-cycle snapshot reads the broker exit file from agentDir without changing GJC state", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-broker-exit-"));
+		const database = await Store.open(join(directory, "gateway.db"));
+		try {
+			const agentDir = join(directory, "agent");
+			const sdkDir = join(agentDir, "sdk");
+			const exitPath = join(sdkDir, "broker.exit.json");
+			await mkdir(sdkDir, { recursive: true });
+			const matchingRecord = '{"reason":"startup-lock-blocked","detail":"retained removal transition"}';
+			await writeFile(exitPath, matchingRecord);
+
+			const projector = new RuntimeCycleProjector(database, { queueDepth: 0 }, { agentDir });
+			const blocked = projector.project();
+			expect(blocked.gates).toContain("broker_index_lock_blocked");
+			expect(blocked.phase).toBe("degraded");
+			expect(await readFile(exitPath, "utf8")).toBe(matchingRecord);
+
+			const malformedFields = '{"reason":{"toString":null},"detail":{"includes":"retained removal transition"}}';
+			await writeFile(exitPath, malformedFields);
+			expect(projector.project().gates).not.toContain("broker_index_lock_blocked");
+
+			await writeFile(exitPath, '{"reason":"ordinary-shutdown"}');
+			expect(projector.project().gates).not.toContain("broker_index_lock_blocked");
+
+			// Invalid/missing primary records fall through to the startup record.
+			const startupPath = join(sdkDir, "broker.startup-exit.json");
+			await writeFile(startupPath, '{"reason":"STARTUP-LOCK-BLOCKED","unknown":true}');
+			for (const invalid of ["invalid JSON", "null", "[]"]) {
+				await writeFile(exitPath, invalid);
+				expect(projector.project().gates).toContain("broker_index_lock_blocked");
+			}
+			await rm(exitPath);
+			expect(projector.project().gates).toContain("broker_index_lock_blocked");
+			await rm(startupPath);
+			expect(projector.project().gates).not.toContain("broker_index_lock_blocked");
+		} finally {
+			database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("empty durable state projects idle with no gates", () => {
 		const result = projectRuntimeCycle(sources(), generatedAt);
 		expect(result.phase).toBe("idle");
@@ -211,6 +340,60 @@ describe("runtime cycle projection", () => {
 		const failedBind = projectRuntimeCycle(sources({ sessionRows: [unbound] }), generatedAt);
 		expect(failedBind.gates).toContain("stale_session_identity");
 		expect(failedBind.phase).toBe("degraded");
+	});
+
+	test("an origin unbound by a broker cutover and untouched since is history, not a stuck rebind", () => {
+		const cutoverAt = "2026-08-10T00:00:00.000Z";
+		// Quarantined worker lane: its job is excluded from settled evidence, yet the cutover unbound it.
+		const quarantinedLane = {
+			...boundSession,
+			origin_key: "work/task/old-fix",
+			origin_ref_json: JSON.stringify({ platform: "work", kind: "task", conversationId: "old-fix" }),
+			gjc_session_id: "",
+			last_activity_at: "2026-08-09T00:00:00.000Z",
+		};
+		// Legacy persona origin no longer addressed after the cutover.
+		const legacyOrigin = {
+			...boundSession,
+			origin_key: "monitor/eventtype/memory.audit",
+			gjc_session_id: "",
+			last_activity_at: cutoverAt,
+		};
+		const history = projectRuntimeCycle(
+			sources({ sessionRows: [quarantinedLane, legacyOrigin], latestCutoverAt: cutoverAt }),
+			generatedAt,
+		);
+		expect(history.gates).toEqual([]);
+		expect(history.phase).toBe("idle");
+		expect(history.sessions.map((s) => s.sessionId)).toEqual(["", ""]);
+
+		// Work admitted for the origin since the cutover (its first bind may have
+		// failed without touching the row): gated even with a pre-cutover timestamp.
+		const addressed = projectRuntimeCycle(
+			sources({
+				sessionRows: [quarantinedLane, legacyOrigin],
+				latestCutoverAt: cutoverAt,
+				addressedSinceCutover: new Set([legacyOrigin.origin_key]),
+			}),
+			generatedAt,
+		);
+		expect(addressed.gates).toContain("stale_session_identity");
+
+		// An epoch bump (/new, work.run) after the cutover stamps last_activity_at: still gated.
+		const rebinding = { ...legacyOrigin, last_activity_at: "2026-08-10T00:00:00.001Z" };
+		const stuck = projectRuntimeCycle(sources({ sessionRows: [rebinding], latestCutoverAt: cutoverAt }), generatedAt);
+		expect(stuck.gates).toContain("stale_session_identity");
+
+		// Without any cutover the same unbound rows stay gated.
+		const noCutover = projectRuntimeCycle(sources({ sessionRows: [quarantinedLane, legacyOrigin] }), generatedAt);
+		expect(noCutover.gates).toContain("stale_session_identity");
+
+		// A negative epoch is never excused by age.
+		const negative = projectRuntimeCycle(
+			sources({ sessionRows: [{ ...legacyOrigin, epoch: -1 }], latestCutoverAt: cutoverAt }),
+			generatedAt,
+		);
+		expect(negative.gates).toContain("stale_session_identity");
 	});
 
 	test("healthy bound session with no work projects idle and carries identity/provenance", () => {
@@ -312,6 +495,13 @@ describe("runtime cycle projection", () => {
 	test("quarantined memory intent gates memory_closure_blocked and degrades", () => {
 		const result = projectRuntimeCycle(sources({ memoryIntents: new Map([["quarantined", 1]]) }), generatedAt);
 		expect(result.gates).toContain("memory_closure_blocked");
+		expect(result.phase).toBe("degraded");
+	});
+	test("memory git index lock gates the projection and preserves its observation", () => {
+		const lock = { path: "/memory/.git/index.lock", ageMs: 60_000 };
+		const result = projectRuntimeCycle(sources({ memoryGitIndexLock: lock }), generatedAt);
+		expect(result.gates).toContain("memory_git_index_locked");
+		expect(result.memoryGitIndexLock).toEqual(lock);
 		expect(result.phase).toBe("degraded");
 	});
 

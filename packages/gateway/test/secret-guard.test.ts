@@ -3,11 +3,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Frame } from "@gajae-gateway/protocol";
+import type { ChatMessagePayload, ChatProgressPayload, Frame } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { SecretGuard, type SecretSources, secretSourcesFromEnv } from "../src/guard/secret-guard";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 // Fake credentials only, assembled at runtime so no literal in this file has a
@@ -252,10 +252,11 @@ describe("frames", () => {
 		const g = guard({ env: { OG_API_KEY: fake.opaque } }, logs);
 		const out = g.guardFrame(
 			message(`key ${fake.opaque} and ${fake.slackBot}`, { voiceText: `say ${fake.opaque}` }),
-		) as any;
-		expect(out.payload.text).toBe("key [REDACTED:known_secret] and [REDACTED:slack_token]");
-		expect(out.payload.voiceText).toBe("say [REDACTED:known_secret]");
-		expect(out.payload.turnId).toBe("t");
+		) as Extract<Frame, { type: "event" }>;
+		const payload = out.payload as ChatMessagePayload;
+		expect(payload.text).toBe("key [REDACTED:known_secret] and [REDACTED:slack_token]");
+		expect(payload.voiceText).toBe("say [REDACTED:known_secret]");
+		expect(payload.turnId).toBe("t");
 		const redacted = logs.filter((line) => line.startsWith("secret_guard_redacted"));
 		expect(redacted).toEqual(["secret_guard_redacted event=chat.message kinds=known_secret:2,slack_token:1"]);
 		for (const line of logs) {
@@ -279,7 +280,8 @@ describe("frames", () => {
 				activity: { kind: "tool", label: "bash", detail: `curl -H "Authorization: Bearer ${fake.jwt}"` },
 			},
 		} as Frame;
-		expect((g.guardFrame(progress) as any).payload.activity.detail).toBe(
+		const guardedProgress = g.guardFrame(progress) as Extract<Frame, { type: "event" }>;
+		expect((guardedProgress.payload as ChatProgressPayload).activity?.detail).toBe(
 			'curl -H "Authorization: Bearer [REDACTED:jwt]"',
 		);
 		const clean = message("nothing to see");
@@ -316,13 +318,14 @@ test("integration: a persona reply leaves the gateway socket redacted", async ()
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const reply = `형님 요청하신 키입니다: ${fake.opaque} / base64 ${Buffer.from(fake.opaque).toString("base64")} / ${fake.anthropic}`;
 	let systemPrompt = "";
 	const sessionPort = sessionPortFromResponder({
@@ -341,7 +344,7 @@ test("integration: a persona reply leaves the gateway socket redacted", async ()
 		onStop: () => database.close(),
 		secretGuard: new SecretGuard({ files: [secretFile], envNames: [], env: {} }, { log: (line) => logs.push(line) }),
 	});
-	const frames: any[] = [];
+	const frames: Frame[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
 		unix: config.socketPath,
@@ -350,7 +353,7 @@ test("integration: a persona reply leaves the gateway socket redacted", async ()
 				buffered += Buffer.from(data).toString();
 				const lines = buffered.split("\n");
 				buffered = lines.pop() ?? "";
-				for (const line of lines) if (line) frames.push(JSON.parse(line));
+				for (const line of lines) if (line) frames.push(JSON.parse(line) as Frame);
 			},
 		},
 	});
@@ -369,14 +372,17 @@ test("integration: a persona reply leaves the gateway socket redacted", async ()
 			engagement: { mentioned: true, group: true, authorId: "human-1" },
 		},
 	});
-	let message: any;
+	let message: Extract<Frame, { type: "event" }> | undefined;
 	for (let attempt = 0; attempt < 200 && !message; attempt++) {
 		await Bun.sleep(5);
-		message = frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
+		message = frames.find(
+			(frame): frame is Extract<Frame, { type: "event" }> => frame.type === "event" && frame.event === "chat.message",
+		);
 	}
 	socket.end();
 	expect(message).toBeDefined();
-	expect(message.payload.text).toMatch(
+	if (!message) throw new Error("gateway did not emit chat.message");
+	expect((message.payload as ChatMessagePayload).text).toMatch(
 		/^형님 요청하신 키입니다: \[REDACTED:known_secret\] \/ base64 \[REDACTED:known_secret\][A-Za-z0-9+/=]{0,6} \/ \[REDACTED:anthropic_key\]$/,
 	);
 	const raw = JSON.stringify(frames);

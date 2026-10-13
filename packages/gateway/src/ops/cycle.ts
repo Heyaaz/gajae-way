@@ -1,17 +1,27 @@
-import { statfsSync } from "node:fs";
+import { statfsSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
 	type AgentDiskView,
+	CATCH_ALL_EVENT_ORIGIN,
 	type CycleGateReason,
 	type CyclePhase,
 	type CycleSessionView,
 	LOOPBACK_ORIGIN,
+	monitorSessionOrigin,
 	type OpsCycleResult,
+	type OpsSloResult,
+	originKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
+import { type BrokerAgentDrift, readBrokerAgentDrift } from "../broker-agent/drift";
 import { DEFAULT_WORK_MAX_LANES } from "../config";
+import { isBrokerIndexLockBlocked, readBrokerExitRecordSync } from "../orchestrator/broker-liveness";
 import { isVerifiedGjcVersion } from "../orchestrator/gjc-contract";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
-import type { GatewayDatabase } from "../store/db";
+import type { Store } from "../store";
+import type { ConversationContextDiagnostics } from "../store/groups/inbox";
+import type { MonitorsGroup } from "../store/groups/monitors";
+import { DEFAULT_SLO_DAYS, evaluateSlo } from "./slo";
 
 /**
  * Operator runtime-cycle projection (ops.cycle).
@@ -88,6 +98,24 @@ function agentDiskLow(disk: AgentDiskView): boolean {
 	return disk.freeBytes < AGENT_DISK_MIN_FREE_BYTES || disk.freeBytes < disk.totalBytes * AGENT_DISK_MIN_FREE_RATIO;
 }
 
+function observeMemoryGitIndexLock(
+	memoryRoot: string | undefined,
+	nowMs: number,
+): {
+	readonly path: string;
+	readonly ageMs: number;
+} | null {
+	if (memoryRoot === undefined) return null;
+	const path = join(memoryRoot, ".git", "index.lock");
+	try {
+		const ageMs = Math.max(0, nowMs - statSync(path).mtimeMs);
+		console.error(`memory_git_index_locked path=${path} age_ms=${Math.floor(ageMs)}`);
+		return { path, ageMs };
+	} catch {
+		return null;
+	}
+}
+
 export interface RuntimeCycleSources {
 	readonly sessionRows: Array<{
 		readonly origin_key: string;
@@ -106,8 +134,8 @@ export interface RuntimeCycleSources {
 	readonly inboundPendingByOrigin: ReadonlyMap<string, number>;
 	/** Age of the oldest replayable pending trigger with nothing in flight; the bricked-origin signature. */
 	readonly oldestStarvedPendingMs: number | null;
-	readonly contextByOrigin: ReadonlyMap<string, ReturnType<GatewayDatabase["contextDiagnostics"]>>;
-	readonly contextDiff: ReturnType<GatewayDatabase["contextDiagnostics"]>;
+	readonly contextByOrigin: ReadonlyMap<string, ConversationContextDiagnostics>;
+	readonly contextDiff: ConversationContextDiagnostics;
 	readonly inboundCounts: ReadonlyMap<string, number>;
 	readonly pendingInbound: number;
 	readonly inFlightInbound: number;
@@ -116,9 +144,10 @@ export interface RuntimeCycleSources {
 	readonly unknownDeliveryStates: readonly string[];
 	readonly unsettledByOrigin: ReadonlyMap<string, { n: number; oldestMs: number }>;
 	readonly memoryIntents: ReadonlyMap<string, number>;
+	readonly memoryGitIndexLock: { readonly path: string; readonly ageMs: number } | null;
 	readonly monitorStages: ReadonlyMap<string, number>;
 	/** Event types whose latest terminal slots in the loss window were lost before authoring. */
-	readonly monitorAuthoringLost: ReturnType<GatewayDatabase["monitorAuthoringLossStreaks"]>;
+	readonly monitorAuthoringLost: ReturnType<MonitorsGroup["authoringLossStreaks"]>;
 	readonly memoryClosing: boolean;
 	readonly instanceId: string;
 	/** Bound `work.run` lanes and the configured admission cap. */
@@ -132,6 +161,19 @@ export interface RuntimeCycleSources {
 	 * `awaiting_operator`, or `stalled` job is a crash-left or held worker.
 	 */
 	readonly settledWorkOrigins: ReadonlySet<string>;
+	/**
+	 * When the newest broker authority cutover committed; null when none ran.
+	 * A cutover unbinds every origin (`gjc_session_id = ''`) and quarantines
+	 * every inbound row, lane job and monitor event it finds.
+	 */
+	readonly latestCutoverAt: string | null;
+	/**
+	 * Origins with durable work admitted since the newest cutover: inbound rows,
+	 * lane jobs and monitor events outside quarantine. A failed first bind leaves
+	 * the session row untouched, so this is the evidence that an origin was asked
+	 * to rebind. Empty when no cutover ran.
+	 */
+	readonly addressedSinceCutover: ReadonlySet<string>;
 	/** Headroom of the broker-bound GJC agent directory; null when none is bound. */
 	readonly agentDisk: AgentDiskView | null;
 	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
@@ -140,22 +182,30 @@ export interface RuntimeCycleSources {
 	readonly monitorTerminalStreak: number;
 	/** True while the shared broker's incarnation keeps changing (die/respawn churn). */
 	readonly brokerRespawnChurn: boolean;
+	/** Untrusted broker exit record from the GJC-owned agent directory, when present. */
+	readonly brokerExitRecord: unknown;
+	readonly brokerAgent: BrokerAgentDrift | null;
+	readonly slo: OpsSloResult;
 }
 
 export class RuntimeCycleProjector {
-	readonly #database: GatewayDatabase;
+	readonly #database: Store;
 	readonly #memory: { readonly queueDepth: number };
 	readonly #maxLanes: number;
 	readonly #agentDir: string | undefined;
+	readonly #memoryRoot: string | undefined;
 	readonly #gjcVersion: () => string | undefined;
 	readonly #brokerRespawnChurn: () => boolean;
+	readonly #home: string | undefined;
 
 	constructor(
-		database: GatewayDatabase,
+		database: Store,
 		memory: { readonly queueDepth: number },
 		options: {
 			readonly maxLanes?: number;
 			readonly agentDir?: string;
+			readonly home?: string;
+			readonly memoryRoot?: string;
 			readonly gjcVersion?: () => string | undefined;
 			readonly brokerRespawnChurn?: () => boolean;
 		} = {},
@@ -164,6 +214,8 @@ export class RuntimeCycleProjector {
 		this.#memory = memory;
 		this.#maxLanes = options.maxLanes ?? DEFAULT_WORK_MAX_LANES;
 		this.#agentDir = options.agentDir;
+		this.#home = options.home;
+		this.#memoryRoot = options.memoryRoot;
 		this.#gjcVersion = options.gjcVersion ?? (() => undefined);
 		this.#brokerRespawnChurn = options.brokerRespawnChurn ?? (() => false);
 	}
@@ -175,9 +227,9 @@ export class RuntimeCycleProjector {
 	}
 
 	#sources(nowMs: number): RuntimeCycleSources {
-		const sessions = this.#database.sessionIdentityRows();
-		const inbound = this.#database.inboundStateCounts();
-		const pendingRows = this.#database.inboundPendingByOrigin();
+		const sessions = this.#database.bindings.sessionIdentityRows();
+		const inbound = this.#database.inbox.stateCounts();
+		const pendingRows = this.#database.inbox.pendingByOrigin();
 		const pendingByOrigin = new Map(pendingRows.map((r) => [r.origin_key, r.n]));
 		const inFlightInbound = pendingRows.reduce((sum, row) => sum + row.active, 0);
 		// Starvation is per origin: an unbound row waiting behind that origin's
@@ -188,16 +240,17 @@ export class RuntimeCycleProjector {
 			const age = nowMs - Date.parse(row.oldest_unbound_received_at);
 			return Number.isFinite(age) && (oldest === null || age > oldest) ? age : oldest;
 		}, null);
-		const contextByOrigin = this.#database.contextDiagnosticsByOrigin();
-		const deliveries = this.#database.deliveryStateCounts();
+		const contextByOrigin = this.#database.inbox.contextDiagnosticsByOrigin();
+		const deliveries = this.#database.outbox.stateCounts();
 		const unsettled = new Map(
-			this.#database.deliveryUnsettledByOrigin(nowMs).map((r) => [r.origin_key, { n: r.n, oldestMs: r.oldest_ms }]),
+			this.#database.outbox.unsettledByOrigin(nowMs).map((r) => [r.origin_key, { n: r.n, oldestMs: r.oldest_ms }]),
 		);
-		const memory = this.#database.memoryIntentCounts();
-		const monitors = this.#database.monitorEventStageCounts();
+		const memory = this.#database.memory.intentCounts();
+		const monitors = this.#database.monitors.eventStageCounts();
 		const inboundMap = new Map(inbound.map((r) => [r.state, r.n]));
 		const unknownInbound = inbound.map((r) => r.state).filter((state) => !KNOWN_INBOUND_STATES.has(state));
 		const unknownDeliveries = deliveries.map((r) => r.state).filter((state) => !KNOWN_DELIVERY_STATES.has(state));
+		const latestCutoverAt = this.#database.bindings.latestBrokerCutoverAt();
 		return {
 			sessionRows: sessions,
 			inboundCounts: inboundMap,
@@ -208,35 +261,75 @@ export class RuntimeCycleProjector {
 			unknownDeliveryStates: unknownDeliveries,
 			unsettledByOrigin: unsettled,
 			memoryIntents: new Map(memory.map((r) => [r.state, r.n])),
+			memoryGitIndexLock: observeMemoryGitIndexLock(this.#memoryRoot, nowMs),
 			monitorStages: new Map(monitors.map((r) => [r.stage, r.n])),
-			monitorAuthoringLost: this.#database.monitorAuthoringLossStreaks(
+			monitorAuthoringLost: this.#database.monitors.authoringLossStreaks(
 				new Date(nowMs - MONITOR_AUTHORING_LOSS_WINDOW_MS).toISOString(),
 			),
 			inboundPendingByOrigin: pendingByOrigin,
 			oldestStarvedPendingMs,
 			contextByOrigin,
-			contextDiff: this.#database.contextDiagnostics(),
+			contextDiff: this.#database.inbox.contextDiagnostics(),
 			memoryClosing: this.#memory.queueDepth > 0,
 			instanceId: this.#database.instanceId,
-			activeLanes: this.#database.workLaneRows().length,
+			activeLanes: this.#database.bindings.workLaneRows().length,
 			maxLanes: this.#maxLanes,
 			settledWorkOrigins: new Set(
-				this.#database
+				this.#database.work
 					.laneJobRows()
 					.filter((row) => SETTLED_JOB_STATES.has(row.state))
 					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
 			),
+			latestCutoverAt,
+			addressedSinceCutover: this.#addressedSinceCutover(latestCutoverAt),
 			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
 			gjcVersion: this.#gjcVersion(),
-			monitorTerminalStreak: this.#database.monitorConsecutiveTerminalFailures(),
+			monitorTerminalStreak: this.#database.monitors.consecutiveTerminalFailures(),
 			brokerRespawnChurn: this.#brokerRespawnChurn(),
+			brokerExitRecord: this.#agentDir === undefined ? undefined : readBrokerExitRecordSync(this.#agentDir),
+			brokerAgent:
+				this.#home === undefined || this.#agentDir === undefined
+					? null
+					: readBrokerAgentDrift({ home: this.#home, agentDir: this.#agentDir }),
+			slo: evaluateSlo(this.#database.core, DEFAULT_SLO_DAYS, new Date(nowMs)),
 		};
+	}
+
+	#addressedSinceCutover(latestCutoverAt: string | null): Set<string> {
+		const origins = new Set<string>();
+		if (latestCutoverAt === null) return origins;
+		for (const key of this.#database.inbox.unquarantinedOrigins()) origins.add(key);
+		// laneJobRows() already leaves quarantined jobs out.
+		for (const row of this.#database.work.laneJobRows())
+			origins.add(`${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`);
+		// Same session-origin choice as monitor dispatch: a declared type gets its
+		// own session, anything else the monitor's catch-all. A deleted monitor's
+		// declarations are unknown, so both candidates count.
+		for (const row of this.#database.monitors.unquarantinedEventTypes()) {
+			const declared = parseDeclaredEventTypes(row.event_types_json);
+			if (declared === undefined || declared.includes(row.event_type))
+				origins.add(originKey(monitorSessionOrigin(row.monitor_id, row.event_type)));
+			if (declared === undefined || !declared.includes(row.event_type))
+				origins.add(originKey(monitorSessionOrigin(row.monitor_id, CATCH_ALL_EVENT_ORIGIN.conversationId)));
+		}
+		return origins;
+	}
+}
+
+function parseDeclaredEventTypes(json: string | null): string[] | undefined {
+	if (json === null) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(json);
+		return Array.isArray(parsed) && parsed.every((type) => typeof type === "string") ? parsed : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
 /** Pure projection over already-snapshotted sources — independently unit-testable. */
 export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: string): OpsCycleResult {
 	const gates = new Set<CycleGateReason>();
+	const cutoverMs = sources.latestCutoverAt === null ? Number.NaN : Date.parse(sources.latestCutoverAt);
 
 	const sessions: CycleSessionView[] = sources.sessionRows.map((row) => {
 		const origin = parseOriginRef(row.origin_ref_json);
@@ -249,7 +342,15 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 			row.origin_key.startsWith(WORK_LANE_PREFIX) &&
 			row.gjc_session_id === "" &&
 			sources.settledWorkOrigins.has(row.origin_key);
-		if ((row.gjc_session_id === "" && !retiredLane) || row.epoch < 0) gates.add("stale_session_identity");
+		// A cutover unbinds every origin at once. An origin with no work admitted
+		// and no epoch change since then is quarantined history, not a rebind in
+		// progress. Admission (inbound, lane job, monitor event) is the evidence:
+		// a failed first bind never touches the session row itself.
+		const lastActivityMs = Date.parse(row.last_activity_at ?? row.created_at);
+		const cutoverRetired =
+			row.gjc_session_id === "" && lastActivityMs <= cutoverMs && !sources.addressedSinceCutover.has(row.origin_key);
+		if ((row.gjc_session_id === "" && !retiredLane && !cutoverRetired) || row.epoch < 0)
+			gates.add("stale_session_identity");
 		return {
 			originKey: row.origin_key,
 			origin,
@@ -288,6 +389,14 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	const written = sources.memoryIntents.get("written") ?? 0;
 	const committed = sources.memoryIntents.get("committed") ?? 0;
 	if (quarantined > 0) gates.add("memory_closure_blocked");
+	if (sources.memoryGitIndexLock) gates.add("memory_git_index_locked");
+	if (
+		sources.brokerAgent &&
+		(sources.brokerAgent.status === "unprovisioned" ||
+			sources.brokerAgent.status === "interrupted" ||
+			sources.brokerAgent.entries.some((entry) => entry.name === "agent.db" && entry.state === "missing_copy"))
+	)
+		gates.add("broker_agent_unprovisioned");
 
 	const monitorFailed = sources.monitorStages.get("failed") ?? 0;
 	if (monitorFailed > 0) gates.add("monitor_settlement_failed");
@@ -320,6 +429,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// Dispatch outcome and incarnation churn are the health signals that moved.
 	if (sources.monitorTerminalStreak >= MONITOR_TERMINAL_STREAK_THRESHOLD) gates.add("monitor_dispatch_failing");
 	if (sources.brokerRespawnChurn) gates.add("broker_respawn_churn");
+	if (isBrokerIndexLockBlocked(sources.brokerExitRecord)) gates.add("broker_index_lock_blocked");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);
@@ -347,6 +457,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 			receipted: sources.memoryIntents.get("receipted") ?? 0,
 			quarantined,
 		},
+		memoryGitIndexLock: sources.memoryGitIndexLock,
 		monitorEvents: [...sources.monitorStages.entries()]
 			.map(([stage, count]) => ({ stage, count }))
 			.sort((a, b) => a.stage.localeCompare(b.stage)),
@@ -363,6 +474,8 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		contextDiff: sources.contextDiff,
 		lanes: { active: sources.activeLanes, max: sources.maxLanes },
 		agentDisk: sources.agentDisk,
+		brokerAgent: sources.brokerAgent,
+		slo: sources.slo,
 	};
 }
 

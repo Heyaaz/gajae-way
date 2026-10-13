@@ -2,9 +2,10 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { OriginRef } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder, sessionPortFromScript } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
@@ -48,7 +49,7 @@ async function settle(): Promise<void> {
 
 interface Harness {
 	readonly client: Client;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	/** Turn texts the gateway actually dispatched to gjc: a reaction must add none. */
 	readonly turns: string[];
 	/** Messages the gateway steered into a running turn. */
@@ -56,15 +57,17 @@ interface Harness {
 }
 
 /** An open channel, so every human message reaches a turn (same shape as silence.test.ts). */
-async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
+async function gateway(reply: string, hold?: Promise<void>, origin: OriginRef = ORIGIN): Promise<Harness> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-reactions-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		dmPolicy: origin.kind === "dm" ? "open" : "allowlist",
 		// Both keys: a bare id only resolves for discord, so telegram needs the prefixed form.
 		channels: {
 			"chan-1": { engagement: "open" },
@@ -72,7 +75,7 @@ async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
 			"slack:C1": { engagement: "open" },
 		},
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	// `hold` keeps the turn running (accepted, no terminal) so later messages are steered.
 	const sessionPort = (hold ? sessionPortFromScript : sessionPortFromResponder)({
@@ -97,6 +100,7 @@ function sendMessage(
 	text = "형님 이거 봐주세요",
 	messageId = "m1",
 	engagement: Record<string, unknown> = { mentioned: true, group: true, authorId: "human-1", authorName: "형님" },
+	origin: OriginRef = ORIGIN,
 ): void {
 	client.send({
 		v: "0.1",
@@ -104,7 +108,7 @@ function sendMessage(
 		id,
 		verb: "chat.send",
 		params: {
-			origin: ORIGIN,
+			origin,
 			text,
 			messageId,
 			engagement,
@@ -138,7 +142,7 @@ test("an accepted steer is acknowledged with 👀 on the steered message at once
 		expect(reactions).toHaveLength(1);
 		expect(reactions[0].payload.reaction).toEqual({ targetMessageId: "m2", emoji: "👀", emojiName: "eyes" });
 		// A real, settleable ledger row like every other reaction.
-		expect(database.deliveryRows().some((row) => row.delivery_id === reactions[0].payload.deliveryId)).toBe(true);
+		expect(database.outbox.rows().some((row) => row.delivery_id === reactions[0].payload.deliveryId)).toBe(true);
 	} finally {
 		finish();
 	}
@@ -213,12 +217,36 @@ test("an inbound reaction is metadata: it never creates a turn", async () => {
 	// The three ways a turn could exist, all absent.
 	expect(turns).toEqual([]);
 	expect(client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")).toBe(false);
-	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+	expect(database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 	// It is recorded as conversation context instead.
-	const unread = database.contextUnread(ORIGIN_KEY);
+	const unread = database.inbox.contextUnread(ORIGIN_KEY);
 	expect(unread).toHaveLength(1);
 	expect(unread[0]?.body).toBe("[reaction] reacted 👍 to message m-ours");
 	expect(unread[0]?.author_name).toBe("형님");
+});
+
+test("an inbound Slack custom emoji preserves the full maximum-length name", async () => {
+	const slack = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
+	const { client, database } = await gateway("unused", undefined, slack);
+	const emoji = `custom:${"a".repeat(80)}`;
+	const targetMessageId = "C1:1726543210.123456";
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "r1",
+		verb: "engagement.reaction",
+		params: {
+			origin: slack,
+			targetMessageId,
+			emoji,
+			action: "add",
+			engagement: { mentioned: false, group: true, authorId: "human-1" },
+		},
+	});
+	await settle();
+	const unread = database.inbox.contextUnread("slack/channel/C1");
+	expect(emoji).toHaveLength(87);
+	expect(unread[0]?.body).toBe(`[reaction] reacted ${emoji} to message ${targetMessageId}`);
 });
 
 test("a removed reaction is recorded as its own retraction, not as an erased add", async () => {
@@ -244,7 +272,7 @@ test("a removed reaction is recorded as its own retraction, not as an erased add
 	}
 	await settle();
 	expect(turns).toEqual([]);
-	const bodies = database.contextUnread(ORIGIN_KEY).map((entry) => entry.body);
+	const bodies = database.inbox.contextUnread(ORIGIN_KEY).map((entry) => entry.body);
 	expect(bodies).toEqual([
 		"[reaction] reacted 👍 to message m-ours",
 		"[reaction] removed their 👍 reaction from message m-ours",
@@ -318,7 +346,7 @@ test("a reaction-only reply acknowledges without speaking, as a ledger delivery"
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "d1").result).toEqual({
 		settled: true,
 	});
-	expect(database.deliveryRows().find((row) => row.delivery_id === deliveryId)?.state).toBe("confirmed");
+	expect(database.outbox.rows().find((row) => row.delivery_id === deliveryId)?.state).toBe("confirmed");
 });
 
 test("a reaction that fails on the platform is a reportable ledger failure, never a silent drop", async () => {
@@ -337,7 +365,7 @@ test("a reaction that fails on the platform is a reportable ledger failure, neve
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "d1").result).toEqual({
 		recorded: true,
 	});
-	const row = database.deliveryRows().find((entry) => entry.delivery_id === deliveryId);
+	const row = database.outbox.rows().find((entry) => entry.delivery_id === deliveryId);
 	expect(row?.attempts).toBe(1);
 	expect(row?.state).toBe("pending");
 });
@@ -378,8 +406,8 @@ test("the silence token still suppresses everything, with no reaction leaking ou
 	sendMessage(client, "c1");
 	await settle();
 	expect(client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")).toBe(false);
-	expect(database.deliveryRows()).toHaveLength(0);
-	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+	expect(database.outbox.rows()).toHaveLength(0);
+	expect(database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 });
 
 test("the per-turn cap bounds how many reactions one reply can emit", async () => {
@@ -410,9 +438,51 @@ test("chat.react reacts to one named message and returns its ledger delivery id"
 	expect(response.result.emoji).toBe("🦞");
 	expect(response.result.deliveryId).toBeString();
 	const event = reactionEvents(client.frames)[0];
-	expect(event.payload.reaction).toEqual({ targetMessageId: "1418812345678", emoji: "🦞", emojiName: "lobster" });
+	expect(event.payload.reaction).toEqual({
+		targetMessageId: "1418812345678",
+		emoji: "🦞",
+		emojiName: "lobster",
+		action: "add",
+	});
 	expect(event.payload.deliveryId).toBe(response.result.deliveryId);
-	expect(database.deliveryRows()).toHaveLength(1);
+	expect(database.outbox.rows()).toHaveLength(1);
+});
+
+test("chat.react keys custom emoji ownership by name and rejects Discord DM custom emoji", async () => {
+	const { client, database } = await gateway("unused");
+	for (const [id, origin, emoji, action] of [
+		["k1", ORIGIN, "custom_emoji_name", "add"],
+		["k2", ORIGIN, "other_custom_emoji", "remove"],
+		["k3", ORIGIN, "custom_emoji_name", "remove"],
+		["k4", ORIGIN, "other_custom_emoji", "add"],
+		["k5", { platform: "discord", kind: "dm", conversationId: "dm-1", peerId: "peer-1" }, "custom_emoji_name", "add"],
+		["k6", { platform: "slack", kind: "channel", conversationId: "C1" }, "slack_custom_name", "add"],
+	] as const) {
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.react",
+			params: { origin, targetMessageId: "custom-message", emoji, action },
+		});
+		await Bun.sleep(10);
+	}
+	await settle();
+	const wrongRemoval = client.frames.find((frame) => frame.type === "error" && frame.id === "k2");
+	expect(wrongRemoval.error.message).toContain("did not add this reaction");
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "k3")).toBeDefined();
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "k4")).toBeDefined();
+	const dmError = client.frames.find((frame) => frame.type === "error" && frame.id === "k5");
+	expect(dmError.error.message).toContain("require a guild channel or thread");
+	expect(
+		reactionEvents(client.frames).map((frame) => [frame.payload.reaction.emojiName, frame.payload.reaction.action]),
+	).toEqual([
+		["custom_emoji_name", "add"],
+		["custom_emoji_name", "remove"],
+		["other_custom_emoji", "add"],
+		["slack_custom_name", "add"],
+	]);
+	expect(database.outbox.rows()).toHaveLength(4);
 });
 
 test("chat.react rejects a disallowed emoji with an error that names the allowlist", async () => {
@@ -526,7 +596,7 @@ test("the reaction verbs refuse an origin no chat adapter can settle", async () 
 		expect(client.frames.find((frame) => frame.type === "error" && frame.id === id).error.message).toContain(
 			"requires a discord, telegram or slack origin",
 		);
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 test("a reaction storm in one millisecond keeps every event instead of colliding on one id", async () => {
@@ -547,7 +617,7 @@ test("a reaction storm in one millisecond keeps every event instead of colliding
 		});
 	await settle();
 	expect(turns).toEqual([]);
-	expect(database.contextUnread(ORIGIN_KEY, 100)).toHaveLength(6);
+	expect(database.inbox.contextUnread(ORIGIN_KEY, 100)).toHaveLength(6);
 });
 
 test("a reactor cannot forge context lines through the emoji field", async () => {
@@ -566,7 +636,7 @@ test("a reactor cannot forge context lines through the emoji field", async () =>
 		},
 	});
 	await settle();
-	const body = database.contextUnread(ORIGIN_KEY)[0]?.body ?? "";
+	const body = database.inbox.contextUnread(ORIGIN_KEY)[0]?.body ?? "";
 	expect(body).not.toContain("\n");
 	expect(body.length).toBeLessThan(120);
 });
@@ -598,7 +668,7 @@ test("a reaction Telegram cannot express is refused, not queued as a dead delive
 	expect(refused.error.message.split("it accepts:")[1]).not.toContain("✅");
 	// The same verb on the same message with a deliverable emoji still works.
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "k2").result.emoji).toBe("👍");
-	expect(database.deliveryRows()).toHaveLength(1);
+	expect(database.outbox.rows()).toHaveLength(1);
 });
 
 test("a reaction token Telegram cannot express is skipped while the reply still speaks", async () => {
@@ -674,6 +744,198 @@ test("a slack channel origin is a chat platform: send, react, and inbound reacti
 		engaged: false,
 	});
 	// Text reply + reply reaction + explicit chat.react: three rows, all settleable.
-	expect(database.deliveryRows()).toHaveLength(3);
+	expect(database.outbox.rows()).toHaveLength(3);
 	expect(turns).toHaveLength(1);
+});
+
+test("[UNREACT:...] fails if the emoji was never added by the persona in this turn", async () => {
+	const { client } = await gateway("[UNREACT:👍@m1] text");
+	sendMessage(client, "c1", "message", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	// The remove fails because 👍 was never added, so no reaction event
+	expect(reactions).toHaveLength(0);
+	// But the text should still be delivered
+	const texts = textEvents(client.frames);
+	expect(texts).toHaveLength(1);
+	expect(texts[0].payload.text).toBe("text");
+});
+
+test("[REACT:...][UNREACT:...] in one reply transitions the emoji on a message", async () => {
+	const { client } = await gateway("[REACT:👍@m1][UNREACT:👍@m1][REACT:👎@m1] done");
+	sendMessage(client, "c1", "message", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	// All three operations should succeed: add 👍, remove 👍, add 👎
+	expect(reactions).toHaveLength(3);
+	expect(reactions[0].payload.reaction.emoji).toBe("👍");
+	expect(reactions[0].payload.reaction.action).toBeUndefined(); // add is default
+	expect(reactions[1].payload.reaction.emoji).toBe("👍");
+	expect(reactions[1].payload.reaction.action).toBe("remove");
+	expect(reactions[2].payload.reaction.emoji).toBe("👎");
+	expect(reactions[2].payload.reaction.action).toBeUndefined();
+	const texts = textEvents(client.frames);
+	expect(texts).toHaveLength(1);
+	expect(texts[0].payload.text).toBe("done");
+});
+
+test("removing a reaction frees the per-message slot so a second add succeeds", async () => {
+	// The gateway enforces REACTIONS_PER_MESSAGE_CAP = 1, so adding two different reactions
+	// to the same message would fail. But if we remove the first and add a second in one
+	// turn, the remove frees the slot for the new add.
+	const { client } = await gateway("[REACT:👍@m1][UNREACT:👍@m1][REACT:👎@m1]");
+	sendMessage(client, "c1", "message", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	// All three succeed: add 👍, remove 👍 (frees slot), add 👎
+	expect(reactions).toHaveLength(3);
+	expect(reactions.map((r) => r.payload.reaction.emoji)).toEqual(["👍", "👍", "👎"]);
+	expect(reactions[1].payload.reaction.action).toBe("remove");
+});
+
+test("[UNREACT:...] without a target message id makes the entire reply plain text", async () => {
+	const { client } = await gateway("[UNREACT:\ud83d\udc4d] plain text because no target");
+	sendMessage(client, "c1", "message", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	// UNREACT without a target is malformed, so no reactions
+	expect(reactions).toHaveLength(0);
+	const texts = textEvents(client.frames);
+	expect(texts).toHaveLength(1);
+	// The entire reply is delivered as plain text because the token was malformed
+	expect(texts[0].payload.text).toBe("[UNREACT:\ud83d\udc4d] plain text because no target");
+});
+
+test("UNREACT in reply-token form requires a target message id", async () => {
+	const { client } = await gateway("[UNREACT:\ud83d\udc4d] this is plain text because token has no target");
+	sendMessage(client, "c1", "message", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	// UNREACT without a target is malformed, so no reactions
+	expect(reactions).toHaveLength(0);
+	const texts = textEvents(client.frames);
+	expect(texts).toHaveLength(1);
+	// The entire reply is plain text because the token was malformed
+	expect(texts[0].payload.text).toBe("[UNREACT:\ud83d\udc4d] this is plain text because token has no target");
+});
+
+test("a malformed [UNREACT:...] token invalidates the entire reply text", async () => {
+	const { client } = await gateway("[UNREACT:🚀@m1] invalid emoji");
+	sendMessage(client, "c1", "bad unreact", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	expect(reactions).toHaveLength(0);
+	const texts = textEvents(client.frames);
+	// The entire reply should be treated as plain text because the token is malformed
+	expect(texts).toHaveLength(1);
+	expect(texts[0].payload.text).toBe("[UNREACT:🚀@m1] invalid emoji");
+});
+
+test("[UNREACT:...] without a target message id invalidates the entire reply (treated as plain text)", async () => {
+	const { client } = await gateway("[UNREACT:👍] this should be plain text");
+	sendMessage(client, "c1", "message", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	// No reactions because the token is invalid (no target)
+	expect(reactions).toHaveLength(0);
+	const texts = textEvents(client.frames);
+	// The entire reply is treated as plain text when the token is malformed
+	expect(texts).toHaveLength(1);
+	expect(texts[0].payload.text).toBe("[UNREACT:👍] this should be plain text");
+});
+
+test("REACTIONS_PER_TURN_CAP is still enforced when a single reply mixes UNREACT and REACT tokens; removals don't refund the per-turn count", async () => {
+	// The cap is 3 reactions per turn (adds only). Removals don't count as operations
+	// in terms of the per-turn counter, so they don't increment it.
+	// [REACT:👍@m1][UNREACT:👍@m1][REACT:👎@m2][REACT:✅@m3][REACT:❌@m4]:
+	// - REACT 👍 (add #1, count=1, owned 👍:m1)
+	// - UNREACT 👍 (remove, count unchanged, owned cleared)
+	// - REACT 👎 (add #2, count=2)
+	// - REACT ✅ (add #3, count=3)
+	// - REACT ❌ (add #4, would exceed cap of 3, rejected)
+	// So we get 4 reactions: the 2 adds, the remove, and 2 more adds, for a total of 4 operations
+	// but only 3 adds (cap enforced) plus 1 remove.
+	const { client } = await gateway("[REACT:👍@m1][UNREACT:👍@m1][REACT:👎@m2][REACT:✅@m3][REACT:❌@m4]");
+	sendMessage(client, "c1", "test message", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	// Expect 4 operations: REACT 👍, UNREACT 👍, REACT 👎, REACT ✅ (the 5th REACT ❌ hits the cap)
+	expect(reactions).toHaveLength(4);
+	expect(reactions[0].payload.reaction.emoji).toBe("👍");
+	expect(reactions[0].payload.reaction.action).toBeUndefined(); // add is default
+	expect(reactions[1].payload.reaction.emoji).toBe("👍");
+	expect(reactions[1].payload.reaction.action).toBe("remove");
+	expect(reactions[2].payload.reaction.emoji).toBe("👎");
+	expect(reactions[3].payload.reaction.emoji).toBe("✅");
+});
+
+test("a reaction added in an earlier part of the turn can be removed in a later part (fire -> check use case)", async () => {
+	// This test verifies the fire -> check use case: within a single turn,
+	// a reaction is added and then removed, and the removal uses the #owned
+	// map of the ReactionBudget to verify ownership before allowing the remove.
+	// The reply [REACT:👍@m1][UNREACT:👍@m1][REACT:✅@m1] demonstrates that
+	// a reaction added early in the reply can be removed and replaced later.
+	const { client } = await gateway("[REACT:👍@m1][UNREACT:👍@m1][REACT:✅@m1]");
+	sendMessage(client, "c1", "test message", "m1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	// Expect all three operations: add 👍, remove 👍, add ✅
+	expect(reactions).toHaveLength(3);
+	expect(reactions[0].payload.reaction.emoji).toBe("👍");
+	expect(reactions[0].payload.reaction.action).toBeUndefined(); // add is default
+	expect(reactions[1].payload.reaction.emoji).toBe("👍");
+	expect(reactions[1].payload.reaction.action).toBe("remove");
+	expect(reactions[2].payload.reaction.emoji).toBe("✅");
+	expect(reactions[2].payload.reaction.action).toBeUndefined(); // add is default
+});
+
+test("custom emoji names are allowed on Discord and reach the adapter with empty emoji field", async () => {
+	const { client } = await gateway("[REACT:custom_emoji_name]");
+	sendMessage(client, "c1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	expect(reactions).toHaveLength(1);
+	const reaction = reactions[0].payload.reaction;
+	expect(reaction.targetMessageId).toBe("m1");
+	expect(reaction.emoji).toBe("");
+	expect(reaction.emojiName).toBe("custom_emoji_name");
+});
+
+test("reply-token removals only release the matching custom emoji name", async () => {
+	const { client } = await gateway(
+		"[REACT:custom_emoji_name@same][UNREACT:other_custom_emoji@same][UNREACT:custom_emoji_name@same][REACT:other_custom_emoji@same]",
+	);
+	sendMessage(client, "c1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	expect(reactions.map((frame) => [frame.payload.reaction.emojiName, frame.payload.reaction.action])).toEqual([
+		["custom_emoji_name", undefined],
+		["custom_emoji_name", "remove"],
+		["other_custom_emoji", undefined],
+	]);
+});
+
+test("reply-token custom emoji are skipped on Telegram while the text is delivered", async () => {
+	const telegram: OriginRef = { platform: "telegram", kind: "channel", conversationId: "chan-1" };
+	const { client, database } = await gateway("[REACT:custom_emoji_name] still here", undefined, telegram);
+	sendMessage(client, "c1", "message", "m1", { mentioned: true, group: true, authorId: "human-1" }, telegram);
+	await settle();
+	expect(reactionEvents(client.frames)).toHaveLength(0);
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["still here"]);
+	expect(database.outbox.rows()).toHaveLength(1);
+});
+
+test("reply-token custom emoji are skipped in Discord DMs while the text is delivered", async () => {
+	const discordDm: OriginRef = {
+		platform: "discord",
+		kind: "dm",
+		conversationId: "dm-1",
+		peerId: "peer-1",
+	};
+	const { client, database } = await gateway("[REACT:custom_emoji_name] still here", undefined, discordDm);
+	sendMessage(client, "c1", "message", "m1", { mentioned: false, group: false, authorId: "human-1" }, discordDm);
+	await settle();
+	expect(reactionEvents(client.frames)).toHaveLength(0);
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["still here"]);
+	expect(database.outbox.rows()).toHaveLength(1);
 });

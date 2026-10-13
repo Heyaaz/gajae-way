@@ -14,9 +14,79 @@ The Bun workspace is divided into small packages:
 | `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, working-status presence, and missed-message recovery. |
 | `@gajae-gateway/cli` | Owner commands over the gateway socket. |
 
-`bun run build` compiles the gateway, Discord adapter, Telegram adapter, Slack adapter, and CLI into standalone executables. The gateway's `GlobalGjcClient` is only a client of the same global-user GJC executable, canonical agent directory, and broker used by the operator's normal SDK. Matching the executable alone is insufficient: the service must resolve the same user profile and broker authority. GJC owns daemon startup and lifecycle; the gateway neither seeds settings nor owns, reaps, repairs, or garbage-collects the shared runtime. Every persona, worker, and monitor operation uses `SessionPort`; no per-turn `gjc --resume` process is spawned. Normal shutdown closes only the gateway's own SDK calls and relays, never the shared user daemon or its session hosts.
+## Authority Map
 
-SQLite records one active broker authority and immutable gateway-created session bindings. Visibility in the user's SDK session list is not ownership: controls require positive creation/binding evidence under that authority, and unrelated user sessions must remain untouched. A populated database with a missing or mismatched authority requires explicit administrative cutover before recovery. Cutover preserves old history and quarantines accepted or unproven old work rather than replaying it in the new authority; old private-broker held lanes do not automatically become global-user lanes. See the operator runbook for the backup, census, and cutover boundary.
+### Resource owners
+
+| Resource | Owner | Boundary |
+|---|---|---|
+| Gateway process and gateway database | Gateway daemon, holding the `gateway` lease | The daemon acquires `gateway` then `memory` before opening its runtime; the service manager starts and stops it. |
+| Memory corpus | Gateway memory writer, holding the `memory` lease | The lease serializes the Git-backed `$GAJAEWAY_HOME/memory` corpus with offline memory administration. |
+| Broker process and agent state | `gajaeway-broker` service, holding the `broker` lease | The broker host runs the pinned GJC executable against `homeLayout(home).brokerAgentDir` (`$GAJAEWAY_HOME/broker/agent`). |
+| Discord adapter | Discord adapter process, holding `adapter-discord` | Owns its adapter process for this home; it connects to the gateway as a client. |
+| Slack adapter | Slack adapter process, holding `adapter-slack` | Owns its adapter process for this home; it connects to the gateway as a client. |
+| Telegram adapter | Telegram adapter process, holding `adapter-telegram` | Owns its adapter process for this home; it connects to the gateway as a client. |
+| Update and restart supervisor | CLI update/restart operation, holding `update` | Serializes binary installation and the ordered service restart; adapters and admin are clients, not database owners. |
+
+Gajaeway provisions the private broker directory from an explicit file allowlist. The source `~/.gjc/agent` is read for that snapshot and drift checks; gajaeway does not write to that source. GJC itself is only invoked against the private broker directory.
+
+### Active broker authority
+
+SQLite records one active private broker authority and immutable gateway-created session bindings. A session ID alone is not ownership: controls require positive creation and binding evidence under that authority. A populated database with missing or mismatched authority fails before schema migration; only offline census and explicit cutover may change it. Cutover preserves historical records and quarantines accepted or unproven work rather than replaying it under the new authority. See the operator runbook for the backup, census, and export boundary.
+
+### Table owners
+
+`TABLE_OWNER` in `packages/gateway/src/store/ownership.ts` is the source of truth. The module column is the owning group implementation from `OWNER_FILE`.
+
+| Table | Owner group | Owner module |
+|---|---|---|
+| `meta` | `core` | `store/core.ts` |
+| `schema_migrations` | `core` | `store/core.ts` |
+| `sessions` | `bindings` | `store/groups/bindings.ts` |
+| `broker_owned_bindings` | `bindings` | `store/groups/bindings.ts` |
+| `broker_tail_cursors` | `bindings` | `store/groups/bindings.ts` |
+| `session_tail_cursors` | `bindings` | `store/groups/bindings.ts` |
+| `conversation_model` | `bindings` | `store/groups/bindings.ts` |
+| `broker_authority` | `bindings` | `store/groups/bindings.ts` |
+| `broker_retired_sessions` | `bindings` | `store/groups/bindings.ts` |
+| `broker_quarantine` | `bindings` | `store/groups/bindings.ts` |
+| `broker_cutovers` | `bindings` | `store/groups/bindings.ts` |
+| `deliveries` | `outbox` | `store/groups/outbox.ts` |
+| `inbound_messages` | `inbox` | `store/groups/inbox.ts` |
+| `conversation_context` | `inbox` | `store/groups/inbox.ts` |
+| `conversation_context_state` | `inbox` | `store/groups/inbox.ts` |
+| `recall_snippets` | `inbox` | `store/groups/inbox.ts` |
+| `lane_jobs` | `work` | `store/groups/work.ts` |
+| `work_attempt_runtime` | `work` | `store/groups/work.ts` |
+| `lane_reports` | `work` | `store/groups/work.ts` |
+| `monitors` | `monitors` | `store/groups/monitors.ts` |
+| `monitor_events` | `monitors` | `store/groups/monitors.ts` |
+| `authored_outputs` | `monitors` | `store/groups/monitors.ts` |
+| `monitor_failures` | `monitors` | `store/groups/monitors.ts` |
+| `monitor_slots` | `monitors` | `store/groups/monitors.ts` |
+| `dispatch_leases` | `monitors` | `store/groups/monitors.ts` |
+| `memory_intents` | `memory` | `store/groups/memory.ts` |
+
+The current schema is version 32 and still contains `broker_quarantine` and `broker_cutovers`. L4h's migration 33 to remove those tables is pending; keep the ownership rows until that migration is deployed.
+
+### Transaction boundary
+
+`StoreCore` owns the SQLite connection, schema migrations, and synchronous transaction boundary. `Store` composes the owner-group repositories. Each group receives a `GroupDb` from `StoreCore.groupDb(group)`: SQL is classified before use, writes are rejected unless the target table belongs to that group, and unclassified SQL fails closed. A write statement requires the active `WriteTx` minted by that same `StoreCore.transaction`; nested, asynchronous, inactive, and foreign-store transactions are rejected. Reads do not need a write token. Core metadata writes use `StoreCore`'s meta methods; schema-migration writes stay in the migration boundary, outside the group repositories.
+
+### Lease names
+
+The exported `LeaseName` union and `LEASE_NAMES` in `@gajae-gateway/home` define the only kernel leases. Each lease is a non-blocking exclusive flock on a permanent file under `$GAJAEWAY_HOME/leases`; the kernel lock, not the diagnostic owner record, decides ownership.
+
+| Lease | Holder / protected resource |
+|---|---|
+| `gateway` | Gateway daemon process and home runtime. |
+| `broker` | Broker host and private broker-agent provisioning. |
+| `update` | Update operation and restart-stack supervisor. |
+| `memory` | Gateway memory lifecycle and offline memory import. |
+| `adapter-discord` | Discord adapter process. |
+| `adapter-slack` | Slack adapter process. |
+| `adapter-telegram` | Telegram adapter process. |
+
 
 ## Wire protocol and negotiation
 
@@ -40,19 +110,28 @@ Inbound messages enter a durable per-origin mailbox actor that applies one rule:
 [turn failed] spawn_failed: SDK startup did not complete before readiness cutoff. Send /new to rebind this conversation.
 ```
 
-The same string goes to the daemon log, so a channel transcript is enough to triage without shell access. The `/new` hint appears only when a rebind is plausibly the remedy.
+That string goes to the daemon log. The room gets the same diagnosis behind a line a person can act on, so a channel transcript is still enough to triage without shell access:
+
+```text
+[turn failed] This message was not answered. Send /new to start a fresh conversation, then send it again.
+(diagnosis: spawn_failed: SDK startup did not complete before readiness cutoff.)
+```
+
+The `/new` remedy appears only when a rebind is plausibly the remedy; otherwise the room is asked to resend. The `terminal_failure` log line also carries the SDK `command=`/`turn=` ids, the only key that joins a redacted `internal: Prompt submission failed.` to gajae-code's local `SDK invocation failed` record holding the real cause.
 
 `/model` applies `model.set` to the existing session through that mailbox; it neither changes the epoch nor truncates the transcript, and each subsequent persona turn logs its effective model. `/new` is the explicit recovery boundary: it atomically advances the epoch, fences stale output, and discards only pending messages not yet in a turn - the one path that completes an inbound row without answering it. Accepted prior-epoch turns retain their bound session identity as durable recovery holds, so a restarted actor can reattach status/tail until terminal reconciliation; the gateway never invents a replacement operation reference or aborts a running SDK turn.
 
-Recognized provider-input/context failures also have a bounded **reset-next** path. Exact current-session provider evidence, rather than occupancy or generic failure text, authorizes one durable consecutive reset per origin. The failed trigger is completed without replay, and subsequent pending messages bind under the fresh epoch without changing the context floor or discarding queued traffic. Reset uses the existing native SDK session operations through `SessionPort`, restricted to positively owned gateway bindings under the current authority; it does not manage the shared broker or resubmit old accepted work. Per-trigger deduplication and the origin budget survive restart; an already-retired turn cannot rotate a newer session. Without complete execution-safety attestation from the runtime, the gateway never retries the failed operation merely because it reset the binding.
+An authenticated structured `turn.prompt` refusal with exact code `model_not_selected` proves the prompt was not admitted. Before awaiting tail closure, notice delivery, or other fallible cleanup, the gateway transactionally calls `retryInboundTurn` to return the trigger to plain pending and pauses that origin in memory, preserving the current session and epoch without adding a durable hold. It emits one ledgered `[turn failed] model_not_selected: … Send /model <id> or /new` notice per message, with a stable diagnostic delivery ID distinct from the eventual answer. Normal delivery retry and retention rules still apply; the notice does not consume the trigger's answer slot. Dispatch attempts blocked by the pause emit one `reason=model_not_selected` diagnostic containing identifiers only, never message content; no pause diagnostic is emitted when there is no pending dispatch. A successful mailbox-serialized `/model` clears the pause and lets the pending message run on the same session; a failed selection leaves it paused. The refusal's `retryInboundTurn` also advances the durable per-trigger retry ordinal shared with the one automatic submission-phase re-send, so this intentionally conservative sharing spends that budget: the resumed, accepted turn's own submission-phase failure is settled once through the ordinary failure path with no re-send; no op-ref sequencing reset, separate retry counter, or hold is introduced. Restart clears the in-memory pause. `/new` (or `/reset`) discards the pending message under the existing reset rules and allows fresh input. Diagnostic text containing that code, nested detail fields, malformed envelopes, and transport failures do not establish this refusal: uncertain operations retain their existing observe/reconcile behavior and are never re-sent on this basis.
+
+Recognized provider-input/context failures also have a bounded **reset-next** path. Exact current-session provider evidence, rather than occupancy or generic failure text, authorizes one durable consecutive reset per origin. The failed trigger is completed without replay, and subsequent pending messages bind under the fresh epoch without changing the context floor or discarding queued traffic. Reset uses the existing native SDK session operations through `SessionPort`, restricted to positively owned gateway bindings under the current authority; it does not manage broker lifecycle or resubmit old accepted work. Per-trigger deduplication and the origin budget survive restart; an already-retired turn cannot rotate a newer session. Without complete execution-safety attestation from the runtime, the gateway never retries the failed operation merely because it reset the binding.
 
 ### Persistent-session observability
 
-The daemon writes grep-stable fields for the persistent-session control plane: `steer_delivered originKey=… opRef=… messageId=…`, `steer_failed origin=… message=… action=recover` (reconcile the current turn and defer the refused row, never replace the session), `steer_ambiguous … action=replay` and `steer_hold … reason=transport_torn` (observe and reconcile the original `clientRef`, never submit a new send), `tail_frame_foreign session=… commandId=… turnId=… expected=…` (a frame on the relay that belongs to another turn, dropped), `tail_relay_lost session=… opRef=…` and `recovery_hold … reason=relay_lost_mid_turn` (the owned relay died; the turn settles by status), `stall_alert originKey=… sessionId=… silentMs=…`, `compaction_event sessionId=… originKey=…`, and `retired_hold originKey=… epoch=… opRef=…`. A stall is an operator alarm only; it never terminates a live operation. Broker-generation changes represent observed user-runtime changes, not gateway-owned daemon replacement. Historical `session_rebound_after_steer_failure` logs identify removed unsafe behavior, not the current recovery policy. A compaction event is observed from a tail frame or authenticated control receipt, never initiated as persona-turn orchestration.
+The daemon writes grep-stable fields for the persistent-session control plane: `steer_delivered originKey=… opRef=… messageId=…`, `steer_failed origin=… message=… action=recover` (reconcile the current turn and defer the refused row, never replace the session), `steer_ambiguous … action=replay` and `steer_hold … reason=transport_torn` (observe and reconcile the original `clientRef`, never submit a new send), `tail_frame_foreign session=… commandId=… turnId=… expected=…` (a frame on the relay that belongs to another turn, dropped), `tail_relay_lost session=… opRef=…` and `recovery_hold … reason=relay_lost_mid_turn` (the owned relay died; the turn settles by status), `stall_alert originKey=… sessionId=… silentMs=…`, `compaction_event sessionId=… originKey=…`, and `retired_hold originKey=… epoch=… opRef=…`. A stall is an operator alarm only; it never terminates a live operation. Broker-generation changes represent observed changes in the broker service, not gateway-owned daemon replacement. Historical `session_rebound_after_steer_failure` logs identify removed unsafe behavior, not the current recovery policy. A compaction event is observed from a tail frame or authenticated control receipt, never initiated as persona-turn orchestration.
 
 ### Worker lanes
 
-`work.start` binds a gateway-created `work/task/<name>` origin hosted by the shared user broker in the coding register and returns after acceptance proof, without waiting for completion. An accepted receipt is not a completed task. Its optional `model` is a model ID or `{ "preset": "name" }`; the selection is applied at `session.create` and re-applied on each send. Admission is capped by `work.maxLanes` (default 8). A new name at capacity fails with `lane_capacity` carrying `{maxLanes, active, candidates[]}`, with candidates sorted idlest first; an already-bound name is always admitted by the capacity check.
+`work.start` binds a gateway-created `work/task/<name>` origin hosted by the GJC broker service in the coding register and returns after acceptance proof, without waiting for completion. An accepted receipt is not a completed task. Its optional `model` is a model ID or `{ "preset": "name" }`; the selection is applied at `session.create` and re-applied on each send. Admission is capped by `work.maxLanes` (default 8). A new name at capacity fails with `lane_capacity` carrying `{maxLanes, active, candidates[]}`, with candidates sorted idlest first; an already-bound name is always admitted by the capacity check.
 Each start/wake send prepends a lane notice to the first accepted send in a session epoch, and repeats it if the parent or nested-work policy changes; the notice identifies the parent-report path and forbids direct chat posting. Runs carry no lane notice.
 
 `work.status` is a read-only durable snapshot plus a live query of the matching operation, not an atomic distributed snapshot; it never binds, attaches, refreshes activity, settles an attempt, or acknowledges a hold. Job state, attempt end state, and broker operation status remain distinct. `work.steer` targets only the current open attempt without rebinding; an ambiguous steer reports `work steer acceptance uncertain` and must not be automatically retried with a new reference. An open attempt blocks another start/run, including `resume:true`, and retirement. Synchronous `work.run` uses the same lifecycle but waits only for a response and never reports to a parent. Start and run from a lane session are refused unless `work.allowNested=true`. Caller timeout, disconnect, or gateway shutdown detaches the waiter without settling or aborting the worker. A timed-out run reports `work wait timed out; attempt remains observable`.
@@ -72,7 +151,7 @@ Worker output requires proven attempt-final attribution and complete original co
 
 `work.retire` closes only a positively owned, gateway-created gjc session with `session.close` and bumps the origin epoch, so the next start/run creates a fresh session. Retirement is fail-closed on ownership: it refuses while the lane job has an open attempt, while the job record is corrupt, and while the last attempt ended without trusted broker proof until the operation is proven terminal or the broker reports the session dead. In particular, `terminal_uncertain` is not proof of stoppage. A failed `session.close` releases the slot only when broker liveness proves the session gone; otherwise the binding is retained and the refusal names the close error, because an uncounted live worker is the exact failure the governor exists to prevent. The 60-second sweep nominates lanes idle for at least `work.idleRetireMs` (default 6 hours, measured from the last attempt's end) or whose lane job is `done` or `aborted`, and each nomination is re-proven under the lane lock against the session id it was selected with, so a lane reused or rebound meanwhile is left alone. The gateway never performs global GC or `session.delete`; retirement bounds owned live worker hosts, not the user's saved-session index.
 
-`ops.cycle` reports `lanes: {active, max}` and gates on `lane_capacity_exhausted` when the cap is reached. A retired lane keeps its `work/task/<name>` row unbound; that row is healthy only while a settled lane job (`attempt_ended`, `done`, `aborted`) vouches for it. The same unbound shape with no job (a failed first bind) or with a `running`/`awaiting_operator`/`stalled` job (a crash-left or held worker) stays a `stale_session_identity` gate. The ActionGuard system notice recommends start/status/steer for delegated long work and forbids direct `gjc` launches from persona turns as prompt guidance, not a new command-enforcement hook. Workers share the user's broker but remain separately owned gateway sessions; unrelated user sessions are never adopted. Host skill/script replacement, deployment, and process cleanup are separate operational work, not part of the worker-lane API change.
+`ops.cycle` reports `lanes: {active, max}` and gates on `lane_capacity_exhausted` when the cap is reached. A retired lane keeps its `work/task/<name>` row unbound; that row is healthy only while a settled lane job (`attempt_ended`, `done`, `aborted`) vouches for it. The same unbound shape with no job (a failed first bind) or with a `running`/`awaiting_operator`/`stalled` job (a crash-left or held worker) stays a `stale_session_identity` gate. An origin unbound by a broker-authority cutover is quarantined history, not a rebind in progress, while nothing has addressed it since: no inbound row, lane job or monitor event for it outside quarantine, and no `last_activity_at` past the cutover. Once any of those exists (for example an inbound turn whose first bind fails, which leaves the session row untouched), it is gated again until it binds. The ActionGuard system notice recommends start/status/steer for delegated long work and forbids direct `gjc` launches from persona turns as prompt guidance, not a new command-enforcement hook. Workers share the user's broker but remain separately owned gateway sessions; unrelated user sessions are never adopted. Host skill/script replacement, deployment, and process cleanup are separate operational work, not part of the worker-lane API change.
 
 Worker-lane logs are grep-stable:
 

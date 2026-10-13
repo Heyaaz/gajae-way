@@ -610,6 +610,8 @@ export interface WorkRunParams {
 	readonly text: string;
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
+	/** Repository binding: remote URL, configured alias, or repo key for worktree creation and push target (issue #480). */
+	readonly repo?: string;
 	/**
 	 * Explicit operator acknowledgement that lets a new attempt start while
 	 * the durable job is awaiting_operator (issue #10 hold semantics).
@@ -677,6 +679,12 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/** Repository binding information (issue #480) */
+	readonly repository?: {
+		readonly url: string;
+		readonly branch: string;
+		readonly base?: string;
+	};
 }
 
 export interface WorkSteerParams {
@@ -740,8 +748,25 @@ export type WorkRunResult =
 			readonly opRef: string;
 	  };
 
+/**
+ * One page of `work.jobs`, newest `updated_at` first. Paged because a home
+ * accumulates lane jobs without bound and the full projection outgrows the
+ * 1 MiB frame.
+ */
+export interface WorkJobsParams {
+	/** 1..WORK_JOBS_MAX_LIMIT; defaults to WORK_JOBS_DEFAULT_LIMIT. */
+	readonly limit?: number;
+	/** Rows to skip; defaults to 0. */
+	readonly offset?: number;
+}
+export const WORK_JOBS_DEFAULT_LIMIT = 100;
+export const WORK_JOBS_MAX_LIMIT = 500;
+
 /** Operator projection over durable lane jobs (issue #10). */
 export interface WorkJobsResult {
+	/** Every lane job in the home, not just this page. */
+	readonly total: number;
+	readonly offset: number;
 	readonly jobs: Array<{
 		readonly job_id: string;
 		readonly lane_key: string;
@@ -799,11 +824,15 @@ export type ConfigReloadResult =
  * refuses an emoji that origin cannot express rather than queueing a delivery
  * that can only fail. `reactionAllowlistFor(platform)` is what a caller should
  * offer.
+ *
+ * `action` defaults to "add"; removal is only allowed for reactions the persona
+ * itself added (tracked by the gateway). Removal frees budget entries.
  */
 export interface ChatReactParams {
 	readonly origin: OriginRef;
 	readonly targetMessageId: string;
 	readonly emoji: string;
+	readonly action?: ReactionAction;
 }
 
 export interface ChatReactResult {
@@ -823,7 +852,7 @@ export interface EngagementReactionParams {
 	readonly origin: OriginRef;
 	/** Platform id of the message that was reacted to. */
 	readonly targetMessageId: string;
-	/** Raw platform emoji as the reactor sent it; not restricted to the allowlist. */
+	/** Raw platform emoji as the reactor sent it; custom emoji without Unicode use `custom:<name>`. */
 	readonly emoji: string;
 	readonly action: ReactionAction;
 	readonly engagement: EngagementContext;
@@ -876,6 +905,7 @@ export type CycleGateReason =
 	| "stale_session_identity"
 	| "delivery_settlement_unknown"
 	| "memory_closure_blocked"
+	| "memory_git_index_locked"
 	| "monitor_settlement_failed"
 	| "monitor_settlement_stuck"
 	| "monitor_authoring_lost"
@@ -884,7 +914,9 @@ export type CycleGateReason =
 	| "agent_disk_headroom"
 	| "gjc_unverified_version"
 	| "monitor_dispatch_failing"
-	| "broker_respawn_churn";
+	| "broker_respawn_churn"
+	| "broker_index_lock_blocked"
+	| "broker_agent_unprovisioned";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -922,6 +954,40 @@ export interface CycleSessionView {
 	/** Durable metadata-only bootstrap projection; source bodies are never exposed. */
 	readonly bootstrap: SessionBootstrapProjection;
 }
+export type SloDayStatus = "ok" | "failed" | "insufficient" | "pending";
+
+export interface SloDayResult {
+	readonly date: string;
+	readonly status: SloDayStatus;
+	readonly complete: boolean;
+	readonly aliveMs: number;
+	readonly maxUncoveredGapMs: number;
+	readonly broker_unavailable: number;
+	readonly persona_bind_failed: number;
+	readonly excluded: number;
+}
+
+export interface OpsSloWindow {
+	readonly id: string;
+	readonly trigger: string;
+	readonly state: string;
+	readonly requestedAt: string;
+	readonly finishedAt: string | null;
+	readonly verified: boolean;
+	readonly eligibleStart: string | null;
+	readonly eligibleEnd: string | null;
+	readonly overCapMs: number;
+}
+
+export interface OpsSloResult {
+	readonly days: readonly SloDayResult[];
+	readonly windows: readonly OpsSloWindow[];
+	readonly ok: boolean;
+}
+
+export interface OpsSloParams {
+	readonly days?: number;
+}
 
 export interface OpsCycleResult {
 	/** Aggregate runtime phase; "degraded" is emitted whenever gates is non-empty. */
@@ -945,6 +1011,8 @@ export interface OpsCycleResult {
 		readonly receipted: number;
 		readonly quarantined: number;
 	};
+	/** Observation-only memory git lock path and age; null when no lock is present. */
+	readonly memoryGitIndexLock: { readonly path: string; readonly ageMs: number } | null;
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
 	/**
@@ -974,6 +1042,47 @@ export interface OpsCycleResult {
 	readonly lanes: { readonly active: number; readonly max: number };
 	/** Agent-directory disk headroom; null when no broker agent directory is bound. */
 	readonly agentDisk: AgentDiskView | null;
+	/** Broker-owned copy of the operator's allowlisted GJC agent inputs. */
+	readonly brokerAgent: {
+		readonly status: "provisioned" | "unprovisioned" | "interrupted";
+		readonly provisionedAt: string | null;
+		readonly genId: string | null;
+		readonly source: string | null;
+		readonly entries: readonly {
+			readonly name: string;
+			readonly kind: string;
+			readonly state:
+				| "in_sync"
+				| "source_changed"
+				| "copy_changed"
+				| "diverged"
+				| "missing_source"
+				| "missing_copy"
+				| "absent";
+		}[];
+	} | null;
+	/** Durable seven-day broker/persona SLO projection from meta evidence. */
+	readonly slo: OpsSloResult;
+}
+
+export interface OpsDeliveryRow {
+	readonly deliveryId: string;
+	readonly turnId: string;
+	readonly originKey: string;
+	readonly conversationId: string;
+	readonly state: string;
+	readonly createdAt: string;
+	readonly textPrefix: string;
+}
+
+export interface OpsDeliveriesParams {
+	readonly since?: string;
+	readonly state?: string;
+	readonly limit?: number;
+}
+
+export interface OpsDeliveriesResult {
+	readonly rows: readonly OpsDeliveryRow[];
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
@@ -1021,15 +1130,19 @@ export interface VerbCatalogV01 {
 	};
 	"ops.redeliver": { params: OpsRedeliverParams; result: { readonly requeued: readonly string[] } };
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
+	"ops.deliveries": { params: OpsDeliveriesParams; result: OpsDeliveriesResult };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
+
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
-	"work.jobs": { result: WorkJobsResult };
+	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
+	"ops.slo": { params: OpsSloParams; result: OpsSloResult };
+
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
 }
 
@@ -1063,6 +1176,7 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.redeliver",
 	"ops.integrity",
+	"ops.deliveries",
 	"work.run",
 	"work.start",
 	"work.status",
@@ -1073,6 +1187,7 @@ export const VERBS_V01 = [
 	"engagement.reaction",
 	"engagement.panel_response",
 	"gateway.reloadConfig",
+	"ops.slo",
 	"ops.cycle",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
@@ -1105,20 +1220,42 @@ export function isSilenceToken(text: string): boolean {
 const MARKDOWN_CODE = /```[\s\S]*?```|(`+)[^\n]*?\1/g;
 
 /**
- * Existing embedded marker grammar; inspect original content before clipping.
+ * Embedded marker grammar; inspect original content before clipping.
  *
- * A marker inside markdown code is a quoted mention, not a directive: a reply
- * explaining the protocol ("`[SILENT]`(답하지 않기) 같은 표시를 해석해요") is a
- * real answer. Counting it silenced two fully written Discord replies whole
- * (live pilot, 2026-09-29).
+ * Models routinely wrap the control token in a reasoning preamble instead of
+ * emitting it alone ("...nothing to add.\n\n[SILENT]", "Nothing to report.
+ * [SILENT]"; #260, #338). Such a part is a decision not to speak, so it is
+ * silent when the marker CLOSES it: `[SILENT]` / `[silent]` is the last thing
+ * on the last non-empty line. A part made only of bracketed control tokens
+ * ("[SILENT][REACT:🔥]") carries no prose either and is silent as well, so a
+ * misplaced control token never reaches the room verbatim (live leak,
+ * 2026-09-02).
+ *
+ * A marker anywhere else is a mention, not a directive:
+ *
+ *   - inside markdown code: a reply explaining the protocol
+ *     ("`[SILENT]`(답하지 않기) 같은 표시를 해석해요") is a real answer. Counting
+ *     it silenced two fully written Discord replies whole (live pilot,
+ *     2026-09-29);
+ *   - inside a sentence, or followed by more prose: a persona that explained
+ *     its own rules ("...reply with exactly [SILENT] when the message is not for
+ *     you...") lost a 1,590-character answer as {"none":"silent"} (live,
+ *     2026-10-12) while any occurrence counted. A marker on its own line with
+ *     prose after it is the same shape (the reply went on, so the marker was
+ *     not the decision to stop) and is likewise delivered.
  */
+const SILENCE_MARKER = /\[(?:SILENT|silent)\]/;
+const CLOSING_SILENCE_MARKER = /\[(?:SILENT|silent)\]\s*$/;
+const CONTROL_TOKENS_ONLY = /^(?:\s*\[[^[\]\n]*\])+\s*$/;
+
 export function containsSilenceToken(text: string): boolean {
-	return /\[(SILENT|silent)\]/.test(text.replace(MARKDOWN_CODE, ""));
+	const prose = text.replace(MARKDOWN_CODE, "");
+	return CLOSING_SILENCE_MARKER.test(prose) || (CONTROL_TOKENS_ONLY.test(prose) && SILENCE_MARKER.test(prose));
 }
 
 /**
  * Unified silence check: a note is silent if it is EITHER an exact match to
- * a silence token OR contains an embedded [SILENT] marker (issue #338).
+ * a silence token OR closes with an embedded [SILENT] marker (issue #338).
  * Use this in all delivery and recovery paths to prevent silent content from
  * leaking into deliveries while preserving authored notes in records.
  */

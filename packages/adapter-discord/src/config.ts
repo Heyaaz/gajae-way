@@ -62,11 +62,33 @@ export interface DiscordChannelPolicy extends ChannelEngagementPolicy {
 	readonly threadOnMention?: boolean;
 }
 
+/**
+ * Says so in a channel when the gateway stays unreachable.
+ *
+ * The adapter keeps its Discord session while the gateway is down, so it is the
+ * one process that can still speak. Without this a gateway that crash-looped on
+ * boot for 4.5 hours left only reconnect lines in a log nobody reads, and the
+ * delivery ledger later recorded the backlog as received on recovery — the
+ * outage was invisible until the owner noticed the silence himself.
+ */
+export interface GatewayDownAlertConfig {
+	/** Channel that gets one line when the link has been down `afterMs`, and one when it returns. */
+	readonly channelId: string;
+	/** User pinged in the down line, so whoever can restart the gateway actually hears it. */
+	readonly mentionUserId?: string;
+	/** Down time before the line goes out. Defaults to 5 minutes: longer than any routine restart. */
+	readonly afterMs?: number;
+	/** Gateway stderr log whose last line is quoted as the last error; relative to the config file. */
+	readonly logFile?: string;
+}
+
 export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly intents?: readonly number[];
 	readonly channels?: Readonly<Record<string, DiscordChannelPolicy>>;
+	/** Absolute or config-relative directories permitted for outbound MEDIA files. Omitted disables file uploads. */
+	readonly mediaDirectories?: readonly string[];
 	readonly voice?: DiscordVoiceConfig;
 	/**
 	 * Controls WorkingStatus reaction behavior:
@@ -78,6 +100,12 @@ export interface DiscordAdapterConfig {
 	 *   * group/bot-audience channels: "off"
 	 */
 	readonly statusReactions?: StatusReactionsMode;
+	/**
+	 * Default for channel mentions auto-creating a thread (default true).
+	 * A per-channel `channels[id].threadOnMention` overrides it.
+	 */
+	readonly threadOnMention?: boolean;
+	readonly gatewayDownAlert?: GatewayDownAlertConfig;
 }
 
 export interface LoadedDiscordAdapterConfig extends DiscordAdapterConfig {
@@ -128,12 +156,30 @@ export async function loadDiscordAdapterConfig(
 			`Discord adapter channels entries may only set engagement to ${ENGAGEMENT_MODES.join(", ")} and audience to ${ENGAGEMENT_AUDIENCES.join(", ")}.`,
 		);
 	}
+	if (
+		raw.mediaDirectories !== undefined &&
+		(!Array.isArray(raw.mediaDirectories) ||
+			raw.mediaDirectories.some((directory) => typeof directory !== "string" || !directory.trim()))
+	) {
+		throw new DiscordAdapterStartupError(
+			"Discord adapter mediaDirectories must be an array of non-empty directory paths.",
+		);
+	}
 	if (raw.statusReactions !== undefined && !isStatusReactionsMode(raw.statusReactions)) {
 		throw new DiscordAdapterStartupError(
 			`Discord adapter statusReactions must be "gradient", "static", or "off" when set.`,
 		);
 	}
+	if (raw.threadOnMention !== undefined && typeof raw.threadOnMention !== "boolean") {
+		throw new DiscordAdapterStartupError("Discord adapter threadOnMention must be a boolean when set.");
+	}
+	const gatewayDownAlert = loadGatewayDownAlert(raw.gatewayDownAlert, configPath);
 	const tokenFile = isAbsolute(raw.tokenFile) ? raw.tokenFile : resolve(dirname(configPath), raw.tokenFile);
+	const mediaDirectories = Array.isArray(raw.mediaDirectories)
+		? raw.mediaDirectories.map((directory: string) =>
+				isAbsolute(directory) ? directory : resolve(dirname(configPath), directory),
+			)
+		: undefined;
 	let token: string;
 	try {
 		token = (await readFile(tokenFile, "utf8")).trim();
@@ -146,7 +192,43 @@ export async function loadDiscordAdapterConfig(
 		throw new DiscordAdapterStartupError(`Discord token credential file ${tokenFile} is empty.`);
 	}
 	const voice = await loadVoiceConfig(raw.voice, configPath);
-	return { ...raw, tokenFile, token, configPath, ...(voice ? { voice } : {}) } as LoadedDiscordAdapterConfig;
+	return {
+		...raw,
+		tokenFile,
+		token,
+		configPath,
+		...(mediaDirectories ? { mediaDirectories } : {}),
+		...(voice ? { voice } : {}),
+		...(gatewayDownAlert ? { gatewayDownAlert } : {}),
+	} as LoadedDiscordAdapterConfig;
+}
+
+/** A present but malformed section is a startup error: a silently disabled alarm is the failure it exists to prevent. */
+function loadGatewayDownAlert(raw: unknown, configPath: string): GatewayDownAlertConfig | undefined {
+	if (raw === undefined) return undefined;
+	if (!isObject(raw) || typeof raw.channelId !== "string" || raw.channelId.trim() === "") {
+		throw new DiscordAdapterStartupError("Discord adapter gatewayDownAlert requires a non-empty channelId.");
+	}
+	for (const field of ["mentionUserId", "logFile"] as const) {
+		if (raw[field] !== undefined && (typeof raw[field] !== "string" || raw[field].trim() === ""))
+			throw new DiscordAdapterStartupError(
+				`Discord adapter gatewayDownAlert ${field} must be a non-empty string when set.`,
+			);
+	}
+	if (raw.afterMs !== undefined && (!Number.isInteger(raw.afterMs) || (raw.afterMs as number) <= 0)) {
+		throw new DiscordAdapterStartupError(
+			"Discord adapter gatewayDownAlert afterMs must be a positive integer when set.",
+		);
+	}
+	const logFile = raw.logFile as string | undefined;
+	return {
+		channelId: raw.channelId,
+		...(raw.mentionUserId !== undefined ? { mentionUserId: raw.mentionUserId as string } : {}),
+		...(raw.afterMs !== undefined ? { afterMs: raw.afterMs as number } : {}),
+		...(logFile !== undefined
+			? { logFile: isAbsolute(logFile) ? logFile : resolve(dirname(configPath), logFile) }
+			: {}),
+	};
 }
 
 /**
