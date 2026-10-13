@@ -44,6 +44,23 @@ export function workAttemptEndState(
 					: "attempt_ended";
 }
 
+function reconciliationReportText(runtime: WorkAttemptRuntime): string {
+	const reason = runtime.terminal?.reasonCode ?? "recovery_indeterminate";
+	const endState = workAttemptEndState(reason);
+	const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
+	const head = `[lane ${runtime.sessionKey.slice("work/task/".length)}] ${label}: ${reason === "end_turn" ? "" : `${reason}: `}`;
+	const body =
+		runtime.output.disposition === "available"
+			? (runtime.output.excerpt ?? "")
+			: reason === "terminal_missing_receipt"
+				? `final_response_missing opRef=${runtime.opRef}`
+				: "output_unavailable";
+	const text = head + body;
+	return Buffer.byteLength(text, "utf8") <= 2048
+		? text
+		: `${head}output excerpt omitted during startup reconciliation opRef=${runtime.opRef}`;
+}
+
 export interface WorkReportRoot {
 	readonly originKey: string;
 	readonly origin: OriginRef;
@@ -544,7 +561,12 @@ export class WorkGroup {
 	/** Repair torn settlement state and refresh lane activity before normal recovery starts. */
 	workAttemptReconcile(
 		tx: WriteTx,
-		refreshWorkSession: (runtime: WorkAttemptRuntime, at: string, childFallback?: ChatMessagePayload) => void,
+		refreshWorkSession: (
+			runtime: WorkAttemptRuntime,
+			at: string,
+			childFallback?: ChatMessagePayload,
+			personaReport?: WorkAttemptAdmissionPersona,
+		) => void,
 		quarantineInvalidWork: (jobId: string) => void,
 		log: (line: string) => void = console.error,
 	): number {
@@ -623,6 +645,7 @@ export class WorkGroup {
 			runtime: WorkAttemptRuntime;
 			next: WorkAttemptRuntime;
 			priorSettledAt: string | null;
+			admission?: WorkAttemptAdmission;
 		}[] = [];
 		const reconcileHistory = (record: LaneJobRecord, runtime: WorkAttemptRuntime, settledAt: string): LaneJobRecord => {
 			const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
@@ -714,6 +737,47 @@ export class WorkGroup {
 					settledAt,
 				};
 				validateWorkRuntime(next, this.instanceId);
+				const admission =
+					runtime.decision === "undecided" &&
+					decision === "recovery_indeterminate" &&
+					next.parent !== null &&
+					next.output.knownSilence === null
+						? (() => {
+								const body = reconciliationReportText(next);
+								if (next.parent?.kind === "persona") {
+									const fallbackPayload = buildDeliveryPayload(next.opRef, next.parent.origin, body, next.deliveryId);
+									workAssert(fallbackPayload !== undefined);
+									return {
+										kind: "persona" as const,
+										row: {
+											messageId: next.reportId,
+											originKey: next.parent.originKey,
+											originRefJson: JSON.stringify(next.parent.origin),
+											body,
+											receivedAt: settledAt,
+										},
+										fallbackPayload,
+									};
+								}
+								workAssert(next.parent?.kind === "lane");
+								const root = next.parent.root;
+								return {
+									kind: "lane" as const,
+									report: {
+										reportId: next.reportId,
+										parentName: next.parent.name,
+										childName: next.sessionKey.slice("work/task/".length),
+										childOpRef: next.opRef,
+										body,
+										root,
+									},
+									fallbackPayload: root
+										? (buildDeliveryPayload(next.opRef, root.origin, body, next.deliveryId) ?? null)
+										: null,
+								};
+							})()
+						: undefined;
+				if (admission?.kind === "lane") this.#assertLaneReportMatches(admission.report);
 				const history = reconcileHistory(record, next, settledAt);
 				this.#workValidateHistory(next, history);
 				if (next.wakeReportId !== null) {
@@ -745,7 +809,7 @@ export class WorkGroup {
 						);
 					}
 				}
-				updates.push({ runtime, next, priorSettledAt: row.settled_at });
+				updates.push({ runtime, next, priorSettledAt: row.settled_at, ...(admission ? { admission } : {}) });
 			} catch (error) {
 				skipped.push(row.op_ref);
 				if (runtimeJobId !== undefined && runtimeJobId !== row.job_id) {
@@ -759,7 +823,7 @@ export class WorkGroup {
 		}
 
 		for (const jobId of quarantinedJobs) quarantineInvalidWork(jobId);
-		for (const { runtime, next, priorSettledAt } of updates) {
+		for (const { runtime, next, priorSettledAt, admission } of updates) {
 			if (quarantinedJobs.has(runtime.jobId)) continue;
 			const json = this.laneJobJson(runtime.jobId);
 			workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
@@ -791,7 +855,14 @@ export class WorkGroup {
 						workAssert(this.laneReportHold(tx, next.wakeReportId, "wake_acceptance_uncertain"));
 				}
 			}
-			refreshWorkSession(next, settledAt, childFallback);
+			if (admission?.kind === "lane") {
+				const existing = this.#laneReportGetInside(admission.report.reportId);
+				if (existing) this.#putLaneReport(tx, admission.report, settledAt);
+				else if (this.laneParentAvailable(admission.report.parentName))
+					this.#putLaneReport(tx, admission.report, settledAt);
+				else childFallback ??= admission.fallbackPayload ?? undefined;
+			}
+			refreshWorkSession(next, settledAt, childFallback, admission?.kind === "persona" ? admission : undefined);
 			reconciled++;
 		}
 
@@ -1006,23 +1077,7 @@ export class WorkGroup {
 		this.#workPutHistory(tx, next, record);
 		if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(tx, next);
 		if (next.decision === "reported" && admission?.kind === "lane") {
-			const report = admission.report;
-			const createdAt = next.settledAt!;
-			this.#db
-				.prepare(
-					"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
-				)
-				.run(
-					tx,
-					report.reportId,
-					report.parentName,
-					report.childName,
-					report.childOpRef,
-					report.body,
-					report.root === null ? null : JSON.stringify(report.root),
-					createdAt,
-					createdAt,
-				);
+			this.#putLaneReport(tx, admission.report, next.settledAt!);
 		}
 		if (fallbackPayload) {
 			const expectedOrigin =
@@ -1349,6 +1404,38 @@ export class WorkGroup {
 		} catch {
 			throw new WorkAttemptStateError();
 		}
+	}
+
+	#putLaneReport(tx: WriteTx, report: WorkAttemptAdmissionLane["report"], createdAt: string): void {
+		if (this.#assertLaneReportMatches(report)) return;
+		this.#db
+			.prepare(
+				"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
+			)
+			.run(
+				tx,
+				report.reportId,
+				report.parentName,
+				report.childName,
+				report.childOpRef,
+				report.body,
+				report.root === null ? null : JSON.stringify(report.root),
+				createdAt,
+				createdAt,
+			);
+	}
+
+	#assertLaneReportMatches(report: WorkAttemptAdmissionLane["report"]): boolean {
+		const existing = this.#laneReportGetInside(report.reportId);
+		if (!existing) return false;
+		const root = laneReportRoot(existing);
+		workAssert(
+			existing.parent_name === report.parentName &&
+				existing.child_name === report.childName &&
+				existing.child_op_ref === report.childOpRef &&
+				(root === null ? report.root === null : report.root !== null && root.originKey === report.root.originKey),
+		);
+		return true;
 	}
 
 	laneReportGet(reportId: string): LaneReportRow | undefined {

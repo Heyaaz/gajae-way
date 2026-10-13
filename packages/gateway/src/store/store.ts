@@ -1,4 +1,4 @@
-import { originKey } from "@gajae-gateway/protocol";
+import { type ChatMessagePayload, originKey } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { StoreCore, type StoreOpenOptions } from "./core";
 import { BindingsGroup, type BrokerAuthority } from "./groups/bindings";
@@ -6,7 +6,7 @@ import { InboxGroup, RETENTION_BATCH_ROWS } from "./groups/inbox";
 import { MemoryGroup } from "./groups/memory";
 import { MonitorsGroup } from "./groups/monitors";
 import { OutboxGroup } from "./groups/outbox";
-import { WorkAttemptStateError, WorkGroup } from "./groups/work";
+import { resolveLaneReportOrigin, WorkAttemptStateError, WorkGroup } from "./groups/work";
 import { type OwnedTable, TABLE_OWNER } from "./ownership";
 import type { WriteTx } from "./tx";
 
@@ -74,7 +74,7 @@ export class Store {
 		return this.transaction((tx) =>
 			this.work.workAttemptReconcile(
 				tx,
-				(runtime, at, childFallback) => {
+				(runtime, at, childFallback, personaReport) => {
 					this.bindings.touchWorkSession(
 						tx,
 						runtime.sessionKey,
@@ -87,15 +87,29 @@ export class Store {
 							conversationId: runtime.sessionKey.slice("work/task/".length),
 						}),
 					);
-					if (!childFallback) return;
-					if (typeof childFallback.deliveryId !== "string")
-						throw new Error("reconciled wake fallback has no delivery id");
-					this.outbox.enqueue(tx, {
-						deliveryId: childFallback.deliveryId,
-						turnId: childFallback.turnId,
-						originKey: originKey(childFallback.origin),
-						payloadJson: JSON.stringify(childFallback),
-					});
+					const enqueueFallback = (payload: ChatMessagePayload) => {
+						if (typeof payload.deliveryId !== "string") throw new Error("reconciled work fallback has no delivery id");
+						this.outbox.enqueue(tx, {
+							deliveryId: payload.deliveryId,
+							turnId: payload.turnId,
+							originKey: originKey(payload.origin),
+							payloadJson: JSON.stringify(payload),
+						});
+					};
+					if (personaReport) {
+						const enqueued =
+							this.bindings.getSessionRecord(personaReport.row.originKey) !== undefined &&
+							this.inbox.enqueue(tx, {
+								messageId: personaReport.row.messageId,
+								originKey: personaReport.row.originKey,
+								originRefJson: resolveLaneReportOrigin(runtime.parent, personaReport.row.originRefJson),
+								body: personaReport.row.body,
+								receivedAt: personaReport.row.receivedAt,
+								source: "lane_report",
+							});
+						if (!enqueued) enqueueFallback(personaReport.fallbackPayload);
+					}
+					if (childFallback) enqueueFallback(childFallback);
 				},
 				(jobId) => this.bindings.quarantineInvalidWork(tx, jobId),
 				log,

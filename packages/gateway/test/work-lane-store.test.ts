@@ -25,6 +25,7 @@ import type { WriteTx } from "../src/store/tx";
 const START = "2026-09-08T00:00:00.000Z";
 const END = "2026-09-08T00:00:10.000Z";
 const SESSION = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
+const PARENT_SESSION = "bcb7f8a3-30e5-4d76-9e7e-32d2e2f51f9a";
 const directories: string[] = [];
 const handles: Array<{ close(): void }> = [];
 afterEach(async () => {
@@ -576,6 +577,104 @@ describe("work attempt boot reconciliation", () => {
 		expect(parseLaneJobRecord(historyJson).attempts.map((attempt) => attempt.endedAt)).toEqual([END, secondEndedAt]);
 		expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(secondEndedAt);
 	});
+
+	for (const parentSessionExists of [false, true]) {
+		test(`reconciliation reports an indeterminate persona child when parent session exists=${parentSessionExists}`, async () => {
+			const f = await fixture();
+			const parentOriginKey = originKey(LOOPBACK_ORIGIN);
+			if (parentSessionExists)
+				expect(
+					f.database.transaction((tx) =>
+						f.database.bindings.recordOwnedBinding(tx, {
+							authority: f.authority,
+							sessionId: PARENT_SESSION,
+							originKey: parentOriginKey,
+							epoch: 0,
+							repo: "/work",
+						}),
+					),
+				).toBe(true);
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+			f.database.transaction((tx) =>
+				f.database.work.putLaneJob(tx, {
+					...f.closed,
+					laneKey: f.runtime.laneKey,
+					json: JSON.stringify(f.closed),
+				}),
+			);
+
+			expect(f.database.reconcileWorkAttempts(() => {})).toBe(1);
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
+				decision: "recovery_indeterminate",
+				settledAt: END,
+			});
+			if (parentSessionExists) {
+				expect(f.database.inbox.messageExists(f.runtime.reportId)).toBe(true);
+				expect(f.database.outbox.rows()).toEqual([]);
+			} else {
+				const fallback = f.database.outbox.rows()[0];
+				expect(fallback).toMatchObject({ delivery_id: f.runtime.deliveryId, origin_key: parentOriginKey });
+				expect(JSON.parse(fallback?.payload_json ?? "{}")).toMatchObject({
+					turnId: f.runtime.opRef,
+					text: expect.stringContaining("recovery_indeterminate"),
+				});
+			}
+		});
+	}
+
+	for (const parentAvailable of [false, true]) {
+		test(`reconciliation reports an indeterminate lane child when parent is available=${parentAvailable}`, async () => {
+			const f = await fixture();
+			const parentName = parentAvailable ? "parent" : "missing-parent";
+			const root = parentAvailable ? null : { originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN };
+			const runtime: WorkAttemptRuntime = {
+				...f.runtime,
+				parent: { kind: "lane", name: parentName, root },
+			};
+			if (parentAvailable) {
+				const parentJob = createLaneJobRecord({
+					jobId: `lanejob-${Buffer.from(parentName, "utf8").toString("hex")}`,
+					branch: "main",
+					worktreePath: "/parent",
+					sessionId: SESSION,
+					now: () => new Date(START),
+				});
+				f.database.transaction((tx) =>
+					f.database.work.putLaneJob(tx, {
+						...parentJob,
+						laneKey: `work-${parentName}`,
+						json: JSON.stringify(parentJob),
+					}),
+				);
+			}
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
+			f.database.transaction((tx) =>
+				f.database.work.putLaneJob(tx, {
+					...f.closed,
+					laneKey: runtime.laneKey,
+					json: JSON.stringify(f.closed),
+				}),
+			);
+
+			expect(f.database.reconcileWorkAttempts(() => {})).toBe(1);
+			if (parentAvailable) {
+				expect(f.database.work.laneReportsByParent(parentName)).toMatchObject([
+					{
+						report_id: runtime.reportId,
+						child_op_ref: runtime.opRef,
+						state: "pending",
+						body: expect.stringContaining("recovery_indeterminate"),
+					},
+				]);
+				expect(f.database.outbox.rows()).toEqual([]);
+			} else {
+				expect(f.database.work.laneReportsByParent(parentName)).toEqual([]);
+				expect(f.database.outbox.rows()).toMatchObject([
+					{ delivery_id: runtime.deliveryId, origin_key: originKey(LOOPBACK_ORIGIN) },
+				]);
+			}
+		});
+	}
 
 	test("boot heals a torn work-history settlement before normal recovery starts", async () => {
 		const f = await fixture();
