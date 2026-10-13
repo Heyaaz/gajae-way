@@ -272,6 +272,82 @@ describe("work attempt boot reconciliation", () => {
 		expect(f.database.work.workAttemptOpen()).toEqual([]);
 	});
 
+	test("reconciliation preserves every repaired attempt in a shared lane history", async () => {
+		const f = await fixture();
+		const secondOpRef = "gw-work-store-b";
+		const secondStartedAt = "2026-09-08T00:00:20.000Z";
+		const secondEndedAt = "2026-09-08T00:00:30.000Z";
+		const firstReconciledAt = "2026-09-08T00:00:11.000Z";
+		const secondReconciledAt = "2026-09-08T00:00:31.000Z";
+		const firstHistory = closeAttempt({
+			record: f.record,
+			opRef: f.runtime.opRef,
+			endState: "terminal_uncertain",
+			errorCode: "recovery_indeterminate",
+			endedAt: END,
+		});
+		const secondRecord = appendAttempt(firstHistory, {
+			opRef: secondOpRef,
+			sessionId: SESSION,
+			startedAt: secondStartedAt,
+		});
+		const secondHistory = closeAttempt({
+			record: secondRecord,
+			opRef: secondOpRef,
+			endState: "terminal_uncertain",
+			errorCode: "recovery_indeterminate",
+			endedAt: secondEndedAt,
+		});
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, {
+				...secondHistory,
+				laneKey: f.runtime.laneKey,
+				json: JSON.stringify(secondHistory),
+			}),
+		);
+		const tornRuntime = (opRef: string, startedAt: string, settledAt: string): WorkAttemptRuntime => ({
+			...f.runtime,
+			opRef,
+			startedAt,
+			terminal: { kind: "local", observedAt: settledAt, reasonCode: "recovery_indeterminate" },
+			output: { ...f.runtime.output, disposition: "unavailable" },
+			reportId: workAttemptReportId(f.database.instanceId, f.runtime.jobId, opRef),
+			deliveryId: workAttemptDeliveryId(f.database.instanceId, f.runtime.jobId, opRef),
+			decision: "recovery_indeterminate",
+			settledAt,
+		});
+		for (const [runtime, columnSettledAt] of [
+			[tornRuntime(f.runtime.opRef, START, firstReconciledAt), END],
+			[tornRuntime(secondOpRef, secondStartedAt, secondReconciledAt), secondEndedAt],
+		] as const)
+			f.raw
+				.query(
+					"INSERT INTO work_attempt_runtime (op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				)
+				.run(
+					runtime.opRef,
+					runtime.jobId,
+					runtime.laneKey,
+					runtime.sessionId,
+					runtime.version,
+					columnSettledAt,
+					runtime.deliveryId,
+					JSON.stringify(runtime),
+				);
+
+		const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx, () => {}));
+		expect(reconciled).toBe(2);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(firstReconciledAt);
+		expect(f.database.work.workAttemptGet(secondOpRef)?.settledAt).toBe(secondReconciledAt);
+		const historyJson = f.database.work.laneJobJson(f.runtime.jobId);
+		expect(historyJson).toBeDefined();
+		if (historyJson === undefined) throw new Error("reconciled lane history is missing");
+		expect(parseLaneJobRecord(historyJson).attempts.map((attempt) => attempt.endedAt)).toEqual([
+			firstReconciledAt,
+			secondReconciledAt,
+		]);
+	});
+
 	test("boot heals a torn work-history settlement before normal recovery starts", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));

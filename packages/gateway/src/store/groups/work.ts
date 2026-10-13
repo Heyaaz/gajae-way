@@ -543,9 +543,24 @@ export class WorkGroup {
 		const updates: {
 			runtime: WorkAttemptRuntime;
 			next: WorkAttemptRuntime;
-			history: LaneJobRecord;
 			priorSettledAt: string | null;
 		}[] = [];
+		const reconcileHistory = (record: LaneJobRecord, opRef: string, settledAt: string): LaneJobRecord => {
+			const attempt = record.attempts.find((item) => item.opRef === opRef);
+			workAssert(attempt !== undefined);
+			return attempt.endedAt === undefined
+				? closeAttempt({
+						record,
+						opRef,
+						endState: "terminal_uncertain",
+						errorCode: "recovery_indeterminate",
+						endedAt: settledAt,
+					})
+				: {
+						...record,
+						attempts: record.attempts.map((item) => (item.opRef === opRef ? { ...item, endedAt: settledAt } : item)),
+					};
+		};
 
 		for (const row of rows) {
 			try {
@@ -592,21 +607,7 @@ export class WorkGroup {
 					settledAt,
 				};
 				validateWorkRuntime(next, this.instanceId);
-				const history: LaneJobRecord =
-					attempt.endedAt === undefined
-						? closeAttempt({
-								record,
-								opRef: runtime.opRef,
-								endState: "terminal_uncertain",
-								errorCode: "recovery_indeterminate",
-								endedAt: settledAt,
-							})
-						: {
-								...record,
-								attempts: record.attempts.map((item) =>
-									item.opRef === runtime.opRef ? { ...item, endedAt: settledAt } : item,
-								),
-							};
+				const history = reconcileHistory(record, runtime.opRef, settledAt);
 				this.#workValidateHistory(next, history);
 				if (next.wakeReportId !== null) {
 					const report = this.#laneReportGetInside(next.wakeReportId);
@@ -624,7 +625,7 @@ export class WorkGroup {
 						);
 					}
 				}
-				updates.push({ runtime, next, history, priorSettledAt: row.settled_at });
+				updates.push({ runtime, next, priorSettledAt: row.settled_at });
 			} catch (error) {
 				skipped.push(row.op_ref);
 				log(
@@ -633,7 +634,14 @@ export class WorkGroup {
 			}
 		}
 
-		for (const { runtime, next, history, priorSettledAt } of updates) {
+		for (const { runtime, next, priorSettledAt } of updates) {
+			const json = this.laneJobJson(runtime.jobId);
+			workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+			const record = parseLaneJobRecord(json);
+			const settledAt = next.settledAt;
+			workAssert(settledAt !== null && workTime(settledAt));
+			const history = reconcileHistory(record, runtime.opRef, settledAt);
+			this.#workValidateHistory(next, history);
 			const changed = this.#db
 				.prepare("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ? WHERE op_ref = ? AND settled_at IS ?")
 				.run(tx, JSON.stringify(next), next.settledAt, runtime.opRef, priorSettledAt).changes;
