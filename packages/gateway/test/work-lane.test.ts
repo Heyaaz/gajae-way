@@ -2990,6 +2990,37 @@ test("#481 a lane whose HEAD is unpushed never waits for checks", async () => {
 	expect(checks.calls).toEqual([{ branch: "fix/unpushed-head", cwd: f.directory }]);
 });
 
+test("#481 a failed PR lookup does not park a commit known to be unpushed", async () => {
+	const checks = scriptedChecks(undefined);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/unpushed-lookup-failed", false);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => checksNotice(f, "[lane a] attempt_ended") !== undefined);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] attempt_ended")).toContain("pushed=false");
+	expect(checks.calls).toEqual([{ branch: "fix/unpushed-lookup-failed", cwd: f.directory }]);
+});
+
+test("#481 a detached checkout is not parked when no PR lookup can be attempted", async () => {
+	const checks = scriptedChecks(undefined);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/detached-head", true);
+	const result = await started(f, "a", origin);
+	const worktreePath = f.job().lane.worktreePath;
+	const checkout = Bun.spawnSync(["git", "-C", worktreePath, "checkout", "--detach", "HEAD"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	expect(checkout.exitCode).toBe(0);
+	f.port.complete(result.opRef, "done");
+	await until(() => checksNotice(f, "[lane a] attempt_ended") !== undefined);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checks.calls).toEqual([]);
+});
+
 test("#481 completed lane with already-green checks settles done and reports the checked head", async () => {
 	const checks = scriptedChecks({ prNumber: 496, status: "green", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });

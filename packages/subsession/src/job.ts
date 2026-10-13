@@ -844,6 +844,12 @@ export function planContinuation(input: PlanContinuationInput): ContinuationPlan
 	if (input.record.state === "done") {
 		return { action: "hold_for_operator", reason: "job is done: run retirement/handoff, do not continue" };
 	}
+	if (input.record.state === "awaiting_checks") {
+		return {
+			action: "hold_for_operator",
+			reason: "checks are still pending; wait for the checks cycle to settle before continuing",
+		};
+	}
 	if (input.record.state === "awaiting_operator") {
 		return {
 			action: "hold_for_operator",

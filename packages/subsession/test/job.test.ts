@@ -662,6 +662,13 @@ describe("awaiting_checks cycle (#481)", () => {
 		for (const settled of [failed, ended]) expect(settled.awaitingChecks).toBeUndefined();
 	});
 
+	test("continuation planning holds an awaiting_checks record until the cycle settles", () => {
+		const parked = awaiting();
+		const decision = planContinuation(planInput({ record: parked, latestAttempt: parked.attempts[0] }));
+		expect(decision.action).toBe("hold_for_operator");
+		expect(decision.reason).toMatch(/checks are still pending/);
+	});
+
 	test("an awaiting_checks record without its cycle, or with a corrupt one, fails closed", () => {
 		const { awaitingChecks: _, ...missing } = awaiting();
 		expect(() => parseLaneJobRecord(JSON.stringify(missing))).toThrow(/awaitingChecks/);

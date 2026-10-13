@@ -1540,7 +1540,14 @@ export class WorkLaneManager {
 						prNumber: checks.prNumber,
 						headSha: facts.headSha,
 					});
-				} else if (facts?.headSha && checks === undefined && this.#options.checkStatusClient) {
+				} else if (
+					facts?.headSha &&
+					facts.branch &&
+					facts.branch !== "HEAD" &&
+					facts.pushed !== false &&
+					checks === undefined &&
+					this.#options.checkStatusClient
+				) {
 					job = transitionToAwaitingChecks({ record: job, at, prNumber: null, headSha: facts.headSha });
 				}
 			}
