@@ -16,6 +16,7 @@ import {
 	isPlatformMessageId,
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
+	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	type MonitorScheduleProjection,
@@ -1673,6 +1674,16 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { eventId } });
 			return;
 		}
+		case "monitor.settle":
+		case "monitor.retry": {
+			const eventId = (request.params as { eventId?: unknown } | undefined)?.eventId;
+			if (typeof eventId !== "string" || eventId.trim().length === 0)
+				throw new ProtocolError("invalid_params", `${request.verb} requires a non-empty eventId`);
+			const result: MonitorEventOperatorResult =
+				request.verb === "monitor.settle" ? runtime.monitors.settle(eventId) : runtime.monitors.retry(eventId);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "monitor.remove": {
 			const monitorId = (request.params as { monitorId?: unknown } | undefined)?.monitorId;
 			if (typeof monitorId !== "string" || !runtime.registry.remove(monitorId))
@@ -2546,11 +2557,13 @@ async function createInboundTurnLifecycle(
 				config: runtime.config,
 			})
 		: undefined;
+	// Stable per origin: the persona actor sends it only when the session's
+	// context may not hold it. The bootstrap and a changed-AGENTS.md section are
+	// one-shot and ride their own send.
+	const sessionBootstrap = [bootstrap?.text, agentsMdSection].filter(Boolean).join("\n\n");
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
-		...(agentsMdSection ? [agentsMdSection] : []),
 		currentConversationNotice(origin),
-		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
 	].join("\n\n");
@@ -3225,7 +3238,7 @@ async function createInboundTurnLifecycle(
 		runtime.inbound.delete(steered.message_id);
 		acknowledgeSteer(runtime, steered, turnId);
 	};
-	const onTerminal = async ({ text }: PersonaTerminalInput) => {
+	const onTerminal = async ({ text, alreadyPosted }: PersonaTerminalInput) => {
 		let threw = false;
 		try {
 			const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
@@ -3248,6 +3261,9 @@ async function createInboundTurnLifecycle(
 				);
 			});
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
+			// Recovered from the transcript after it already reached the room under
+			// another turn: recorded above, never posted a second time.
+			if (alreadyPosted) return;
 			if (!nonLoopback) {
 				if (connection)
 					connection.write({
@@ -3295,7 +3311,7 @@ async function createInboundTurnLifecycle(
 			throw error;
 		} finally {
 			try {
-				if (!threw) closeTerminalLink(nonLoopback ? "silent" : "loopback");
+				if (!threw) closeTerminalLink(nonLoopback ? (alreadyPosted ? "no_delivery" : "silent") : "loopback");
 			} finally {
 				endProgress();
 			}
@@ -3390,6 +3406,7 @@ async function createInboundTurnLifecycle(
 	return {
 		text: turnText,
 		systemPreamble,
+		...(sessionBootstrap ? { sessionBootstrap } : {}),
 		...(effectiveModel ? { effectiveModel } : {}),
 		...(runtime.config.serviceTier ? { effectiveServiceTier: runtime.config.serviceTier } : {}),
 		contextMessageIds: new Set(contextMessageIds),

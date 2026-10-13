@@ -399,12 +399,17 @@ test("restart-stack CLI exits 1 when an update owns the lease", async () => {
 test("launchRestartStack queues a detached worker and preserves the home", async () => {
 	const { home, cleanup } = await tempHome();
 	try {
-		const queued = await launchRestartStack({ home, worker: [process.execPath, "-e", "process.exit(0)"] });
+		const queued = await launchRestartStack({
+			home,
+			platform: "darwin",
+			worker: [process.execPath, "-e", "process.exit(0)"],
+		});
 		expect(queued.receipt.state).toBe("queued");
 		expect(queued.receipt.trigger).toBe("manual");
 		expect(queued.supervisorPid).toBeGreaterThan(0);
 		const update = await launchRestartStack({
 			home,
+			platform: "darwin",
 			trigger: "update",
 			worker: [process.execPath, "-e", "process.exit(0)"],
 		});
@@ -656,6 +661,63 @@ test("a supervisor that cannot start fails the receipt instead of leaving it que
 	}
 });
 
+test("a nonzero systemd-run result fails the receipt and cannot be replayed as a worker", async () => {
+	const { home, cleanup } = await tempHome();
+	let command: readonly string[] | undefined;
+	try {
+		await expect(
+			launchRestartStack({
+				home,
+				platform: "linux",
+				systemdRun: (argv) => {
+					command = argv;
+					return Bun.spawn([process.execPath, "-e", "process.exit(23)"], {
+						stdin: "ignore",
+						stdout: "ignore",
+						stderr: "ignore",
+					});
+				},
+			}),
+		).rejects.toThrow(/supervisor systemd-run exited with status 23/);
+		const receipt = await readRestartReceipt(home);
+		expect(command?.at(-2)).toBe("--run");
+		expect(receipt?.state).toBe("failed");
+		expect(receipt?.detail).toContain("systemd-run exited with status 23");
+		expect(receipt?.steps.every((step) => step.result === "skipped")).toBe(true);
+		await expect(runRestartStack({ home, id: receipt!.id })).rejects.toThrow(
+			"receipt is failed; refusing to start worker",
+		);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("a timed-out systemd-run result records an indeterminate failed receipt", async () => {
+	const { home, cleanup } = await tempHome();
+	try {
+		await expect(
+			launchRestartStack({
+				home,
+				platform: "linux",
+				systemdRunTimeoutMs: 20,
+				systemdRun: () =>
+					Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+						stdin: "ignore",
+						stdout: "ignore",
+						stderr: "ignore",
+					}),
+			}),
+		).rejects.toThrow(/systemd-run timed out after 20ms; handoff outcome is indeterminate/);
+		const receipt = await readRestartReceipt(home);
+		expect(receipt?.state).toBe("failed");
+		expect(receipt?.finishedAt).toBeDefined();
+		expect(receipt?.detail).toContain("handoff outcome is indeterminate");
+		expect(receipt?.steps.every((step) => step.result === "skipped")).toBe(true);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("an uninstalled service is skipped and does not abort the remaining stack", async () => {
 	const { home, cleanup } = await tempHome();
 	const unitDir = await mkdtemp(join(tmpdir(), "gajaeway-restart-units-"));
@@ -716,6 +778,7 @@ test("supervisorArgv escapes the gateway cgroup on systemd without bootout", () 
 	const linux = supervisorArgv("linux", worker, "/h", "r1", BIN_DIR);
 
 	expect(linux.slice(0, 2)).toEqual(["systemd-run", "--user"]);
+	expect(linux).toContain("--service-type=exec");
 	expect(linux).toContain("--unit=gajaeway-restart-stack-r1");
 	expect(linux).toContain(`--setenv=GAJAEWAY_BIN_DIR=${BIN_DIR}`);
 	expect(linux.slice(-worker.length)).toEqual(worker);

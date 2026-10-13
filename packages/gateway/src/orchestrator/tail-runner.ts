@@ -190,6 +190,20 @@ export class RelayClosedError extends Error {
 	}
 }
 
+/** A relay never completed its hello handshake before a prompt could be sent. */
+export class RelayHelloError extends Error {
+	readonly code = "relay_hello_missing";
+	readonly elapsedMs: number;
+	readonly childState: "stream_ended" | "stream_open";
+
+	constructor(elapsedMs: number, childState: "stream_ended" | "stream_open") {
+		super(`relay hello did not arrive within ${elapsedMs}ms (${childState})`);
+		this.name = "RelayHelloError";
+		this.elapsedMs = elapsedMs;
+		this.childState = childState;
+	}
+}
+
 /**
  * `gjc sdk serve` refused to attach: it printed one SDK error envelope and
  * exited. `endpoint_stale` / `not_found` mean the broker no longer serves this
@@ -576,7 +590,11 @@ class ManagedTailHandle implements TailHandle {
 			const hello = new Promise<void>((resolve) => {
 				this.#helloResolve = resolve;
 			});
-			const helloTimer = setTimeout(() => this.#helloResolve?.(), this.#runner.helloTimeoutMs);
+			let helloTimedOut = false;
+			const helloTimer = setTimeout(() => {
+				helloTimedOut = true;
+				this.#helloResolve?.();
+			}, this.#runner.helloTimeoutMs);
 			try {
 				const consume = (async () => {
 					try {
@@ -598,6 +616,7 @@ class ManagedTailHandle implements TailHandle {
 				if (!this.#connectionId) {
 					const elapsedMs = this.#runner.now() - openedAt;
 					const childState = streamEnded ? "stream_ended" : "stream_open";
+					if (helloTimedOut) throw new RelayHelloError(elapsedMs, childState);
 					throw new Error(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
 				}
 				if (!this.#ready) {

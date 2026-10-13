@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { containsSilenceToken, isSilenceToken } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -28,6 +29,7 @@ import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
 	type FailedTurnEvidenceInput,
+	locateSavedTranscript,
 	readFailedTransportCause,
 	readFailedTurnEvidence,
 } from "./failed-turn-evidence";
@@ -63,13 +65,51 @@ export type TerminateHostOutcome =
 	| { readonly outcome: "not_a_host"; readonly pid: number; readonly command: string }
 	| { readonly outcome: "refused"; readonly reason: string };
 
+/**
+ * What the session host is doing, as `gjc sdk session inspect` reports it:
+ * `state` ("idle", or whatever the host is busy with) since `at` (epoch ms).
+ */
+export interface SessionActivity {
+	readonly state: string;
+	readonly at: number;
+}
+
+/** Raw broker liveness; `activity` is present only when inspect reported a well-formed one. */
+export interface SessionLiveness {
+	readonly live: boolean | undefined;
+	readonly disowned: boolean;
+	readonly activity?: SessionActivity;
+	/** The broker still holds the saved session but marks it deleted. */
+	readonly deleted?: boolean;
+	/** `locator.repo`, or the `locator.cwd` gjc >= 0.16.0 reports in its place. */
+	readonly workspace?: string;
+	/** The (last) host process identity; a closed session keeps its dead host's. */
+	readonly hostIncarnation?: string;
+}
+
+/**
+ * The parts of a reply the delivery path would post: split on `[BREAK]`,
+ * `[REPLY:id]` markers stripped, and every part that is or carries a silence
+ * token dropped whole.
+ */
+export function spokenParts(text: string): string[] {
+	return text
+		.split(/\n\s*\[BREAK\]\s*\n?/)
+		.map((part) => part.trim())
+		.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
+		.map((part) => part.replace(/\[REPLY:[^\]\s]+\]/g, "").trim())
+		.filter((part) => part.length > 0);
+}
+
+/** True when nothing in `text` would be posted. */
+export function isSilentReply(text: string): boolean {
+	return spokenParts(text).length === 0;
+}
+
 export interface SessionPort {
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
-	liveness?(input: {
-		sessionId: string;
-		repo: string;
-	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
+	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean>;
 	/**
@@ -78,6 +118,16 @@ export interface SessionPort {
 	 * about to do that reads this first. Throws when the host cannot answer.
 	 */
 	runningJobs?(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]>;
+	/**
+	 * Context-window usage of the session (`context.get`), read on the turn's
+	 * owned relay. Undefined when the host does not report it (gjc reports none
+	 * between a compaction and the next model response).
+	 */
+	contextUsage?(input: {
+		sessionId: string;
+		repo: string;
+		relay: TailHandle;
+	}): Promise<SessionContextUsage | undefined>;
 	/**
 	 * Ends the host process of a session this gateway created and has retired.
 	 * Ownership is the point: the shared GJC daemon and broker are never touched,
@@ -121,13 +171,16 @@ export interface SessionPort {
 	 * (stamped at bind, before the send, and cleared on requeue). Turn-scoped
 	 * by wall clock, independent of gjc ring
 	 * coordinates (gajae-code#5200); undefined when the newest row predates
-	 * the turn.
+	 * the turn. With `preferSpoken`, the last row that is not a silent reply
+	 * wins over a later silent one (a trailing `[SILENT]` after a real answer);
+	 * a silent row is returned only when no spoken row qualifies.
 	 */
 	fetchAssistantSince?(input: {
 		sessionId: string;
 		repo: string;
 		notBeforeMs: number;
 		relay?: TailHandle;
+		preferSpoken?: boolean;
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
 	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
@@ -154,6 +207,12 @@ export interface RunningHostJob {
 }
 
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
+
+/** Session context usage: percent of the model's context window and the token count it stands for. */
+export interface SessionContextUsage {
+	readonly percent: number;
+	readonly tokens: number;
+}
 
 export interface SessionCompactionInput {
 	readonly sessionId: string;
@@ -272,6 +331,52 @@ export interface SessionRequestInput extends SessionSendInput {
 	readonly pollMs?: number;
 }
 
+export const SESSION_REQUEST_STEPS = ["authority", "attach", "send", "status", "last_assistant", "close"] as const;
+export type SessionRequestStep = (typeof SESSION_REQUEST_STEPS)[number];
+
+const SESSION_REQUEST_ERROR_STEPS = new WeakMap<object, SessionRequestStep>();
+
+class SessionRequestStepError extends Error {
+	constructor(step: SessionRequestStep, cause: unknown) {
+		super(`session request failed during ${step}`, { cause });
+		this.name = "SessionRequestStepError";
+	}
+}
+
+function markSessionRequestStep(error: unknown, step: SessionRequestStep): unknown {
+	if ((typeof error === "object" && error !== null) || typeof error === "function") {
+		if (!SESSION_REQUEST_ERROR_STEPS.has(error)) SESSION_REQUEST_ERROR_STEPS.set(error, step);
+		return error;
+	}
+	const wrapped = new SessionRequestStepError(step, error);
+	SESSION_REQUEST_ERROR_STEPS.set(wrapped, step);
+	return wrapped;
+}
+
+/** Returns the request stage associated with an error without mutating it. */
+export function sessionRequestStep(error: unknown): SessionRequestStep | undefined {
+	if ((typeof error !== "object" || error === null) && typeof error !== "function") return undefined;
+	return SESSION_REQUEST_ERROR_STEPS.get(error);
+}
+
+export type LastAssistantUnreadableCode =
+	| "last_assistant_not_json"
+	| "last_assistant_no_page"
+	| "last_assistant_no_items"
+	| "last_assistant_null_item"
+	| "last_assistant_non_text_item";
+
+/** A protocol-safe diagnosis for an invalid `session.last_assistant` page. */
+export class LastAssistantUnreadableError extends Error {
+	readonly code: LastAssistantUnreadableCode;
+
+	constructor(code: LastAssistantUnreadableCode) {
+		super(`session.last_assistant response is unreadable (${code})`);
+		this.name = "LastAssistantUnreadableError";
+		this.code = code;
+	}
+}
+
 export interface SessionRequestResult {
 	readonly receipt: SendReceipt;
 	readonly status: StatusReport;
@@ -349,6 +454,13 @@ function createRotationMetaKey(originKey: string): string {
 export const SESSION_BUSY_CODE = "busy";
 const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
 const BUSY_POLL_MS = 2_000;
+const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
+/**
+ * `compaction.run` answers only after gjc finished compacting, which takes tens
+ * of seconds at a few hundred thousand tokens (measured 27-45s at 270-295K,
+ * 2026-09-30); the default 30s command bound reported such runs as failed.
+ */
+const COMPACTION_TIMEOUT_MS = 5 * 60_000;
 
 /**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
@@ -442,6 +554,9 @@ export class BrokerSessionPort implements SessionPort {
 						} catch (error) {
 							if (error instanceof BrokerAuthorityError) throw error;
 							// Saved authority cannot be resumed: replace it below.
+							console.error(
+								`session_resume_failed origin=${input.originKey} epoch=${input.epoch} session=${existing.sessionId} path=bind detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+							);
 						}
 					}
 					indexed = false;
@@ -634,11 +749,9 @@ export class BrokerSessionPort implements SessionPort {
 	 * Raw liveness judged on the broker envelope: gjc >= 0.16.0 omits
 	 * `locator.repo`, which makes the subsession normalizer return undefined for a
 	 * perfectly well-known session. `disowned` = the broker rejects the id.
+	 * `activity` is the host's own `{state, at}` when inspect reports one.
 	 */
-	async liveness(input: {
-		sessionId: string;
-		repo: string;
-	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }> {
+	async liveness(input: { sessionId: string; repo: string }): Promise<SessionLiveness> {
 		this.#assertOwned(input);
 		try {
 			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], {
@@ -646,12 +759,34 @@ export class BrokerSessionPort implements SessionPort {
 			});
 			const envelope = JSON.parse(result.stdout) as {
 				ok?: unknown;
-				result?: { session?: { live?: unknown } };
+				result?: {
+					session?: {
+						live?: unknown;
+						deleted?: unknown;
+						locator?: { repo?: unknown; cwd?: unknown };
+						activity?: { state?: unknown; at?: unknown };
+						hostIncarnation?: unknown;
+					};
+				};
 				error?: { code?: unknown };
 			};
 			if (envelope.ok === false) return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
-			const live = envelope.result?.session?.live;
-			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
+			const session = envelope.result?.session;
+			const live = session?.live;
+			const state = session?.activity?.state;
+			const at = session?.activity?.at;
+			const workspace = session?.locator?.repo ?? session?.locator?.cwd;
+			const host = session?.hostIncarnation;
+			return {
+				live: typeof live === "boolean" ? live : undefined,
+				disowned: false,
+				...(session?.deleted === true ? { deleted: true } : {}),
+				...(typeof workspace === "string" ? { workspace } : {}),
+				...(typeof host === "string" && /^[A-Za-z0-9:._-]{1,128}$/.test(host) ? { hostIncarnation: host } : {}),
+				...(typeof state === "string" && typeof at === "number" && Number.isFinite(at) && at > 0
+					? { activity: { state, at } }
+					: {}),
+			};
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return { live: undefined, disowned: isSessionGoneCode(sdkErrorCode(error)) };
@@ -714,29 +849,66 @@ export class BrokerSessionPort implements SessionPort {
 		return { outcome: "terminated", pid };
 	}
 
+	/**
+	 * Judged on the raw envelope (`liveness`), like every other liveness read:
+	 * the normalized `inspect` is undefined for any session gjc >= 0.16.0
+	 * reports, which made every resume fail as "saved authority unavailable".
+	 */
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
 		this.#assertOwned(input);
-		const existing = await this.inspect(input);
-		if (!existing || existing.deleted || existing.repo !== input.repo)
+		const resumable = (state: SessionLiveness) =>
+			!state.disowned &&
+			state.live !== undefined &&
+			state.deleted !== true &&
+			(state.workspace === undefined || state.workspace === input.repo);
+		const existing = await this.liveness(input);
+		if (!resumable(existing))
 			throw new Error(`cannot resume session ${input.sessionId}: saved authority is unavailable`);
 		if (!existing.live) {
-			parseEnvelope(
-				await this.#cli([
-					"sdk",
-					"session",
-					"raw",
-					"control",
-					input.sessionId,
-					"--op",
+			// `session.resume` is a global lifecycle op, not a session control
+			// (gjc broker/lifecycle.ts launchInput): it needs the workspace `cwd`
+			// and the saved transcript `sessionPath`, which gjc itself verifies
+			// belongs to that cwd and session id.
+			const sessionPath = await locateSavedTranscript(this.#authority.canonicalAgentDir, input.sessionId);
+			if (sessionPath === undefined)
+				throw new Error(`cannot resume session ${input.sessionId}: no unique saved transcript`);
+			this.#assertOwned(input);
+			let failure: unknown;
+			try {
+				parseEnvelope(
+					await this.#cli([
+						"sdk",
+						"session",
+						"raw",
+						"global",
+						"--op",
+						"session.resume",
+						"--idempotency-key",
+						sessionResumeKey(input.sessionId, input.epoch, existing.hostIncarnation),
+						"--json-input",
+						JSON.stringify({
+							sessionId: input.sessionId,
+							sessionPath,
+							cwd: input.repo,
+							readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
+						}),
+					]),
 					"session.resume",
-					"--json-input",
-					"{}",
-				]),
-				"session.resume",
-			);
-			const resumed = await this.inspect(input);
-			if (!resumed || resumed.deleted || !resumed.live || resumed.repo !== input.repo)
+				);
+			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
+				// A refused request never restored anything. Every other failure -
+				// including the CLI's `operation_failed` (outcome unknown), which is
+				// also how it reports a broker invalid_input - is settled by inspect.
+				if (sdkErrorCode(error) === "invalid_input" || sdkErrorCode(error) === "idempotency_conflict")
+					throw sanitizeSdkFailure(error);
+				failure = error;
+			}
+			const resumed = await this.liveness(input);
+			if (!resumable(resumed) || resumed.live !== true) {
+				if (failure !== undefined) throw sanitizeSdkFailure(failure);
 				throw new Error(`session.resume did not restore live authority for ${input.sessionId}`);
+			}
 		}
 		this.#resetCreateRotations(input.originKey);
 		return { sessionId: input.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
@@ -992,6 +1164,26 @@ export class BrokerSessionPort implements SessionPort {
 		return parseRunningJobs(result.stdout);
 	}
 
+	async contextUsage(input: {
+		sessionId: string;
+		repo: string;
+		relay: TailHandle;
+	}): Promise<SessionContextUsage | undefined> {
+		this.#assertOwned(input);
+		this.#database.bindings.assertAuthority(this.#authority);
+		const response = await input.relay.query("context.get", {}, { timeoutMs: CONTEXT_QUERY_TIMEOUT_MS });
+		if (!response.ok) return undefined;
+		const items = response.page?.items;
+		const snapshot = Array.isArray(items) ? recordOf(items[0]) : undefined;
+		const usage = recordOf(snapshot?.usage);
+		const percent = usage?.percent;
+		const window = usage?.contextWindow;
+		if (typeof percent !== "number" || !Number.isFinite(percent)) return undefined;
+		if (typeof window !== "number" || !Number.isFinite(window) || window <= 0) return undefined;
+		// The wire usage carries no token count; percent is tokens over the window.
+		return { percent, tokens: Math.round((percent / 100) * window) };
+	}
+
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
 		this.#assertOwned(input);
 		assertControlAllowed("session.close", { operatorApproval: true });
@@ -1023,14 +1215,22 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		notBeforeMs: number;
 		relay?: TailHandle;
+		preferSpoken?: boolean;
 	}): Promise<LastAssistantResult | undefined> {
 		this.#assertOwned(input);
 		return await this.#overRelay(input, "transcript.list", async (sdk) => await this.#assistantSince(input, sdk));
 	}
 
-	async #assistantSince(input: { notBeforeMs: number }, sdk: SdkTransport): Promise<LastAssistantResult | undefined> {
+	async #assistantSince(
+		input: { notBeforeMs: number; preferSpoken?: boolean },
+		sdk: SdkTransport,
+	): Promise<LastAssistantResult | undefined> {
 		let cursor: string | undefined;
-		let latest: { role?: string; ts?: string; textSummary?: string; body?: string } | undefined;
+		type Row = { role?: string; ts?: string; textSummary?: string; body?: string };
+		const rowText = (row: Row): string =>
+			(typeof row.body === "string" && row.body) || (typeof row.textSummary === "string" ? row.textSummary : "");
+		let latest: Row | undefined;
+		let latestSpoken: Row | undefined;
 		const seenCursors = new Set<string>();
 		for (let pages = 1; pages <= 1_000; pages++) {
 			const result = await sdk("query", "transcript.list", {}, { timeoutMs: 15_000, ...(cursor ? { cursor } : {}) });
@@ -1050,14 +1250,15 @@ export class BrokerSessionPort implements SessionPort {
 			for (const row of page.items) {
 				if (row.role !== "assistant") continue;
 				const at = typeof row.ts === "string" ? Date.parse(row.ts) : Number.NaN;
-				if (Number.isFinite(at) && at + 2_000 >= input.notBeforeMs) latest = row;
+				if (!Number.isFinite(at) || at + 2_000 < input.notBeforeMs) continue;
+				latest = row;
+				const text = rowText(row);
+				if (text.trim() && !isSilentReply(text)) latestSpoken = row;
 			}
 			if (page.complete === true) {
-				if (!latest) return undefined;
-				const text =
-					(typeof latest.body === "string" && latest.body) ||
-					(typeof latest.textSummary === "string" ? latest.textSummary : "");
-				return { text, pages, complete: true };
+				const chosen = (input.preferSpoken ? latestSpoken : undefined) ?? latest;
+				if (!chosen) return undefined;
+				return { text: rowText(chosen), pages, complete: true };
 			}
 			const next = typeof page.continuationCursor === "string" ? page.continuationCursor : undefined;
 			if (!next || seenCursors.has(next))
@@ -1089,17 +1290,10 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		try {
 			const result = parseEnvelope<Record<string, unknown>>(
-				await this.#cli([
-					"sdk",
-					"session",
-					"raw",
-					"control",
-					input.sessionId,
-					"--op",
-					"compaction.run",
-					"--json-input",
-					"{}",
-				]),
+				await this.#cli(
+					["sdk", "session", "raw", "control", input.sessionId, "--op", "compaction.run", "--json-input", "{}"],
+					{ timeoutMs: COMPACTION_TIMEOUT_MS },
+				),
 				"compaction.run",
 			);
 			this.#tailRunner.recordCompactionReceipt({ sessionId: input.sessionId, originKey: input.originKey, result });
@@ -1155,24 +1349,31 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
-		this.#assertOwned(input);
+		try {
+			this.#assertOwned(input);
+		} catch (error) {
+			throw markSessionRequestStep(error, "authority");
+		}
 		// One relay owns the whole request: the send, the terminal wait, and the
 		// final read. Monitor/batch authoring consumes no mid-turn content, so
 		// the handle's frames only feed the stall alarm and the activity lease.
 		let lastActivityAt = this.#now();
-		const relay = await this.attachTail({
-			sessionId: input.sessionId,
-			brokerGeneration: 0,
-			repo: input.repo,
-			...(input.originKey ? { originKey: input.originKey } : {}),
-			onFrame: () => {
-				lastActivityAt = this.#now();
-			},
-			onStall: ({ elapsedMs }) =>
-				console.warn(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
-		});
-		relay.beginTurn(input.opRef);
-		relay.setTurnRunning(true);
+		let relay: TailHandle;
+		try {
+			relay = await this.attachTail({
+				sessionId: input.sessionId,
+				brokerGeneration: 0,
+				repo: input.repo,
+				...(input.originKey ? { originKey: input.originKey } : {}),
+				onFrame: () => {
+					lastActivityAt = this.#now();
+				},
+				onStall: ({ elapsedMs }) =>
+					console.warn(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
+			});
+		} catch (error) {
+			throw markSessionRequestStep(error, error instanceof BrokerAuthorityError ? "authority" : "attach");
+		}
 		// `turn.result` on the relay while it is up; on the CLI (the authoritative
 		// recovery transport) when the relay tore. A torn relay is never a verdict
 		// about the operation: the accepted op keeps being observed under the SAME
@@ -1182,30 +1383,45 @@ export class BrokerSessionPort implements SessionPort {
 			try {
 				return await this.status({ ...target, relay });
 			} catch (error) {
-				if (!isRelayTransportFailure(error)) throw error;
+				if (!isRelayTransportFailure(error)) throw markSessionRequestStep(error, "status");
 				console.error(`status_relay_unavailable session=${input.sessionId} opRef=${input.opRef}`);
-				return await this.status(target);
+				try {
+					return await this.status(target);
+				} catch (fallbackError) {
+					throw markSessionRequestStep(fallbackError, "status");
+				}
 			}
 		};
+		let result: SessionRequestResult | undefined;
+		let requestFailed = false;
+		let requestError: unknown;
 		try {
+			try {
+				relay.beginTurn(input.opRef);
+				relay.setTurnRunning(true);
+			} catch (error) {
+				throw markSessionRequestStep(error, "attach");
+			}
 			let receipt: SendReceipt;
 			let status: StatusReport | undefined;
 			try {
 				receipt = await this.send({ ...input, relay });
 				relay.correlate(input.opRef, receipt);
 			} catch (sendError) {
-				if (sendError instanceof BrokerAuthorityError) throw sendError;
+				if (sendError instanceof BrokerAuthorityError) throw markSessionRequestStep(sendError, "authority");
+				const taggedSendError = markSessionRequestStep(sendError, "send");
 				// A transport/control failure may occur after the runtime accepted the
 				// prompt. Query the SAME clientRef before retrying; monitor authoring
 				// otherwise ran the event, produced a final answer, then executed it
 				// again because the torn send was treated as definitive failure.
 				try {
 					status = await readStatus();
-				} catch (error) {
-					if (error instanceof BrokerAuthorityError) throw error;
-					throw sendError;
+				} catch (statusError) {
+					const taggedStatusError = markSessionRequestStep(statusError, "status");
+					if (statusError instanceof BrokerAuthorityError) throw taggedStatusError;
+					throw taggedSendError;
 				}
-				if (status.status.status === "unknown") throw sendError;
+				if (status.status.status === "unknown") throw taggedSendError;
 				receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
 			}
 			// The wait leases on the turn's own activity: every frame the relay
@@ -1221,17 +1437,42 @@ export class BrokerSessionPort implements SessionPort {
 				status = await readStatus();
 			}
 			if (!isTerminalStatus(status.status.status))
-				throw new SessionRequestTimeoutError(input.sessionId, input.opRef, status);
-			if (status.status.status !== "terminal_ok") throw new SessionTerminalError(status);
-			return {
+				throw markSessionRequestStep(new SessionRequestTimeoutError(input.sessionId, input.opRef, status), "status");
+			if (status.status.status !== "terminal_ok")
+				throw markSessionRequestStep(new SessionTerminalError(status), "status");
+			result = {
 				receipt,
 				status,
-				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }),
+				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }).catch(
+					(error: unknown) => {
+						throw markSessionRequestStep(error, "last_assistant");
+					},
+				),
 			};
-		} finally {
-			relay.setTurnRunning(false);
-			await relay.close();
+		} catch (error) {
+			requestFailed = true;
+			requestError = error;
 		}
+		let cleanupFailed = false;
+		let cleanupError: unknown;
+		try {
+			relay.setTurnRunning(false);
+		} catch (error) {
+			cleanupFailed = true;
+			cleanupError = error;
+		}
+		try {
+			await relay.close();
+		} catch (error) {
+			if (!cleanupFailed) {
+				cleanupFailed = true;
+				cleanupError = error;
+			}
+		}
+		if (requestFailed) throw requestError;
+		if (cleanupFailed) throw markSessionRequestStep(cleanupError, "close");
+		if (result === undefined) throw new Error("session request completed without a result");
+		return result;
 	}
 
 	#assertOwned(input: { sessionId: string; repo: string }): void {
@@ -1525,21 +1766,25 @@ function parseLastAssistantPage(result: CliResult): LastAssistantPage {
 	let envelope: Record<string, unknown>;
 	try {
 		const parsed: unknown = JSON.parse(result.stdout);
-		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+			throw new LastAssistantUnreadableError("last_assistant_no_page");
 		envelope = parsed as Record<string, unknown>;
-	} catch {
-		throw new Error("session.last_assistant did not print a JSON query response");
+	} catch (error) {
+		if (error instanceof LastAssistantUnreadableError) throw error;
+		throw new LastAssistantUnreadableError("last_assistant_not_json");
 	}
-	if (envelope.ok !== true) {
+	if (envelope.ok === false) {
 		parseEnvelope<unknown>(result, "session raw query session.last_assistant");
-		throw new Error("unreachable failed session.last_assistant query response");
 	}
+	if (envelope.ok !== true) throw new LastAssistantUnreadableError("last_assistant_no_page");
 	const page = envelope.page;
 	if (typeof page !== "object" || page === null || Array.isArray(page))
-		throw new Error("session.last_assistant succeeded without a query page");
+		throw new LastAssistantUnreadableError("last_assistant_no_page");
 	const items = (page as Record<string, unknown>).items;
-	if (!Array.isArray(items) || items.some((item) => typeof item !== "string"))
-		throw new Error("session.last_assistant query page contained non-text items");
+	if (!Array.isArray(items)) throw new LastAssistantUnreadableError("last_assistant_no_items");
+	if (items.some((item) => item === null)) throw new LastAssistantUnreadableError("last_assistant_null_item");
+	if (items.some((item) => typeof item !== "string"))
+		throw new LastAssistantUnreadableError("last_assistant_non_text_item");
 	// gjc hosts grant `continuationCursor`; older CLI prints carried `cursor`.
 	const record = page as Record<string, unknown>;
 	const cursor = typeof record.continuationCursor === "string" ? record.continuationCursor : record.cursor;
@@ -1709,6 +1954,17 @@ function isTransientCreateFailure(error: unknown): boolean {
 	if (!(error instanceof GjcCliError)) return false;
 	const code = envelopeErrorCode(error.details);
 	return code === "terminal_uncertain" || code === "uncertain_after_send" || code === "spawn_failed";
+}
+
+/**
+ * One resume attempt per dead host: the closed session keeps its last host's
+ * incarnation, and a successful resume replaces it. So a resend of the same
+ * attempt (gateway restart mid-resume) reuses the key and gets gjc's ledger
+ * replay, while resuming again after that host closes too is a new key - the
+ * old one would replay a success whose endpoint is gone.
+ */
+export function sessionResumeKey(sessionId: string, epoch: number, hostIncarnation: string | undefined): string {
+	return `gw-resume-${sessionId}-${epoch}-${hostIncarnation ?? "nohost"}`;
 }
 
 function sessionCreateRef(instanceId: string, originKey: string, epoch: number, repo: string): string {
