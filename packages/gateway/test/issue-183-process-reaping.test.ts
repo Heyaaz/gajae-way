@@ -223,10 +223,11 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 		`300 402 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir}2 SHELL=/bin/zsh`,
 		`300 403 Mon Oct 13 03:20:00 2026 bun ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} SHELL=/bin/zsh`,
 		`300 404 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} --extra HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`300 405 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} other SHELL=/bin/zsh`,
 	].join("\n");
 	const table = parseUnixProcessTable(output, spacedAgentDir);
 
-	expect(table).toHaveLength(5);
+	expect(table).toHaveLength(6);
 	expect(table[1]).toEqual({
 		pid: 401,
 		ppid: 300,
@@ -236,6 +237,7 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	});
 	expect(table[3]?.argv).toEqual(["bun", spacedPreviousGjc, "sdk", "serve", "--stdio", "--session", SESSION]);
 	expect(table[4]?.argv).toEqual([spacedCurrentGjc, "sdk", "serve", "--stdio", "--session", SESSION, "--extra"]);
+	expect(table[5]?.agentDir).toBeUndefined();
 	expect(
 		select(table, {
 			gjcPath: spacedCurrentGjc,

@@ -396,7 +396,8 @@ function findUnixAgentDir(
 	) {
 		const before = index === 0 || /\s/.test(commandAndEnvironment[index - 1] ?? "");
 		const end = index + token.length;
-		const after = end === commandAndEnvironment.length || /\s/.test(commandAndEnvironment[end] ?? "");
+		const followingEnvironment = commandAndEnvironment.slice(end);
+		const after = end === commandAndEnvironment.length || /^\s+[A-Za-z_][A-Za-z0-9_]*=/.test(followingEnvironment);
 		if (before && after) return { index, value: expectedAgentDir };
 	}
 	return undefined;
@@ -419,6 +420,7 @@ function findUnixEnvironmentStart(commandAndEnvironment: string, agentDirIndex: 
 
 async function readProcessTableUnix(matchOptions?: WorkerMatchOptions): Promise<ProcessTableEntry[]> {
 	const proc = Bun.spawn(["ps", "-A", "-ww", "eww", "-o", "ppid=,pid=,lstart=,command="], {
+		env: { ...process.env, LC_ALL: "C" },
 		stdout: "pipe",
 		stderr: "ignore",
 	});
