@@ -307,6 +307,27 @@ describe("work attempt boot reconciliation", () => {
 		expect(parseLaneJobRecord(historyJson).attempts[0]?.endedAt).toBe(END);
 	});
 
+	test("reconciliation preserves a definitive completion when lane history is open", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+		);
+		f.raw
+			.query("UPDATE lane_jobs SET state = ?, record_json = ?, updated_at = ? WHERE job_id = ?")
+			.run(f.record.state, JSON.stringify(f.record), f.record.updatedAt, f.runtime.jobId);
+
+		expect(() => f.database.work.workAttemptGet(f.runtime.opRef)).toThrow(WorkAttemptStateError);
+		expect(f.database.reconcileWorkAttempts(() => {})).toBe(1);
+		const historyJson = f.database.work.laneJobJson(f.runtime.jobId);
+		expect(historyJson).toBeDefined();
+		if (historyJson === undefined) throw new Error("reconciled lane history is missing");
+		expect(parseLaneJobRecord(historyJson)).toMatchObject({
+			state: "attempt_ended",
+			attempts: [{ endedAt: END, endState: "completed" }],
+		});
+	});
+
 	test("reconciliation quarantines invalid settled candidates", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));

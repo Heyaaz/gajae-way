@@ -30,6 +30,20 @@ export type WorkAttemptDecision =
 	| "recovery_indeterminate";
 export type WorkAttemptRequestedDecision = "report" | "suppressed" | "no_target" | "wake_unaccepted";
 
+export function workAttemptEndState(
+	reason: string,
+): "completed" | "terminal_missing_receipt" | "terminal_uncertain" | "failed" | "attempt_ended" {
+	return reason === "end_turn"
+		? "completed"
+		: reason === "terminal_missing_receipt"
+			? "terminal_missing_receipt"
+			: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
+				? "terminal_uncertain"
+				: ["sdk_failed", "send_rejected"].includes(reason)
+					? "failed"
+					: "attempt_ended";
+}
+
 export interface WorkReportRoot {
 	readonly originKey: string;
 	readonly origin: OriginRef;
@@ -584,20 +598,27 @@ export class WorkGroup {
 			next: WorkAttemptRuntime;
 			priorSettledAt: string | null;
 		}[] = [];
-		const reconcileHistory = (record: LaneJobRecord, opRef: string, settledAt: string): LaneJobRecord => {
-			const attempt = record.attempts.find((item) => item.opRef === opRef);
+		const reconcileHistory = (record: LaneJobRecord, runtime: WorkAttemptRuntime, settledAt: string): LaneJobRecord => {
+			const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
 			workAssert(attempt !== undefined);
+			const terminal = runtime.terminal ?? {
+				kind: "local" as const,
+				reasonCode: "recovery_indeterminate",
+				observedAt: settledAt,
+			};
 			return attempt.endedAt === undefined
 				? closeAttempt({
 						record,
-						opRef,
-						endState: "terminal_uncertain",
-						errorCode: "recovery_indeterminate",
+						opRef: runtime.opRef,
+						endState: workAttemptEndState(terminal.reasonCode),
+						...(terminal.reasonCode === "end_turn" ? {} : { errorCode: terminal.reasonCode }),
 						endedAt: settledAt,
 					})
 				: {
 						...record,
-						attempts: record.attempts.map((item) => (item.opRef === opRef ? { ...item, endedAt: settledAt } : item)),
+						attempts: record.attempts.map((item) =>
+							item.opRef === runtime.opRef ? { ...item, endedAt: settledAt } : item,
+						),
 					};
 		};
 
@@ -650,7 +671,7 @@ export class WorkGroup {
 					settledAt,
 				};
 				validateWorkRuntime(next, this.instanceId);
-				const history = reconcileHistory(record, runtime.opRef, settledAt);
+				const history = reconcileHistory(record, next, settledAt);
 				this.#workValidateHistory(next, history);
 				if (next.wakeReportId !== null) {
 					const report = this.#laneReportGetInside(next.wakeReportId);
@@ -699,7 +720,7 @@ export class WorkGroup {
 			const record = parseLaneJobRecord(json);
 			const settledAt = next.settledAt;
 			workAssert(settledAt !== null && workTime(settledAt));
-			const history = reconcileHistory(record, runtime.opRef, settledAt);
+			const history = reconcileHistory(record, next, settledAt);
 			this.#workValidateHistory(next, history);
 			const changed = this.#db
 				.prepare("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ? WHERE op_ref = ? AND settled_at IS ?")
