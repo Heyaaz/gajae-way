@@ -181,6 +181,18 @@ export class OutboxGroup {
 		return rows.map((row) => this.#toRow(row));
 	}
 
+	/** Texts of confirmed, posted, non-reaction deliveries for one origin since `since`. */
+	confirmedTextsSince(originKey: string, since: string): string[] {
+		const rows = this.#db
+			.prepare(
+				"SELECT payload_json FROM deliveries WHERE origin_key = ? AND state = 'confirmed' AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ?",
+			)
+			.all(originKey, since) as Array<{ payload_json: string }>;
+		return rows
+			.map((row) => (JSON.parse(row.payload_json) as { text?: unknown }).text)
+			.filter((text): text is string => typeof text === "string" && text.length > 0);
+	}
+
 	/** Fresh unsettled rows, with the retry backoff and adapter-ack timeout applied. */
 	listUndelivered(freshnessMs: number, now = Date.now(), ignoreBackoff = false): DeliveryRow[] {
 		return this.unsettledRows().filter(

@@ -890,6 +890,21 @@ export function isPresenceReaction(unicode: string): boolean {
 	return PRESENCE_ALL_MARKERS.some((marker) => marker.unicode.replace(/\uFE0F/g, "") === bare);
 }
 
+function endDiscordWorkingState(
+	conversationId: string,
+	status: Pick<WorkingStatus, "clear"> | undefined,
+	typing: TypingPort | undefined,
+	log: Pick<Console, "error"> = console,
+): void {
+	typing?.end(conversationId);
+	if (!status) return;
+	void status
+		.clear(conversationId)
+		.catch((error) =>
+			log.error(`Discord working status clear failed: ${error instanceof Error ? error.message : String(error)}`),
+		);
+}
+
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -904,11 +919,7 @@ export async function settleDiscordDelivery(
 	const deliveryId = message.deliveryId;
 	// A reaction delivery reacts and posts nothing; it settles on the same ledger.
 	if (message.reaction) {
-		try {
-			await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
-		} finally {
-			await settleTurnPresence(message, typing, status);
-		}
+		await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
 		return;
 	}
 	try {
@@ -918,73 +929,61 @@ export async function settleDiscordDelivery(
 		const text = notice ? `${notice}\n${body}` : body;
 		const chunks = text === "" ? [] : chunkDiscordMessage(text);
 		const files = await loadDiscordMedia(parsed.paths, mediaDirectories);
-		if (files.length > 0 && chunks.length === 0) {
-			const reply =
-				message.replyToMessageId && !notice
-					? { messageReference: message.replyToMessageId, failIfNotExists: false }
-					: undefined;
-			await channel.send({
-				files,
-				content: chunks[0] ?? "",
-				...(reply ? { reply } : {}),
-			});
-		} else {
-			for (let index = 0; index < chunks.length; index++) {
-				// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-				// deleted target from failing the whole delivery.
-				const chunk = chunks[index] as string;
-				// A reply reference points into the thread, so it is dropped on parent fallback.
-				if (index === 0 && files.length > 0)
-					await channel.send({
-						content: chunk,
-						files,
-						...(message.replyToMessageId && !notice
-							? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
-							: {}),
-					});
-				else if (index === 0 && message.replyToMessageId && !notice)
-					await channel.send({
-						content: chunk,
-						reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-					});
-				else await channel.send(chunk);
+		try {
+			if (files.length > 0 && chunks.length === 0) {
+				const reply =
+					message.replyToMessageId && !notice
+						? { messageReference: message.replyToMessageId, failIfNotExists: false }
+						: undefined;
+				await channel.send({
+					files,
+					content: chunks[0] ?? "",
+					...(reply ? { reply } : {}),
+				});
+			} else {
+				for (let index = 0; index < chunks.length; index++) {
+					// Reply-threading applies to the first chunk only; failIfNotExists keeps a
+					// deleted target from failing the whole delivery.
+					const chunk = chunks[index] as string;
+					// A reply reference points into the thread, so it is dropped on parent fallback.
+					if (index === 0 && files.length > 0)
+						await channel.send({
+							content: chunk,
+							files,
+							...(message.replyToMessageId && !notice
+								? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
+								: {}),
+						});
+					else if (index === 0 && message.replyToMessageId && !notice)
+						await channel.send({
+							content: chunk,
+							reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+						});
+					else await channel.send(chunk);
+				}
 			}
+		} finally {
+			if (!message.final) typing?.refresh(message.origin.conversationId);
 		}
+		if (message.final) endDiscordWorkingState(message.origin.conversationId, status, typing);
 		// Voice rides AFTER the text, and only after the text actually landed:
 		// pairing them is for a readable history, so the readable half must be
 		// the one that is guaranteed. A synthesis failure is logged and the
 		// delivery still confirms — the words arrived, which is the deliverable.
-		if (message.voiceText && speech) await sendVoiceMessage(channel, message.voiceText, speech);
+		if (message.voiceText && speech) {
+			await sendVoiceMessage(channel, message.voiceText, speech);
+			// A voice post clears Discord's typing hint just like a text post.
+			if (!message.final) typing?.refresh(message.origin.conversationId);
+		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
+		if (message.final) endDiscordWorkingState(message.origin.conversationId, status, typing);
 		await gateway.request("delivery.fail", {
 			deliveryId,
 			reason: error instanceof Error ? error.message : String(error),
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
-	} finally {
-		await settleTurnPresence(message, typing, status);
 	}
-}
-
-/**
- * Only the turn's final reply ends its working status. Mid-turn speech and
- * reactions arrive with `final: false` while the persona is still streaming:
- * tearing presence down on them left the room looking idle for the rest of the
- * turn. Posting a message does clear Discord's typing hint, so it is re-sent
- * at once instead of waiting for the next refresh tick.
- */
-async function settleTurnPresence(
-	message: ChatMessagePayload,
-	typing: TypingPort | undefined,
-	status: WorkingStatus | undefined,
-): Promise<void> {
-	if (!message.final) {
-		if (!message.reaction) typing?.refresh(message.origin.conversationId);
-		return;
-	}
-	await status?.clear(message.origin.conversationId);
-	typing?.end(message.origin.conversationId);
 }
 
 interface ArchivableThreadLike {
@@ -1138,19 +1137,19 @@ export function subscribeDiscordProgress(
 ): () => void {
 	if (!gateway.onChatProgress) return () => {};
 	return gateway.onChatProgress((progress) => {
-		// `final` means the turn stopped working. It arrives even when the turn
-		// delivered nothing - a silence token in an open channel - which is the only
-		// signal that the temporary status must go. Clearing on delivery alone left
-		// one orphaned "working" message per suppressed turn, and the typing hint
-		// (begun on engagement, ended only by a delivery) "typing…" for its full
-		// 330s cap after every silent turn (집가재, 2026-09-02).
-		if (progress.final) typing?.end(progress.origin.conversationId);
-		const action = progress.final ? status.clear(progress.origin.conversationId) : status.update(progress);
-		void action.catch((error) =>
-			log.error(
-				`Discord working status ${progress.final ? "clear" : "update"} failed: ${error instanceof Error ? error.message : String(error)}`,
-			),
-		);
+		// A final tick is unconditional, including silent turns. Terminal delivery
+		// settlement also clears commands without progress and replayed replies.
+		if (progress.final) {
+			// The chat.send response may have resolved earlier in this same read batch.
+			// Let its continuation arm typing/status before applying this terminal tick.
+			queueMicrotask(() => endDiscordWorkingState(progress.origin.conversationId, status, typing, log));
+			return;
+		}
+		void status
+			.update(progress)
+			.catch((error) =>
+				log.error(`Discord working status update failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
 	});
 }
 

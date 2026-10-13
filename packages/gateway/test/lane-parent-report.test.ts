@@ -689,7 +689,8 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 	f.port.complete(persona.opRef, "ack");
 });
 
-test("AC-435 Discord channel root trigger routes lane report to thread", async () => {
+// A channel message id is not a Discord thread id; public visibility makes a missing-thread fallback safe.
+test("AC-435 Discord channel root trigger routes the lane report through a public-thread fallback", async () => {
 	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-435" };
 	const f = await fixture({
 		ownerTarget: discordChannelOrigin,

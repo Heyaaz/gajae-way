@@ -60,6 +60,8 @@ dist/gajaeway-admin
 dist/gajaeway
 ```
 
+On macOS, `bun run build` finishes with `scripts/sign-dist.sh`, which re-signs every binary with a local code-signing identity if one is configured (identifiers: `dev.gajaeway.<gateway|slack|discord|telegram|admin|cli>`). Without macOS code signing, TCC grants (Documents, Desktop, Downloads, Full Disk Access) are pinned to one build's hash, so every rebuild re-prompts; with a stable identity a grant persists. The script reads the signing identity from `GAJAEWAY_CODESIGN_IDENTITY` or `~/.gajaeway/codesign-identity` (first line); if neither is set, ad-hoc signatures remain in place. On non-macOS hosts the script exits early, making it a safe no-op.
+
 Each adapter binary runs in the foreground. Discord and Slack `--help` and `--version` return without connecting. Every adapter acquires its own non-blocking home lease (`adapter-discord`, `adapter-slack`, or `adapter-telegram`) and refuses a second owner for the same `$GAJAEWAY_HOME`; no PID file decides ownership.
 
 The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the gateway package pin; the current pin is `0.18.11`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.
@@ -418,7 +420,8 @@ Both token files are credential-file references (relative paths resolve against 
 Create the Slack app from a manifest with:
 
 - Socket Mode **enabled**, and an app-level token with the `connections:write` scope (`appTokenFile`).
-- Bot token scopes: `app_mentions:read channels:history channels:read chat:write groups:history groups:read im:history im:read im:write mpim:history mpim:read reactions:read reactions:write users:read files:read commands`.
+- Bot token scopes: `app_mentions:read channels:history channels:read chat:write groups:history groups:read im:history im:read im:write mpim:history mpim:read reactions:read reactions:write users:read files:read files:write commands`.
+- `files:write` is required for outbound persona file attachments; the gateway accepts standalone `MEDIA:<absolute-path>` lines for Slack replies.
 - Event subscriptions (bot events): `message.channels message.groups message.im message.mpim reaction_added reaction_removed`.
 - Slash commands `/new`, `/reset`, `/restart`, and `/model` (any request URL; Socket Mode delivers them over the socket). Register `/model` even if you never plan to type it: Slack delivers a slash command to whichever workspace app registered its name, so if this app does not register `/model`, typing `/model` anywhere — including this bot's own DM — reaches whichever other app claimed it instead.
 

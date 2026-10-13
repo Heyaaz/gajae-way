@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
 	type ChatMessagePayload,
@@ -151,8 +151,8 @@ export interface WorkLaneManagerOptions {
 	readonly port: SessionPort;
 	readonly lanes: LaneGovernor;
 	readonly gajaewayHome: string;
-	/** Service directory (checkout root) where the gateway runs from. Derived from process.execPath if not provided. */
-	readonly serviceDirectory?: string;
+	/** Service directory (checkout root) where the gateway runs from. Lanes must not run inside this directory. */
+	readonly serviceDirectory: string;
 	/** Lane root directory where worktrees are created for repo bindings. If not provided, defaults to gajaewayHome. */
 	readonly laneRoot?: string;
 	readonly ownerTarget?: () => OriginRef | undefined;
@@ -188,19 +188,36 @@ interface StartContext {
  * Get the service directory where the gateway is running from.
  * This is the git root of the directory containing the running binary.
  */
-function getServiceDirectory(): string {
+export function getServiceDirectory(): string {
+	// A source checkout runs this module from disk; a compiled binary embeds it under a
+	// virtual root, so fall back to the binary's own directory there. `process.execPath`
+	// alone is the bun runtime in a source checkout, never the service checkout.
+	const moduleDir = import.meta.dir;
+	const anchor = existsSync(moduleDir) ? moduleDir : dirname(process.execPath);
 	try {
-		const binaryDir = dirname(process.execPath);
-		// Find the git root by running git rev-parse --show-toplevel
-		const gitRoot = execSync("git rev-parse --show-toplevel", {
-			cwd: binaryDir,
-			encoding: "utf-8",
-		}).trim();
-		return gitRoot;
-	} catch (error) {
-		// If not in a git repo, return the binary directory
-		return dirname(process.execPath);
+		return execSync("git rev-parse --show-toplevel", { cwd: anchor, encoding: "utf-8" }).trim();
+	} catch {
+		return anchor;
 	}
+}
+
+/** Nearest existing ancestor's realpath with the missing tail re-appended. */
+function realpathOfPossiblyMissing(path: string): string {
+	const absolute = resolve(path);
+	let existing = absolute;
+	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+	return join(realpathSync(existing), absolute.slice(existing.length));
+}
+
+/** Refuses a lane path equal to or nested in the service checkout (issue #480). */
+export function assertOutsideServiceDirectory(serviceDirectory: string, path: string, name: string): void {
+	const serviceDir = realpathOfPossiblyMissing(serviceDirectory);
+	const candidate = realpathOfPossiblyMissing(path);
+	if (candidate === serviceDir || candidate.startsWith(`${serviceDir}/`))
+		throw new ProtocolError("invalid_params", "lane cwd cannot be inside service directory", {
+			reasonCode: "cwd_inside_service_dir",
+			name,
+		});
 }
 
 /** Attempt ownership is independent of sockets, response deadlines and broker generations. */
@@ -281,6 +298,19 @@ export class WorkLaneManager {
 			this.#db.work.workAttemptPrepare(tx, runtime, record, runtime.mode === "historical" || bindingMatches);
 			this.#refreshWorkSession(tx, runtime, runtime.startedAt);
 		});
+	}
+	#rollbackUnpersistedWorktree(
+		name: string,
+		worktree: { readonly repository: string; readonly path: string; readonly branch: string },
+	): void {
+		try {
+			removeCreatedWorktree(worktree.repository, worktree.path, worktree.branch);
+		} catch (error) {
+			const reason = sanitizeDiagnostic(error instanceof Error ? error.message : String(error))
+				.replace(/\s+/gu, " ")
+				.slice(0, 200);
+			console.error(`work_setup_rollback_failed name=${name} reason=${reason || "unknown"}`);
+		}
 	}
 
 	#updateAttempt(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
@@ -687,59 +717,15 @@ export class WorkLaneManager {
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
-		// Validate that cwd is not inside the service directory (issue #480)
-		// Use realpath to properly handle symlinks and .. sequences
-		try {
-			const serviceDir = realpathSync(this.#options.serviceDirectory ?? getServiceDirectory());
-
-			// Get the realpath of cwd, handling non-existent paths
-			let cwdRealpath: string;
-			try {
-				cwdRealpath = realpathSync(input.cwd);
-			} catch (realpathError) {
-				// If realpath fails (e.g., path doesn't exist), resolve to absolute path
-				// and then try to resolve parent directories up to an existing ancestor
-				let current = resolve(input.cwd);
-				// Try to realpath the parent directories to handle the case where
-				// the path might be under a symlinked directory
-				while (current !== "/" && current !== dirname(current)) {
-					try {
-						const parent = dirname(current);
-						const realparent = realpathSync(parent);
-						// Reconstruct the path with the realpath of the parent
-						const relative = current.slice(parent.length);
-						current = realparent + relative;
-						break;
-					} catch {
-						current = dirname(current);
-					}
-				}
-				cwdRealpath = current;
-			}
-
-			// Normalize paths for comparison (remove trailing slashes)
-			const serviceDirNorm = serviceDir.endsWith("/") ? serviceDir.slice(0, -1) : serviceDir;
-			const cwdNorm = cwdRealpath.endsWith("/") ? cwdRealpath.slice(0, -1) : cwdRealpath;
-
-			// Refuse if cwd equals or is nested in service dir
-			if (cwdNorm === serviceDirNorm || cwdNorm.startsWith(`${serviceDirNorm}/`)) {
-				throw new ProtocolError("invalid_params", "lane cwd cannot be inside service directory", {
-					reasonCode: "cwd_inside_service_dir",
-					name: input.name,
-				});
-			}
-		} catch (error) {
-			// ProtocolError thrown by service dir validation should pass through
-			if (error instanceof ProtocolError) throw error;
-			throw new ProtocolError("invalid_params", `failed to validate lane cwd: ${error}`, {
-				reasonCode: "cwd_validation_failed",
-				name: input.name,
-			});
-		}
+		assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);
-		if (job && job.lane.worktreePath !== input.cwd)
+		// A repo-bound lane is identified by its repository; its cwd is the generated worktree.
+		if (
+			job &&
+			(job.lane.repository !== undefined ? job.lane.repository !== input.repo : job.lane.worktreePath !== input.cwd)
+		)
 			throw new ProtocolError("invalid_params", "work lane cwd mismatch", {
 				reasonCode: "lane_cwd_mismatch",
 				name: input.name,
@@ -763,65 +749,93 @@ export class WorkLaneManager {
 				};
 			job = acknowledgeHold({ record: job, note: "operator resumed the work lane", at: this.#at() });
 		}
+		let createdWorktree: { readonly repository: string; readonly path: string; readonly branch: string } | undefined;
 		if (!job) {
 			// If repo binding is provided, create a worktree from that repo
 			let worktreePath = input.cwd;
 			if (input.repo !== undefined) {
 				const laneRoot = this.#options.laneRoot ?? this.#options.gajaewayHome;
 				worktreePath = await createWorktreeFromRepo(laneRoot, input.name, input.repo, input.base);
+				createdWorktree = {
+					repository: input.repo,
+					path: worktreePath,
+					branch: `work/${input.name.toLowerCase()}`,
+				};
 			}
-			const facts = await collectRepoFacts(worktreePath);
-			job = createLaneJobRecord({
-				jobId,
-				branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
-				worktreePath,
-				baselineSha: facts?.headSha,
-				...(input.repo !== undefined ? { repository: input.repo } : {}),
-			});
-			// Use the actual worktree path for binding, not the input cwd
-			input = { ...input, cwd: worktreePath };
-		}
-		const binding = await this.#port.runExclusive("work/admission", async () => {
-			this.#live();
-			this.#options.lanes.assertAdmission(input.name);
 			try {
-				return await this.#port.bind({
-					originKey: sessionKey,
-					epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
-					repo: input.cwd,
-					codingRegister: true,
-					...(input.model ? { model: input.model } : {}),
+				assertOutsideServiceDirectory(this.#options.serviceDirectory, worktreePath, input.name);
+				const facts = await collectRepoFacts(worktreePath);
+				job = createLaneJobRecord({
+					jobId,
+					branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
+					worktreePath,
+					baselineSha: facts?.headSha,
+					...(input.repo !== undefined ? { repository: input.repo } : {}),
 				});
 			} catch (error) {
-				const cause = workBindFailureCause(error);
-				console.error(
-					`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${input.cwd} cause=${cause} error=${workBindFailureMessage(error)}`,
-				);
-				throw new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
-					reasonCode: "bind_failed",
-					cause,
-					name: input.name,
-				});
+				if (createdWorktree) this.#rollbackUnpersistedWorktree(input.name, createdWorktree);
+				throw error;
 			}
-		});
-		this.#live();
-		const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
-		const notice = mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch) : undefined;
-		const runtime = makeRuntime(
-			this.#db,
-			input.name,
-			binding.sessionId,
-			binding.epoch,
-			input.cwd,
-			this.#at(),
-			opRef,
-			mode,
-			mode === "start" ? context.parent : null,
-			context.wakeReportId ?? null,
-			notice?.hash ?? null,
-		);
-		job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
-		this.#prepareAttempt(runtime, job);
+		}
+		if (!job) throw new Error("work lane job was not initialized");
+		const initialJob = job;
+		// The session and the attempt share one path: the lane's recorded worktree (issue #480).
+		input = { ...input, cwd: job.lane.worktreePath };
+		const initialized = await (async () => {
+			try {
+				const binding = await this.#port.runExclusive("work/admission", async () => {
+					this.#live();
+					this.#options.lanes.assertAdmission(input.name);
+					try {
+						return await this.#port.bind({
+							originKey: sessionKey,
+							epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
+							repo: input.cwd,
+							codingRegister: true,
+							...(input.model ? { model: input.model } : {}),
+						});
+					} catch (error) {
+						const cause = workBindFailureCause(error);
+						console.error(
+							`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${input.cwd} cause=${cause} error=${workBindFailureMessage(error)}`,
+						);
+						throw new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
+							reasonCode: "bind_failed",
+							cause,
+							name: input.name,
+						});
+					}
+				});
+				this.#live();
+				const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+				const notice = mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch) : undefined;
+				const runtime = makeRuntime(
+					this.#db,
+					input.name,
+					binding.sessionId,
+					binding.epoch,
+					input.cwd,
+					this.#at(),
+					opRef,
+					mode,
+					mode === "start" ? context.parent : null,
+					context.wakeReportId ?? null,
+					notice?.hash ?? null,
+				);
+				const attemptJob = appendAttempt(initialJob, {
+					opRef,
+					sessionId: binding.sessionId,
+					startedAt: runtime.startedAt,
+				});
+				this.#prepareAttempt(runtime, attemptJob);
+				return { binding, notice, opRef, runtime };
+			} catch (error) {
+				if (createdWorktree && this.#db.work.laneJobJson(jobId) === undefined)
+					this.#rollbackUnpersistedWorktree(input.name, createdWorktree);
+				throw error;
+			}
+		})();
+		const { binding, notice, opRef, runtime } = initialized;
 
 		const observer = this.#register(runtime);
 		this.#attach(observer);
@@ -2614,4 +2628,26 @@ async function createWorktreeFromRepo(
 			repo,
 		});
 	}
+}
+
+function removeCreatedWorktree(repository: string, worktreePath: string, branch: string): void {
+	const remove = Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
+		stdout: "pipe",
+		stderr: "pipe",
+		cwd: repository,
+	});
+	const deleteBranch = Bun.spawnSync(["git", "branch", "-D", branch], {
+		stdout: "pipe",
+		stderr: "pipe",
+		cwd: repository,
+	});
+	const failures = [
+		remove.exitCode === 0
+			? undefined
+			: `git worktree remove failed: ${remove.stderr?.toString().trim() || "unknown error"}`,
+		deleteBranch.exitCode === 0
+			? undefined
+			: `git branch delete failed: ${deleteBranch.stderr?.toString().trim() || "unknown error"}`,
+	].filter((failure): failure is string => failure !== undefined);
+	if (failures.length > 0) throw new Error(failures.join("; "));
 }

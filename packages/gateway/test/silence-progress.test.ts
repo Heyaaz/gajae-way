@@ -48,17 +48,19 @@ describe("progress subscription", () => {
 		expect(h.calls).toEqual(["update:c1"]);
 	});
 
-	test("a final event clears it, which is what a silenced turn relies on", () => {
+	test("a final event clears it, which is what a silenced turn relies on", async () => {
 		const h = harness();
 		h.emit();
 		h.emit({ final: true });
+		await Promise.resolve();
 		expect(h.calls).toEqual(["update:c1", "clear:c1"]);
 	});
 
-	test("clear happens even when the turn never delivered a message", () => {
+	test("clear happens even when the turn never delivered a message", async () => {
 		const h = harness();
 		h.emit();
 		h.emit({ final: true, outputTokens: 0 });
+		await Promise.resolve();
 		expect(h.calls.filter((call) => call.startsWith("clear:"))).toEqual(["clear:c1"]);
 	});
 

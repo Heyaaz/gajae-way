@@ -320,8 +320,8 @@ describe("durable single broker authority", () => {
 		).toThrow("old_work_open");
 		const id = cutover(database);
 		const snapshot = JSON.parse(database.bindings.cutoverSnapshot(id)!);
+		expect(Object.keys(snapshot)).toEqual(["sessions"]);
 		expect(snapshot.sessions[0].gjc_session_id).toBe(SESSION);
-		expect(snapshot.inbound_messages).toHaveLength(3);
 		expect(database.bindings.getSessionRecord(ORIGIN)).toEqual({ sessionId: "", epoch: 1 });
 		expect(raw.query("SELECT * FROM inbound_messages ORDER BY message_id").all()).toEqual(inboundBefore);
 		expect(raw.query("SELECT * FROM deliveries").all()).toEqual(deliveriesBefore);
