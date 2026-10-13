@@ -28,26 +28,6 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-slo-"));
 	const path = join(home, "gateway.sock");
 	const requests: Array<{ verb: string; params: unknown }> = [];
-	const output: string[] = [];
-	const errors: string[] = [];
-	const originalLog = console.log;
-	const originalError = console.error;
-	const previousExit = process.exitCode;
-	console.log = (line: unknown) => {
-		const text = String(line);
-		if (text.startsWith("SLO ")) {
-			output.push(text);
-			return;
-		}
-		try {
-			const value = JSON.parse(text) as { days?: unknown; windows?: unknown; ok?: unknown };
-			if (Array.isArray(value.days) && Array.isArray(value.windows) && typeof value.ok === "boolean") output.push(text);
-		} catch {
-			// Another concurrently running test may write to the shared console.
-		}
-	};
-	console.error = (line: unknown) => errors.push(String(line));
-	process.exitCode = 0;
 	const listener = Bun.listen<{ buffer: string }>({
 		unix: path,
 		socket: {
@@ -64,7 +44,8 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 					if (frame.type === "hello")
 						socket.write(`${JSON.stringify({ v: "0.1", type: "negotiated", payload: { profileVersion: "v0.1" } })}\n`);
 					else if (frame.type === "request") {
-						requests.push({ verb: frame.verb!, params: frame.params });
+						if (frame.verb === undefined) throw new Error("gateway request omitted verb");
+						requests.push({ verb: frame.verb, params: frame.params });
 						socket.write(`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result })}\n`);
 					}
 					newline = socket.data.buffer.indexOf("\n");
@@ -73,12 +54,23 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 		},
 	});
 	try {
-		await main(["--socket", path, "ops", "slo", ...args]);
-		return { requests, output, errors, exitCode: process.exitCode ?? 0 };
+		const child = Bun.spawn(
+			[process.execPath, join(import.meta.dir, "../src/main.ts"), "--socket", path, "ops", "slo", ...args],
+			{
+				cwd: join(import.meta.dir, "../../.."),
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env, GAJAEWAY_HOME: home },
+			},
+		);
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		return { requests, stdout, stderr, exitCode };
 	} finally {
-		console.log = originalLog;
-		console.error = originalError;
-		process.exitCode = previousExit;
 		listener.stop(true);
 		await rm(home, { recursive: true, force: true });
 	}
@@ -121,26 +113,37 @@ describe("ops slo exit contract", () => {
 		const run = await runOpsSloCli(result, ["--days", "1", "--json"]);
 		expect(run.requests).toEqual([{ verb: "ops.slo", params: { days: 1 } }]);
 		expect(run.exitCode).toBe(0);
-		expect(JSON.parse(run.output[0]!)).toEqual(result);
+		expect(run.stderr).toBe("");
+		expect(run.stdout).toBe(`${JSON.stringify(result)}\n`);
+		expect(JSON.parse(run.stdout)).toEqual(result);
 		expect(sloExitCode(result)).toBe(0);
 		expect(renderSlo(result).join("\\n")).toContain("verified=true");
 		expect(renderSlo(result).join("\\n")).toContain("over_cap_ms=60000");
 	});
 
 	test("pending has a rerun-later message and a nonzero exit", async () => {
-		const run = await runOpsSloCli(sampleSloResult("pending"), ["--days", "1"]);
+		const result = sampleSloResult("pending");
+		const run = await runOpsSloCli(result, ["--days", "1"]);
 		expect(run.exitCode).toBe(1);
-		expect(run.output[0]).toContain("SLO pending");
-		expect(run.output[0]).toContain("rerun later");
+		expect(run.stderr).toBe("");
+		expect(run.stdout).toBe(`${renderSlo(result).join("\n")}\n`);
+		expect(run.stdout).toContain("SLO pending");
+		expect(run.stdout).toContain("rerun later");
 	});
 
 	test("failed and insufficient are distinct nonzero outcomes", async () => {
-		const failed = await runOpsSloCli(sampleSloResult("failed"), []);
-		const insufficient = await runOpsSloCli(sampleSloResult("insufficient"), []);
+		const failedResult = sampleSloResult("failed");
+		const insufficientResult = sampleSloResult("insufficient");
+		const failed = await runOpsSloCli(failedResult, []);
+		const insufficient = await runOpsSloCli(insufficientResult, []);
 		expect(failed.exitCode).toBe(1);
-		expect(failed.output[0]).toContain("SLO failed");
+		expect(failed.stderr).toBe("");
+		expect(failed.stdout).toBe(`${renderSlo(failedResult).join("\n")}\n`);
+		expect(failed.stdout).toContain("SLO failed");
 		expect(insufficient.exitCode).toBe(1);
-		expect(insufficient.output[0]).toContain("SLO insufficient");
+		expect(insufficient.stderr).toBe("");
+		expect(insufficient.stdout).toBe(`${renderSlo(insufficientResult).join("\n")}\n`);
+		expect(insufficient.stdout).toContain("SLO insufficient");
 	});
 });
 describe("cli arguments", () => {
