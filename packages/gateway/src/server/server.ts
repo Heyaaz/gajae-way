@@ -63,7 +63,7 @@ import { MemoryClosureQueue } from "../memory/closure";
 import { initializeMemory, memoryRoot } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
 import { validateMemory } from "../memory/validator";
-import { MonitorPropagator } from "../monitors/propagate";
+import { MONITOR_REPORT_MESSAGE_ID_PREFIX, MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
@@ -819,6 +819,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		memory,
 		delivery,
 		ownerTarget: options.config.ownerTarget,
+		notifyInbound: (originKey) => personaSessions.notifyInbound(originKey),
 		contextFailureRollThreshold: options.config.monitorContextFailureRollThreshold,
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
@@ -2029,6 +2030,9 @@ async function handleRequest(
 			throw new ProtocolError("unknown_verb", `unknown verb: ${request.verb}`);
 	}
 }
+function isInternalReportMessageId(messageId: string): boolean {
+	return messageId.startsWith("lane-report-") || messageId.startsWith(MONITOR_REPORT_MESSAGE_ID_PREFIX);
+}
 async function sendChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -2047,8 +2051,8 @@ async function sendChat(
 		| undefined;
 	if (!params || typeof params.text !== "string" || !params.text)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
-	if (typeof params.messageId === "string" && params.messageId.startsWith("lane-report-"))
-		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be sent to chat");
+	if (typeof params.messageId === "string" && isInternalReportMessageId(params.messageId))
+		throw new ProtocolError("invalid_params", "internal report identifiers cannot be sent to chat");
 	const userText: string = params.text;
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
@@ -2483,8 +2487,8 @@ async function editChat(
 		throw new ProtocolError("invalid_params", "chat.edit requires non-empty text");
 	if (typeof params.messageId !== "string" || !params.messageId)
 		throw new ProtocolError("invalid_params", "chat.edit requires the edited messageId");
-	if (params.messageId.startsWith("lane-report-"))
-		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be edited");
+	if (isInternalReportMessageId(params.messageId))
+		throw new ProtocolError("invalid_params", "internal report identifiers cannot be edited");
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
 		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
@@ -3690,7 +3694,7 @@ function reportTerminalLinkAudit(database: Store): void {
 }
 
 function laneReportTriggerText(body: string): string {
-	return `[Internal lane report: from your work lane, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
+	return `[Internal report from another Gajae session, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
 }
 function deliveryProjection(payloadJson: string): { readonly conversationId: string; readonly text: string } {
 	try {
