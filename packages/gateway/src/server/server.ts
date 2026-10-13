@@ -98,6 +98,7 @@ import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachme
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
+	extractHandoffIfMidMessage,
 	type HandoffProvenance,
 	type HandoffReply,
 	handoffMessageId,
@@ -107,6 +108,7 @@ import {
 	renderHandoffPointer,
 	renderHandoffTurn,
 	resolveHandoffTarget,
+	stripHandoffTokens,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
@@ -2512,17 +2514,50 @@ async function createInboundTurnLifecycle(
 	const postRefusalsLogged = new Set<string>();
 	const deliverTurnText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
-		const handoff = parseHandoffReply(rawMessage);
-		if (handoff) {
+		let messageToProcess = rawMessage;
+		let handoffAfterDelivery: HandoffReply | undefined;
+
+		// Check if message STARTS with a handoff token
+		const handoffAtStart = parseHandoffReply(rawMessage);
+		if (handoffAtStart) {
 			// The work itself never posts here; only the final answer hands off.
-			if (source === "terminal") await handOff(handoff);
+			if (source === "terminal") await handOff(handoffAtStart);
 			return;
 		}
-		let message = rawMessage;
+
+		// Check if message contains a handoff token mid-message (after some text).
+		// If so, deliver the text before the token first, then trigger handoff.
+		const midMessageHandoff = extractHandoffIfMidMessage(rawMessage);
+		if (midMessageHandoff) {
+			// Process only the text before the token
+			messageToProcess = midMessageHandoff.textBefore;
+			// Save handoff to trigger after delivery
+			if (source === "terminal") {
+				handoffAfterDelivery = midMessageHandoff.handoff;
+			}
+		}
+		let message = messageToProcess;
+		// Strip tokens that failed to parse as handoff (e.g., [HANDOFF:] with empty target).
+		// These are tokens at line boundaries that don't have a valid target.
+		const lineTokens = message.match(/^\s*\[HANDOFF:[^\]]*\][^\S\n]*(?:\n|$)|\n\s*\[HANDOFF:[^\]]*\][^\S\n]*(?:\n|$)/g);
+		if (lineTokens) {
+			// Check if any of these tokens are invalid (have empty or whitespace-only targets)
+			const hasInvalidToken = lineTokens.some((token) => {
+				const targetMatch = token.match(/\[HANDOFF:([^\]\s]*)\]/);
+				return !targetMatch || !targetMatch[1];
+			});
+			if (hasInvalidToken) {
+				message = stripHandoffTokens(message);
+				console.warn(`gateway ${key}: invalid HANDOFF token at line boundary stripped from delivery`);
+			}
+		}
 		const reactionReply = parseReactionReply(message);
 		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
 			message = reactionReply.body;
-			if (!message) return;
+			if (!message) {
+				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
+				return;
+			}
 		} else if (reactionReply) {
 			reactionsClaimedFor.add(rawMessage);
 			reactionTokensSeen = true;
@@ -2594,7 +2629,10 @@ async function createInboundTurnLifecycle(
 				}
 			}
 			message = reactionReply.body;
-			if (!message) return;
+			if (!message) {
+				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
+				return;
+			}
 		}
 		// Control tokens are internal protocol, never user-visible. Models routinely
 		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
@@ -2738,6 +2776,9 @@ async function createInboundTurnLifecycle(
 			assistantDeliveryStarted = true;
 			const isLast = step === local.at(-1);
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
+		}
+		if (handoffAfterDelivery) {
+			await handOff(handoffAfterDelivery);
 		}
 	};
 	/**

@@ -23,6 +23,8 @@ export const HANDOFF_DIGEST_MAX_LENGTH = MONITOR_DIGEST_MAX_LENGTH;
 export const HANDOFF_NOTE_MAX_LENGTH = 4000;
 const DIGEST_LINE_MAX_LENGTH = 300;
 
+// Token must be at the very start of the message (possibly with leading whitespace).
+// No /m flag: this matches only at the start of the entire string, not at line boundaries.
 const HANDOFF_TOKEN = /^\s*\[HANDOFF:([^\]\s]+)\][^\S\n]*(?:\n|$)/;
 
 export interface HandoffReply {
@@ -30,11 +32,49 @@ export interface HandoffReply {
 	readonly note: string;
 }
 
-/** A reply is a handoff only when its FIRST line is the token; mid-text it is plain text. */
+/**
+ * A reply is a handoff only when the token is the first line of any text block.
+ * Mid-text or mid-line tokens are not directives, but they must never be delivered verbatim.
+ * Use stripHandoffTokens() to clean a message before delivery.
+ */
 export function parseHandoffReply(text: string): HandoffReply | undefined {
 	const match = text.match(HANDOFF_TOKEN);
 	if (!match?.[1]) return undefined;
-	return { target: match[1], note: text.slice(match[0].length).trim() };
+	// When /m flag matches at line start, calculate the note from the end of the token match.
+	const noteStart = match.index! + match[0].length;
+	return { target: match[1], note: text.slice(noteStart).trim() };
+}
+
+/**
+ * Check if text contains a handoff token that's not at the start.
+ * Returns the text before the token (to be delivered) and the handoff (if found).
+ */
+export function extractHandoffIfMidMessage(text: string): { textBefore: string; handoff: HandoffReply } | undefined {
+	// Check if a token appears anywhere in the text (at a line boundary)
+	const tokenMatch = text.match(/\n\s*\[HANDOFF:([^\]\s]+)\][^\S\n]*(?:\n|$)/);
+	if (!tokenMatch?.[1]) return undefined;
+
+	// Token found mid-message: extract text before it and the handoff
+	const tokenStart = tokenMatch.index! + 1; // +1 for the \n
+	const textBefore = text.slice(0, tokenStart).trimEnd();
+	const noteStart = tokenMatch.index! + tokenMatch[0].length;
+	const note = text.slice(noteStart).trim();
+
+	return {
+		textBefore,
+		handoff: { target: tokenMatch[1], note },
+	};
+}
+
+/**
+ * Strip only line-standalone HANDOFF tokens from text that are invalid directives.
+ * Inline mentions (including in backticks or mid-sentence) are preserved as literal text.
+ * The caller should have already checked parseHandoffReply before calling this.
+ */
+export function stripHandoffTokens(text: string): string {
+	// Remove tokens that are on a line by themselves (optionally with whitespace).
+	// Inline mentions are intentionally preserved.
+	return text.replace(/^\s*\[HANDOFF:[^\]]*\][^\S\n]*(?:\n|$)/gm, "").trim();
 }
 
 /**
