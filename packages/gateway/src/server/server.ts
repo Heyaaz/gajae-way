@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
@@ -16,17 +16,22 @@ import {
 	isPlatformMessageId,
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
+	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	type MonitorScheduleProjection,
 	negotiate,
 	OrderedFrameWriter,
 	type OriginRef,
+	OUTBOUND_FILE_MAX_BYTES,
+	OUTBOUND_FILES_PER_TURN_CAP,
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
+	parseFileReply,
 	parseOriginKey,
 	parseReactionReply,
+	platformSupportsFiles,
 	platformSupportsReaction,
 	REACTIONS_PER_MESSAGE_CAP,
 	REACTIONS_PER_TURN_CAP,
@@ -58,7 +63,7 @@ import { MemoryClosureQueue } from "../memory/closure";
 import { initializeMemory, memoryRoot } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
 import { validateMemory } from "../memory/validator";
-import { MonitorPropagator } from "../monitors/propagate";
+import { MONITOR_REPORT_MESSAGE_ID_PREFIX, MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
@@ -87,7 +92,7 @@ import {
 	deterministicPostDeliveryId,
 	deterministicTerminalDeliveryId,
 } from "../orchestrator/tail-runner";
-import { laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
+import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
@@ -127,6 +132,7 @@ import {
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
+import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -318,9 +324,97 @@ async function applyConfigReload(
 	return result;
 }
 
+/**
+ * Prune expired memory operations and cap the map size to prevent unbounded growth.
+ * Extracted for testability; called periodically during operation and in tests.
+ */
+export function pruneExpiredMemoryOps(memoryOps: Map<string, MemoryOpStatus>, nowMs: number): void {
+	// Remove expired operations (past their 24h TTL)
+	for (const [opRef, op] of Array.from(memoryOps.entries())) {
+		if (op.status !== "pending" && new Date(op.expireAt).getTime() < nowMs) {
+			memoryOps.delete(opRef);
+		}
+	}
+
+	// Cap the map size to prevent unbounded memory growth
+	if (memoryOps.size > 10_000) {
+		const entries = Array.from(memoryOps.entries())
+			.filter(([, op]) => op.status !== "pending")
+			.sort(([, a], [, b]) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime());
+		for (const [opRef] of entries.slice(0, memoryOps.size - 5_000)) {
+			memoryOps.delete(opRef);
+		}
+	}
+}
+
+/**
+ * Get or create a pending memory operation of a specific kind.
+ * Returns opRef and created flag: created=true means a new operation was just created
+ * and the caller should start the sweep; created=false means it's reusing an existing pending op.
+ * Ensures kind-specific deduplication: audit pending ops never dedup autolink requests and vice versa.
+ */
+export function getOrCreatePendingMemoryOp(
+	memoryOps: Map<string, MemoryOpStatus>,
+	kind: "audit" | "autolink",
+): { opRef: string; created: boolean } {
+	// Check for existing pending operation of the SAME kind
+	for (const [opRef, op] of Array.from(memoryOps.entries())) {
+		if (op.status === "pending") {
+			// Distinguish by opRef prefix: gw-ma- (audit), gw-ml- (autolink)
+			const opKind = opRef.startsWith("gw-ma-") ? "audit" : "autolink";
+			if (opKind === kind) {
+				return { opRef, created: false }; // Reuse existing pending operation of same kind
+			}
+		}
+	}
+
+	// No pending operation of this kind; create new one
+	const prefix = kind === "audit" ? "gw-ma" : "gw-ml";
+	const opRef = `${prefix}-${crypto.randomUUID()}`;
+	const started = new Date().toISOString();
+	const expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+	memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
+	return { opRef, created: true };
+}
+
+interface MemoryOpStatus {
+	status: "pending" | "completed" | "failed";
+	result?: unknown;
+	error?: string;
+	elapsedMs?: number;
+	startedAt: string;
+	expireAt: string; // For pruning old operations
+}
+
+function startMemoryOperation(runtime: Runtime, opRef: string, work: () => Promise<unknown>): void {
+	let task: Promise<void>;
+	task = Promise.resolve()
+		.then(work)
+		.then((result) => {
+			const operation = runtime.memoryOps.get(opRef);
+			if (operation) {
+				operation.status = "completed";
+				operation.result = result;
+				operation.elapsedMs = Math.max(0, Date.now() - Date.parse(operation.startedAt));
+			}
+		})
+		.catch((error: unknown) => {
+			const operation = runtime.memoryOps.get(opRef);
+			if (operation) {
+				operation.status = "failed";
+				operation.error = diagnostic(error);
+				operation.elapsedMs = Math.max(0, Date.now() - Date.parse(operation.startedAt));
+			}
+		})
+		.finally(() => runtime.memoryOperationTasks.delete(task));
+	runtime.memoryOperationTasks.add(task);
+}
+
 interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
+	/** Canonical persona workspace shared by session binding and outbound file checks. */
+	readonly workspace: string;
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
 	readonly sessionPort: SessionPort;
@@ -329,6 +423,10 @@ interface Runtime {
 	stop?: (reason?: string) => Promise<void>;
 	readonly connections: Set<Connection>;
 	readonly memory: MemoryClosureQueue;
+	/** Tracked memory operations (autolink, audit) keyed by opRef. */
+	readonly memoryOps: Map<string, MemoryOpStatus>;
+	/** Running memory operations are drained before gateway shutdown. */
+	readonly memoryOperationTasks: Set<Promise<void>>;
 	readonly registry: MonitorRegistry;
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
@@ -337,6 +435,7 @@ interface Runtime {
 	readonly panelExpirySweepTimer: ReturnType<typeof setInterval>;
 	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
+	readonly memoryOpsCleanupTimer: ReturnType<typeof setInterval>;
 	readonly stopRetention: () => void;
 	readonly stopBrokerGenerationListener?: () => void;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
@@ -391,6 +490,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			clearInterval(runtime.panelExpirySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
+			clearInterval(runtime.memoryOpsCleanupTimer);
 			runtime.stopRetention();
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
 			// quiesce every admitted producer before taking the final writer snapshot.
@@ -398,6 +498,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			runtime.stopBrokerGenerationListener?.();
 			await runtime.work.stop();
 			await Promise.all([...runtime.requests]);
+			await Promise.all([...runtime.memoryOperationTasks]);
 			await runtime.personaSessions.drain();
 			await runtime.personaSessions.stop();
 			await runtime.monitorRuntime.stop();
@@ -510,6 +611,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			clearInterval(runtime.panelExpirySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
+			clearInterval(runtime.memoryOpsCleanupTimer);
 			runtime.stopRetention();
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			runtime.stopBrokerGenerationListener?.();
@@ -517,6 +619,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			// Same producer quiescence as the Unix server: in-flight stdio requests are
 			// tracked and awaited before persona/tail/broker teardown.
 			await Promise.all([...runtime.requests]);
+			await Promise.all([...runtime.memoryOperationTasks]);
 			await runtime.personaSessions.drain();
 			await runtime.personaSessions.stop();
 			await runtime.monitorRuntime.stop();
@@ -716,6 +819,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		memory,
 		delivery,
 		ownerTarget: options.config.ownerTarget,
+		notifyInbound: (originKey) => personaSessions.notifyInbound(originKey),
 		contextFailureRollThreshold: options.config.monitorContextFailureRollThreshold,
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
@@ -753,6 +857,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		port: sessionPort,
 		lanes,
 		gajaewayHome: options.config.home,
+		serviceDirectory: getServiceDirectory(),
 		ownerTarget: () => runtime.config.ownerTarget?.origin,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		allowNested: () => runtime.config.work?.allowNested === true,
@@ -822,6 +927,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		60 * 60 * 1000,
 	);
+	// Clean up expired memory operations to prevent unbounded growth (#473)
+	const memoryOpsCleanupTimer = setInterval(
+		() => {
+			try {
+				pruneExpiredMemoryOps(runtime.memoryOps, Date.now());
+			} catch (error) {
+				console.error(`memory operations cleanup failed: ${diagnostic(error)}`);
+			}
+		},
+		5 * 60 * 1000,
+	); // Every 5 minutes
 	// History GC: bounded batches with a macrotask yield between them so a large
 	// backlog never holds the event loop (and the single writer) for long.
 	let retentionRunning = false;
@@ -874,6 +990,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			: undefined;
 	runtime = {
 		config: options.config,
+		workspace,
 		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		sessionPort,
@@ -888,6 +1005,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		panelExpirySweepTimer,
 		stallTimer,
 		contextMaintenanceTimer,
+		memoryOpsCleanupTimer,
 		stopRetention,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
@@ -906,6 +1024,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		inbound,
 		requests: new Set(),
 		permissionPanels,
+		memoryOps: new Map(),
+		memoryOperationTasks: new Set(),
 		secretGuard:
 			options.secretGuard ??
 			new SecretGuard(secretSourcesFromEnv(process.env, options.broker?.agentDir, options.config.home)),
@@ -1444,23 +1564,55 @@ async function handleRequest(
 			return;
 		}
 		case "memory.audit": {
-			const root = await initializeMemory(options.config.home);
-			const issues = await validateMemory(root);
+			// Track async memory operations to prevent client timeouts during long operations (#473).
+			// Kind-specific deduplication: audit requests don't dedup with autolink operations.
+			const { opRef, created } = getOrCreatePendingMemoryOp(runtime.memoryOps, "audit");
+
+			if (!created) {
+				// Already running; return existing opRef
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { opRef },
+				});
+				return;
+			}
+
+			startMemoryOperation(runtime, opRef, async () => {
+				const root = await initializeMemory(options.config.home);
+				const issues = await validateMemory(root);
+				return { ok: issues.length === 0, issues };
+			});
+
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { ok: issues.length === 0, issues },
+				result: { opRef },
 			});
 			return;
 		}
 		case "memory.autolink": {
+			// Track async memory operations to prevent client timeouts during long operations (#473).
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
 			// Runs through shared lock to serialize with intent commits (#341).
-			const root = await initializeMemory(options.config.home);
-			const report = await autolinkCorpus(root, runtime.memory);
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
+			// Kind-specific deduplication: autolink requests don't dedup with audit operations.
+			const { opRef, created } = getOrCreatePendingMemoryOp(runtime.memoryOps, "autolink");
+
+			if (!created) {
+				// Already running; return existing opRef
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
+				return;
+			}
+
+			startMemoryOperation(runtime, opRef, async () => {
+				const root = await initializeMemory(options.config.home);
+				return autolinkCorpus(root, runtime.memory);
+			});
+
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
 			return;
 		}
 		case "memory.search": {
@@ -1473,6 +1625,24 @@ async function handleRequest(
 				type: "response",
 				id: request.id,
 				result: { hits: await searchMemory(root, params.query, limit) },
+			});
+			return;
+		}
+		case "memory.status": {
+			const params = (request.params ?? {}) as { opRef?: unknown };
+			if (typeof params.opRef !== "string") throw new ProtocolError("invalid_params", "memory.status requires opRef");
+			const op = runtime.memoryOps.get(params.opRef);
+			if (!op) throw new ProtocolError("invalid_params", `unknown opRef: ${params.opRef}`);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: {
+					status: op.status,
+					elapsedMs: op.elapsedMs ?? Math.max(0, Date.now() - Date.parse(op.startedAt)),
+					...(op.result !== undefined ? { result: op.result } : {}),
+					...(op.error ? { error: op.error } : {}),
+				},
 			});
 			return;
 		}
@@ -1569,6 +1739,16 @@ async function handleRequest(
 				params.payload ?? {},
 			);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { eventId } });
+			return;
+		}
+		case "monitor.settle":
+		case "monitor.retry": {
+			const eventId = (request.params as { eventId?: unknown } | undefined)?.eventId;
+			if (typeof eventId !== "string" || eventId.trim().length === 0)
+				throw new ProtocolError("invalid_params", `${request.verb} requires a non-empty eventId`);
+			const result: MonitorEventOperatorResult =
+				request.verb === "monitor.settle" ? runtime.monitors.settle(eventId) : runtime.monitors.retry(eventId);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
 		case "monitor.remove": {
@@ -1850,6 +2030,9 @@ async function handleRequest(
 			throw new ProtocolError("unknown_verb", `unknown verb: ${request.verb}`);
 	}
 }
+function isInternalReportMessageId(messageId: string): boolean {
+	return messageId.startsWith("lane-report-") || messageId.startsWith(MONITOR_REPORT_MESSAGE_ID_PREFIX);
+}
 async function sendChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -1868,8 +2051,8 @@ async function sendChat(
 		| undefined;
 	if (!params || typeof params.text !== "string" || !params.text)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
-	if (typeof params.messageId === "string" && params.messageId.startsWith("lane-report-"))
-		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be sent to chat");
+	if (typeof params.messageId === "string" && isInternalReportMessageId(params.messageId))
+		throw new ProtocolError("invalid_params", "internal report identifiers cannot be sent to chat");
 	const userText: string = params.text;
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
@@ -2303,8 +2486,8 @@ async function editChat(
 		throw new ProtocolError("invalid_params", "chat.edit requires non-empty text");
 	if (typeof params.messageId !== "string" || !params.messageId)
 		throw new ProtocolError("invalid_params", "chat.edit requires the edited messageId");
-	if (params.messageId.startsWith("lane-report-"))
-		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be edited");
+	if (isInternalReportMessageId(params.messageId))
+		throw new ProtocolError("invalid_params", "internal report identifiers cannot be edited");
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
 		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
@@ -2511,11 +2694,13 @@ async function createInboundTurnLifecycle(
 				config: runtime.config,
 			})
 		: undefined;
+	// Stable per origin: the persona actor sends it only when the session's
+	// context may not hold it. The bootstrap and a changed-AGENTS.md section are
+	// one-shot and ride their own send.
+	const sessionBootstrap = [bootstrap?.text, agentsMdSection].filter(Boolean).join("\n\n");
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
-		...(agentsMdSection ? [agentsMdSection] : []),
 		currentConversationNotice(origin),
-		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
 		SECRET_GUARD_SYSTEM_NOTICE,
@@ -2791,6 +2976,51 @@ async function createInboundTurnLifecycle(
 	const terminalPosts = new Set<string>();
 	/** A refused [POST:] part is logged once, not on every pass over the same text. */
 	const postRefusalsLogged = new Set<string>();
+	/** Requested paths this turn already handled, so the terminal pass and the cap see each file once. */
+	const filesHandled = new Set<string>();
+	/**
+	 * Uploads the reply's MEDIA:<path> attachments into the same place its text
+	 * went. Each file is its own ledger delivery under a deterministic id; a file
+	 * that cannot be sent becomes a short visible note instead of vanishing.
+	 */
+	const deliverFiles = async (paths: readonly string[], replyTo: string | undefined) => {
+		const notify = (deliveryId: string, text: string) => {
+			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, replyTo, deliveryId, false);
+			if (!payload) return;
+			deliveredIds.push(payload.deliveryId as string);
+			assistantDeliveryStarted = true;
+			broadcastDelivery(runtime, payload);
+		};
+		for (const requested of paths) {
+			if (filesHandled.has(requested)) continue;
+			filesHandled.add(requested);
+			const deliveryId = deterministicFileDeliveryId(key, input.turn.triggerMessageId, requested);
+			if (filesHandled.size > OUTBOUND_FILES_PER_TURN_CAP) {
+				notify(
+					`${deliveryId}-x`,
+					`(file not sent: ${basename(requested)} - at most ${OUTBOUND_FILES_PER_TURN_CAP} files per reply)`,
+				);
+				continue;
+			}
+			const checked = await checkOutboundFile(requested, {
+				home: runtime.config.home,
+				workspace: runtime.workspace,
+				...(runtime.config.outboundFileRoots ? { roots: runtime.config.outboundFileRoots } : {}),
+			});
+			if (!checked.ok) {
+				console.error(
+					`gateway file refused origin=${key} file=${safeDiagnosticField(checked.name)}: ${checked.reason}`,
+				);
+				notify(`${deliveryId}-x`, `(file not sent: ${checked.name} - ${checked.reason})`);
+				continue;
+			}
+			const payload = runtime.delivery.prepareFile(crypto.randomUUID(), origin, checked.file, deliveryId, replyTo);
+			if (!payload) continue;
+			deliveredIds.push(payload.deliveryId as string);
+			assistantDeliveryStarted = true;
+			broadcastDelivery(runtime, payload);
+		}
+	};
 	const deliverTurnText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		let messageToProcess = rawMessage;
@@ -2910,6 +3140,11 @@ async function createInboundTurnLifecycle(
 				return;
 			}
 		}
+		// MEDIA:<path> lines become their own deliveries after the text parts, on
+		// platforms whose upload goes through the ledger. Elsewhere the lines stay in
+		// the text for an adapter that attaches them natively.
+		const fileReply = platformSupportsFiles(origin.platform) ? parseFileReply(message) : undefined;
+		if (fileReply) message = fileReply.body;
 		// Control tokens are internal protocol, never user-visible. Models routinely
 		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
 		// part is judged by whether it CLOSES with the token, not whether it equals
@@ -2996,7 +3231,7 @@ async function createInboundTurnLifecycle(
 			// The per-turn part budget bounds MID-WORK speech only. The terminal
 			// answer always records its claim: with an ungated stream a chatty turn
 			// could otherwise exhaust the budget on interims and lose its final.
-			if (source === "interim" && deliveredParts.length >= maxTurnParts) return;
+			if (source === "interim" && deliveredParts.length >= maxTurnParts) break;
 			const step = planned[index] as PlannedPart;
 			if (step.post) {
 				// A post leaves this conversation, so it is sent once, from the
@@ -3053,6 +3288,7 @@ async function createInboundTurnLifecycle(
 			const isLast = step === local.at(-1);
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
 		}
+		if (fileReply) await deliverFiles(fileReply.paths, planned.at(-1)?.replyTo ?? inboundThreadRoot);
 		if (handoffAfterDelivery) {
 			await handOff(handoffAfterDelivery);
 		}
@@ -3118,8 +3354,6 @@ async function createInboundTurnLifecycle(
 	let lastProgressAt = 0;
 	let lastKnown = { toolCalls: 0, outputTokens: 0 };
 	let activity: ChatProgressActivity | undefined;
-	/** Heartbeats present the most recent tail observation; they never invent progress. */
-	let tailActivitySeen = false;
 	let ended = false;
 	const emitProgress = (
 		progress: { toolCalls: number; outputTokens: number },
@@ -3181,7 +3415,6 @@ async function createInboundTurnLifecycle(
 	// biome-ignore lint/correctness/noUnusedFunctionParameters: sessionId provided by caller
 	const onFrame = async ({ frame, sessionId }: PersonaTailFrameInput) => {
 		if (ended) return false;
-		tailActivitySeen = true;
 		// Every assistant message the owned relay delivers before the final answer
 		// is mid-work speech. The persona's own instructions decide what it says
 		// mid-turn; the gateway delivers it. The stream delivers each message
@@ -3249,7 +3482,7 @@ async function createInboundTurnLifecycle(
 		runtime.inbound.delete(steered.message_id);
 		acknowledgeSteer(runtime, steered, turnId);
 	};
-	const onTerminal = async ({ text }: PersonaTerminalInput) => {
+	const onTerminal = async ({ text, alreadyPosted }: PersonaTerminalInput) => {
 		let threw = false;
 		try {
 			const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
@@ -3272,6 +3505,9 @@ async function createInboundTurnLifecycle(
 				);
 			});
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
+			// Recovered from the transcript after it already reached the room under
+			// another turn: recorded above, never posted a second time.
+			if (alreadyPosted) return;
 			if (!nonLoopback) {
 				if (connection)
 					connection.write({
@@ -3319,7 +3555,7 @@ async function createInboundTurnLifecycle(
 			throw error;
 		} finally {
 			try {
-				if (!threw) closeTerminalLink(nonLoopback ? "silent" : "loopback");
+				if (!threw) closeTerminalLink(nonLoopback ? (alreadyPosted ? "no_delivery" : "silent") : "loopback");
 			} finally {
 				endProgress();
 			}
@@ -3414,6 +3650,7 @@ async function createInboundTurnLifecycle(
 	return {
 		text: turnText,
 		systemPreamble,
+		...(sessionBootstrap ? { sessionBootstrap } : {}),
 		...(effectiveModel ? { effectiveModel } : {}),
 		...(runtime.config.serviceTier ? { effectiveServiceTier: runtime.config.serviceTier } : {}),
 		contextMessageIds: new Set(contextMessageIds),
@@ -3456,7 +3693,7 @@ function reportTerminalLinkAudit(database: Store): void {
 }
 
 function laneReportTriggerText(body: string): string {
-	return `[Internal lane report: from your work lane, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
+	return `[Internal report from another Gajae session, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
 }
 function deliveryProjection(payloadJson: string): { readonly conversationId: string; readonly text: string } {
 	try {
@@ -3781,6 +4018,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. Remove a reaction you added earlier with [UNREACT:<emoji>@<message id>]; removal frees up your reaction budget and allows you to add a different emoji to the same message (e.g. change 🔥 to ❤). With nothing after the tokens you acknowledge with a reaction and say nothing; text after the tokens is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. Custom emoji names (Slack-valid: lowercase, digits, underscores, hyphens, 2-80 chars) are also accepted on Slack and Discord and will be validated server-side. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+				]
+			: []),
+		...(platformSupportsFiles(origin.platform)
+			? [
+					`File attachments: to upload a file into this conversation (same thread as the reply), put MEDIA:<absolute path> on a line of its own. The line is removed from the text; one line per file, at most ${OUTBOUND_FILES_PER_TURN_CAP} per reply and ${Math.floor(OUTBOUND_FILE_MAX_BYTES / (1024 * 1024))} MB each. Write the file into your workspace first: only files inside the workspace (or a configured outbound root) are sent, everything else is refused. A file that cannot be sent shows up as a short "(file not sent: ...)" note.`,
 				]
 			: []),
 		// Live 2026-09-25: the persona held turns open for 13 minutes in a

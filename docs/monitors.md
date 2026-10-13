@@ -1,6 +1,6 @@
 # Monitors
 
-A monitor turns an external or scheduled signal into a Gajae-authored event. It has a name, one trigger, a non-empty list of declared event types, an optional burst policy, and at most one output target. A cron is simply a monitor whose trigger is periodic.
+A monitor turns an external or scheduled signal into a Gajae-authored event. It has a name, one trigger, a non-empty list of declared event types, an optional burst policy, and at most one external channel-delivery target. A cron is simply a monitor whose trigger is periodic.
 
 ## MonitorSpec and triggers
 
@@ -17,13 +17,14 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
     "origin": { "platform": "discord", "kind": "channel", "conversationId": "1470204268933022023" },
     "mentionUserIds": ["1468532331001413743"]
   },
+  "reportTo": { "platform": "discord", "kind": "channel", "conversationId": "1470204268933022023" },
   "enabled": true
 }
 ```
 
 `instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note. Write it as prose sentences, not a tag bundle: it reaches the authoring session verbatim.
 
-Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Keep `eventTypes` short, stable identifiers that are safe to group by.
+Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Optional `reportTo` identifies a chat or loopback conversation whose persona session should also receive each reportable authored note as a durable internal report. Silent outputs and contract-only echoes suppressed by channel delivery are not injected. This is context injection, not a chat delivery: it lets the conversation session know what the separate monitor session did, without posting another message to the channel. `reportTo` may match `channelTarget.origin`; omitting it preserves the existing behavior. Monitor execution origins are not valid report targets. Keep `eventTypes` short, stable identifiers that are safe to group by.
 
 `procedureFiles` (optional, at most 8) lists the procedure/doctrine files the monitor follows, relative to `$GAJAEWAY_HOME/workspace` (`memory/ops/...` reaches the memory corpus through the workspace link). The event-type session is long-lived and never re-reads files it saw at session start, so these files are re-read from disk at **every** firing and their current content goes into that firing's authoring prompt. A doctrine edit therefore takes effect on the very next firing, without a session roll or restart. Each file is inlined up to 24 KiB; a larger one is versioned and the session is told to read it from disk. Paths must stay inside the workspace (symlinks may resolve into the memory corpus only); a missing or escaping file is reported, not fatal.
 
@@ -71,14 +72,16 @@ The durable propagation path is:
 1. **Admitted** — persist the incoming event before work begins and emit its systematic event record.
 2. **Batched** — apply the monitor burst policy and assign a batch.
 3. **Session selected** — choose the monitor's declared-type session or its catch-all session.
-4. **Authored** — ask Gajae for exactly one note per event, then persist each authored output.
+4. **Authored** — ask Gajae for exactly one note per event, persist each authored output, and atomically enqueue it as an internal report to `reportTo` when configured.
 5. **Memory queued** — create a durable `monitor-event` memory intent for the authored note.
 6. **Delivered** — when a `channelTarget` exists, prepare and mark an outbound ledger delivery.
-7. **Reconciled** — startup and periodic reconciliation replays unfinished admitted, dispatched, or failed events, and repairs authored events missing their memory intent. A `failed` event is reclaimed on a backoff measured from its last failure — immediately, then after 10 minutes, 1 hour, 4 hours and 12 hours — so the five-attempt budget spans ~17 hours and a slot survives a multi-hour dispatch outage. Only after that does it land on the terminal `failed_no_retry`. A `session_busy` or `gateway_shutdown` failure is not evidence of a dispatch outage, so it is reclaimed on the next sweep without waiting out the backoff; it still counts against the budget.
+7. **Reconciled** — startup and periodic reconciliation replays unfinished admitted, dispatched, or failed events, and repairs authored events missing their memory intent. A `failed` event is reclaimed on a backoff measured from its last failure — immediately, then after 10 minutes, 1 hour, 4 hours and 12 hours — so the five-attempt budget spans ~17 hours and a slot survives a multi-hour dispatch outage. Only after that does it land on the terminal `failed_no_retry`. A `session_busy`, `session_host_unavailable`, or `gateway_shutdown` failure is not evidence of a dispatch outage, so it is reclaimed on the next sweep without waiting out the backoff; it still counts against the budget.
 
 A gateway stop waits a bounded 10 seconds for in-flight authoring turns. A turn still running past that is failed as `gateway_shutdown` with the bound session id and stop time in `monitor_failures.detail`, its lease is released, and the event is re-dispatched by the next boot's reconcile rather than retried against a session whose host the stop orphaned.
 
 The admission log occurs before propagation. Systematic state is held in the gateway database (`monitor_event` stages such as `admitted`, `batched`, `dispatched`, `authored`, `failed`, and the terminal `skipped`); the authored note is separately persisted and fed to the Markdown-memory closure queue. This dual logging preserves both operational history and human-readable memory.
+
+The stale-event reaper only handles events still owing an authoring turn: `admitted`, `batched`, `dispatched`, or `failed`, with no authored output, live lease, or saved authoring-turn pointer. It marks eligible events older than 24 hours (measured from `updated_at`) `failed_no_retry`. Authored events awaiting memory or delivery, including delivery-pending events, are not reaped. Since age is based on `updated_at`, a retry resets the stale-age window; `firedAt` remains the original event/fire time.
 
 ## Session context: native compaction and the safety net
 
@@ -145,6 +148,10 @@ gajaeway monitors list --fields id,name,schedule --limit 20 --offset 20
 gajaeway monitors inspect <monitor-id>
 gajaeway monitors test <monitor-id> --type review.due --payload '{"source":"manual"}'
 gajaeway monitors test <monitor-id> --wait=60
+gajaeway monitors settle <event-id>
+gajaeway monitors retry <event-id>
 ```
+
+`settle` marks an event that still owes authoring as `failed_no_retry`; it refuses an event with a live authoring lease and preserves any saved authoring-turn pointer. `retry` requeues a `failed` or `failed_no_retry` event for immediate reconciliation, provided it has no authored output or live lease. It resets the dispatch-attempt count and refreshes `updated_at` without changing `firedAt`, and also retains the saved authoring-turn pointer so an already accepted turn can be recovered safely. Both commands print JSON with `{ eventId, done, previousStage?, reason? }`; a result with `done: false` exits with status 1. Neither command reaps or retries authored output that is waiting on memory closure or delivery settlement.
 
 `update` changes the existing monitor in place, preserving its identity and event history. Its `--json` value is a partial `MonitorSpec`: only supplied fields are merged into the current spec. Use either `--json` or the shorthand flags; `--schedule '<cron>'` and `--enabled true|false` may be used together. The enabled flag requires an explicit `true` or `false`. The command prints the resulting monitor ID as JSON. `list` prints a one-line-per-monitor table (`id`, `name`, `schedule`, `timezone`, `nextFire`, `events`, `target`, `enabled`); `--json` emits `{ monitors, schedules }`, with `schedules` keyed by monitor ID. Each schedule projection contains `effectiveTimezone` and nullable `nextFireAt.local` / `nextFireAt.utc`; those fields are not added to the monitor record. `--fields a,b,c` selects columns (an unknown name errors and lists the valid names) and `--limit N` / `--offset N` page the rows; both apply to `--json` as well. `sessions list` accepts the same flags. `inspect` returns `{ monitor, schedule, recentEvents }`, with the effective zone in `schedule.effectiveTimezone` and next local/UTC times in `schedule.nextFireAt.local` and `schedule.nextFireAt.utc`. `test` submits an event and returns its `eventId`; omit `--type` to use the monitor’s first declared type. Add `--wait` to observe stage events without polling (30-second default), or `--wait=SECONDS` to choose a non-negative timeout up to 24 hours. It exits when delivery, no-delivery, or dispatch failure is observed; on timeout it returns the latest observed stage, such as `batched`, `authored`, `delivered`, or `failed`. See [deployment](deployment.md) for `webhook`, `watcherRoots`, and `scriptRoot` configuration.

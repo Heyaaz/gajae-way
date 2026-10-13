@@ -1,13 +1,17 @@
+import { constants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { installStructuredLogging } from "@gajae-gateway/log";
-import type {
-	ChannelEngagementPolicy,
-	ChatMessagePayload,
-	ChatProgressPayload,
-	EngagementContext,
-	EngagementPanelResponseParams,
-	OriginRef,
+import {
+	type ChannelEngagementPolicy,
+	type ChatMessagePayload,
+	type ChatProgressPayload,
+	type EngagementContext,
+	type EngagementPanelResponseParams,
+	type FileRef,
+	type OriginRef,
+	OUTBOUND_FILE_MAX_BYTES,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -304,7 +308,7 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 
 export async function settleSlackDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
-	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction">,
+	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction"> & Partial<Pick<SlackWebApi, "uploadFile">>,
 	message: ChatMessagePayload,
 	_log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
@@ -315,6 +319,14 @@ export async function settleSlackDelivery(
 	if (message.reaction) {
 		try {
 			await settleSlackReaction(gateway, api, message);
+		} finally {
+			await settleTurnPresence(message, status);
+		}
+		return;
+	}
+	if (message.file) {
+		try {
+			await settleSlackFile(gateway, api, message);
 		} finally {
 			await settleTurnPresence(message, status);
 		}
@@ -396,6 +408,69 @@ async function settleTurnPresence(
 		return;
 	}
 	await status.clear(conversationId).catch(() => {});
+}
+
+export async function settleSlackFile(
+	gateway: Pick<GatewayClientLike, "request">,
+	api: Partial<Pick<SlackWebApi, "uploadFile">>,
+	message: ChatMessagePayload,
+): Promise<void> {
+	if (message.origin.platform !== "slack" || !message.deliveryId || !message.file) return;
+	const deliveryId = message.deliveryId;
+	try {
+		if (!api.uploadFile) throw new SlackApiError(0, "unsupported", "this Slack client cannot upload files");
+		const channel = deliveryChannel(message.origin);
+		const threadTs = replyThreadTs(message);
+		const bytes = await readOutboundFile(message.file);
+		const initialComment = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : undefined;
+		await api.uploadFile(channel, { name: message.file.name, bytes }, threadTs, initialComment);
+		await gateway.request("delivery.confirm", { deliveryId });
+	} catch (error) {
+		await gateway.request("delivery.fail", {
+			deliveryId,
+			reason: errorText(error),
+			ambiguous: deliveryFailureIsAmbiguous(error),
+		});
+	}
+}
+
+async function readOutboundFile(file: FileRef): Promise<Uint8Array> {
+	if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > OUTBOUND_FILE_MAX_BYTES)
+		throw new SlackApiError(0, "file_changed", `${file.name} has an invalid checked size`);
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	} catch (error) {
+		throw new SlackApiError(0, "file_unreadable", `cannot open ${file.name}: ${errorText(error)}`);
+	}
+	try {
+		const descriptorPath =
+			process.platform === "linux"
+				? `/proc/self/fd/${handle.fd}`
+				: process.platform === "darwin"
+					? `/dev/fd/${handle.fd}`
+					: undefined;
+		if (!descriptorPath || (await realpath(descriptorPath)) !== file.path)
+			throw new SlackApiError(0, "file_changed", `${file.name} changed after the gateway checked it`);
+		const stat = await handle.stat();
+		if (!stat.isFile() || stat.size !== file.size || stat.size > OUTBOUND_FILE_MAX_BYTES)
+			throw new SlackApiError(0, "file_changed", `${file.name} changed after the gateway checked it`);
+		const bytes = Buffer.allocUnsafe(file.size + 1);
+		let length = 0;
+		while (length < bytes.length) {
+			const read = await handle.read(bytes, length, bytes.length - length, null);
+			if (read.bytesRead === 0) break;
+			length += read.bytesRead;
+		}
+		if (length !== file.size)
+			throw new SlackApiError(0, "file_changed", `${file.name} changed while the adapter read it`);
+		return bytes.subarray(0, length);
+	} catch (error) {
+		if (error instanceof SlackApiError) throw error;
+		throw new SlackApiError(0, "file_unreadable", `cannot read ${file.name}: ${errorText(error)}`);
+	} finally {
+		await handle.close().catch(() => {});
+	}
 }
 
 export async function settleSlackReaction(

@@ -516,6 +516,7 @@ test("RT14 work start survives observer spawn failure, sends once without relay 
 		port,
 		lanes: new LaneGovernor({ database: db, sessionPort: port, maxLanes: 1 }),
 		gajaewayHome,
+		serviceDirectory: join(home, "service"),
 		pollMs: 5,
 		waitTimeoutMs: 1000,
 	});
