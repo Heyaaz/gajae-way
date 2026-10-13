@@ -665,6 +665,22 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
+	emitTurnEnd(sessionId: string, opRef: string, kind: "agent_end" | "agent_failed"): void {
+		const operation = this.#operations.get(opRef);
+		const frame: TailFrame = {
+			kind,
+			rawKind: kind,
+			commandId: operation?.commandId ?? `command-${opRef}`,
+			turnId: operation?.turnId ?? `turn-${opRef}`,
+			payload: kind === "agent_end" ? { outcome: { reason: "end_turn" } } : { error: { code: "sdk_failed" } },
+			steerEcho: false,
+			idle: true,
+		};
+		for (const tail of this.#tails.get(sessionId) ?? []) {
+			if (tail.opRef === opRef) tail.emit(frame);
+		}
+	}
+
 	emitActivity(sessionId: string, progress: { readonly toolCalls: number; readonly outputTokens: number }): void {
 		// Correlated to the in-flight turn: progress counters attributed to a turn
 		// only reach the relay that owns it, like every other turn frame.
