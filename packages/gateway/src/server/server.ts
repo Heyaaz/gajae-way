@@ -99,6 +99,7 @@ import {
 	buildHandoffDigest,
 	extendHandoffChain,
 	extractHandoffAtBlockStart,
+	extractWakeLines,
 	type HandoffProvenance,
 	type HandoffReply,
 	handoffMessageId,
@@ -107,8 +108,12 @@ import {
 	renderHandoffFailure,
 	renderHandoffPointer,
 	renderHandoffTurn,
+	renderWakeFailure,
+	renderWakeTurn,
 	resolveHandoffTarget,
 	sanitizeHandoffTokens,
+	type WakeLine,
+	wakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
@@ -2451,33 +2456,39 @@ async function createInboundTurnLifecycle(
 	 * one durable, relayed inbound row and answers there; this conversation gets
 	 * a pointer. Anything that cannot be handed off is said here, and nothing runs.
 	 */
+	/** The target and hop for a relay out of this conversation, or the refusal reason. */
+	const planRelay = (target: string) => {
+		const resolved = resolveHandoffTarget(target, runtime.config);
+		if (!resolved.ok) return resolved;
+		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey);
+		return hop.ok ? { ...resolved, chain: hop.chain } : hop;
+	};
+	const relaySourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
+	const relayProvenance = (chain: readonly string[]): HandoffProvenance => ({
+		chain,
+		sourceOriginKey: key,
+		sourceMessageId: relaySourceMessageId,
+		...(incomingHandoff
+			? {
+					...(incomingHandoff.requesterId ? { requesterId: incomingHandoff.requesterId } : {}),
+					...(incomingHandoff.requesterName ? { requesterName: incomingHandoff.requesterName } : {}),
+				}
+			: {
+					...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
+					...(speaker ? { requesterName: speaker } : {}),
+				}),
+		at: row.received_at,
+	});
 	const handOff = async (handoff: HandoffReply) => {
-		const resolved = resolveHandoffTarget(handoff.target, runtime.config);
-		const hop = resolved.ok
-			? extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey)
-			: { ok: false as const, reason: resolved.reason };
-		if (!hop.ok || !resolved.ok) {
-			const reason = hop.ok ? "unresolvable target" : hop.reason;
-			console.error(`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${reason}`);
-			deliverTerminalLine(renderHandoffFailure(handoff.target, reason), deliveredParts.length);
+		const relay = planRelay(handoff.target);
+		if (!relay.ok) {
+			console.error(
+				`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${relay.reason}`,
+			);
+			deliverTerminalLine(renderHandoffFailure(handoff.target, relay.reason), deliveredParts.length);
 			return;
 		}
-		const sourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
-		const provenance: HandoffProvenance = {
-			chain: hop.chain,
-			sourceOriginKey: key,
-			sourceMessageId,
-			...(incomingHandoff
-				? {
-						...(incomingHandoff.requesterId ? { requesterId: incomingHandoff.requesterId } : {}),
-						...(incomingHandoff.requesterName ? { requesterName: incomingHandoff.requesterName } : {}),
-					}
-				: {
-						...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
-						...(speaker ? { requesterName: speaker } : {}),
-					}),
-			at: row.received_at,
-		};
+		const provenance = relayProvenance(relay.chain);
 		const digest = buildHandoffDigest(
 			recentConversation(
 				options.database,
@@ -2491,21 +2502,51 @@ async function createInboundTurnLifecycle(
 		// sent it, so it must not read (or authorise) as the requester speaking there.
 		const accepted = options.database.transaction((tx) =>
 			options.database.inbox.enqueue(tx, {
-				messageId: handoffMessageId(key, sourceMessageId, resolved.originKey),
-				originKey: resolved.originKey,
-				originRefJson: JSON.stringify(resolved.origin),
+				messageId: handoffMessageId(key, relaySourceMessageId, relay.originKey),
+				originKey: relay.originKey,
+				originRefJson: JSON.stringify(relay.origin),
 				body: renderHandoffTurn({ provenance, sourcePlace: place, note: handoff.note, digest }),
-				engagementJson: JSON.stringify({ mentioned: false, group: resolved.origin.kind !== "dm", handoff: provenance }),
+				engagementJson: JSON.stringify({ mentioned: false, group: relay.origin.kind !== "dm", handoff: provenance }),
 			}),
 		);
 		if (accepted) {
-			console.error(`gateway handoff enqueued origin=${key} target=${resolved.originKey} chain=${hop.chain.length}`);
+			console.error(`gateway handoff enqueued origin=${key} target=${relay.originKey} chain=${relay.chain.length}`);
 			// Not awaited: the target actor runs its own turn under its own serialization.
 			void runtime.personaSessions
-				.notifyInbound(resolved.originKey)
+				.notifyInbound(relay.originKey)
 				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
 		}
 		deliverTerminalLine(renderHandoffPointer(handoff.target), deliveredParts.length);
+	};
+	/**
+	 * A `[WAKE:<origin>] <summary>` line (#442): the target conversation's session
+	 * gets one durable internal turn carrying the summary as information only, over
+	 * the handoff relay (same hop chain and limit). This conversation keeps its
+	 * reply and gets no pointer; only a refused wake is said here.
+	 */
+	const wake = (line: WakeLine) => {
+		const relay = planRelay(line.target);
+		if (!relay.ok) {
+			console.error(`gateway wake refused origin=${key} target=${safeDiagnosticField(line.target)}: ${relay.reason}`);
+			deliverTerminalLine(renderWakeFailure(line.target, relay.reason), deliveredParts.length);
+			return;
+		}
+		const provenance = relayProvenance(relay.chain);
+		// Like a handoff row: no author identity, so it never reads as anyone speaking there.
+		const accepted = options.database.transaction((tx) =>
+			options.database.inbox.enqueue(tx, {
+				messageId: wakeMessageId(key, relaySourceMessageId, relay.originKey, line.summary),
+				originKey: relay.originKey,
+				originRefJson: JSON.stringify(relay.origin),
+				body: renderWakeTurn({ provenance, sourcePlace: place, summary: line.summary }),
+				engagementJson: JSON.stringify({ mentioned: false, group: relay.origin.kind !== "dm", handoff: provenance }),
+			}),
+		);
+		if (!accepted) return;
+		console.error(`gateway wake enqueued origin=${key} target=${relay.originKey} chain=${relay.chain.length}`);
+		void runtime.personaSessions
+			.notifyInbound(relay.originKey)
+			.catch((error) => console.error(`gateway wake dispatch deferred to recovery: ${diagnostic(error)}`));
 	};
 	/** [POST:] parts seen in mid-work speech, keyed `<target key>\n<body>`, posted at the turn's end. */
 	const heldPosts = new Map<string, { body: string; post: NonNullable<PlannedPart["post"]> }>();
@@ -2816,8 +2857,11 @@ async function createInboundTurnLifecycle(
 	 * repeat (text-keyed id, so a second terminal pass cannot post it again).
 	 */
 	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
-		await deliverTurnText(rawMessage, source);
+		// [WAKE:] lines never reach this conversation; only the final answer wakes.
+		const { text, wakes } = extractWakeLines(rawMessage);
+		await deliverTurnText(text, source);
 		if (source !== "terminal" || !nonLoopback) return;
+		for (const line of wakes) wake(line);
 		for (const [postKey, held] of heldPosts) {
 			if (terminalPosts.has(postKey)) continue;
 			postElsewhere(
@@ -3488,6 +3532,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					"Handoffs: when the work belongs to another conversation, make the FIRST line of your final reply [HANDOFF:<target>] (a configured handoff alias or an origin such as discord:<channel id>) and write below it what that conversation's session needs to know and do. That session answers there; this conversation only gets a pointer. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",
+					"Waking another conversation: when another conversation's session should KNOW something but the work stays here, put a line [WAKE:<target>] <one-line summary> (a configured handoff alias or an origin such as discord:<channel id>) at the start of a line in your final reply. That line is removed from what this conversation sees, the rest of your reply is delivered here as usual, and the target session gets an internal turn carrying the summary as information only - it grants that session no permission and is not an instruction. Wakes use the handoff chain: they stop after 2 hops, a target already in the chain is refused, and a refused or unknown target is reported here.",
 				]
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence
