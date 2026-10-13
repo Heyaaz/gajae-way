@@ -54,7 +54,9 @@ export interface WorkerMatchOptions {
  *
  * A candidate must have an exact GJC relay argv, the canonical configured agent directory,
  * and no live gateway as its parent. Every candidate's process-start identity is checked
- * again immediately before each signal to avoid signaling a reused PID.
+ * again immediately before each signal to avoid signaling a reused PID. A relay directly
+ * parented by a live gateway is still owned; after its gateway exits, the OS reparents it to
+ * systemd or another subreaper, where this scan can identify it as orphaned.
  */
 export async function reapLeftoverWorkers(home: string, options: ProcessReaperOptions = {}): Promise<ReapResult> {
 	if (options.processTable !== undefined && (options.kill === undefined || options.isProcessAlive === undefined)) {
@@ -282,7 +284,11 @@ export function parseUnixProcessTable(output: string, expectedAgentDir?: string)
 
 		const commandAndEnvironment = match[4];
 		const envMatch = findUnixAgentDir(commandAndEnvironment, expectedAgentDir);
-		const command = envMatch ? commandAndEnvironment.slice(0, envMatch.index).trimEnd() : commandAndEnvironment;
+		const environmentStart = envMatch ? findUnixEnvironmentStart(commandAndEnvironment, envMatch.index) : undefined;
+		const command =
+			environmentStart === undefined
+				? commandAndEnvironment
+				: commandAndEnvironment.slice(0, environmentStart).trimEnd();
 		const argv = parseUnixCommandArgv(command);
 		if (argv.length === 0) continue;
 		result.push({
@@ -337,41 +343,64 @@ function findUnixAgentDir(
 	return undefined;
 }
 
+function findUnixEnvironmentStart(commandAndEnvironment: string, agentDirIndex: number): number {
+	const marker = " sdk serve --stdio --session ";
+	const markerIndex = commandAndEnvironment.lastIndexOf(marker);
+	if (markerIndex < 0) return agentDirIndex;
+
+	const sessionStart = markerIndex + marker.length;
+	const sessionEnd = commandAndEnvironment.indexOf(" ", sessionStart);
+	if (sessionEnd < 0 || sessionEnd >= agentDirIndex) return agentDirIndex;
+
+	// BSD ps appends the whole environment after argv, not only the configured GJC variable.
+	const precedingEnvironment = commandAndEnvironment.slice(sessionEnd, agentDirIndex);
+	const firstVariable = /\s[A-Za-z_][A-Za-z0-9_]*=/.exec(precedingEnvironment);
+	return firstVariable ? sessionEnd + firstVariable.index : agentDirIndex;
+}
+
 async function readProcessTableUnix(expectedAgentDir?: string): Promise<ProcessTableEntry[]> {
-	try {
-		const proc = Bun.spawn(["ps", "-A", "-ww", "eww", "-o", "ppid=,pid=,lstart=,command="], {
-			stdout: "pipe",
-			stderr: "ignore",
-		});
-		const output = await new Response(proc.stdout as ReadableStream).text();
-		const exitCode = await proc.exited;
-		if (exitCode !== 0) return [];
-		return parseUnixProcessTable(output, expectedAgentDir);
-	} catch {
-		return [];
-	}
+	const proc = Bun.spawn(["ps", "-A", "-ww", "eww", "-o", "ppid=,pid=,lstart=,command="], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	const output = await new Response(proc.stdout as ReadableStream).text();
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`ps process-table scan exited with status ${exitCode}`);
+	return parseUnixProcessTable(output, expectedAgentDir);
 }
 
 async function isProcessAlive(pid: number, procRoot?: string): Promise<boolean> {
 	if (process.platform === "linux" || procRoot !== undefined) {
 		const statRoot = procRoot ?? "/proc";
-		const statText = await readFile(join(statRoot, String(pid), "stat"), "utf8").catch(() => "");
-		if (statText) {
-			const stat = parseLinuxStat(statText);
-			if (stat) return stat.state !== "Z" && stat.state !== "X";
+		let statText: string;
+		try {
+			statText = await readFile(join(statRoot, String(pid), "stat"), "utf8");
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT" || code === "ENOTDIR") return false;
+			throw error;
 		}
-		if (procRoot !== undefined) return false;
+		const stat = parseLinuxStat(statText);
+		if (!stat) throw new Error(`invalid /proc stat for pid=${pid}`);
+		return stat.state !== "Z" && stat.state !== "X";
 	}
 
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "EPERM") return true;
-		if (code === "ESRCH") return false;
-		throw error;
-	}
+	return await isProcessAliveUnix(pid);
+}
+
+async function isProcessAliveUnix(pid: number): Promise<boolean> {
+	const proc = Bun.spawn(["ps", "-p", String(pid), "-o", "pid=,stat="], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	const output = (await new Response(proc.stdout as ReadableStream).text()).trim();
+	const exitCode = await proc.exited;
+	if (output === "" && (exitCode === 0 || exitCode === 1)) return false;
+	if (exitCode !== 0) throw new Error(`ps liveness check exited with status ${exitCode} for pid=${pid}`);
+
+	const match = output.match(/^(\d+)\s+(\S+)/);
+	if (!match || Number(match[1]) !== pid) throw new Error(`ps returned an invalid liveness row for pid=${pid}`);
+	return match[2]?.[0] !== "Z" && match[2]?.[0] !== "X";
 }
 
 interface KillProcessOptions {

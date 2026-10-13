@@ -219,13 +219,14 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	const spacedPreviousGjc = `${spacedPrefix}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
 	const output = [
 		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
-		`300 401 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} PATH=/bin`,
-		`300 402 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}2 PATH=/bin`,
-		`300 403 Mon Oct 13 03:20:00 2026 bun ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir} PATH=/bin`,
+		`300 401 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} SHELL=/bin/zsh`,
+		`300 402 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir}2 SHELL=/bin/zsh`,
+		`300 403 Mon Oct 13 03:20:00 2026 bun ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir} SHELL=/bin/zsh`,
+		`300 404 Mon Oct 13 03:20:00 2026 ${spacedCurrentGjc} sdk serve --stdio --session ${SESSION} --extra HOME=/home/user PATH=/bin GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
 	].join("\n");
 	const table = parseUnixProcessTable(output, spacedAgentDir);
 
-	expect(table).toHaveLength(4);
+	expect(table).toHaveLength(5);
 	expect(table[1]).toEqual({
 		pid: 401,
 		ppid: 300,
@@ -234,6 +235,7 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 		identity: "Mon Oct 13 03:20:00 2026",
 	});
 	expect(table[3]?.argv).toEqual(["bun", spacedPreviousGjc, "sdk", "serve", "--stdio", "--session", SESSION]);
+	expect(table[4]?.argv).toEqual([spacedCurrentGjc, "sdk", "serve", "--stdio", "--session", SESSION, "--extra"]);
 	expect(
 		select(table, {
 			gjcPath: spacedCurrentGjc,
@@ -325,6 +327,42 @@ test("Linux proc reader parses comm with spaces and parentheses and selects a sy
 
 		expect(result).toEqual({ found: 1, killed: 1, failed: 0 });
 		expect(calls).toEqual([{ pid: 4501, signal: "SIGTERM" }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reaper confirms Linux worker exit through procfs", async () => {
+	const home = await temporaryHome("gajaeway-reaper-proc-exit-");
+	const procRoot = join(home, "proc");
+	const brokerAgentDir = join(home, "broker", "agent");
+	const gjcExecutable = join(home, "gjc", "0.18.11", "bin", "gjc");
+	const workerPid = 4551;
+	const signals: string[] = [];
+	try {
+		await mkdir(brokerAgentDir, { recursive: true });
+		const workerDir = join(procRoot, String(workerPid));
+		await mkdir(workerDir, { recursive: true });
+		await writeFile(join(workerDir, "stat"), linuxStat(workerPid, 1, 20));
+		await writeFile(
+			join(workerDir, "cmdline"),
+			`${[gjcExecutable, "sdk", "serve", "--stdio", "--session", SESSION].join("\0")}\0`,
+		);
+		await writeFile(join(workerDir, "environ"), `GJC_CODING_AGENT_DIR=${brokerAgentDir}\0`);
+
+		const result = await reapLeftoverWorkers(home, {
+			gjcExecutable,
+			brokerAgentDir,
+			procRoot,
+			timeoutMs: 0,
+			kill: async (_pid, signal) => {
+				signals.push(signal);
+				await rm(join(workerDir, "stat"), { force: true });
+			},
+		});
+
+		expect(result).toEqual({ found: 1, killed: 1, failed: 0 });
+		expect(signals).toEqual(["SIGTERM"]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
