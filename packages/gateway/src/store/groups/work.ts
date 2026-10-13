@@ -115,6 +115,8 @@ export interface WorkAttemptRuntime {
 	readonly mode: WorkAttemptMode;
 	readonly sendPhase: "prepared" | "accepted" | "uncertain";
 	readonly sendEvidence: { readonly source: "receipt" | "status"; readonly observedAt: string } | null;
+	/** Lifecycle proof that the session turn ended; a missing receipt alone is not terminal proof. */
+	readonly turnEndObservedAt?: string;
 	readonly terminal: WorkAttemptTerminalEvidence | null;
 	readonly output: WorkAttemptOutput;
 	readonly parent: WorkParent | null;
@@ -127,7 +129,9 @@ export interface WorkAttemptRuntime {
 	readonly version: number;
 }
 
-export type WorkAttemptPatch = Partial<Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "terminal" | "output">>;
+export type WorkAttemptPatch = Partial<
+	Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "turnEndObservedAt" | "terminal" | "output">
+>;
 export interface WorkAttemptSettlement extends WorkAttemptPatch {
 	readonly decision: WorkAttemptRequestedDecision;
 	readonly settledAt: string;
@@ -307,6 +311,7 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 		workAssert(["receipt", "status"].includes(value.sendEvidence.source) && workTime(value.sendEvidence.observedAt));
 	}
 	workAssert(value.sendPhase !== "accepted" || value.sendEvidence !== null);
+	workAssert(value.turnEndObservedAt === undefined || workTime(value.turnEndObservedAt));
 	if (value.terminal !== null) {
 		const terminal = value.terminal;
 		workAssert(["broker", "local"].includes(terminal.kind) && workTime(terminal.observedAt));
@@ -1145,12 +1150,13 @@ export class WorkGroup {
 	}
 
 	#workPatched(current: WorkAttemptRuntime, patch: WorkAttemptPatch): WorkAttemptRuntime {
-		const allowed = new Set(["sendPhase", "sendEvidence", "terminal", "output"]);
+		const allowed = new Set(["sendPhase", "sendEvidence", "turnEndObservedAt", "terminal", "output"]);
 		workAssert(Object.keys(patch).every((key) => allowed.has(key)));
 		const next = { ...current, ...patch, version: current.version + 1 };
 		validateWorkRuntime(next, this.instanceId);
 		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
 		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
+		workAssert(current.turnEndObservedAt === undefined || next.turnEndObservedAt === current.turnEndObservedAt);
 		workAssert(
 			current.terminal === null ||
 				JSON.stringify(current.terminal) === JSON.stringify(next.terminal) ||
