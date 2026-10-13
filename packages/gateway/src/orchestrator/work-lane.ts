@@ -2145,6 +2145,9 @@ function workBindFailureCause(error: unknown): WorkBindFailureCause {
 		/\bwas created but never became live\b/.test(message)
 	)
 		return "timeout";
+	// BrokerSessionPort's SDK sanitizer can drop GjcCliUnavailableError.code while
+	// retaining this stable prefix on the plain Error it returns.
+	if (/^gjc sdk request failed: broker_unavailable(?:\s|\(|$)/.test(message)) return "broker_unavailable";
 	if (error instanceof BrokerAuthorityError) {
 		if (error.code === "unowned_session") return "cwd_rejected";
 		if (error.code === "authority_mismatch" || error.code === "cutover_required") return "epoch_conflict";

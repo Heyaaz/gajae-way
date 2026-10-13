@@ -128,6 +128,11 @@ test("bind failures map causes and emit one redacted diagnostic each", async () 
 	cleanups.push(async () => errors.mockRestore());
 	const failures = [
 		["broker unavailable", "broker_unavailable", () => new GjcCliUnavailableError("broker unavailable")],
+		[
+			"sanitized broker unavailable",
+			"broker_unavailable",
+			() => new Error("gjc sdk request failed: broker_unavailable (broker unavailable)"),
+		],
 		["timeout", "timeout", () => new GjcCliUnavailableError("request timed out after 1000ms")],
 		["session-create timeout", "timeout", () => new Error("gjc session.create did not complete within 60000ms")],
 		["cwd rejected", "cwd_rejected", () => new BrokerAuthorityError("unowned_session")],
