@@ -556,6 +556,54 @@ async function settleMemory(runtime: Runtime): Promise<void> {
 	}
 }
 
+/** A row whose stored origin ref names another conversation is logged once, not on every sweep. */
+const idleResetMismatchesLogged = new Set<string>();
+
+/**
+ * Rotate idle persona sessions like `/new`. This drops the old GJC context while
+ * leaving the next turn to bind a fresh session. Host retirement is different:
+ * it ends only the host and preserves the session history. Loopback and monitor
+ * origins, active turns, and rows with no bound GJC session are never reset.
+ */
+export async function sweepIdleSessions(
+	runtime: Pick<Runtime, "config" | "personaSessions">,
+	database: Pick<Store, "bindings">,
+	now: number = Date.now(),
+): Promise<readonly string[]> {
+	const idleMs = runtime.config.sessions?.idleResetMs;
+	if (idleMs === undefined) return [];
+	const rotated: string[] = [];
+	for (const row of database.bindings.sessionIdentityRows()) {
+		if (!row.origin_ref_json || row.gjc_session_id === "") continue;
+		let origin: OriginRef;
+		try {
+			origin = validateOriginRef(JSON.parse(row.origin_ref_json) as OriginRef);
+		} catch {
+			continue;
+		}
+		if (origin.platform === "loopback" || origin.platform === "monitor") continue;
+		const lastActivity = Date.parse(row.last_activity_at ?? row.created_at);
+		if (!Number.isFinite(lastActivity) || now - lastActivity < idleMs) continue;
+		const key = originKey(origin);
+		if (key !== row.origin_key) {
+			if (!idleResetMismatchesLogged.has(row.origin_key)) {
+				idleResetMismatchesLogged.add(row.origin_key);
+				console.error(`session_idle_reset_skipped origin=${row.origin_key} ref=${key} reason=origin_ref_mismatch`);
+			}
+			continue;
+		}
+		if (runtime.personaSessions.state(key) === "turn-running") continue;
+		try {
+			await runtime.personaSessions.reset(key, JSON.stringify(origin));
+			console.error(`session_idle_reset origin=${key} epoch=${row.epoch} idleMs=${now - lastActivity}`);
+			rotated.push(key);
+		} catch (error) {
+			console.error(`session_idle_reset_failed origin=${key} detail=${diagnostic(error)}`);
+		}
+	}
+	return rotated;
+}
+
 function createRuntime(options: GatewayServerOptions): Runtime {
 	const sessionPort = options.sessionPort;
 	const connections = new Set<Connection>();
@@ -707,6 +755,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.recover()
 			.then(async () => {
 				await personaSessions.sweepIdleHosts();
+				await sweepIdleSessions(runtime, options.database);
 			})
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
 		void work
