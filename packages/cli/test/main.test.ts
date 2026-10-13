@@ -254,8 +254,9 @@ describe("cli arguments", () => {
 			turnId: "turn-42",
 			originKey: "discord:channel:channel-42",
 			conversationId: "channel-42",
-			state: "confirmed",
+			state: "expired",
 			createdAt: "2026-10-01T00:00:00.000Z",
+			lastError: "not_found",
 			textPrefix: "delivery text",
 		};
 		console.log = (line: unknown) => {
@@ -310,7 +311,7 @@ describe("cli arguments", () => {
 				"--since",
 				"2026-10-01T00:00:00.000Z",
 				"--state",
-				"confirmed",
+				"expired",
 				"--limit",
 				"25",
 				"--json",
@@ -319,14 +320,14 @@ describe("cli arguments", () => {
 			expect(received).toEqual([
 				{
 					verb: "ops.deliveries",
-					params: { since: "2026-10-01T00:00:00.000Z", state: "confirmed", limit: 25 },
+					params: { since: "2026-10-01T00:00:00.000Z", state: "expired", limit: 25 },
 				},
 				{ verb: "ops.deliveries", params: {} },
 			]);
 			expect(output).toEqual([
 				JSON.stringify({ rows: [row] }),
 				"deliveries: 1",
-				'2026-10-01T00:00:00.000Z confirmed delivery=delivery-42 turn=turn-42 origin=discord:channel:channel-42 conversation=channel-42 text="delivery text"',
+				'2026-10-01T00:00:00.000Z expired delivery=delivery-42 turn=turn-42 origin=discord:channel:channel-42 conversation=channel-42 lastError=not_found text="delivery text"',
 			]);
 			expect(CLI_USAGE).toContain("ops deliveries [--since ISO]");
 			expect(CLI_USAGE).not.toContain("ops restore");
