@@ -1640,7 +1640,8 @@ async function handleRequest(
 			// The reactor's emoji is untrusted text that ends up in the turn's context
 			// block: bound it and strip control characters so it cannot forge extra lines
 			// (a newline here would look like another context entry to the persona).
-			const emoji = stripControlCharacters(params.emoji).trim().slice(0, 64);
+			// Slack custom emoji names can be 80 chars; preserve all of `custom:<name>`.
+			const emoji = clipByCodePoints(stripControlCharacters(params.emoji).trim(), 87);
 			if (!emoji) throw new ProtocolError("invalid_params", "engagement.reaction requires a non-empty emoji");
 			const targetMessageId = params.targetMessageId.trim();
 			const authorId = params.engagement.authorId;

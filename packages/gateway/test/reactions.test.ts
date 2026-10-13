@@ -225,6 +225,30 @@ test("an inbound reaction is metadata: it never creates a turn", async () => {
 	expect(unread[0]?.author_name).toBe("형님");
 });
 
+test("an inbound Slack custom emoji preserves the full maximum-length name", async () => {
+	const slack = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
+	const { client, database } = await gateway("unused", undefined, slack);
+	const emoji = `custom:${"a".repeat(80)}`;
+	const targetMessageId = "C1:1726543210.123456";
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "r1",
+		verb: "engagement.reaction",
+		params: {
+			origin: slack,
+			targetMessageId,
+			emoji,
+			action: "add",
+			engagement: { mentioned: false, group: true, authorId: "human-1" },
+		},
+	});
+	await settle();
+	const unread = database.inbox.contextUnread("slack/channel/C1");
+	expect(emoji).toHaveLength(87);
+	expect(unread[0]?.body).toBe(`[reaction] reacted ${emoji} to message ${targetMessageId}`);
+});
+
 test("a removed reaction is recorded as its own retraction, not as an erased add", async () => {
 	const { client, database, turns } = await gateway("unused");
 	for (const [id, action] of [
