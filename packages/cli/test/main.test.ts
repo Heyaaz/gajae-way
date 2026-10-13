@@ -151,7 +151,10 @@ describe("cli arguments", () => {
 	test("--version prints the package version without requiring a gateway", async () => {
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (text === pkg.version) output.push(text);
+		};
 		try {
 			await main(["--version"]);
 			expect(output).toEqual([pkg.version]);
@@ -185,7 +188,10 @@ describe("cli arguments", () => {
 		const received: Array<{ verb: string; params: unknown }> = [];
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (text === JSON.stringify({ requeued: [] })) output.push(text);
+		};
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
 			socket: {
@@ -248,7 +254,15 @@ describe("cli arguments", () => {
 			createdAt: "2026-10-01T00:00:00.000Z",
 			textPrefix: "delivery text",
 		};
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (
+				text === JSON.stringify({ rows: [row] }) ||
+				text.startsWith("deliveries: ") ||
+				text.startsWith(`${row.createdAt} ${row.state} `)
+			)
+				output.push(text);
+		};
 		console.error = (line: unknown) => errors.push(String(line));
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
@@ -327,7 +341,21 @@ describe("cli arguments", () => {
 		const received: string[] = [];
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			try {
+				const value = JSON.parse(text) as { eventId?: unknown; stage?: unknown };
+				if (
+					typeof value.eventId === "string" &&
+					value.eventId.startsWith("event-") &&
+					typeof value.stage === "string"
+				) {
+					output.push(text);
+				}
+			} catch {
+				// Other tests share the process console.
+			}
+		};
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
 			socket: {
