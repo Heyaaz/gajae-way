@@ -7,7 +7,7 @@ import { AdminGateway, type AdminGatewayRetryOptions } from "../src/gateway";
 
 type Peer = { end(): void; write(data: string): unknown };
 type Frame = { type: string; id?: string; verb?: string };
-type RetryTask = { callback: () => void; delayMs: number; cancelled: boolean; ran: boolean };
+type RetryTask = { callback: () => void; delayMs: number; dueAt: number; cancelled: boolean; ran: boolean };
 
 type FixtureOptions = {
 	negotiate?: boolean;
@@ -110,9 +110,10 @@ async function until(predicate: () => boolean): Promise<void> {
 
 function retryScheduler() {
 	const tasks: RetryTask[] = [];
+	let now = 0;
 	const options: AdminGatewayRetryOptions = {
 		setTimeout: ((callback: () => void, delayMs: number) => {
-			const task = { callback, delayMs, cancelled: false, ran: false };
+			const task = { callback, delayMs, dueAt: now + delayMs, cancelled: false, ran: false };
 			tasks.push(task);
 			return task as unknown as ReturnType<typeof setTimeout>;
 		}) as typeof setTimeout,
@@ -120,8 +121,23 @@ function retryScheduler() {
 			(timer as unknown as RetryTask).cancelled = true;
 		},
 	};
+	const advanceBy = (delayMs: number) => {
+		const deadline = now + delayMs;
+		for (;;) {
+			const task = tasks
+				.filter((item) => !item.cancelled && !item.ran && item.dueAt <= deadline)
+				.sort((left, right) => left.dueAt - right.dueAt)[0];
+			if (!task) break;
+			now = task.dueAt;
+			task.ran = true;
+			task.callback();
+		}
+		now = deadline;
+	};
 	return {
 		options,
+		now: () => now,
+		advanceBy,
 		pending: () => tasks.filter((task) => !task.cancelled && !task.ran),
 		firstPending: () => {
 			const task = tasks.find((item) => !item.cancelled && !item.ran);
@@ -140,8 +156,7 @@ function retryScheduler() {
 		runNext: () => {
 			const task = tasks.find((item) => !item.cancelled && !item.ran);
 			if (!task) throw new Error("no scheduled retry");
-			task.ran = true;
-			task.callback();
+			advanceBy(Math.max(0, task.dueAt - now));
 			return task;
 		},
 	};
@@ -284,6 +299,10 @@ test("reconnect backoff escalates through crash loops and resets only after stab
 		retries.runNext();
 		await until(() => gateway?.connected === true);
 		expect(logs).toEqual(["Admin gateway disconnected; reconnecting.", "Admin gateway reconnected."]);
+		const unstableStabilityTimer = retries.lastPending();
+		retries.advanceBy(unstableStabilityTimer.delayMs - 1);
+		expect(retries.now()).toBe(unstableStabilityTimer.dueAt - 1);
+		expect(unstableStabilityTimer.ran).toBe(false);
 
 		replacement.stop();
 		await until(() => gateway?.connected === false);
@@ -295,7 +314,8 @@ test("reconnect backoff escalates through crash loops and resets only after stab
 		await until(() => gateway?.connected === true);
 		const stabilityTimer = retries.lastPending();
 		expect(stabilityTimer.delayMs).toBe(30_000);
-		retries.run(stabilityTimer);
+		retries.advanceBy(stabilityTimer.delayMs);
+		expect(stabilityTimer.ran).toBe(true);
 		random = 0;
 		replacement.stop();
 		await until(() => gateway?.connected === false);
