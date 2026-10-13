@@ -86,7 +86,7 @@ export class StoreCore {
 			const actualJournalMode = database
 				.query<{ journal_mode: string }, []>(`PRAGMA journal_mode = ${journalMode}`)
 				.get()?.journal_mode;
-			if (actualJournalMode !== journalMode.toLowerCase())
+			if (actualJournalMode !== journalMode.toLowerCase() && !(path === ":memory:" && actualJournalMode === "memory"))
 				throw new Error(
 					`SQLite journal_mode is ${actualJournalMode ?? "unknown"}, expected ${journalMode.toLowerCase()}`,
 				);

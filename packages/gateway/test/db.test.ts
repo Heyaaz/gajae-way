@@ -238,3 +238,12 @@ test("configures SQLite journal mode and changes an existing WAL database", asyn
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("allows SQLite's intrinsic memory journal mode for an in-memory store", async () => {
+	const store = await Store.open(":memory:");
+	try {
+		expect(store.core.getJournalMode()).toBe("memory");
+	} finally {
+		store.close();
+	}
+});
