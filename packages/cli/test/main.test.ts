@@ -337,7 +337,7 @@ describe("cli arguments", () => {
 						else if (frame.type === "request") {
 							received.push(frame.verb as string);
 							const eventId = `event-${41 + received.length}`;
-							const stage = received.length === 1 ? "delivered" : "authored";
+							const stage = received.length === 1 ? "delivered" : received.length === 2 ? "authored" : "skipped";
 							const event = {
 								v: "0.1",
 								type: "event",
@@ -368,10 +368,14 @@ describe("cli arguments", () => {
 		try {
 			await main(["--socket", path, "monitors", "test", "monitor-1", "--wait=1"]);
 			await main(["--socket", path, "monitors", "test", "monitor-1", "--wait=0"]);
-			expect(received).toEqual(["monitor.test", "monitor.test"]);
+			const skippedStartedAt = Date.now();
+			await main(["--socket", path, "monitors", "test", "monitor-1", "--wait=1"]);
+			expect(Date.now() - skippedStartedAt).toBeLessThan(900);
+			expect(received).toEqual(["monitor.test", "monitor.test", "monitor.test"]);
 			expect(output).toEqual([
 				'{"eventId":"event-42","stage":"delivered"}',
 				'{"eventId":"event-43","stage":"authored"}',
+				'{"eventId":"event-44","stage":"skipped"}',
 			]);
 		} finally {
 			console.log = originalLog;
@@ -409,6 +413,27 @@ describe("cli arguments", () => {
 				true,
 			);
 			expect(errors[5]).toContain("duplicate --wait");
+		} finally {
+			console.error = originalError;
+			process.exitCode = previousExitCode;
+		}
+	});
+
+	test("monitor settle and retry reject malformed arguments before connecting", async () => {
+		const errors: string[] = [];
+		const originalError = console.error;
+		const previousExitCode = process.exitCode ?? 0;
+		console.error = (line: unknown) => errors.push(String(line));
+		try {
+			for (const args of [
+				["monitors", "settle"],
+				["monitors", "retry", "event-1", "extra"],
+			]) {
+				await main(["--socket", "/nonexistent/gajaeway-monitor-operator.sock", ...args]);
+			}
+			expect(errors).toHaveLength(2);
+			expect(errors.every((error) => error.startsWith("usage: gajaeway monitors settle"))).toBe(true);
+			expect(errors.every((error) => !error.includes("could not connect"))).toBe(true);
 		} finally {
 			console.error = originalError;
 			process.exitCode = previousExitCode;

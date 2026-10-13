@@ -623,6 +623,14 @@ export interface MonitorEventRecord {
 	readonly recovery?: MonitorEventRecovery;
 }
 
+/** Result of an operator action on one monitor event. */
+export interface MonitorEventOperatorResult {
+	readonly eventId: string;
+	readonly done: boolean;
+	readonly previousStage?: string;
+	readonly reason?: string;
+}
+
 /** Version of one declared procedure file as read for one firing. */
 export interface MonitorProcedureVersion {
 	readonly path: string;
@@ -1152,6 +1160,14 @@ export interface VerbCatalogV01 {
 		};
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
+	"monitor.settle": {
+		params: { readonly eventId: string };
+		result: MonitorEventOperatorResult;
+	};
+	"monitor.retry": {
+		params: { readonly eventId: string };
+		result: MonitorEventOperatorResult;
+	};
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
 	"ops.backup": {
 		params: { readonly path: string };
@@ -1202,6 +1218,8 @@ export const VERBS_V01 = [
 	"monitor.list",
 	"monitor.inspect",
 	"monitor.test",
+	"monitor.settle",
+	"monitor.retry",
 	"monitor.remove",
 	"ops.backup",
 	"ops.redeliver",
