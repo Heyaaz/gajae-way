@@ -93,6 +93,10 @@ function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: st
 	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
 }
 
+function providerTransportRetryMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
+	return `provider_transport_retry_attempt:${originKey}:${epoch}:${triggerMessageId}`;
+}
+
 function failedTurnKeyPrefix(originKey: string): string {
 	return `turn-failed:${originKey}:`;
 }
@@ -108,6 +112,19 @@ export function freshTurnAttempt(store: Store, originKey: string, epoch: number,
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function providerTransportRetryAttempt(
+	store: Store,
+	originKey: string,
+	epoch: number,
+	triggerMessageId: string,
+): number {
+	const value = Number.parseInt(
+		store.core.metaGet(providerTransportRetryMetaKey(originKey, epoch, triggerMessageId)) ?? "0",
+		10,
+	);
+	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): number {
 	store.core.assertActive(tx);
 	const trigger = store.inbox.turnRow(opRef);
@@ -120,6 +137,18 @@ export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): numb
 	const attempt = Number.isSafeInteger(prior) && prior >= 0 ? prior + 1 : 1;
 	store.core.metaSet(key, String(attempt));
 	store.inbox.turnRequeue(tx, opRef);
+	return attempt;
+}
+
+function retryProviderTransportTurn(store: Store, tx: WriteTx, opRef: string): number {
+	store.core.assertActive(tx);
+	const trigger = store.inbox.turnRow(opRef);
+	if (!trigger || trigger.turn_epoch === null) throw new Error(`turn ${opRef} has no retryable trigger`);
+	const retryKey = providerTransportRetryMetaKey(trigger.origin_key, trigger.turn_epoch, trigger.message_id);
+	const previous = providerTransportRetryAttempt(store, trigger.origin_key, trigger.turn_epoch, trigger.message_id);
+	retryInboundTurn(store, tx, opRef);
+	const attempt = previous + 1;
+	store.core.metaSet(retryKey, String(attempt));
 	return attempt;
 }
 
@@ -828,12 +857,14 @@ type BoundTurn = PersonaTurnIdentity & {
 	lastAssistantText?: string;
 	/** A tool ran during this turn; replaying its trigger could repeat external side effects. */
 	hadToolActivity: boolean;
+	/** A permission request may already have displayed an approval panel for this turn. */
+	permissionRequestObserved: boolean;
 	/** A tool the tail saw start and not end: the prime suspect when the turn then fails (#210). */
 	openTool?: { readonly name: string; readonly startedAtMs: number };
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
-	/** Number of times this turn has been retried after a transient provider failure. */
-	retryAttempt: number;
+	/** Number of provider-transport retries already used for this trigger, independent of other requeues. */
+	providerRetryAttempt: number;
 	/** A bounded provider retry is already scheduled for this failed turn. */
 	agentErrorRetryScheduled: boolean;
 };
@@ -1392,8 +1423,12 @@ class OriginActor {
 			);
 		}
 		const dispatchedAtMs = this.#dispatchFloorMs(turn.opRef);
-		// Retrieve the actual retry attempt number from the database
-		const retryAttempt = freshTurnAttempt(this.#manager.database, this.originKey, turn.epoch, turn.triggerMessageId);
+		const providerRetryAttempt = providerTransportRetryAttempt(
+			this.#manager.database,
+			this.originKey,
+			turn.epoch,
+			turn.triggerMessageId,
+		);
 		const bound: BoundTurn = {
 			originKey: this.originKey,
 			epoch: turn.epoch,
@@ -1407,12 +1442,13 @@ class OriginActor {
 			tailTerminalObserved: false,
 			replyVisible: false,
 			hadToolActivity: true,
+			permissionRequestObserved: false,
 			agentErrorRetryScheduled: false,
 			answerWanted: false,
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
-			retryAttempt,
+			providerRetryAttempt,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 		};
 		tail?.beginTurn(turn.opRef);
@@ -1573,8 +1609,14 @@ class OriginActor {
 		const trigger = this.#manager.database.inbox.pendingOldest(this.originKey);
 		if (!trigger) return;
 		const epoch = this.#epoch();
-		const retryAttempt = freshTurnAttempt(this.#manager.database, this.originKey, epoch, trigger.message_id);
-		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
+		const turnAttempt = freshTurnAttempt(this.#manager.database, this.originKey, epoch, trigger.message_id);
+		const providerRetryAttempt = providerTransportRetryAttempt(
+			this.#manager.database,
+			this.originKey,
+			epoch,
+			trigger.message_id,
+		);
+		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, turnAttempt);
 		if (!this.hostLive) {
 			const admission = await this.#manager.admitHost(this);
 			if (!admission.admitted) {
@@ -1670,11 +1712,12 @@ class OriginActor {
 			tailTerminalObserved: false,
 			replyVisible: false,
 			hadToolActivity: false,
+			permissionRequestObserved: false,
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
-			retryAttempt, // Already computed from freshTurnAttempt above
+			providerRetryAttempt,
 			agentErrorRetryScheduled: false,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 		};
@@ -2084,12 +2127,12 @@ class OriginActor {
 				const oldOpRef = bound.turn.opRef;
 				try {
 					await bound.tail?.close();
-					// Mark the turn as pending again and increment the attempt counter
-					const nextAttempt = this.#manager.database.transaction((tx) =>
-						retryInboundTurn(this.#manager.database, tx, oldOpRef),
+					// Increment the provider retry budget independently of other turn requeues.
+					const nextProviderRetryAttempt = this.#manager.database.transaction((tx) =>
+						retryProviderTransportTurn(this.#manager.database, tx, oldOpRef),
 					);
 					this.#manager.log(
-						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} oldOpRef=${oldOpRef} attempt=${nextAttempt}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS}`,
+						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} oldOpRef=${oldOpRef} attempt=${nextProviderRetryAttempt}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS}`,
 						"warn",
 					);
 					// Clear current turn only after the old tail is closed and the row is requeued.
@@ -2118,6 +2161,7 @@ class OriginActor {
 			bound.replyVisible ||
 			bound.lastAssistantText !== undefined ||
 			bound.hadToolActivity ||
+			bound.permissionRequestObserved ||
 			bound.openTool ||
 			bound.tailEvidenceUnavailable
 		)
@@ -2822,6 +2866,7 @@ class OriginActor {
 				.catch(() => {});
 			return;
 		}
+		if (input.payload.method === "permission.request") bound.permissionRequestObserved = true;
 		// Extract the trigger author ID from the bound turn
 		const trigger = this.#manager.database.inbox.turnRow(bound.turn.opRef);
 		const triggerAuthorId = trigger?.engagement_json
@@ -3100,7 +3145,7 @@ class OriginActor {
 				};
 				const retryEligible =
 					isRetryableError(report, !!bound.openTool) &&
-					bound.retryAttempt < MAX_AGENT_ERROR_RETRY_ATTEMPTS &&
+					bound.providerRetryAttempt < MAX_AGENT_ERROR_RETRY_ATTEMPTS &&
 					this.#canRetryProviderTransport(bound);
 				if (retryEligible) {
 					failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
@@ -3114,12 +3159,14 @@ class OriginActor {
 				) {
 					const retryDelayMs = Math.min(
 						AGENT_ERROR_RETRY_MAX_MS,
-						AGENT_ERROR_RETRY_INITIAL_MS * 2 ** bound.retryAttempt,
+						AGENT_ERROR_RETRY_INITIAL_MS * 2 ** bound.providerRetryAttempt,
 					);
 					this.#manager.log(
-						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} attempt=${bound.retryAttempt + 1}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} delayMs=${retryDelayMs} type=provider_transport error=${terminalFailureDiagnosis(report)}`,
+						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} attempt=${bound.providerRetryAttempt + 1}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} delayMs=${retryDelayMs} type=provider_transport error=${terminalFailureDiagnosis(report)}`,
 						"warn",
 					);
+					// The failed call may not have committed its system preamble to context.
+					this.#personaPreamble.delete(bound.sessionId);
 					this.#scheduleAgentErrorRetry(bound, retryDelayMs);
 					return;
 				}

@@ -352,6 +352,79 @@ test("provider quota evidence suppresses transport retry", async () => {
 	expect(port.sends).toHaveLength(1);
 });
 
+test("provider retry budget is independent of prior submission retries", async () => {
+	let sendCount = 0;
+	const failures: string[] = [];
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) => {
+			sendCount++;
+			if (sendCount === 1) {
+				scripted.fail(input.opRef, "Prompt submission failed", {
+					code: "internal",
+					outcome: { kind: "failed", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+				});
+				return;
+			}
+			scripted.fail(input.opRef, "Provider unavailable", {
+				code: "provider_unavailable",
+				outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+			});
+		},
+	});
+
+	await setupHarness(port, {
+		submissionRetryDelayMs: 1,
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
+	});
+
+	enqueue("submission-then-provider", "retry budget isolation");
+	await manager!.notifyInbound(KEY);
+	await eventually(
+		() => failures.length === 1 && manager!.state(KEY) === "idle",
+		"provider retries did not exhaust after a submission retry",
+		10_000,
+	);
+	expect(port.sends).toHaveLength(4);
+	expect(failures).toHaveLength(1);
+});
+
+test("permission panels make provider replay unsafe", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+	let permissionRequests = 0;
+
+	await setupHarness(port, {
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
+		onReverseRequest: () => {
+			permissionRequests++;
+		},
+	});
+
+	enqueue("permission-before-failure", "permission-gated action");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("permission-gated request was not dispatched");
+	await port.emitPermissionRequest(first.sessionId);
+	expect(permissionRequests).toBe(1);
+	port.fail(first.opRef, "Provider unavailable", {
+		code: "provider_unavailable",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+	});
+	await manager!.tick(KEY);
+	await eventually(() => failures.length === 1, "permission-gated failure was not delivered");
+	expect(port.sends).toHaveLength(1);
+});
+
 test("a queued retry cannot clear a turn created by reset", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const timers: { work: () => void; delayMs: number; canceled: boolean }[] = [];
