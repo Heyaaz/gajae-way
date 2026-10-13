@@ -49,11 +49,11 @@ async function fixture() {
 	return { home, path, config: await loadConfig({ home }) };
 }
 
-test("census is a read-only v32 view and reports quarantined invalid work by cutover id", async () => {
+test("census is a read-only v33 view and reports quarantined invalid work by cutover id", async () => {
 	const f = await fixture();
 	const before = await readFile(f.path);
 	const report = await runCensus(f.config);
-	expect(report.schemaVersion).toBe(32);
+	expect(report.schemaVersion).toBe(33);
 	expect(report.authority).toEqual({
 		canonicalAgentDir: join(f.home, "agent"),
 		identity: `gjc:${join(f.home, "agent")}`,
