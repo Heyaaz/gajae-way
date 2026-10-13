@@ -361,8 +361,8 @@ export class GlobalGjcClient {
 		this.discoveryPath = join(this.agentDir, "sdk", "broker.json");
 		this.#env = {
 			...trusted,
-			GJC_CODING_AGENT_DIR: this.agentDir,
 			[GJC_ATTACH_ONLY_ENV]: "0",
+			GJC_CODING_AGENT_DIR: this.agentDir,
 		};
 		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
 		this.#timeout = integer(options.healthProbeTimeoutMs, COMMAND_TIMEOUT_MS, 1);
@@ -998,6 +998,7 @@ function trustedEnvironment(cwd: string): Record<string, string> {
 	delete env.GJC_CODING_AGENT_DIR;
 	delete env.PI_CODING_AGENT_DIR;
 	delete env.GJC_AGENT_DIR;
+	delete env[GJC_ATTACH_ONLY_ENV];
 	return env;
 }
 /** Canonicalize the configured agent directory, resolving existing ancestor aliases first. */

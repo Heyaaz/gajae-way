@@ -7,9 +7,9 @@ import { isSilenceToken } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import {
 	freshTurnAttempt,
-	type PersonaFailureInput,
 	PERSONA_COMPACTION_TOKENS,
 	PERSONA_PREAMBLE_REFRESH_SENDS,
+	type PersonaFailureInput,
 	PersonaSessionManager,
 	personaTurnOpRef,
 	resetFailedTurn,
@@ -17,7 +17,11 @@ import {
 	WEDGED_TURN_IDLE_MS,
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
-import { ModelNotSelectedError, type SessionCompactionStatus, type SessionContextUsage } from "../src/orchestrator/session-port";
+import {
+	ModelNotSelectedError,
+	type SessionCompactionStatus,
+	type SessionContextUsage,
+} from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";

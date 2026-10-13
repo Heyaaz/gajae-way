@@ -94,6 +94,10 @@ test("all spawned GJC commands and relays pin the configured agent directory and
 			expect(invocation.cmd[0]).toBe("/configured/gjc");
 			expect(invocation.env.GJC_CODING_AGENT_DIR).toBe(client.agentDir);
 			expect(invocation.env[GJC_ATTACH_ONLY_ENV]).toBe("0");
+			expect(Object.keys(invocation.env).at(-1)).toBe("GJC_CODING_AGENT_DIR");
+			expect(Object.keys(invocation.env).indexOf(GJC_ATTACH_ONLY_ENV)).toBeLessThan(
+				Object.keys(invocation.env).indexOf("GJC_CODING_AGENT_DIR"),
+			);
 			expect(invocation.env.GJC_EXECUTABLE).toBeUndefined();
 			expect(invocation.env.PI_CODING_AGENT_DIR).toBeUndefined();
 			expect(invocation.env.GJC_AGENT_DIR).toBeUndefined();
