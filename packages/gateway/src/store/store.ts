@@ -133,17 +133,16 @@ export class Store {
 		let openWork = 0;
 		try {
 			for (const row of this.work.laneJobHistoryRows()) {
+				if (this.bindings.isQuarantined("work", row.job_id)) continue;
 				const job = parseLaneJobRecord(row.record_json);
 				if (job.jobId !== row.job_id) throw new WorkAttemptStateError();
-				if (
-					!this.bindings.isQuarantined("work", job.jobId) &&
-					(job.attempts.some((attempt) => attempt.endedAt === undefined) || !["done", "aborted"].includes(job.state))
-				)
+				if (job.attempts.some((attempt) => attempt.endedAt === undefined) || !["done", "aborted"].includes(job.state))
 					openWork++;
 			}
 			for (const row of this.work.workAttemptRows()) {
-				const runtime = this.work.workAttemptGet(row.op_ref)!;
-				if (runtime.settledAt === null && !this.bindings.isQuarantined("work", runtime.jobId)) openWork++;
+				if (this.bindings.isQuarantined("work", row.job_id)) continue;
+				const runtime = this.work.workAttemptGet(row.op_ref);
+				if (runtime?.settledAt === null) openWork++;
 			}
 			openWork += this.work.laneReportOpenCount();
 		} catch (error) {

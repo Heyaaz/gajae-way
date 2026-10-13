@@ -673,6 +673,7 @@ export class WorkGroup {
 
 		for (const row of rows) {
 			let runtimeJobId: string | undefined;
+			let conflictingSettlements = false;
 			try {
 				const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
 				validateWorkRuntime(runtime, this.instanceId);
@@ -705,10 +706,8 @@ export class WorkGroup {
 				const storedSettledAt = [runtime.settledAt, attempt.endedAt ?? null, row.settled_at].filter(
 					(at): at is string => at !== null,
 				);
-				workAssert(
-					sharedSettledAt !== undefined || storedSettledAt.length <= 1,
-					"settlement timestamps conflict without corroboration",
-				);
+				conflictingSettlements = sharedSettledAt === undefined && storedSettledAt.length > 1;
+				workAssert(!conflictingSettlements, "settlement timestamps conflict without corroboration");
 				const settledAt = sharedSettledAt ?? storedSettledAt[0] ?? runtime.terminal?.observedAt;
 				workAssert(settledAt !== undefined && settledAt !== null && workTime(settledAt));
 				const terminal = runtime.terminal ?? {
@@ -815,7 +814,7 @@ export class WorkGroup {
 				if (runtimeJobId !== undefined && runtimeJobId !== row.job_id) {
 					quarantinedJobs.add(row.job_id);
 					quarantinedJobs.add(runtimeJobId);
-				} else if (row.settled_at !== null) quarantinedJobs.add(row.job_id);
+				} else if (row.settled_at !== null || conflictingSettlements) quarantinedJobs.add(row.job_id);
 				log(
 					`work_attempt_reconcile_skip opRef=${row.op_ref} reason=${error instanceof Error ? error.message : String(error)}`,
 				);

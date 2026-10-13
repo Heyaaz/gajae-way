@@ -301,6 +301,42 @@ describe("work attempt boot reconciliation", () => {
 		expect(f.database.bindings.isQuarantined("work", runtime.jobId)).toBe(true);
 	});
 
+	test("reconciliation quarantines conflicting runtime and history timestamps with a NULL SQL settlement", async () => {
+		const f = await fixture();
+		const runtimeSettledAt = "2026-09-08T00:00:20.000Z";
+		const historySettledAt = "2026-09-08T00:00:30.000Z";
+		const runtime: WorkAttemptRuntime = {
+			...f.runtime,
+			terminal: { kind: "local", observedAt: runtimeSettledAt, reasonCode: "recovery_indeterminate" },
+			output: { ...f.runtime.output, disposition: "unavailable" },
+			decision: "recovery_indeterminate",
+			settledAt: runtimeSettledAt,
+		};
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.raw
+			.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+			.run(JSON.stringify(runtime), runtime.opRef);
+		const history = closeAttempt({
+			record: f.record,
+			opRef: runtime.opRef,
+			endState: "terminal_uncertain",
+			errorCode: "recovery_indeterminate",
+			endedAt: historySettledAt,
+		});
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, {
+				...history,
+				laneKey: runtime.laneKey,
+				json: JSON.stringify(history),
+			}),
+		);
+
+		expect(() => f.database.work.workAttemptGet(runtime.opRef)).toThrow(WorkAttemptStateError);
+		expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
+		expect(f.database.bindings.isQuarantined("work", runtime.jobId)).toBe(true);
+		expect(f.database.inspectBrokerAuthority().openWork).toBe(0);
+	});
+
 	test("reconciliation quarantines settled attempts with mismatched history identity", async () => {
 		for (const [field, value] of [
 			["sessionId", "59bd7e80-cfbb-429a-b06b-bcf28cf75890"],
@@ -327,6 +363,7 @@ describe("work attempt boot reconciliation", () => {
 			expect(() => f.database.work.workAttemptGet(f.runtime.opRef)).toThrow(WorkAttemptStateError);
 			expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
 			expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(true);
+			expect(f.database.inspectBrokerAuthority().openWork).toBe(0);
 		}
 	});
 
@@ -351,6 +388,7 @@ describe("work attempt boot reconciliation", () => {
 			expect(() => f.database.work.workAttemptGet(f.runtime.opRef)).toThrow(WorkAttemptStateError);
 			expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
 			expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(true);
+			expect(f.database.inspectBrokerAuthority().openWork).toBe(0);
 		}
 	});
 
