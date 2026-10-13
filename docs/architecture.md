@@ -96,7 +96,7 @@ A client must start with `hello`, listing `supportedVersions` and optionally `re
 
 ## Conversation identity and sessions
 
-An origin is a validated, platform-neutral record: platform, kind, conversation ID, and (only where appropriate) parent or peer IDs. Platforms are `loopback`, `discord`, `telegram`, `slack`, and `monitor`; kinds include DM, channel, thread, topic, loopback, and monitor event type. `discord`, `telegram`, and `slack` are the *chat platforms* (`CHAT_PLATFORMS`): the only origins the message and reaction verbs accept, because only they have an adapter that can settle a delivery. Slack thread origins carry a `channel:ts` conversation id with the channel as parent; Slack has no `topic` kind. The only canonical identity string is `originKey`:
+An origin is a validated, platform-neutral record: platform, kind, conversation ID, and (only where appropriate) parent or peer IDs. Platforms are `loopback`, `discord`, `telegram`, `slack`, and `monitor`; kinds include DM, channel, thread, topic, loopback, and monitor event type. `discord`, `telegram`, and `slack` are the *chat platforms* (`CHAT_PLATFORMS`): the only origins the message and reaction verbs accept, because only they have an adapter that can settle a delivery. Slack thread origins carry a `channel:ts` conversation id with the channel as parent; Slack has no `topic` kind. Discord thread origins may also carry `threadVisibility` (`public` or `private`) as delivery-safety metadata; it is excluded from `originKey`. A missing or unarchiveable Discord thread falls back to its parent only when visibility is explicitly public, never for private or unknown threads. The only canonical identity string is `originKey`:
 
 ```text
 platform/kind/conversationId[/parent=…][/peer=…]
