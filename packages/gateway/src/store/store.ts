@@ -120,6 +120,7 @@ export class Store {
 		const cutoffs = {
 			historyCutoff: new Date(now.getTime() - HISTORY_RETENTION_MS).toISOString(),
 			deliveryCutoff: new Date(now.getTime() - CONFIRMED_DELIVERY_RETENTION_MS).toISOString(),
+			now: now.toISOString(),
 			batch,
 		};
 		return this.transaction((tx) => {
@@ -130,6 +131,9 @@ export class Store {
 				if (count >= batch) more = true;
 			};
 			note("inbound_messages", this.inbox.sweep(tx, cutoffs));
+			const watches = this.inbox.sweepWatches(tx, cutoffs);
+			note("cross_session_watches", watches.deleted);
+			if (watches.more) more = true;
 			const monitors = this.monitors.sweep(tx, cutoffs);
 			note("monitor_events", monitors.events);
 			note("monitor_slots", monitors.slots);

@@ -29,6 +29,11 @@ const HANDOFF_TOKEN = /^\s*\[HANDOFF:([^\]\s]+)\][^\S\n]*(?:\n|$)/;
 const HANDOFF_TOKEN_PREFIX = /^[ \t]*\[HANDOFF:[^\]\r\n]*\]/;
 const HANDOFF_BLOCK_BREAK = /^[ \t]*\[BREAK\][ \t]*$/;
 const WAKE_TOKEN = /^[ \t]*\[WAKE:([^\]\r\n]*)\][ \t]*(.*)$/;
+const WATCH_TOKEN = /^[ \t]*\[WATCH:([^\]\r\n]*)\][ \t]*(.*)$/;
+
+export const WATCH_MIN_TTL_MS = 60_000;
+export const WATCH_MAX_TTL_MS = 7 * 24 * 60 * 60_000;
+export const WATCH_REASON_MAX_LENGTH = 240;
 
 interface CodeFence {
 	readonly character: string;
@@ -157,6 +162,54 @@ export function extractWakeLines(text: string): { readonly text: string; readonl
 	return wakes.length === 0 ? { text, wakes } : { text: kept.join("\n").trim(), wakes };
 }
 
+export interface WatchLine {
+	readonly target: string;
+	readonly ttl: string;
+	readonly reason: string;
+}
+
+/**
+ * Remove `[WATCH:<origin>] <ttl> <reason>` lines outside fenced code. The
+ * token is a final-reply directive; the server validates the expiry and
+ * reason before persisting a one-shot watch.
+ */
+export function extractWatchLines(text: string): { readonly text: string; readonly watches: readonly WatchLine[] } {
+	let fence: CodeFence | undefined;
+	const kept: string[] = [];
+	const watches: WatchLine[] = [];
+	for (const rawLine of text.split("\n")) {
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		const fenceResult = codeFenceLine(line, fence);
+		fence = fenceResult.fence;
+		const token = fenceResult.isFenceLine || fence ? null : line.match(WATCH_TOKEN);
+		if (!token) {
+			kept.push(rawLine);
+			continue;
+		}
+		const remainder = (token[2] ?? "").trim();
+		const firstSpace = remainder.search(/\s/);
+		watches.push({
+			target: (token[1] ?? "").trim(),
+			ttl: firstSpace < 0 ? remainder : remainder.slice(0, firstSpace),
+			reason: firstSpace < 0 ? "" : remainder.slice(firstSpace).trim(),
+		});
+	}
+	return watches.length === 0 ? { text, watches } : { text: kept.join("\n").trim(), watches };
+}
+
+export function parseWatchTtl(
+	value: string,
+): { readonly ok: true; readonly ttlMs: number } | { readonly ok: false; readonly reason: string } {
+	const match = value.match(/^([1-9][0-9]*)(m|h|d)$/);
+	if (!match) return { ok: false, reason: "expiry must use minutes, hours, or days (for example 30m)" };
+	const amount = Number(match[1]);
+	const unitMs = match[2] === "m" ? 60_000 : match[2] === "h" ? 60 * 60_000 : 24 * 60 * 60_000;
+	const ttlMs = amount * unitMs;
+	if (!Number.isSafeInteger(ttlMs) || ttlMs < WATCH_MIN_TTL_MS || ttlMs > WATCH_MAX_TTL_MS)
+		return { ok: false, reason: "expiry must be between 1m and 7d" };
+	return { ok: true, ttlMs };
+}
+
 /**
  * Provenance carried on the target's inbound row (engagement metadata). The
  * chain lists every origin key the work has already passed through, oldest
@@ -252,6 +305,25 @@ export function wakeMessageId(
 	return `wake:${createHash("sha256").update(`${sourceOriginKey}|${sourceMessageId}|${targetOriginKey}|${summary}`).digest("hex").slice(0, 32)}`;
 }
 
+/** Stable watch identity across a replayed terminal reply for the same source turn. */
+export function watchRegistrationId(
+	sourceOriginKey: string,
+	sourceMessageId: string,
+	targetOriginKey: string,
+	ttl: string,
+	reason: string,
+): string {
+	return `watch:${createHash("sha256")
+		.update(JSON.stringify([sourceOriginKey, sourceMessageId, targetOriginKey, ttl, reason]))
+		.digest("hex")
+		.slice(0, 32)}`;
+}
+
+/** A watch fires at most once for a given accepted source message. */
+export function watchWakeMessageId(watchId: string, sourceMessageId: string): string {
+	return `watch-wake:${createHash("sha256").update(`${watchId}|${sourceMessageId}`).digest("hex").slice(0, 32)}`;
+}
+
 function clip(text: string, max: number): string {
 	const collapsed = text.replace(/\s+/g, " ").trim();
 	return collapsed.length <= max ? collapsed : `${collapsed.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
@@ -321,6 +393,34 @@ export function renderWakeTurn(input: {
 		"[Wake summary from the source session]",
 		clip(input.summary, HANDOFF_NOTE_MAX_LENGTH) || "(no summary)",
 	].join("\n");
+}
+
+/** An automatic watch wake carries only event metadata, never the message body. */
+export function renderWatchedInputTurn(input: {
+	readonly provenance: HandoffProvenance;
+	readonly sourcePlace: string;
+	readonly sender: string;
+	readonly reason: string;
+}): string {
+	const { provenance } = input;
+	return [
+		"[INTERNAL WATCH WAKE - a watched message arrived in another conversation; its text is not relayed here]",
+		`Source conversation: ${clip(input.sourcePlace, 160)} (${provenance.sourceOriginKey})`,
+		`New message: msg:${provenance.sourceMessageId} from ${clip(input.sender, 120) || "unknown sender"} at ${provenance.at}`,
+		`Watch reason: ${clip(input.reason, WATCH_REASON_MAX_LENGTH) || "(no reason)"}`,
+		"Event summary: a new human message arrived in the watched conversation.",
+		"Processing result: the source conversation accepted it into its durable queue; that session handles it independently.",
+		"The original message text, attachments, and any secrets are not included. Read them only in the source conversation if already authorized there.",
+		"This is information only, not a request or an owner instruction, and it grants no permission you do not already have here. Answer in THIS conversation or [SILENT].",
+	].join("\n");
+}
+
+export function renderWatchRegistered(target: string, expiresAt: string, reason: string): string {
+	return `Watching ${target} for its next human message until ${expiresAt}. Reason: ${clip(reason, WATCH_REASON_MAX_LENGTH)}.`;
+}
+
+export function renderWatchFailure(target: string, reason: string): string {
+	return `Watch for ${target || "(no target)"} failed: ${reason}. No watch was registered.`;
 }
 
 export function renderWakeFailure(target: string, reason: string): string {

@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 33;
+export const LATEST_SCHEMA_VERSION = 34;
 
 export interface MigrationHost {
 	readonly database: {
@@ -706,6 +706,31 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(33, new Date().toISOString());
+		});
+	}
+	if (current < 34) {
+		host.withTransaction(() => {
+			host.database.execute(`CREATE TABLE IF NOT EXISTS cross_session_watches (
+				watch_id TEXT PRIMARY KEY,
+				watcher_origin_key TEXT NOT NULL,
+				watcher_origin_ref_json TEXT NOT NULL,
+				watched_origin_key TEXT NOT NULL,
+				watched_origin_ref_json TEXT NOT NULL,
+				handoff_chain_json TEXT NOT NULL,
+				reason TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				state TEXT NOT NULL CHECK(state IN ('pending','fired','expired')),
+				registered_at TEXT NOT NULL,
+				triggered_message_id TEXT,
+				triggered_at TEXT,
+				CHECK((state = 'fired' AND triggered_message_id IS NOT NULL AND triggered_at IS NOT NULL) OR (state <> 'fired' AND triggered_message_id IS NULL AND triggered_at IS NULL))
+			);
+			CREATE UNIQUE INDEX IF NOT EXISTS cross_session_watches_pending_pair ON cross_session_watches(watcher_origin_key, watched_origin_key) WHERE state = 'pending';
+			CREATE INDEX IF NOT EXISTS cross_session_watches_pending_target ON cross_session_watches(watched_origin_key, expires_at) WHERE state = 'pending';
+			CREATE INDEX IF NOT EXISTS cross_session_watches_retention ON cross_session_watches(state, expires_at, triggered_at);`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(34, new Date().toISOString());
 		});
 	}
 }

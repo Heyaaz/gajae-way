@@ -53,6 +53,7 @@ SQLite records one active private broker authority and immutable gateway-created
 | `broker_cutovers` | `bindings` | `store/groups/bindings.ts` |
 | `deliveries` | `outbox` | `store/groups/outbox.ts` |
 | `inbound_messages` | `inbox` | `store/groups/inbox.ts` |
+| `cross_session_watches` | `inbox` | `store/groups/inbox.ts` |
 | `conversation_context` | `inbox` | `store/groups/inbox.ts` |
 | `conversation_context_state` | `inbox` | `store/groups/inbox.ts` |
 | `recall_snippets` | `inbox` | `store/groups/inbox.ts` |
@@ -67,7 +68,7 @@ SQLite records one active private broker authority and immutable gateway-created
 | `dispatch_leases` | `monitors` | `store/groups/monitors.ts` |
 | `memory_intents` | `memory` | `store/groups/memory.ts` |
 
-The current schema is version 32 and still contains `broker_quarantine` and `broker_cutovers`. L4h's migration 33 to remove those tables is pending; keep the ownership rows until that migration is deployed.
+The current schema is version 34 and still contains `broker_quarantine` and `broker_cutovers`. Cross-session watches are owned by the inbox group and migrate in schema 34.
 
 ### Transaction boundary
 
@@ -164,9 +165,13 @@ Worker-lane logs are grep-stable:
 
 The persona preamble comes from `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`; the same directory is passed to `gjc` as the session working directory.
 
-The first attempted turn in every origin epoch also receives a trusted `Session bootstrap` system section. Its stable ID is derived from the opaque origin key and epoch. It carries current conversation metadata plus bounded navigation from `$GAJAEWAY_HOME/memory`; it is never placed in unread/user text. The serialized section is capped at 8 KiB by UTF-8 bytes. Identity is mandatory, today and yesterday receive bounded priority shares, and recoverable channel/rules/navigation pointers consume only the remainder. Daily sources alone may be labelled newest-entry excerpts and have a 4 MiB read ceiling; other sections remain whole. Excerpts, read-ceiling drops, and budget omissions all set truncation and are named explicitly. Source paths are realpath-confined to the resolved memory root, so a configured root symlink and in-root canonical symlinks work while traversal and escaped symlinks are rejected. Public/group turns require explicit full-origin association for channel/project/task/handoff material, exact-origin filtering for daily entries, and an explicit `bootstrap-safe: public` or `bootstrap-visibility: public` marker before associated document bodies are admitted. Included source material is delimited as reference data, never executable instruction text.
+The first attempted turn in every origin epoch also receives a trusted `Session bootstrap` system section. Its stable ID is derived from the opaque origin key and epoch. It carries current conversation metadata plus bounded navigation from `$GAJAEWAY_HOME/memory`; it is never placed in unread/user text. The serialized section is capped at 8 KiB by UTF-8 bytes. Identity is mandatory, today and yesterday receive bounded priority shares, and recoverable channel/rules/navigation pointers consume only the remainder. Daily sources alone may be labelled newest-entry excerpts and have a 4 MiB read ceiling; other sections remain whole. Excerpts, read-ceiling drops, and budget omissions all set truncation and are named explicitly. Source paths are realpath-confined to…
 
 Bootstrap completion is durable in schema 14. An epoch is pending while `epoch > last_bootstrapped_epoch`; `/new` establishes pending state in the same session-row update that bumps the epoch. The gateway commits the projection only after a terminal text or intentional-silence success. A failure before terminal success retries with the same stable bootstrap ID. If an intermediate reply was already delivered before failure, the unread body is consumed to prevent a harmful answer replay, while the still-pending bootstrap is safely re-presented under that same idempotent ID on the next turn. Session and ops projections expose only epoch, applied time, included section names, byte count, truncation, and diagnostics—never source bodies.
+
+## Cross-session handoff, wake, and watch
+
+`[HANDOFF:<target>]` moves work to another chat origin; `[WAKE:<target>] <summary>` sends an explicit information-only relay while keeping the work here. A final reply may also register a one-shot `[WATCH:<target>] <ttl> <reason>` for the next accepted human message at another origin. Watches are durable in schema 34, unique per waiting/watched origin pair, expire between one minute and seven days, and are claimed atomically with the source message's durable inbox admission. The resulting internal turn carries sender, origin, reason, and queue status only; it never copies message text, attachments, or secrets. Its provenance uses the same two-hop and loop checks as relays, and it grants no authorization. Watch registration and firing are recorded as origin-tagged daily-memory events.
 
 ## Delivery and crash semantics
 
