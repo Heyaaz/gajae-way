@@ -1073,7 +1073,7 @@ export class WorkGroup {
 		this.#workPutHistory(tx, next, record);
 		if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(tx, next);
 		if (next.decision === "reported" && admission?.kind === "lane")
-			this.laneReportInsert(tx, admission.report, next.settledAt!);
+			this.#putLaneReport(tx, admission.report, next.settledAt!);
 		if (fallbackPayload) {
 			const expectedOrigin =
 				admission?.kind === "persona"
@@ -1106,24 +1106,9 @@ export class WorkGroup {
 		};
 	}
 
-	/** Admits one pending child report for its parent lane; idempotent if report already exists and matches. */
+	/** Admits one pending child report for its parent lane; a matching existing report is a no-op. */
 	laneReportInsert(tx: WriteTx, report: WorkAttemptAdmissionLane["report"], createdAt: string): void {
-		if (this.#assertLaneReportMatches(report)) return;
-		this.#db
-			.prepare(
-				"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
-			)
-			.run(
-				tx,
-				report.reportId,
-				report.parentName,
-				report.childName,
-				report.childOpRef,
-				report.body,
-				report.root === null ? null : JSON.stringify(report.root),
-				createdAt,
-				createdAt,
-			);
+		this.#putLaneReport(tx, report, createdAt);
 	}
 
 	laneParentAvailable(name: string): boolean {
