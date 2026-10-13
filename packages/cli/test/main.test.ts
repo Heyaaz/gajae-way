@@ -1,8 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -33,7 +33,19 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 	const originalLog = console.log;
 	const originalError = console.error;
 	const previousExit = process.exitCode;
-	console.log = (line: unknown) => output.push(String(line));
+	console.log = (line: unknown) => {
+		const text = String(line);
+		if (text.startsWith("SLO ")) {
+			output.push(text);
+			return;
+		}
+		try {
+			const value = JSON.parse(text) as { days?: unknown; windows?: unknown; ok?: unknown };
+			if (Array.isArray(value.days) && Array.isArray(value.windows) && typeof value.ok === "boolean") output.push(text);
+		} catch {
+			// Another concurrently running test may write to the shared console.
+		}
+	};
 	console.error = (line: unknown) => errors.push(String(line));
 	process.exitCode = 0;
 	const listener = Bun.listen<{ buffer: string }>({
@@ -140,7 +152,10 @@ describe("cli arguments", () => {
 	test("--version prints the package version without requiring a gateway", async () => {
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (text === pkg.version) output.push(text);
+		};
 		try {
 			await main(["--version"]);
 			expect(output).toEqual([pkg.version]);
@@ -174,7 +189,10 @@ describe("cli arguments", () => {
 		const received: Array<{ verb: string; params: unknown }> = [];
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (text === JSON.stringify({ requeued: [] })) output.push(text);
+		};
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
 			socket: {
@@ -237,7 +255,15 @@ describe("cli arguments", () => {
 			createdAt: "2026-10-01T00:00:00.000Z",
 			textPrefix: "delivery text",
 		};
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (
+				text === JSON.stringify({ rows: [row] }) ||
+				text.startsWith("deliveries: ") ||
+				text.startsWith(`${row.createdAt} ${row.state} `)
+			)
+				output.push(text);
+		};
 		console.error = (line: unknown) => errors.push(String(line));
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
@@ -316,7 +342,21 @@ describe("cli arguments", () => {
 		const received: string[] = [];
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			try {
+				const value = JSON.parse(text) as { eventId?: unknown; stage?: unknown };
+				if (
+					typeof value.eventId === "string" &&
+					value.eventId.startsWith("event-") &&
+					typeof value.stage === "string"
+				) {
+					output.push(text);
+				}
+			} catch {
+				// Other tests share the process console.
+			}
+		};
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
 			socket: {
@@ -527,7 +567,10 @@ describe("service installation", () => {
 					runtime: { path: ["~/custom", "/usr/bin"] },
 				}),
 			);
-			const env = { HOME: "/Users/operator", GAJAEWAY_HOME: home };
+			const env = { HOME: home, GAJAEWAY_HOME: home };
+			const binDir = join(home, "gaja&<bin>");
+			await mkdir(binDir);
+			for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
 			const writes: Array<{ path: string; contents: string }> = [];
 			const writer = async (path: string, contents: string): Promise<void> => {
 				writes.push({ path, contents });
@@ -1051,6 +1094,26 @@ describe("work operator commands", () => {
 			sessionId: "s",
 		});
 		expect(output.requests).toEqual([{ verb: "work.start", params: { name: "fix", text: "task" } }]);
+	});
+
+	test("work start resolves relative repo paths in the CLI process", async () => {
+		const output = await run(["start", "fix", "--repo", ".", "task"], {
+			started: true,
+			jobId: "j",
+			opRef: "o",
+			sessionKey: "k",
+			sessionId: "s",
+		});
+		expect(output.requests).toEqual([
+			{ verb: "work.start", params: { name: "fix", repo: resolve("."), text: "task" } },
+		]);
+	});
+
+	test("work start rejects --base without --repo before connecting", async () => {
+		const output = await run(["start", "fix", "--cwd", "/repo", "--base", "dev", "task"], {});
+		expect(output.requests).toEqual([]);
+		expect(output.connections).toBe(0);
+		expect(output.errors.join(" ")).toContain("--repo");
 	});
 
 	for (const command of ["run", "start"]) {

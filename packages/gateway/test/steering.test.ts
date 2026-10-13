@@ -183,7 +183,8 @@ test("a mid-turn group message that did not address the persona is steered with 
 	enqueue("trigger", "draft the release note", { group: true, mentioned: true, authorId: "U1" });
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial send did not become accepted");
-	const running = port.sends[0]!;
+	const running = port.sends.at(0);
+	if (!running) throw new Error("initial send missing");
 
 	enqueue("aside", "예찬님 그건 내일 봐요", { group: true, mentioned: false, authorId: "U2" });
 	await manager.notifyInbound(ORIGIN_KEY);

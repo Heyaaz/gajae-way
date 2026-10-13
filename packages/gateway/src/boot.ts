@@ -146,6 +146,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 	};
 	try {
 		await assertNoRestoreJournal(config.home);
+
 		const layout = homeLayout(config.home);
 		let executable = options.broker?.executable;
 		if (executable === undefined) {
@@ -183,6 +184,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 		const database = await Store.open(config.dbPath, {
 			canonicalAgentDir: broker.agentDir,
 			backupsDir: layout.backupsDir,
+			journalMode: config.sqlite?.journalMode,
 		});
 		const slo = new SloRecorder(database.core, { home: config.home });
 		sloRecorder = slo;
