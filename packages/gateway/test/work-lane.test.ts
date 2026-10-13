@@ -2563,3 +2563,200 @@ test("#439 relay non-transport failure is not caught as transport failure", asyn
 	expect(fallbackCalled).toBe(false);
 	expect(f.port.statusReads.filter((read) => read.opRef === result.opRef).every((read) => read.relayUsed)).toBe(true);
 });
+
+test("issue #480: operator retire cleans up worktree and branch", async () => {
+	// Create a bare git repo to test against
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-retire-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-retire-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "retire-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		if (!result.started) throw new Error("work did not start");
+
+		const job = f.job("retire-test");
+		const worktreePath = job.lane.worktreePath;
+		expect(worktreePath).toBeDefined();
+
+		// Verify worktree exists
+		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+		});
+		expect(existsBefore.exitCode).toBe(0);
+
+		// Complete the work and retire the lane
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		const retireOutcome = await f.lanes.retire("retire-test", "operator");
+		expect(retireOutcome.retired).toBe(true);
+
+		// Verify worktree was deleted
+		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(exitsAfter.exitCode).not.toBe(0);
+
+		// Verify branch was deleted
+		const branchCheck = Bun.spawnSync(["git", "-C", bareRepo, "show-ref", "work/retire-test"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(branchCheck.exitCode).not.toBe(0);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: cleanup failure on operator retire fails the retirement", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-cleanup-fail-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-cleanup-fail-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "cleanup-fail",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		expect(result.started).toBe(true);
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("cleanup-fail");
+		const repository = job.lane.repository;
+
+		// Complete the work
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		// Corrupt the repository to cause cleanup to fail
+		if (repository) {
+			await rm(join(repository, "objects"), { recursive: true, force: true });
+		}
+
+		// Attempt to retire should fail due to cleanup failure
+		const retireOutcome = await f.lanes.retire("cleanup-fail", "operator");
+		expect(retireOutcome.retired).toBe(false);
+		if (!retireOutcome.retired) {
+			expect(retireOutcome.reason).toContain("worktree cleanup failed");
+		}
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: force retire cleans up worktree and branch", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-force-retire-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-force-retire-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture({ hostLostGraceMs: 20 });
+		const result = await f.manager.start({
+			name: "force-retire-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		expect(result.started).toBe(true);
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("force-retire-test");
+		const worktreePath = job.lane.worktreePath;
+
+		// Simulate host loss by making session unavailable and marking as dead
+		f.port.status = async () => {
+			throw new Error("Session unavailable");
+		};
+		f.port.setSessionState(result.sessionId, { live: false });
+
+		// Force retire should clean up worktree
+		const retireOutcome = await f.lanes.forceRetire("force-retire-test");
+		expect(retireOutcome.retired).toBe(true);
+
+		// Verify worktree was deleted
+		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(exitsAfter.exitCode).not.toBe(0);
+
+		// Verify branch was deleted
+		const branchCheck = Bun.spawnSync(["git", "-C", bareRepo, "show-ref", "work/force-retire-test"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(branchCheck.exitCode).not.toBe(0);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});

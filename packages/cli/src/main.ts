@@ -907,16 +907,24 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const name = args[0];
 				let cwd: string | undefined;
 				let resume = false;
+				let repo: string | undefined;
+				let base: string | undefined;
 				let model: string | { preset: string } | undefined;
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
 					const arg = args[i];
-					if (arg === "--cwd" || arg === "--model" || arg === "--preset") {
+					if (arg === "--cwd" || arg === "--repo" || arg === "--base" || arg === "--model" || arg === "--preset") {
 						const value = args[++i];
 						if (!value?.trim() || value.startsWith("--")) throw new Error(usage);
 						if (arg === "--cwd") {
 							if (cwd !== undefined || !isAbsolute(value)) throw new Error(usage);
 							cwd = value;
+						} else if (arg === "--repo") {
+							if (repo !== undefined) throw new Error(usage);
+							repo = value;
+						} else if (arg === "--base") {
+							if (base !== undefined) throw new Error(usage);
+							base = value;
 						} else {
 							if (model !== undefined) throw new Error(`${usage}\n--model and --preset are mutually exclusive`);
 							model = arg === "--preset" ? { preset: value } : value;
@@ -938,6 +946,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						name,
 						text,
 						...(cwd ? { cwd } : {}),
+						...(repo ? { repo } : {}),
+						...(base ? { base } : {}),
 						...(resume ? { resume: true } : {}),
 						...(model === undefined ? {} : { model }),
 						...(callerSessionId ? { callerSessionId } : {}),

@@ -614,6 +614,8 @@ export interface WorkRunParams {
 	readonly cwd?: string;
 	/** Repository binding: remote URL, configured alias, or repo key for worktree creation and push target (issue #480). */
 	readonly repo?: string;
+	/** Base branch or ref for worktree creation when repo is specified (issue #480). */
+	readonly base?: string;
 	/**
 	 * Explicit operator acknowledgement that lets a new attempt start while
 	 * the durable job is awaiting_operator (issue #10 hold semantics).
