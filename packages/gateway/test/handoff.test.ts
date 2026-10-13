@@ -8,11 +8,14 @@ import {
 	extendHandoffChain,
 	extractHandoffAtBlockStart,
 	extractWakeLines,
+	extractWatchLines,
 	HANDOFF_DIGEST_MAX_LENGTH,
 	handoffMessageId,
 	parseHandoffReply,
+	parseWatchTtl,
 	resolveHandoffTarget,
 	sanitizeHandoffTokens,
+	WATCH_MAX_TTL_MS,
 } from "../src/server/handoff";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -99,7 +102,7 @@ async function gateway(replies: Replies) {
 	return { client, database, turns };
 }
 
-function say(client: Client, origin: typeof A, messageId: string, text: string): void {
+function say(client: Client, origin: typeof A | typeof B | typeof C, messageId: string, text: string): void {
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -465,7 +468,7 @@ test("a [WAKE:] line is parsed and stripped; the rest of the reply and code exam
 });
 
 test("a wake delivers an internal information-only turn to the target; the source keeps its reply and gets no pointer", async () => {
-	const { client, turns } = await gateway({
+	const { client, database, turns } = await gateway({
 		[KEY_A]: () => "Fixed the relay here.\n[WAKE:gajae-way-dev] relay stall fixed in chan-a, no action needed",
 		[KEY_B]: () => "Noted.",
 	});
@@ -482,6 +485,13 @@ test("a wake delivers an internal information-only turn to the target; the sourc
 	expect(woken).toContain("relay stall fixed in chan-a, no action needed");
 	expect(delivered(client, "chan-a")).toEqual(["Fixed the relay here."]);
 	expect(delivered(client, "chan-b")).toEqual(["Noted."]);
+	const wakeAudit = database.memory
+		.rows()
+		.map((row) => JSON.parse(row.payload_json) as { originRefJson: string; userText: string; replyText: string })
+		.filter((entry) => entry.userText.includes("Cross-session wake"));
+	expect(wakeAudit).toHaveLength(1);
+	expect(wakeAudit[0]?.originRefJson).toBe(JSON.stringify(A));
+	expect(JSON.stringify(wakeAudit)).not.toContain("relay stall fixed in chan-a");
 });
 
 test("a wake that would exceed the hop limit is refused and reported in the source", async () => {
@@ -512,4 +522,117 @@ test("a wake to an unknown origin is reported back to the source and runs nothin
 	expect(source[1]).toContain("Wake for nowhere failed");
 	expect(source[1]).toContain("unknown handoff target");
 	expect(source.join("\n")).not.toContain("[WAKE:");
+});
+
+test("a [WATCH:] line is removed, fenced examples stay literal, and expiry bounds are strict", () => {
+	const output =
+		"I'll wait here.\n[WATCH:gajae-way-dev] 30m waiting for the Harbor credential\n```text\n[WATCH:ops] 2h example\n```";
+	expect(extractWatchLines(output)).toEqual({
+		text: "I'll wait here.\n```text\n[WATCH:ops] 2h example\n```",
+		watches: [{ target: "gajae-way-dev", ttl: "30m", reason: "waiting for the Harbor credential" }],
+	});
+	expect(parseWatchTtl("1m")).toEqual({ ok: true, ttlMs: 60_000 });
+	expect(parseWatchTtl("7d")).toEqual({ ok: true, ttlMs: WATCH_MAX_TTL_MS });
+	expect(parseWatchTtl("0m").ok).toBe(false);
+	expect(parseWatchTtl("30s").ok).toBe(false);
+	expect(parseWatchTtl("8d").ok).toBe(false);
+});
+
+test("a watched human message wakes its waiting session without copying message content", async () => {
+	const secret = "synthetic-secret-value-do-not-relay";
+	const { client, database, turns } = await gateway({
+		[KEY_A]: (text) =>
+			text.includes("INTERNAL WATCH WAKE")
+				? "The DM has a new message; I'll continue from its authorized context."
+				: "Waiting for the DM reply.\n[WATCH:gajae-way-dev] 30m waiting for the credential delivery",
+		[KEY_B]: () => "The credential was received and stored in the DM.",
+	});
+	say(client, A, "watch-register", "Please wait for the DM credential.");
+	await settle();
+	expect(delivered(client, "chan-a").join("\n")).toContain("Watching gajae-way-dev");
+
+	say(client, B, "credential-message", `Credential received: ${secret}`);
+	await settle();
+	const sourceTurn = turns.find((turn) => turn.originKey === KEY_B)?.text ?? "";
+	const watcherTurns = turns.filter((turn) => turn.originKey === KEY_A);
+	const wakeTurn = watcherTurns.at(-1)?.text ?? "";
+	expect(sourceTurn).toContain(secret);
+	expect(wakeTurn).toContain("INTERNAL WATCH WAKE");
+	expect(wakeTurn).toContain("from 형님");
+	expect(wakeTurn).toContain(KEY_B);
+	expect(wakeTurn).toContain("waiting for the credential delivery");
+	expect(wakeTurn).toContain("accepted it into its durable queue");
+	expect(wakeTurn).toContain("secrets are not included");
+	expect(wakeTurn).not.toContain(secret);
+	expect(watcherTurns).toHaveLength(2);
+	const [watch] = database.inbox.watchRows();
+	expect(watch).toMatchObject({
+		watcher_origin_key: KEY_A,
+		watched_origin_key: KEY_B,
+		state: "fired",
+		triggered_message_id: "credential-message",
+	});
+	const audit = database.memory
+		.rows()
+		.map((row) => JSON.parse(row.payload_json) as { originRefJson: string; userText: string; replyText: string });
+	const watchAudit = audit.filter((entry) => entry.userText.includes("Cross-session watch"));
+	expect(watchAudit).toHaveLength(2);
+	expect(watchAudit.map((entry) => entry.originRefJson).sort()).toEqual([JSON.stringify(A), JSON.stringify(B)].sort());
+	expect(JSON.stringify(watchAudit)).not.toContain(secret);
+});
+
+test("a watch expires and fires at most once for its next accepted message", async () => {
+	const { database } = await gateway({});
+	const first = {
+		watchId: "watch-expiring",
+		watcherOriginKey: KEY_A,
+		watcherOriginRefJson: JSON.stringify(A),
+		watchedOriginKey: KEY_B,
+		watchedOriginRefJson: JSON.stringify(B),
+		handoffChainJson: JSON.stringify([KEY_B]),
+		reason: "wait for a result",
+		registeredAt: "2026-10-13T08:00:00.000Z",
+		expiresAt: "2026-10-13T09:00:00.000Z",
+	};
+	expect(database.transaction((tx) => database.inbox.registerWatch(tx, first)).kind).toBe("registered");
+	expect(
+		database.transaction((tx) =>
+			database.inbox.claimWatchesForOrigin(tx, KEY_B, "late-message", "2026-10-13T09:00:00.000Z"),
+		),
+	).toEqual([]);
+	expect(database.inbox.watchRows()[0]?.state).toBe("expired");
+
+	const second = {
+		...first,
+		watchId: "watch-one-shot",
+		registeredAt: "2026-10-13T09:01:00.000Z",
+		expiresAt: "2026-10-13T10:00:00.000Z",
+	};
+	expect(database.transaction((tx) => database.inbox.registerWatch(tx, second)).kind).toBe("registered");
+	expect(
+		database.transaction((tx) =>
+			database.inbox.claimWatchesForOrigin(tx, KEY_B, "next-message", "2026-10-13T09:30:00.000Z"),
+		),
+	).toHaveLength(1);
+	expect(
+		database.transaction((tx) =>
+			database.inbox.claimWatchesForOrigin(tx, KEY_B, "following-message", "2026-10-13T09:31:00.000Z"),
+		),
+	).toEqual([]);
+	expect(database.inbox.watchRows().find((watch) => watch.watch_id === second.watchId)).toMatchObject({
+		state: "fired",
+		triggered_message_id: "next-message",
+	});
+});
+
+test("a watch cannot route back to an origin already in its handoff chain", async () => {
+	const { client, database, turns } = await gateway({
+		[KEY_B]: () => "[HANDOFF:marketing]\nThis belongs in chan-a.",
+		[KEY_A]: () => "Waiting for the original room.\n[WATCH:gajae-way-dev] 30m wait for the reply",
+	});
+	say(client, B, "handoff-to-a", "Please take this work.");
+	await settle();
+	expect(turns.map((turn) => turn.originKey)).toEqual([KEY_B, KEY_A]);
+	expect(database.inbox.watchRows()).toEqual([]);
+	expect(delivered(client, "chan-a").join("\n")).toContain("already in this handoff chain");
 });

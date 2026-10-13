@@ -689,6 +689,7 @@ export class BindingsGroup {
 			"monitor_events",
 			"authored_outputs",
 			"inbound_messages",
+			"cross_session_watches",
 			"conversation_context",
 			"lane_jobs",
 			"monitor_failures",
