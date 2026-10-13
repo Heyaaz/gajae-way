@@ -53,6 +53,7 @@ import {
 	type LaneForceRetireReason,
 	type LaneGovernor,
 	laneJobIdentity,
+	managedLaneBranchName,
 	managedLaneRepositoryPath,
 	managedLaneWorktreePath,
 	workSessionKey,
@@ -768,7 +769,7 @@ export class WorkLaneManager {
 			const facts = await collectRepoFacts(worktreePath, undefined, false);
 			job = createLaneJobRecord({
 				jobId,
-				branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
+				branch: facts?.branch ?? managedLaneBranchName(input.name),
 				worktreePath,
 				baselineSha: createdWorktree?.baseSha ?? facts?.headSha,
 				...(input.repo !== undefined ? { repository: input.repo } : {}),
@@ -2958,7 +2959,7 @@ async function createWorktreeFromRepo(
 
 		worktreeAddAttempted = true;
 		const addResult = Bun.spawnSync(
-			["git", "worktree", "add", "-b", `work/${laneName.toLowerCase()}`, worktreePath, baseSha],
+			["git", "worktree", "add", "-b", managedLaneBranchName(laneName), worktreePath, baseSha],
 			{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
 		);
 		if (addResult.exitCode !== 0) {
@@ -3056,7 +3057,7 @@ async function discardCreatedWorktree(name: string, created: CreatedRepoWorktree
 	});
 	if (removeResult.exitCode !== 0)
 		throw new Error(removeResult.stderr?.toString().trim() || "git worktree remove failed");
-	Bun.spawnSync(["git", "branch", "-D", `work/${name.toLowerCase()}`], {
+	Bun.spawnSync(["git", "branch", "-D", managedLaneBranchName(name)], {
 		cwd: created.repositoryPath,
 		stdout: "ignore",
 		stderr: "ignore",

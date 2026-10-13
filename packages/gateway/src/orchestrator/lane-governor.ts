@@ -32,6 +32,10 @@ export function laneJobIdentity(workName: string): { jobId: string; laneKey: str
 	return { jobId: `lanejob-${Buffer.from(workName, "utf8").toString("hex")}`, laneKey: `work-${workName}` };
 }
 
+export function managedLaneBranchName(workName: string): string {
+	return `work/${Buffer.from(workName, "utf8").toString("hex")}`;
+}
+
 export function managedLaneRepositoryPath(laneRoot: string, workName: string): string {
 	return join(resolve(laneRoot), "repositories", Buffer.from(workName, "utf8").toString("hex"));
 }
@@ -624,7 +628,7 @@ export class LaneGovernor {
 		}
 
 		// Delete the branch using git branch -D
-		const branchName = `work/${name.toLowerCase()}`;
+		const branchName = managedLaneBranchName(name);
 		const branchResult = Bun.spawnSync(["git", "branch", "-D", branchName], {
 			cwd: repository,
 			stdout: "pipe",
