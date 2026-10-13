@@ -32,7 +32,11 @@ async function tempHome(): Promise<{ home: string; cleanup: () => Promise<void> 
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-restart-"));
 	const provisionDir = join(home, "broker", "provision");
 	await mkdir(provisionDir, { recursive: true });
-	await writeFile(join(provisionDir, "manifest.json"), "{}\\n", "utf8");
+	await writeFile(join(provisionDir, "manifest.json"), "{}\n", "utf8");
+	// Installed adapters are units that can actually start; the unconfigured case has its
+	// own test and removes one of these files.
+	for (const adapter of ["discord", "slack", "telegram"])
+		await writeFile(join(home, `adapter-${adapter}.json`), "{}\n", "utf8");
 	return { home, cleanup: () => rm(home, { recursive: true, force: true }) };
 }
 
@@ -214,6 +218,25 @@ test("lease verification stats only SERVICE_SPECS binaries, never zombie ps outp
 		expect(receipt.state).toBe("ok");
 		expect(host.binaryPaths).toContain(join(BIN_DIR, "gajaeway-gateway"));
 		expect(host.binaryPaths.some((path) => path.includes("[gajaeway-gatewa]"))).toBe(false);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
+test("an installed adapter with no adapter config is skipped, not a failed restart", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	try {
+		// A legacy install left the slack unit behind after its adapter-slack.json was
+		// removed: the process exits on the credential read, so the restart must skip the
+		// unit and carry on instead of failing the receipt and skipping the later services.
+		await rm(join(home, "adapter-slack.json"));
+		const receipt = await runRestartStack({ ...host.options, id: "unconfigured-adapter" });
+		expect(receipt.state).toBe("ok");
+		expect(receipt.steps.map((step) => step.result)).toEqual(["ok", "ok", "ok", "skipped", "ok", "ok"]);
+		expect(receipt.steps[3]?.detail).toBe("adapter is not configured");
+		expect(host.ran).not.toContain("dev.gajaeway.adapter-slack");
 	} finally {
 		await host.close();
 		await cleanup();
