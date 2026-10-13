@@ -1,3 +1,4 @@
+import { type ChatMessagePayload, originKey } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { StoreCore, type StoreOpenOptions } from "./core";
 import { BindingsGroup, type BrokerAuthority } from "./groups/bindings";
@@ -5,7 +6,7 @@ import { InboxGroup, RETENTION_BATCH_ROWS } from "./groups/inbox";
 import { MemoryGroup } from "./groups/memory";
 import { MonitorsGroup } from "./groups/monitors";
 import { OutboxGroup } from "./groups/outbox";
-import { WorkAttemptStateError, WorkGroup } from "./groups/work";
+import { resolveLaneReportOrigin, WorkAttemptStateError, WorkGroup } from "./groups/work";
 import { type OwnedTable, TABLE_OWNER } from "./ownership";
 import type { WriteTx } from "./tx";
 
@@ -69,6 +70,53 @@ export class Store {
 		return this.core.transaction(fn);
 	}
 
+	reconcileWorkAttempts(log: (line: string) => void = console.error): number {
+		return this.transaction((tx) =>
+			this.work.workAttemptReconcile(
+				tx,
+				(runtime, at, childFallback, personaReport) => {
+					this.bindings.touchWorkSession(
+						tx,
+						runtime.sessionKey,
+						runtime.sessionId,
+						runtime.epoch,
+						at,
+						JSON.stringify({
+							platform: "work",
+							kind: "task",
+							conversationId: runtime.sessionKey.slice("work/task/".length),
+						}),
+					);
+					const enqueueFallback = (payload: ChatMessagePayload) => {
+						if (typeof payload.deliveryId !== "string") throw new Error("reconciled work fallback has no delivery id");
+						this.outbox.enqueue(tx, {
+							deliveryId: payload.deliveryId,
+							turnId: payload.turnId,
+							originKey: originKey(payload.origin),
+							payloadJson: JSON.stringify(payload),
+						});
+					};
+					if (personaReport) {
+						const enqueued =
+							this.bindings.getSessionRecord(personaReport.row.originKey) !== undefined &&
+							this.inbox.enqueue(tx, {
+								messageId: personaReport.row.messageId,
+								originKey: personaReport.row.originKey,
+								originRefJson: resolveLaneReportOrigin(runtime.parent, personaReport.row.originRefJson),
+								body: personaReport.row.body,
+								receivedAt: personaReport.row.receivedAt,
+								source: "lane_report",
+							});
+						if (!enqueued) enqueueFallback(personaReport.fallbackPayload);
+					}
+					if (childFallback) enqueueFallback(childFallback);
+				},
+				(jobId) => this.bindings.quarantineInvalidWork(tx, jobId),
+				log,
+			),
+		);
+	}
+
 	inspectBrokerAuthority(): BrokerAuthorityCensus {
 		let populated = false;
 		for (const table of Object.keys(TABLE_OWNER) as OwnedTable[]) {
@@ -94,8 +142,9 @@ export class Store {
 					openWork++;
 			}
 			for (const row of this.work.workAttemptRows()) {
-				const runtime = this.work.workAttemptGet(row.op_ref)!;
-				if (runtime.settledAt === null && !this.bindings.isQuarantined("work", runtime.jobId)) openWork++;
+				if (this.bindings.isQuarantined("work", row.job_id)) continue;
+				const runtime = this.work.workAttemptGet(row.op_ref);
+				if (runtime?.settledAt === null) openWork++;
 			}
 			openWork += this.work.laneReportOpenCount();
 		} catch (error) {

@@ -51,6 +51,7 @@ import {
 	type WorkReportRoot,
 	workAssert,
 	workAttemptDeliveryId,
+	workAttemptEndState,
 	workAttemptReportId,
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
@@ -121,19 +122,6 @@ const pendingOutput = () => ({
 });
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
-}
-function workAttemptEndState(
-	reason: string,
-): "completed" | "terminal_missing_receipt" | "terminal_uncertain" | "failed" | "attempt_ended" {
-	return reason === "end_turn"
-		? "completed"
-		: reason === "terminal_missing_receipt"
-			? "terminal_missing_receipt"
-			: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
-				? "terminal_uncertain"
-				: ["sdk_failed", "send_rejected"].includes(reason)
-					? "failed"
-					: "attempt_ended";
 }
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
