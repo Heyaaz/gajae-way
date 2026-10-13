@@ -92,7 +92,7 @@ test("main wires the census verb to the offline command", async () => {
 	]);
 	expect(stderr).toBe("");
 	expect(exitCode).toBe(0);
-	expect(stdout).toContain('"schemaVersion": 32');
+	expect(stdout).toContain('"schemaVersion": 33');
 });
 
 test("census refuses a restore journal before opening the database and releases its lease", async () => {
