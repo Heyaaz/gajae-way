@@ -472,7 +472,7 @@ describe("work attempt boot reconciliation", () => {
 		expect(f.database.work.laneParentAvailable("a")).toBe(false);
 	});
 
-	test("reconciliation quarantines both jobs when a settled SQL identity disagrees", async () => {
+	test("reconciliation quarantines only the job whose row indicates a problem", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
 		f.database.transaction((tx) =>
@@ -495,7 +495,7 @@ describe("work attempt boot reconciliation", () => {
 		f.raw.query("UPDATE work_attempt_runtime SET job_id = ? WHERE op_ref = ?").run(unrelated.jobId, f.runtime.opRef);
 
 		expect(f.database.reconcileWorkAttempts(() => {})).toBe(0);
-		expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(true);
+		expect(f.database.bindings.isQuarantined("work", f.runtime.jobId)).toBe(false);
 		expect(f.database.bindings.isQuarantined("work", unrelated.jobId)).toBe(true);
 	});
 
