@@ -25,6 +25,7 @@ export {
 	type ConversationContextDiagnostics,
 	type ConversationContextRow,
 	type ConversationContextWindow,
+	type CrossSessionWatchRow,
 	INBOUND_TURN_ROLES,
 	INBOUND_TURN_STATES,
 	type InboundMessageRow,
@@ -36,6 +37,7 @@ export {
 	RETENTION_BATCH_ROWS,
 	type TerminalUnlinkedReason,
 	terminalDeliveryIds,
+	type WatchRegistration,
 } from "./groups/inbox";
 export { MemoryGroup, type MemoryIntentDbRow } from "./groups/memory";
 export {
