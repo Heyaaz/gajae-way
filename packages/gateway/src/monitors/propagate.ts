@@ -920,6 +920,9 @@ export class MonitorPropagator {
 						const row = this.#database.monitors.eventGet(entry.eventId);
 						if (!row) continue;
 						const intentId = `monitor-event-intent:${entry.eventId}`;
+						const reportable = Boolean(
+							monitor.reportTo && this.#isReportableResult(monitor, row.event_type, entry.note),
+						);
 						const authoredOk = this.#database.transaction((tx) => {
 							const authored = this.#database.monitors.authorFenced(
 								tx,
@@ -940,14 +943,14 @@ export class MonitorPropagator {
 										replyText: entry.note,
 									}),
 								});
-							if (monitor.reportTo) this.#enqueueMonitorReport(tx, monitor, row, entry.note as string);
+							if (reportable) this.#enqueueMonitorReport(tx, monitor, row, entry.note as string);
 							return true;
 						});
 						if (!authoredOk) continue;
 						// Wake the closure queue so the atomically admitted intent is
 						// processed in the same run (no restart needed).
 						this.#memory.enqueueExistingId(intentId);
-						if (monitor.reportTo) this.#notifyMonitorReport(monitor.reportTo);
+						if (reportable && monitor.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 						this.#emit({
 							eventId: entry.eventId,
 							monitorId: monitor.monitorId,
@@ -1005,9 +1008,7 @@ export class MonitorPropagator {
 				const validDeliveryEntries: typeof nonSilentEntries = [];
 				for (const entry of nonSilentEntries) {
 					const eventRow = fenced.find((row) => row.event_id === entry.eventId);
-					const isEcho =
-						isAuthoredEchoSuspected(monitor.instruction, entry.note) ||
-						isAuthoredEchoSuspected(eventRow?.event_type, entry.note);
+					const isEcho = this.#isContractEcho(monitor, eventRow?.event_type, entry.note);
 					if (!isEcho) {
 						validDeliveryEntries.push(entry);
 						continue;
@@ -1410,6 +1411,7 @@ export class MonitorPropagator {
 		const eventRow = row ?? this.#database.monitors.eventGet(eventId);
 		if (!eventRow) return;
 		const monitor = this.#registry.get(eventRow.monitor_id);
+		const reportable = Boolean(monitor?.reportTo && this.#isReportableResult(monitor, eventRow.event_type, note));
 		const intentId = `monitor-event-intent:${eventId}`;
 		const authored = this.#database.transaction((tx) => {
 			const updated = this.#database.monitors.authorFenced(tx, eventId, "", note, noDelivery);
@@ -1426,14 +1428,22 @@ export class MonitorPropagator {
 						replyText: note,
 					}),
 				});
-			if (monitor?.reportTo) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
+			if (reportable && monitor) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
 			return true;
 		});
 		if (!authored) return;
 		// Wake the closure queue for the intent admitted above.
 		this.#memory.enqueueExistingId(intentId);
-		if (monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
+		if (reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
+	}
+	#isReportableResult(monitor: MonitorRecord, eventType: string, note: string): boolean {
+		if (isSilentOutput(note)) return false;
+		if (!monitor.channelTarget && !this.#ownerTarget) return true;
+		return !this.#isContractEcho(monitor, eventType, note);
+	}
+	#isContractEcho(monitor: MonitorRecord, eventType: string | undefined, note: string): boolean {
+		return isAuthoredEchoSuspected(monitor.instruction, note) || isAuthoredEchoSuspected(eventType, note);
 	}
 	#enqueueMonitorReport(
 		tx: WriteTx,

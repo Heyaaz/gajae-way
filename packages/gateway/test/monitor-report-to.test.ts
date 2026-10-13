@@ -13,10 +13,10 @@ import { attachTestBrokerOwnership, sessionPortFromResponder, sessionPortFromScr
 
 const target: OriginRef = { platform: "discord", kind: "channel", conversationId: "report-room" };
 
-function eventsFromPrompt(text: string): Array<{ eventId: string }> {
+function eventsFromPrompt(text: string): Array<{ eventId: string; eventType: string }> {
 	const match = text.match(/\[.*\]$/s);
 	if (!match) throw new Error("prompt has no event array");
-	return JSON.parse(match[0]) as Array<{ eventId: string }>;
+	return JSON.parse(match[0]) as Array<{ eventId: string; eventType: string }>;
 }
 
 async function openTestStore() {
@@ -168,6 +168,75 @@ test("reportTo injects into the conversation even when the monitor also delivers
 		expect(delivered).toHaveLength(1);
 		expect(database.inbox.pendingOldest(originKey(target))?.message_id).toBe(`monitor-report:${eventId}`);
 		expect(notifications).toEqual([originKey(target)]);
+	} finally {
+		await propagator?.drain();
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reportTo omits silent and contract-only notes rejected by the delivery path", async () => {
+	const { home, database } = await openTestStore();
+	let propagator: MonitorPropagator | undefined;
+	try {
+		const registry = new MonitorRegistry(database);
+		const instruction = "Inspect deploys and report only verified changes.";
+		const monitor = registry.add({
+			name: "filtered-watch",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["deploy.silent", "deploy.echo"],
+			burstPolicy: "serialize",
+			instruction,
+			channelTarget: { origin: target },
+			reportTo: target,
+		});
+		const notifications: string[] = [];
+		const sessionPort = sessionPortFromScript({
+			bind: async () => ({ sessionId: "monitor-session" }),
+			respond: async (_sessionId, text) =>
+				JSON.stringify(
+					eventsFromPrompt(text).map(({ eventId, eventType }) => ({
+						eventId,
+						note: eventType === "deploy.silent" ? "[SILENT]" : instruction,
+					})),
+				),
+		});
+		propagator = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			notifyInbound: async (key) => {
+				notifications.push(key);
+			},
+		});
+
+		const silentEventId = await propagator.submitAwaitable(monitor.monitorId, "deploy.silent", {});
+		expect(database.monitors.eventGet(silentEventId)?.stage).toBe("authored_no_delivery");
+		expect(database.inbox.pendingByOrigin()).toEqual([]);
+		const echoEventId = await propagator.submitAwaitable(monitor.monitorId, "deploy.echo", {});
+		expect(database.monitors.eventGet(echoEventId)?.stage).toBe("contract_unmet");
+		expect(database.monitors.failure(echoEventId)?.code).toBe("authored_echo_suspected");
+		expect(database.inbox.pendingByOrigin()).toEqual([]);
+
+		const recoveryEventId = crypto.randomUUID();
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
+				eventId: recoveryEventId,
+				monitorId: monitor.monitorId,
+				eventType: "deploy.silent",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			database.monitors.eventUpdate(tx, recoveryEventId, "authored");
+			database.monitors.authoredOutputCreate(tx, recoveryEventId, "[SILENT]");
+		});
+		await propagator.reconcile();
+		expect(database.monitors.eventGet(recoveryEventId)?.stage).toBe("authored_no_delivery");
+		expect(database.inbox.pendingByOrigin()).toEqual([]);
+		expect(notifications).toEqual([]);
 	} finally {
 		await propagator?.drain();
 		database.close();
