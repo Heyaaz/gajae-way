@@ -185,6 +185,7 @@ test("reaper recognizes a previous GJC entrypoint after its version directory wa
 	const currentPackageBin = join(prefix, "0.18.11", "node_modules", "@gajae-code", "coding-agent", "bin");
 	const currentExecutable = join(prefix, "0.18.11", "bin", "gjc");
 	const oldProcessExecutable = join(prefix, "0.18.9", "node_modules", "@gajae-code", "coding-agent", "bin", "gjc.js");
+	const agentDir = join(home, "agent");
 	const calls: Array<{ pid: number; signal: string }> = [];
 	try {
 		await mkdir(currentPackageBin, { recursive: true });
@@ -195,10 +196,10 @@ test("reaper recognizes a previous GJC entrypoint after its version directory wa
 		const result = await reapLeftoverWorkers(home, {
 			gjcExecutable: currentProcessExecutable,
 			gjcPrefix: prefix,
-			brokerAgentDir: AGENT_DIR,
+			brokerAgentDir: agentDir,
 			processTable: [
-				worker(2205, 2, { executable: oldProcessExecutable }),
-				worker(2206, 2, { executable: join(prefix, "0.18.9", "bin", "unrelated") }),
+				worker(2205, 2, { executable: oldProcessExecutable, agentDir }),
+				worker(2206, 2, { executable: join(prefix, "0.18.9", "bin", "unrelated"), agentDir }),
 			],
 			kill: async (pid, signal) => {
 				calls.push({ pid, signal });
@@ -419,13 +420,14 @@ test("reaper confirms Linux worker exit through procfs", async () => {
 
 test("reaper sends SIGKILL when SIGTERM leaves the worker alive and counts only confirmed exits", async () => {
 	const home = await temporaryHome("gajaeway-reaper-kill-escalation-");
+	const agentDir = join(home, "agent");
 	let alive = true;
 	const signals: string[] = [];
 	try {
 		const result = await reapLeftoverWorkers(home, {
 			gjcExecutable: GJC,
-			brokerAgentDir: AGENT_DIR,
-			processTable: [worker(4601, 2)],
+			brokerAgentDir: agentDir,
+			processTable: [worker(4601, 2, { agentDir })],
 			timeoutMs: 1,
 			kill: async (_pid, signal) => {
 				signals.push(signal);
@@ -443,12 +445,13 @@ test("reaper sends SIGKILL when SIGTERM leaves the worker alive and counts only 
 
 test("reaper does not report a live worker as killed when both signals fail", async () => {
 	const home = await temporaryHome("gajaeway-reaper-kill-failed-");
+	const agentDir = join(home, "agent");
 	const signals: string[] = [];
 	try {
 		const result = await reapLeftoverWorkers(home, {
 			gjcExecutable: GJC,
-			brokerAgentDir: AGENT_DIR,
-			processTable: [worker(4602, 2)],
+			brokerAgentDir: agentDir,
+			processTable: [worker(4602, 2, { agentDir })],
 			timeoutMs: 0,
 			kill: async (_pid, signal) => {
 				signals.push(signal);
@@ -467,13 +470,14 @@ test("reaper does not report a live worker as killed when both signals fail", as
 
 test("reaper revalidates process identity before escalating a stale PID", async () => {
 	const home = await temporaryHome("gajaeway-reaper-pid-reuse-");
+	const agentDir = join(home, "agent");
 	const signals: string[] = [];
 	let identityChecks = 0;
 	try {
 		const result = await reapLeftoverWorkers(home, {
 			gjcExecutable: GJC,
-			brokerAgentDir: AGENT_DIR,
-			processTable: [worker(4603, 2)],
+			brokerAgentDir: agentDir,
+			processTable: [worker(4603, 2, { agentDir })],
 			timeoutMs: 0,
 			kill: async (_pid, signal) => {
 				signals.push(signal);
