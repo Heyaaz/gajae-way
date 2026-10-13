@@ -374,6 +374,8 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 				const target = join(binDir, name);
 				if (await exists(target)) await copyFile(target, join(backupDir, name));
 			}
+			const packagePath = join(binDir, "package.json");
+			if (await exists(packagePath)) await copyFile(packagePath, join(backupDir, "package.json"));
 			for (const name of toInstall) {
 				const stagedPath = join(staged.dir, name);
 				const tempPath = join(binDir, `.update-${name}`);
@@ -381,6 +383,9 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 				await chmod(tempPath, 0o755);
 				await rename(tempPath, join(binDir, name));
 			}
+			const packageTempPath = join(binDir, ".update-package.json");
+			await copyFile(join(staged.dir, "package.json"), packageTempPath);
+			await rename(packageTempPath, packagePath);
 			await writeFile(releaseMarkerPath(binDir), `${latest}\n`, "utf8");
 			const brokerNotEnabled = await installUpdatedServices({
 				home: options.home,

@@ -229,6 +229,8 @@ describe("runUpdate", () => {
 
 	test("an install replaces installed binaries, backs them up, marks the release, and queues the restart", async () => {
 		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
+		const previousManifest = JSON.stringify({ gjc: { version: "0.18.8" } });
+		await writeFile(join(dir, "package.json"), `${previousManifest}\n`, "utf8");
 		const home = await homeWithConfig();
 		const calls = recorder();
 		const extractor = extractorFor(KNOWN_BINARIES.map((name) => ({ name, marker: `staged-${name}` })));
@@ -267,12 +269,16 @@ describe("runUpdate", () => {
 				expect(body.startsWith(`staged-${name}\n`)).toBe(true);
 				expect((await stat(join(dir, name))).mode & 0o777).toBe(0o755);
 			}
+			expect(JSON.parse(await readFile(join(dir, "package.json"), "utf8"))).toEqual({
+				gjc: { version: PINNED_GJC },
+			});
 			expect(await readFile(join(dir, ".gajaeway-release"), "utf8")).toBe("0.2.0\n");
 			expect(await readlink(homeLayout(home).gjcCurrent)).toBe(PINNED_GJC);
 			const backups = (await readdir(dir)).filter((name) => name.startsWith("backup-0.1.1-"));
 			expect(backups).toHaveLength(1);
 			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"])
 				expect(await readFile(join(dir, backups[0], name), "utf8")).toBe(`old-${name}`);
+			expect(await readFile(join(dir, backups[0], "package.json"), "utf8")).toBe(`${previousManifest}\n`);
 			for (const entry of await readdir(dir)) expect(entry.startsWith(".update-")).toBe(false);
 			expect(await readdir(dir)).not.toContain("gajaeway-admin");
 			const lines = renderUpdate(result);
@@ -310,6 +316,9 @@ describe("runUpdate", () => {
 			});
 			expect(result.restartSkipped).toBe(true);
 			expect(result.restartQueued).toBeUndefined();
+			expect(JSON.parse(await readFile(join(dir, "package.json"), "utf8"))).toEqual({
+				gjc: { version: PINNED_GJC },
+			});
 			expect(calls.restarts).toHaveLength(0);
 			expect(renderUpdate(result)).toContain("restart: skipped (--no-restart)");
 			expect(renderUpdate(result)).toContain("broker unit installed, not enabled: run gajaeway setup --broker-agent");
