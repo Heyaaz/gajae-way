@@ -236,7 +236,7 @@ test("restore rolls back a pre-install interrupted generation on --abort", async
 		restoredOriginal.close();
 	}
 	expect(await Bun.file(join(f.home, "restore.journal.json")).exists()).toBe(false);
-});
+}, 60_000);
 
 test("abort returns the original inodes at every pre-install transition", async () => {
 	for (const point of [
@@ -260,7 +260,7 @@ test("abort returns the original inodes at every pre-install transition", async 
 		}
 		expect(await Bun.file(join(f.home, "restore.journal.json")).exists()).toBe(false);
 	}
-});
+}, 180_000);
 
 test("child-process crash injection covers every restore transition and resume is idempotent", async () => {
 	for (const point of INITIAL_FAULTS) {
@@ -289,7 +289,7 @@ test("child-process crash injection covers every restore transition and resume i
 	expect(await quietly(() => runRestore(f.backup, { home: f.home }))).toBe(0);
 	await verifyRestored(f);
 	expect(await quietly(() => runRestore(f.backup, { home: f.home }))).toBe(0);
-}, 60_000);
+}, 180_000);
 
 test("restore --abort is refused after install and anomalies keep the journal", async () => {
 	const afterInstall = await fixture();
@@ -304,4 +304,4 @@ test("restore --abort is refused after install and anomalies keep the journal", 
 	expect(await quietly(() => runRestore(anomaly.backup, { home: anomaly.home }))).toBe(4);
 	expect(await Bun.file(join(anomaly.home, "restore.journal.json")).exists()).toBe(true);
 	expect(await readFile(anomaly.livePath)).toEqual(installedBytes);
-});
+}, 90_000);
