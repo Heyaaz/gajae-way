@@ -211,6 +211,25 @@ export function getServiceDirectory(): string {
 	}
 }
 
+/** Nearest existing ancestor's realpath with the missing tail re-appended. */
+function realpathOfPossiblyMissing(path: string): string {
+	const absolute = resolve(path);
+	let existing = absolute;
+	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+	return join(realpathSync(existing), absolute.slice(existing.length));
+}
+
+/** Refuses a lane path equal to or nested in the service checkout (issue #480). */
+export function assertOutsideServiceDirectory(serviceDirectory: string, path: string, name: string): void {
+	const serviceDir = realpathOfPossiblyMissing(serviceDirectory);
+	const candidate = realpathOfPossiblyMissing(path);
+	if (candidate === serviceDir || candidate.startsWith(`${serviceDir}/`))
+		throw new ProtocolError("invalid_params", "lane cwd cannot be inside service directory", {
+			reasonCode: "cwd_inside_service_dir",
+			name,
+		});
+}
+
 /** Attempt ownership is independent of sockets, response deadlines and broker generations. */
 export class WorkLaneManager {
 	readonly #options: WorkLaneManagerOptions;
@@ -289,6 +308,19 @@ export class WorkLaneManager {
 			this.#db.work.workAttemptPrepare(tx, runtime, record, runtime.mode === "historical" || bindingMatches);
 			this.#refreshWorkSession(tx, runtime, runtime.startedAt);
 		});
+	}
+	#rollbackUnpersistedWorktree(
+		name: string,
+		worktree: { readonly repository: string; readonly path: string; readonly branch: string },
+	): void {
+		try {
+			removeCreatedWorktree(worktree.repository, worktree.path, worktree.branch);
+		} catch (error) {
+			const reason = sanitizeDiagnostic(error instanceof Error ? error.message : String(error))
+				.replace(/\s+/gu, " ")
+				.slice(0, 200);
+			console.error(`work_setup_rollback_failed name=${name} reason=${reason || "unknown"}`);
+		}
 	}
 
 	#updateAttempt(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
@@ -695,6 +727,7 @@ export class WorkLaneManager {
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
+		assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);

@@ -247,12 +247,19 @@ export async function preflightGjcRuntime(
 
 	const detectedVersion = version.slice(1, 4).join(".");
 
-	// If a pinned version is required, check for exact match
+	// The pin is a floor, not an exact match: gjc is the user's global runtime and is
+	// upgraded underneath the gateway (gjc-autoupdate), so an exact pin turns every gjc
+	// release into a boot failure. Newer releases run; one past VERIFIED_GJC_THROUGH is
+	// still flagged by `gjc_unverified_version`.
 	if (options?.pinnedVersion) {
-		if (detectedVersion !== options.pinnedVersion) {
-			throw new Error(
-				`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires ${options.pinnedVersion}). Run 'gajaeway update --force' to update the gateway's gjc.`,
-			);
+		const pinned = options.pinnedVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
+		if (!pinned) throw new Error("gjc runtime preflight failed: invalid pinned version spec");
+		for (let i = 1; i <= 3; i++) {
+			if (Number(version[i]) < Number(pinned[i]))
+				throw new Error(
+					`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires >= ${options.pinnedVersion}). Run 'gajaeway ops upgrade' to update the gateway's gjc.`,
+				);
+			if (Number(version[i]) > Number(pinned[i])) break;
 		}
 	} else {
 		// Otherwise check minimum version
@@ -311,6 +318,7 @@ export class GlobalGjcClient {
 	readonly #maxBackoff: number;
 	readonly #listeners = new Set<BrokerGenerationListener>();
 	readonly #children = new Set<ReturnType<SpawnFn>>();
+	readonly #childStartTimes = new Map<ReturnType<SpawnFn>, number>();
 	readonly #terminations = new Map<ReturnType<SpawnFn>, Promise<void>>();
 	readonly #relays = new Set<() => void>();
 	readonly #queue: Array<{ resolve: () => void; priority: "interactive" | "background" }> = [];
@@ -488,9 +496,11 @@ export class GlobalGjcClient {
 	}
 	#track(child: ReturnType<SpawnFn>): void {
 		this.#children.add(child);
+		this.#childStartTimes.set(child, Date.now());
 		void child.exited.then(
 			() => {
 				this.#children.delete(child);
+				this.#childStartTimes.delete(child);
 				// If this was the last unconfirmed child from an involuntary stop,
 				// clear the stop markers and attempt recovery via start().
 				if (this.#stoppedAtEpoch !== undefined && this.#children.size === 0) {
@@ -527,6 +537,17 @@ export class GlobalGjcClient {
 			});
 		this.#terminations.set(child, termination);
 		return termination;
+	}
+	/** Reaps child processes that have exceeded the TTL. Called periodically to prevent resource accumulation. */
+	#reapAgedChildren(now = Date.now()): void {
+		for (const [child, startTime] of [...this.#childStartTimes.entries()]) {
+			if (now - startTime > CHILD_PROCESS_TTL_MS) {
+				this.#log(
+					`reaping aged child process (age=${Math.round((now - startTime) / 1000)}s, ttl=${CHILD_PROCESS_TTL_MS / 1000}s)`,
+				);
+				void this.#terminate(child).catch(() => {});
+			}
+		}
 	}
 	async #discovery(): Promise<BrokerDiscovery | undefined> {
 		this.#assertAgentDirIdentity();
@@ -682,6 +703,8 @@ export class GlobalGjcClient {
 						);
 					}
 				}
+				// Reap aged children to prevent resource accumulation.
+				this.#reapAgedChildren(now);
 				this.#schedule(epoch);
 			});
 		}, wait);
@@ -1028,6 +1051,9 @@ async function bounded<T>(promise: Promise<T>, timeout: number): Promise<T> {
 		if (timer) clearTimeout(timer);
 	}
 }
+/** Hard TTL for any spawned agent child process (6 hours). */
+const CHILD_PROCESS_TTL_MS = 6 * 60 * 60 * 1000;
+
 async function terminateChild(child: ReturnType<SpawnFn>): Promise<void> {
 	// Signal errors alone do not establish failure: a concurrently exiting child
 	// can reject a signal while its exit promise still supplies definitive proof.

@@ -298,7 +298,8 @@ export type SessionRollReason =
 	| "context_failures_native_compaction_failed"
 	| "context_failures_native_compaction_skipped"
 	| "protocol_failures_off_contract"
-	| "session_busy_stalled";
+	| "session_busy_stalled"
+	| "session_host_unavailable";
 
 const ROLL_REASON_BY_STATUS: Partial<Record<NativeCompactionStatus, SessionRollReason>> = {
 	unavailable: "context_failures_native_compaction_unavailable",

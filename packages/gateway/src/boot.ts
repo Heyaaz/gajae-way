@@ -4,7 +4,6 @@ import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gat
 
 import { type ConfigOverrides, loadConfig } from "./config";
 import { DeliveryService } from "./delivery/delivery";
-
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
 import { assertNoRestoreJournal } from "./offline";
@@ -147,6 +146,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 	};
 	try {
 		await assertNoRestoreJournal(config.home);
+
 		const layout = homeLayout(config.home);
 		let executable = options.broker?.executable;
 		if (executable === undefined) {

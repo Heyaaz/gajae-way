@@ -1,3 +1,4 @@
+import type { FileRef } from "./files";
 import type { OriginRef } from "./origin";
 import type { ReactionAction, ReactionRef } from "./reactions";
 
@@ -281,6 +282,13 @@ export interface ChatMessagePayload {
 	 */
 	readonly reaction?: ReactionRef;
 	/**
+	 * When present this delivery is a FILE UPLOAD: the adapter uploads `file.path`
+	 * into the conversation (inside `replyToMessageId`'s thread when set) and posts
+	 * no other message. `text` carries a short "📎 name" line so an adapter without
+	 * upload support degrades to a visible mention instead of a lost delivery.
+	 */
+	readonly file?: FileRef;
+	/**
 	 * When present the adapter must ALSO post this text as a spoken voice
 	 * message, in addition to delivering `text` normally.
 	 *
@@ -414,9 +422,15 @@ export interface SessionBootstrapProjection {
 
 /**
  * Memory system surface (P3, spec fact 8): filesystem-first Markdown memory.
- * memory.audit runs the structural validator; memory.search is map-then-BM25
- * retrieval over the canonical tree. Both are read-only verbs.
+ * memory.audit runs the structural validator; memory.autolink commits canonical
+ * crosslinks; memory.search is map-then-BM25 retrieval over the canonical tree.
+ * Audit and autolink return an operation ID immediately and expose the outcome
+ * through memory.status, so client request timeouts do not imply operation failure.
  */
+export interface MemoryOperationAccepted {
+	readonly opRef: string;
+}
+
 export interface MemoryAuditResult {
 	readonly ok: boolean;
 	readonly issues: readonly {
@@ -424,6 +438,21 @@ export interface MemoryAuditResult {
 		readonly path: string;
 		readonly message: string;
 	}[];
+}
+
+export interface MemoryAutolinkResult {
+	readonly filesChanged: number;
+	readonly linksAdded: number;
+	readonly aliases: number;
+	readonly commitSha: string | null;
+	readonly elapsedMs: number;
+}
+
+export interface MemoryOperationStatusResult {
+	readonly status: "pending" | "completed" | "failed";
+	readonly elapsedMs: number;
+	readonly result?: MemoryAuditResult | MemoryAutolinkResult;
+	readonly error?: string;
 }
 
 export interface MemorySearchParams {
@@ -594,6 +623,14 @@ export interface MonitorEventRecord {
 	/** Procedure file versions the authoring turn was given; present once authored with declared procedure files. */
 	readonly procedure?: readonly MonitorProcedureVersion[];
 	readonly recovery?: MonitorEventRecovery;
+}
+
+/** Result of an operator action on one monitor event. */
+export interface MonitorEventOperatorResult {
+	readonly eventId: string;
+	readonly done: boolean;
+	readonly previousStage?: string;
+	readonly reason?: string;
 }
 
 /** Version of one declared procedure file as read for one firing. */
@@ -1102,11 +1139,9 @@ export interface VerbCatalogV01 {
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
 	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
-	"memory.audit": { params: undefined; result: MemoryAuditResult };
-	"memory.autolink": {
-		params: undefined;
-		result: { readonly filesChanged: number; readonly linksAdded: number; readonly aliases: number };
-	};
+	"memory.audit": { params: undefined; result: MemoryOperationAccepted };
+	"memory.autolink": { params: undefined; result: MemoryOperationAccepted };
+	"memory.status": { params: { readonly opRef: string }; result: MemoryOperationStatusResult };
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
@@ -1128,6 +1163,14 @@ export interface VerbCatalogV01 {
 		};
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
+	"monitor.settle": {
+		params: { readonly eventId: string };
+		result: MonitorEventOperatorResult;
+	};
+	"monitor.retry": {
+		params: { readonly eventId: string };
+		result: MonitorEventOperatorResult;
+	};
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
 	"ops.backup": {
 		params: { readonly path: string };
@@ -1172,11 +1215,14 @@ export const VERBS_V01 = [
 	"memory.audit",
 	"memory.autolink",
 	"memory.search",
+	"memory.status",
 	"monitor.add",
 	"monitor.update",
 	"monitor.list",
 	"monitor.inspect",
 	"monitor.test",
+	"monitor.settle",
+	"monitor.retry",
 	"monitor.remove",
 	"ops.backup",
 	"ops.redeliver",

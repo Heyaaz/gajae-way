@@ -445,8 +445,23 @@ export class LaneGovernor {
 					return { retired: false, sessionKey, reason: detail };
 				}
 			}
-			// Forced retirement is unattended; preserve the durable worktree and
-			// branch so its commits and the stored worktree path remain resumable.
+			// Clean up the worktree for force retire as well (issue #480)
+			const repositoryPath = record?.lane.repositoryPath ?? record?.lane.repository;
+			if (record?.lane.worktreePath && repositoryPath) {
+				try {
+					this.#cleanupWorktree(
+						name,
+						lane.sessionId,
+						record.lane.worktreePath,
+						repositoryPath,
+						record.lane.repositoryPath !== undefined,
+					);
+				} catch (error) {
+					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
+					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "error");
+					return { retired: false, sessionKey, reason: `worktree cleanup failed: ${detail}` };
+				}
+			}
 			// Close the session and rebind the epoch.
 			let closed = false;
 			try {
@@ -579,7 +594,6 @@ export class LaneGovernor {
 			if (existsSync(worktreePath)) throw new Error("managed repository is missing while the worktree still exists");
 			return;
 		}
-
 		// Remove the worktree using git worktree remove --force
 		const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
 			cwd: repository,
