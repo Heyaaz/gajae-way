@@ -2446,11 +2446,11 @@ function recordingCheckClient(answer: CheckStatusAnswer | null) {
 	return { calls, client };
 }
 
-async function settledReport(f: Awaited<ReturnType<typeof fixture>>) {
+async function settledReport(f: Awaited<ReturnType<typeof fixture>>, label = "completed") {
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "done");
-	await until(() => f.notices.some((notice) => notice.text.includes("[lane a] completed")));
-	return f.notices.find((notice) => notice.text.includes("[lane a] completed"))?.text ?? "";
+	await until(() => f.notices.some((notice) => notice.text.includes(`[lane a] ${label}`)));
+	return f.notices.find((notice) => notice.text.includes(`[lane a] ${label}`))?.text ?? "";
 }
 
 test("#481 settled report of an unpushed lane carries its head and pushed=false without a PR lookup", async () => {
@@ -2690,7 +2690,7 @@ test("#481 settled report of a pushed lane with a red PR names the PR and failin
 	const { client } = recordingCheckClient({ prNumber: 484, status: "red", failingChecks: ["lint", "test"] });
 	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
 	await laneRepo(f.directory, "fix/red", true);
-	const text = await settledReport(f);
+	const text = await settledReport(f, "attempt_ended");
 	expect(text).toContain("pushed=true");
 	expect(text).toContain("pr=484");
 	expect(text).toContain("checks=red(lint,test)");
