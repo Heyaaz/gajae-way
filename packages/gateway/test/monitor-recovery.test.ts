@@ -512,6 +512,81 @@ describe("monitor crash-boundary state machine", () => {
 		expect(turns).toBe(0);
 	});
 
+	test("exhausted event with saved authoring turn terminalize as monitor_invalid when monitor is removed and turn is terminal_ok (#508, #187)", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-exhausted-invalid-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+
+		// Create a monitor and event
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "test-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.event"],
+		});
+
+		const eventId = crypto.randomUUID();
+		const sessionId = "s1";
+		const opRef = crypto.randomUUID();
+		const turnPointer = JSON.stringify({
+			sessionId,
+			opRef,
+			eventIds: [eventId],
+		});
+
+		createEvent(db, {
+			eventId,
+			monitorId: monitor.monitorId,
+			eventType: "test.event",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+
+		// Simulate dispatch attempts that exhausted
+		for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
+			updateEvent(db, eventId, "failed");
+			db.transaction((tx) => db.monitors.eventIncrementAttempts(tx, eventId));
+		}
+
+		// Save the authoring turn pointer to simulate a previous dispatch that started
+		db.transaction((_tx) => {
+			db.core.metaSet(`monitor_authoring_turn:${eventId}`, turnPointer);
+		});
+
+		const sessionPort = fakeSessionPort(async () => {
+			// Return terminal_ok to simulate the turn being complete
+			return "[]";
+		});
+
+		// Pre-seed the operation with terminal_ok state
+		sessionPort.seedOperation(opRef, sessionId, "terminal_ok", "");
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		// Remove the monitor to simulate invalidation after the turn pointer was saved
+		db.transaction((tx) => db.monitors.delete(tx, monitor.monitorId));
+
+		// Reconcile should fail the event with monitor_invalid
+		await propagator.reconcile();
+
+		expect(stage(db, eventId)).toBe("failed_no_retry");
+		expect(db.monitors.failure(eventId)).toMatchObject({
+			code: "monitor_invalid",
+			detail: "dispatch setup failed (monitor_invalid)",
+		});
+		// Verify the event stays failed and doesn't loop forever
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("failed_no_retry");
+	});
+
 	test("authored + confirmed delivery → delivered; failure keeps it authored", async () => {
 		const { monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),

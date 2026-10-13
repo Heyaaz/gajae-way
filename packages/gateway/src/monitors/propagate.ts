@@ -125,7 +125,8 @@ interface AuthoringTurnPointer {
 type ExhaustedTurnDisposition =
 	| { readonly kind: "terminal"; readonly raw: string | undefined }
 	| { readonly kind: "hold" }
-	| { readonly kind: "resume"; readonly turn: AuthoringTurnPointer };
+	| { readonly kind: "resume"; readonly turn: AuthoringTurnPointer }
+	| { readonly kind: "monitor_invalid" };
 
 export interface MonitorDispatchFailure {
 	readonly eventId: string;
@@ -589,11 +590,24 @@ export class MonitorPropagator {
 							await this.#dispatch([...disposition.turn.eventIds], disposition.turn);
 							continue;
 						}
+						if (disposition.kind === "monitor_invalid") {
+							const failed = this.#database.transaction((tx) =>
+								this.#database.monitors.eventTerminalFail(
+									tx,
+									row.event_id,
+									"monitor_invalid",
+									"dispatch setup failed (monitor_invalid)",
+								),
+							);
+							if (failed) this.#emitStage(row, "failed_no_retry");
+							continue;
+						}
+						const expectedRaw = disposition.kind === "terminal" ? disposition.raw : undefined;
 						const failedRow = this.#database.transaction((tx) => {
 							const current = this.#database.monitors.eventGet(row.event_id);
 							if (
 								!current ||
-								this.#database.core.metaGet(authoringTurnKey(row.event_id)) !== disposition.raw ||
+								this.#database.core.metaGet(authoringTurnKey(row.event_id)) !== expectedRaw ||
 								current.dispatch_attempts !== row.dispatch_attempts ||
 								current.dispatch_attempts < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS ||
 								(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
@@ -629,7 +643,6 @@ export class MonitorPropagator {
 		const turn = parseAuthoringTurnPointer(raw);
 		if (!turn?.eventIds.includes(row.event_id)) return { kind: "hold" };
 		const monitor = this.#registry.get(row.monitor_id);
-		if (!monitor) return { kind: "hold" };
 		// The per-event pointer owns the original session/op-ref. Do not infer the
 		// session from row.event_type (including catch-all) or the current binding.
 		let report: Awaited<ReturnType<SessionPort["status"]>>;
@@ -642,6 +655,8 @@ export class MonitorPropagator {
 		const state = report.status?.status;
 		if (state === "failed") return { kind: "terminal", raw };
 		if (state !== "terminal_ok") return { kind: "hold" };
+		// The turn has ended. If the monitor is gone, the events are now unrecoverable.
+		if (!monitor) return { kind: "monitor_invalid" };
 		for (const eventId of turn.eventIds) {
 			const related = this.#database.monitors.eventGet(eventId);
 			if (
