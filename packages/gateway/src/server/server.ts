@@ -2213,7 +2213,6 @@ async function sendChat(
 							[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 							`${origin.platform} ${origin.kind} ${origin.conversationId}`,
 						sender: watchSender ?? "unknown sender",
-						reason: watch.reason,
 					}),
 					engagementJson: JSON.stringify({ mentioned: false, group: watcherOrigin.kind !== "dm", handoff: provenance }),
 					receivedAt: matchedAt,
@@ -2227,7 +2226,7 @@ async function sendChat(
 						kind: "daily_capture",
 						originRefJson: JSON.stringify(origin),
 						userText: `Cross-session watch ${watch.watch_id} matched msg:${messageId} from ${watchSender ?? "unknown sender"}`,
-						replyText: `An information-only wake was enqueued for ${watch.watcher_origin_key}. The message text, attachments, and secrets were not copied. Reason: ${watch.reason}`,
+						replyText: `An information-only wake was enqueued for ${watch.watcher_origin_key}. Message text, attachments, watch reason, and secrets were omitted.`,
 					}),
 				});
 				watchWakeOrigins.push(watch.watcher_origin_key);
@@ -2736,7 +2735,7 @@ async function createInboundTurnLifecycle(
 		const registeredAtDate = new Date();
 		const registeredAt = registeredAtDate.toISOString();
 		const expiresAt = new Date(registeredAtDate.getTime() + ttl.ttlMs).toISOString();
-		const watchId = watchRegistrationId(key, relaySourceMessageId, relay.originKey, line.ttl, reason);
+		const watchId = watchRegistrationId(key, relaySourceMessageId, relay.originKey, line.ttl);
 		const outcome = options.database.transaction((tx) => {
 			const registration = options.database.inbox.registerWatch(tx, {
 				watchId,
@@ -2758,7 +2757,7 @@ async function createInboundTurnLifecycle(
 					kind: "daily_capture",
 					originRefJson: JSON.stringify(origin),
 					userText: `Cross-session watch ${watchId} registered for ${relay.originKey}`,
-					replyText: `Waiting for the next human message until ${expiresAt}. Reason: ${reason}`,
+					replyText: `Waiting for the next human message until ${expiresAt}. Watch reason is stored in the durable watch record.`,
 				}),
 			});
 			return { registration, auditIntentId };
@@ -2782,7 +2781,7 @@ async function createInboundTurnLifecycle(
 			return;
 		}
 		deliverTerminalLine(
-			renderWatchRegistered(line.target, outcome.registration.watch.expires_at, outcome.registration.watch.reason),
+			renderWatchRegistered(line.target, outcome.registration.watch.expires_at),
 			deliveredParts.length,
 		);
 	};
