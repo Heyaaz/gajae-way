@@ -1106,8 +1106,9 @@ export class WorkGroup {
 		};
 	}
 
-	/** Admits one pending child report for its parent lane. */
+	/** Admits one pending child report for its parent lane; idempotent if report already exists and matches. */
 	laneReportInsert(tx: WriteTx, report: WorkAttemptAdmissionLane["report"], createdAt: string): void {
+		if (this.#assertLaneReportMatches(report)) return;
 		this.#db
 			.prepare(
 				"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
