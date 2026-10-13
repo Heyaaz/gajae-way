@@ -260,6 +260,28 @@ describe("work attempt boot reconciliation", () => {
 		expect(f.database.outbox.rows()).toEqual(deliveries);
 	});
 
+	test("reconciliation prefers the matching history and SQL timestamp over torn runtime JSON", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+		);
+		const runtime = f.database.work.workAttemptGet(f.runtime.opRef);
+		if (runtime === undefined) throw new Error("settled work attempt is missing");
+		const tornRuntime = { ...runtime, settledAt: "2026-09-08T00:00:30.000Z" };
+		f.raw
+			.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+			.run(JSON.stringify(tornRuntime), runtime.opRef);
+
+		expect(() => f.database.work.workAttemptGet(runtime.opRef)).toThrow(WorkAttemptStateError);
+		expect(f.database.reconcileWorkAttempts(() => {})).toBe(1);
+		expect(f.database.work.workAttemptGet(runtime.opRef)?.settledAt).toBe(END);
+		const historyJson = f.database.work.laneJobJson(runtime.jobId);
+		expect(historyJson).toBeDefined();
+		if (historyJson === undefined) throw new Error("reconciled lane history is missing");
+		expect(parseLaneJobRecord(historyJson).attempts[0]?.endedAt).toBe(END);
+	});
+
 	test("reconciliation settles a stale database column without replaying the open attempt", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
@@ -475,16 +497,13 @@ describe("work attempt boot reconciliation", () => {
 
 		const reconciled = f.database.reconcileWorkAttempts(() => {});
 		expect(reconciled).toBe(2);
-		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(firstReconciledAt);
-		expect(f.database.work.workAttemptGet(secondOpRef)?.settledAt).toBe(secondReconciledAt);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(END);
+		expect(f.database.work.workAttemptGet(secondOpRef)?.settledAt).toBe(secondEndedAt);
 		const historyJson = f.database.work.laneJobJson(f.runtime.jobId);
 		expect(historyJson).toBeDefined();
 		if (historyJson === undefined) throw new Error("reconciled lane history is missing");
-		expect(parseLaneJobRecord(historyJson).attempts.map((attempt) => attempt.endedAt)).toEqual([
-			firstReconciledAt,
-			secondReconciledAt,
-		]);
-		expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(secondReconciledAt);
+		expect(parseLaneJobRecord(historyJson).attempts.map((attempt) => attempt.endedAt)).toEqual([END, secondEndedAt]);
+		expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(secondEndedAt);
 	});
 
 	test("boot heals a torn work-history settlement before normal recovery starts", async () => {

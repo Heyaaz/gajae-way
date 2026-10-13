@@ -645,7 +645,16 @@ export class WorkGroup {
 				if (attempt.endedAt === undefined && runtime.settledAt === null && row.settled_at === null) continue;
 				this.#assertNotQuarantined(runtime.jobId);
 
-				const settledAt = runtime.settledAt ?? attempt.endedAt ?? row.settled_at ?? runtime.terminal?.observedAt;
+				const sharedSettledAt =
+					runtime.settledAt !== null && runtime.settledAt === attempt.endedAt
+						? runtime.settledAt
+						: runtime.settledAt !== null && runtime.settledAt === row.settled_at
+							? runtime.settledAt
+							: attempt.endedAt !== undefined && attempt.endedAt === row.settled_at
+								? attempt.endedAt
+								: undefined;
+				const settledAt =
+					sharedSettledAt ?? runtime.settledAt ?? attempt.endedAt ?? row.settled_at ?? runtime.terminal?.observedAt;
 				workAssert(settledAt !== undefined && settledAt !== null && workTime(settledAt));
 				const terminal = runtime.terminal ?? {
 					kind: "local" as const,
