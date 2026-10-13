@@ -45,6 +45,7 @@ const fake = {
 	// An opaque value with no recognisable format: only exact matching can catch it.
 	opaque: "Zr8qLm2VxN4tPw7Kc9HdJb3FgYs6",
 	opaqueRefresh: "Pq7Wm3Ns9Kx2Lc8Vb4Zt6Hy1Jd5Rf0Gw",
+	opaqueSession: ["Vb7K", "m2Qx", "9Np4", "sR6t", "1Yc8", "aD3f", "G5hJ"].join(""),
 };
 
 const directories: string[] = [];
@@ -85,10 +86,18 @@ describe("format patterns", () => {
 		});
 
 	test("a bearer header keeps the scheme and loses the token", () => {
-		const token = "4f9a1c7e2b8d6a3f5e0c9b7a1d2e3f4a5b6c";
+		const token = "abcdefghijklmnopqrstuvwxyz";
 		expect(guard().redact(`curl -H "Authorization: Bearer ${token}" x`).text).toBe(
 			'curl -H "Authorization: Bearer [REDACTED:bearer_token]" x',
 		);
+	});
+
+	test("bearer scheme matching is case-insensitive", () => {
+		const token = "abcdefghijklmnopqrstuvwxyz";
+		for (const scheme of ["BEARER", "bEaReR"])
+			expect(guard().redact(`Authorization: ${scheme} ${token}`).text).toBe(
+				`Authorization: ${scheme} [REDACTED:bearer_token]`,
+			);
 	});
 
 	test("a PEM block without its END line is redacted to the end of the text", () => {
@@ -154,13 +163,15 @@ describe("exact values", () => {
 			env: {
 				SLACK_BOT_TOKEN_FILE: "/secrets/slack/slack-bot-token",
 				GAJAEWAY_SECRET_GUARD_FILES: "/secrets/slack:/secrets/model-auth",
-				CUSTOM_THING: fake.opaqueRefresh,
+				CUSTOM_THING: fake.opaque,
+				SESSION_COOKIE: fake.opaqueRefresh,
 				HOME: "/data/home/with/a/long/path",
 			},
 			envNames: ["CUSTOM_THING"],
 		});
-		expect(g.knownSecrets).toBe(1);
+		expect(g.knownSecrets).toBe(2);
 		expect(g.redact("token file is /secrets/slack/slack-bot-token").counts).toEqual({});
+		expect(g.redact(fake.opaque).text).toBe("[REDACTED:known_secret]");
 		expect(g.redact(fake.opaqueRefresh).text).toBe("[REDACTED:known_secret]");
 	});
 
@@ -177,19 +188,30 @@ describe("exact values", () => {
 			join(codex, "auth.json"),
 			JSON.stringify({
 				OPENAI_API_KEY: null,
-				tokens: { refresh_token: fake.opaqueRefresh, account_id: "3f2b8c1e-9a7d-4e6f-b5c4-1d2e3f4a5b6c" },
+				tokens: {
+					refresh_token: fake.opaqueRefresh,
+					session: fake.opaqueSession,
+					account_id: "3f2b8c1e-9a7d-4e6f-b5c4-1d2e3f4a5b6c",
+				},
 				last_refresh: "2026-10-06T11:22:33.123456Z",
 			}),
 		);
 		const g = guard({ files: [slack, join(root, "model-auth"), join(root, "missing")] });
-		expect(g.knownSecrets).toBe(2);
-		expect(g.redact(`a ${fake.opaque} b ${fake.opaqueRefresh}`).text).toBe(
-			"a [REDACTED:known_secret] b [REDACTED:known_secret]",
+		expect(g.knownSecrets).toBe(3);
+		expect(g.redact(`a ${fake.opaque} b ${fake.opaqueRefresh} c ${fake.opaqueSession}`).text).toBe(
+			"a [REDACTED:known_secret] b [REDACTED:known_secret] c [REDACTED:known_secret]",
 		);
 		// Metadata under credential-looking keys is not a secret.
 		expect(
 			g.redact("account 3f2b8c1e-9a7d-4e6f-b5c4-1d2e3f4a5b6c refreshed 2026-10-06T11:22:33.123456Z").counts,
 		).toEqual({});
+	});
+
+	test("configured secret directories include hidden credential files", () => {
+		const root = tempDir("secret-guard-hidden-file-");
+		writeFileSync(join(root, ".access-token"), fake.opaque);
+		const g = guard({ files: [root] });
+		expect(g.redact(fake.opaque).text).toBe("[REDACTED:known_secret]");
 	});
 
 	test("gjc agent.db credentials are indexed and a refreshed token is picked up on reload", () => {
@@ -314,11 +336,12 @@ describe("frames", () => {
 					],
 				},
 			}),
-		) as any;
-		expect(out.payload.askUserPanel.question).toBe("What is your [REDACTED:known_secret]?");
-		expect(out.payload.askUserPanel.options[0].label).toBe("Option A with [REDACTED:known_secret]");
-		expect(out.payload.askUserPanel.options[1].label).toBe("Option B clean");
-		expect(out.payload.askUserPanel.options[2].label).toBe("Option C with [REDACTED:slack_token]");
+		) as Extract<Frame, { type: "event" }>;
+		const payload = out.payload as ChatMessagePayload;
+		expect(payload.askUserPanel?.question).toBe("What is your [REDACTED:known_secret]?");
+		expect(payload.askUserPanel?.options[0]?.label).toBe("Option A with [REDACTED:known_secret]");
+		expect(payload.askUserPanel?.options[1]?.label).toBe("Option B clean");
+		expect(payload.askUserPanel?.options[2]?.label).toBe("Option C with [REDACTED:slack_token]");
 		const redacted = logs.filter((line) => line.startsWith("secret_guard_redacted"));
 		expect(redacted).toEqual(["secret_guard_redacted event=chat.message kinds=known_secret:2,slack_token:1"]);
 	});
@@ -339,11 +362,12 @@ describe("frames", () => {
 					],
 				},
 			}),
-		) as any;
-		expect(out.payload.approvalPanel.message).toBe("Please approve access to [REDACTED:known_secret]");
-		expect(out.payload.approvalPanel.options[0].name).toBe("Allow - token [REDACTED:known_secret]");
-		expect(out.payload.approvalPanel.options[1].name).toBe("Deny");
-		expect(out.payload.approvalPanel.options[2].name).toBe("Maybe with [REDACTED:github_token]");
+		) as Extract<Frame, { type: "event" }>;
+		const payload = out.payload as ChatMessagePayload;
+		expect(payload.approvalPanel?.message).toBe("Please approve access to [REDACTED:known_secret]");
+		expect(payload.approvalPanel?.options?.[0]?.name).toBe("Allow - token [REDACTED:known_secret]");
+		expect(payload.approvalPanel?.options?.[1]?.name).toBe("Deny");
+		expect(payload.approvalPanel?.options?.[2]?.name).toBe("Maybe with [REDACTED:github_token]");
 		const redacted = logs.filter((line) => line.startsWith("secret_guard_redacted"));
 		expect(redacted).toEqual(["secret_guard_redacted event=chat.message kinds=known_secret:2,github_token:1"]);
 	});

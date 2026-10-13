@@ -33,11 +33,12 @@ const MAX_DEPTH = 4;
 /** Characters an agent can sprinkle into a value without changing it for a reader. */
 const IGNORED = /[\s\u200b-\u200d\u2060\ufeff'"`,+|\\]/u;
 /** Env names whose values are credentials (OG_API_KEY, SLACK_BOT_TOKEN, AWS_SECRET_ACCESS_KEY ...). */
-const SECRET_ENV_NAME = /(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS?)(?:$|_)/i;
+const SECRET_ENV_NAME =
+	/(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS?|AUTH|COOKIE|SESSION)(?:$|_)/i;
 /** ...but not the ones that only point at a secret (SLACK_BOT_TOKEN_FILE, GAJAEWAY_SECRET_GUARD_FILES). */
 const POINTER_ENV_NAME = /_(?:FILES?|PATH|DIR|URL|ENV)$/i;
 /** JSON keys whose string values are credentials in credential files and gjc's auth rows. */
-const SECRET_JSON_KEY = /token|secret|key|password|passwd|credential|refresh|access|private|cookie|auth/i;
+const SECRET_JSON_KEY = /token|secret|key|password|passwd|credential|refresh|access|private|cookie|auth|session/i;
 /** Credential-file fields under such keys that are metadata (last_refresh timestamps, emails, URLs). */
 const NOT_A_SECRET = /^(?:\d{4}-\d{2}-\d{2}|https?:\/\/|[^@\s]+@[^@\s]+$)/;
 
@@ -66,7 +67,7 @@ const PATTERNS: readonly Pattern[] = [
 	{ kind: "github_token", regex: /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})/g },
 	{ kind: "aws_access_key", regex: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
 	{ kind: "opengateway_key", regex: /\bapik_[0-9a-fA-F]{24,64}\b/g },
-	{ kind: "bearer_token", regex: /\b[Bb]earer\s+([A-Za-z0-9._~+/=-]{20,})/g, group: 1, accept: mixed },
+	{ kind: "bearer_token", regex: /\bbearer\s+([A-Za-z0-9._~+/=-]{20,})/gi, group: 1 },
 ];
 
 export interface SecretSources {
@@ -248,7 +249,7 @@ export class SecretGuard {
 					return name === option.name ? option : { ...option, name };
 				})
 			: undefined;
-		const optionsChanged = options && options.some((option, i) => option !== (panel.options?.[i] ?? undefined));
+		const optionsChanged = options?.some((option, i) => option !== (panel.options?.[i] ?? undefined));
 		return message === panel.message && !optionsChanged
 			? panel
 			: { ...panel, message, ...(options === undefined ? {} : { options }) };
@@ -406,8 +407,11 @@ function listFiles(path: string, depth: number, out: string[]): void {
 		return;
 	}
 	// Kubernetes secret volumes expose each key as a top-level symlink into a
-	// hidden `..data` generation dir; skipping dot entries reads each key once.
-	for (const entry of entries.sort()) if (!entry.startsWith(".")) listFiles(join(path, entry), depth + 1, out);
+	// hidden `..data` generation dir; skip only those internal entries so user
+	// dotfiles such as `.env` are still scanned.
+	for (const entry of entries.sort())
+		if (entry !== "..data" && entry !== "..data_tmp" && !/^\.\.\d{4}_\d{2}_\d{2}/.test(entry))
+			listFiles(join(path, entry), depth + 1, out);
 }
 
 /** A credential file: JSON credential fields, otherwise the whole trimmed content. */
