@@ -664,11 +664,7 @@ export class WorkGroup {
 				if (workAccepted(next)) this.#consumeWakeReport(tx, next);
 				else {
 					const report = this.#laneReportGetInside(next.wakeReportId);
-					if (
-						report?.state === "claimed" &&
-						report.claim_kind === "wake" &&
-						report.claim_ref === next.opRef
-					)
+					if (report?.state === "claimed" && report.claim_kind === "wake" && report.claim_ref === next.opRef)
 						workAssert(this.laneReportHold(tx, next.wakeReportId, "wake_acceptance_uncertain"));
 				}
 			}

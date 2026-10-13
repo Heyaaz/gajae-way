@@ -469,7 +469,10 @@ describe("work attempt boot reconciliation", () => {
 			const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx, () => {}));
 
 			expect(reconciled).toBe(1);
-			expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({ decision: "wake_unaccepted", settledAt: END });
+			expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({
+				decision: "wake_unaccepted",
+				settledAt: END,
+			});
 			expect(f.database.work.laneReportGet(wakeReportId)?.state).toBe(scenario.state);
 			expect(f.database.outbox.rows()).toEqual(deliveries);
 			expect(f.database.work.workAttemptOpen()).toEqual([]);
