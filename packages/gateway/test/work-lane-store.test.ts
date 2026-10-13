@@ -437,6 +437,44 @@ describe("work attempt boot reconciliation", () => {
 		expect(f.database.outbox.rows()).toEqual([]);
 		expect(lines).toEqual(["work_attempt_runtime_reconciled count=1"]);
 	});
+
+	for (const scenario of [
+		{ state: "pending", parentHeld: false, root: null },
+		{
+			state: "fallback",
+			parentHeld: true,
+			root: { originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN },
+		},
+		{ state: "undeliverable", parentHeld: true, root: null },
+	] as const) {
+		test(`reconciliation preserves an already-settled wake report in ${scenario.state}`, async () => {
+			const f = await fixture();
+			const wakeReportId = seedLinkedWakeReport(f, scenario.root);
+			const runtime = { ...f.runtime, parent: null, wakeReportId };
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
+			const record = scenario.parentHeld
+				? closeAttempt({ record: f.record, opRef: runtime.opRef, endState: "terminal_uncertain", endedAt: END })
+				: f.closed;
+			const settlement: WorkAttemptSettlement = {
+				terminal: { kind: "local", observedAt: END, reasonCode: "send_rejected" },
+				output: { ...runtime.output, disposition: "unavailable" },
+				decision: "wake_unaccepted",
+				settledAt: END,
+			};
+			f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, record, settlement));
+			const deliveries = f.database.outbox.rows();
+			expect(f.database.work.laneReportGet(wakeReportId)?.state).toBe(scenario.state);
+
+			f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?").run(runtime.opRef);
+			const reconciled = f.database.transaction((tx) => f.database.work.workAttemptReconcile(tx, () => {}));
+
+			expect(reconciled).toBe(1);
+			expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({ decision: "wake_unaccepted", settledAt: END });
+			expect(f.database.work.laneReportGet(wakeReportId)?.state).toBe(scenario.state);
+			expect(f.database.outbox.rows()).toEqual(deliveries);
+			expect(f.database.work.workAttemptOpen()).toEqual([]);
+		});
+	}
 });
 
 describe("work attempt durable transactions", () => {

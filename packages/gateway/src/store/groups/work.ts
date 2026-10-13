@@ -611,14 +611,27 @@ export class WorkGroup {
 				this.#workValidateHistory(next, history);
 				if (next.wakeReportId !== null) {
 					const report = this.#laneReportGetInside(next.wakeReportId);
-					workAssert(report?.claim_kind === "wake" && report.claim_ref === next.opRef);
+					workAssert(report !== undefined);
+					const ownsWakeClaim = report.claim_kind === "wake" && report.claim_ref === next.opRef;
 					if (workAccepted(next)) {
+						workAssert(ownsWakeClaim);
 						workAssert(
 							report.state === "claimed" ||
 								report.state === "held" ||
 								(report.state === "consumed" && report.consumed_op_ref === next.opRef),
 						);
+					} else if (runtime.decision === "wake_unaccepted" && runtime.settledAt !== null) {
+						const refusalSettledReport =
+							runtime.terminal?.reasonCode === "send_rejected" &&
+							((report.state === "pending" && report.claim_kind === null && report.claim_ref === null) ||
+								(ownsWakeClaim && (report.state === "fallback" || report.state === "undeliverable")));
+						const uncertainReport =
+							ownsWakeClaim &&
+							(report.state === "claimed" ||
+								(report.state === "held" && report.hold_reason === "wake_acceptance_uncertain"));
+						workAssert(refusalSettledReport || uncertainReport);
 					} else {
+						workAssert(ownsWakeClaim);
 						workAssert(
 							report.state === "claimed" ||
 								(report.state === "held" && report.hold_reason === "wake_acceptance_uncertain"),
@@ -649,7 +662,15 @@ export class WorkGroup {
 			this.#workPutHistory(tx, next, history);
 			if (next.wakeReportId !== null) {
 				if (workAccepted(next)) this.#consumeWakeReport(tx, next);
-				else workAssert(this.laneReportHold(tx, next.wakeReportId, "wake_acceptance_uncertain"));
+				else {
+					const report = this.#laneReportGetInside(next.wakeReportId);
+					if (
+						report?.state === "claimed" &&
+						report.claim_kind === "wake" &&
+						report.claim_ref === next.opRef
+					)
+						workAssert(this.laneReportHold(tx, next.wakeReportId, "wake_acceptance_uncertain"));
+				}
 			}
 			reconciled++;
 		}
