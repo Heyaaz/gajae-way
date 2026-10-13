@@ -36,9 +36,10 @@ test("reportTo survives a store reopen on the current schema", async () => {
 			eventTypes: ["reopen.changed"],
 			reportTo: target,
 		});
+		const schemaVersion = database.schemaVersion;
 		database.close();
 		database = await Store.open(path);
-		expect(database.schemaVersion).toBe(32);
+		expect(database.schemaVersion).toBe(schemaVersion);
 		expect(new MonitorRegistry(database).get(monitor.monitorId)).toMatchObject({
 			name: "reopen-watch",
 			reportTo: target,
