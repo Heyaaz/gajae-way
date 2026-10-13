@@ -305,7 +305,7 @@ export function parseUnixProcessTable(output: string, expectedAgentDir?: string)
 function parseUnixCommandArgv(command: string): string[] {
 	const marker = " sdk serve --stdio --session ";
 	const markerIndex = command.lastIndexOf(marker);
-	if (markerIndex < 0) return command.split(/\s+/).filter(Boolean);
+	if (markerIndex < 0) return parseUnixGatewayArgv(command) ?? command.split(/\s+/).filter(Boolean);
 
 	const executable = command.slice(0, markerIndex);
 	const firstSpace = executable.indexOf(" ");
@@ -318,6 +318,44 @@ function parseUnixCommandArgv(command: string): string[] {
 		.split(/\s+/)
 		.filter(Boolean);
 	return [...launcher, ...args];
+}
+
+function parseUnixGatewayArgv(command: string): string[] | undefined {
+	const directExecutable = "gajaeway-gateway";
+	for (
+		let index = command.indexOf(directExecutable);
+		index >= 0;
+		index = command.indexOf(directExecutable, index + directExecutable.length)
+	) {
+		const executableEnd = index + directExecutable.length;
+		const executable = command.slice(0, executableEnd);
+		if (basename(executable) === directExecutable && /^\s+daemon(?:\s|$)/.test(command.slice(executableEnd))) {
+			return [executable, "daemon"];
+		}
+	}
+
+	const sourceScript = "packages/gateway/src/main.ts";
+	for (
+		let index = command.indexOf(sourceScript);
+		index >= 0;
+		index = command.indexOf(sourceScript, index + sourceScript.length)
+	) {
+		const scriptEnd = index + sourceScript.length;
+		if (!/^\s+daemon(?:\s|$)/.test(command.slice(scriptEnd))) continue;
+
+		for (
+			let separator = command.indexOf(" ");
+			separator >= 0 && separator < index;
+			separator = command.indexOf(" ", separator + 1)
+		) {
+			const executable = command.slice(0, separator);
+			if (basename(executable) !== "bun") continue;
+
+			const script = command.slice(separator + 1, scriptEnd);
+			if (script === sourceScript || script.endsWith(`/${sourceScript}`)) return [executable, script, "daemon"];
+		}
+	}
+	return undefined;
 }
 
 function findUnixAgentDir(

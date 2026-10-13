@@ -245,6 +245,33 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	).toEqual([401, 403]);
 });
 
+test("Unix ps parser preserves spaced gateway paths so their workers stay owned", () => {
+	const spacedAgentDir = "/home/user/gajae way/agent";
+	const spacedPrefix = "/home/user/gajae way/.gajaeway/gjc";
+	const spacedGjc = `${spacedPrefix}/0.18.11/bin/gjc`;
+	const spacedBun = "/home/user/gajae way/.bun/bin/bun";
+	const spacedSource = "/home/user/gajae way/packages/gateway/src/main.ts";
+	const spacedGateway = "/home/user/gajae way/.gajaeway/bin/gajaeway-gateway";
+	const output = [
+		"  1  300 Sun Oct 13 03:20:00 2026 /usr/lib/systemd/systemd --user",
+		`300 501 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedSource} daemon`,
+		`501 601 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`300 502 Mon Oct 13 03:20:00 2026 ${spacedGateway} daemon`,
+		`502 602 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+	].join("\n");
+	const table = parseUnixProcessTable(output, spacedAgentDir);
+
+	expect(table[1]?.argv).toEqual([spacedBun, spacedSource, "daemon"]);
+	expect(table[3]?.argv).toEqual([spacedGateway, "daemon"]);
+	expect(
+		select(table, {
+			gjcPath: spacedGjc,
+			gjcPrefix: spacedPrefix,
+			brokerAgentDir: spacedAgentDir,
+		}),
+	).toEqual([]);
+});
+
 test("injected process tables require isolated signal and liveness seams", async () => {
 	await expect(reapLeftoverWorkers("/tmp/gajaeway-process-reaper", { processTable: [] })).rejects.toThrow(
 		"processTable injection requires kill and isProcessAlive functions",
