@@ -13,7 +13,7 @@ import {
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
-import { classifyCheckRollup } from "../src/orchestrator/gh-checks";
+import { classifyCheckRollup, failedCheckLogTargets } from "../src/orchestrator/gh-checks";
 import {
 	LaneGovernor,
 	laneJobIdentity,
@@ -1719,6 +1719,33 @@ test("report and fallback text stay within 2048 UTF-8 bytes including the lane h
 	expect(Buffer.byteLength(f.notices[0]!.text, "utf8")).toBeLessThanOrEqual(2048);
 });
 
+test("repository and PR head facts survive a large completion excerpt", () => {
+	const headSha = "a".repeat(40);
+	const prHeadSha = "b".repeat(40);
+	const output = {
+		disposition: "available" as const,
+		reads: 0,
+		nextReadAt: null,
+		excerpt: "x".repeat(8_000),
+		proof: null,
+		knownSilence: null,
+	};
+	const facts = {
+		headSha,
+		dirtyFiles: 0,
+		pushed: true,
+		remoteHeadSha: headSha,
+		checkStatus: { prNumber: 545, headSha: prHeadSha, status: "green" as const, failingChecks: [] },
+	};
+	const text = reportText("a", "completed", "end_turn", "op-ref", output, facts);
+	expect(text.startsWith("[lane a] attempt_ended:")).toBe(true);
+	expect(text).toContain("head=aaaaaaaaaaaa");
+	expect(text).toContain("pushed=true");
+	expect(text).toContain("remoteHead=aaaaaaaaaaaa");
+	expect(text).toContain("pr=545 checks=green prHead=bbbbbbbbbbbb");
+	expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(2048);
+});
+
 test("AC-K notice names persona parent", () => {
 	expect(
 		laneSystemNotice({
@@ -2632,7 +2659,8 @@ test("#550 local checkout lanes preserve scp-like origin URLs", async () => {
 
 test("#481 remote push probes are asynchronous and bounded", async () => {
 	const { bareRepo, cleanup } = await bareRepoFixture("bounded-remote-probe");
-	const f = await fixture({ ownerTarget: () => origin });
+	const { calls, client } = recordingCheckClient({ prNumber: 485, status: "red", failingChecks: ["lint"] });
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
 	let remoteRequests = 0;
 	const slowRemote = Bun.serve({
 		hostname: "127.0.0.1",
@@ -2674,12 +2702,16 @@ test("#481 remote push probes are asynchronous and bounded", async () => {
 		expect(timerFired).toBe(true);
 		await until(() => remoteRequests > 0);
 
-		let report: string | undefined;
-		for (let attempt = 0; attempt < 1_400 && report === undefined; attempt++) {
-			report = f.notices.find((notice) => notice.text.includes("[lane slow-remote] completed"))?.text;
-			if (report === undefined) await Bun.sleep(5);
-		}
-		expect(report).toContain("pushed=false");
+		await until(() => f.job(name).state === "awaiting_checks");
+		const report = f.notices.find((notice) => notice.text.includes("[lane slow-remote] attempt_ended"))?.text ?? "";
+		const headSha = Bun.spawnSync(["git", "-C", f.job(name).lane.worktreePath, "rev-parse", "HEAD"])
+			.stdout.toString()
+			.trim();
+		expect(report).toContain("pushed=unknown");
+		expect(report).toContain("pr=485");
+		expect(f.job(name).awaitingChecks?.headSha).toBe(headSha);
+		expect(calls.length).toBeGreaterThan(0);
+		expect(f.port.sends).toHaveLength(1);
 	} finally {
 		await slowRemote.stop(true);
 		await cleanup();
@@ -2721,6 +2753,22 @@ test("#481 check rollup: any failure is red, unfinished is pending, all success 
 	).toEqual(["ci/x"]);
 	expect(classifyCheckRollup(6, headSha, [run("lint", "COMPLETED", "STALE")]).status).toBe("pending");
 	expect(classifyCheckRollup(7, headSha, [run("lint", "COMPLETED", "UNKNOWN")]).status).toBe("pending");
+	for (const conclusion of ["NEUTRAL", "SKIPPED"])
+		expect(classifyCheckRollup(9, headSha, [run("optional", "COMPLETED", conclusion)]).status).toBe("green");
+	expect(
+		failedCheckLogTargets([
+			{
+				status: "COMPLETED",
+				conclusion: "FAILURE",
+				detailsUrl: "https://github.com/example/repo/actions/runs/123/job/456",
+			},
+			{
+				status: "COMPLETED",
+				conclusion: "FAILURE",
+				detailsUrl: "https://github.com/example/repo/actions/runs/123junk",
+			},
+		]),
+	).toEqual([{ runId: "123", jobId: "456" }]);
 	expect(() => classifyCheckRollup(8, "invalid", [])).toThrow("PR head SHA is invalid");
 });
 
@@ -2773,13 +2821,13 @@ function checksNotice(f: Awaited<ReturnType<typeof fixture>>, lead: string): str
 	return f.notices.find((notice) => notice.text.startsWith(lead))?.text;
 }
 
-test("#481 a completed lane whose PR checks are pending waits in awaiting_checks with its PR and head recorded", async () => {
+test("#481 a lane with pending PR checks reports an unfinished attempt and waits with its PR and head recorded", async () => {
 	const checks = scriptedChecks({ prNumber: 485, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 	const { head } = await awaitingLane(f, "fix/pending");
 	const job = f.job();
 	expect(job.awaitingChecks).toMatchObject({ prNumber: 485, headSha: head, retries: 0 });
-	const notice = checksNotice(f, "[lane a] completed");
+	const notice = checksNotice(f, "[lane a] attempt_ended");
 	expect(notice).toContain(`head=${head.slice(0, 12)}`);
 	expect(notice).toContain("pr=485");
 	expect(notice).toContain("checks=pending");
@@ -3037,6 +3085,36 @@ test("#481 awaiting_checks binds a green rollup to the remote PR head, not the s
 	);
 	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks head_moved")).toContain("pr=496");
 	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 green checks cannot settle after the remote branch advances beyond the local head", async () => {
+	const checks = scriptedChecks({ prNumber: 499, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/remote-ref-moved");
+	const worktree = f.job().lane.worktreePath;
+	const branch = Bun.spawnSync(["git", "-C", worktree, "branch", "--show-current"]).stdout.toString().trim();
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const commit = Bun.spawnSync(["git", "-C", worktree, "commit", "-q", "--allow-empty", "-m", "advance remote"], {
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	expect(commit.exitCode).toBe(0);
+	const remoteHead = Bun.spawnSync(["git", "-C", worktree, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(Bun.spawnSync(["git", "-C", worktree, "push", "-q", "origin", branch]).exitCode).toBe(0);
+	expect(Bun.spawnSync(["git", "-C", worktree, "reset", "-q", "--hard", head]).exitCode).toBe(0);
+	checks.set({ prNumber: 499, headSha: head, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().escalations.at(-1)).toContain(
+		`awaiting_checks ended: head_moved from=${head.slice(0, 12)} to=${remoteHead.slice(0, 12)}`,
+	);
 });
 
 test("#481 checks on the old PR head cannot settle a new local commit that was not pushed", async () => {

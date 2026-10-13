@@ -1521,7 +1521,7 @@ export class WorkLaneManager {
 					job = transitionToAwaitingChecks({
 						record: job,
 						at,
-						prNumber: previousCycle.prNumber ?? (facts?.pushed === true ? (checks?.prNumber ?? null) : null),
+						prNumber: previousCycle.prNumber ?? (facts?.pushed !== false ? (checks?.prNumber ?? null) : null),
 						headSha: facts?.pushed === true && facts.headSha !== undefined ? facts.headSha : previousCycle.headSha,
 					});
 				} else if (facts?.headSha && checks) {
@@ -1531,7 +1531,12 @@ export class WorkLaneManager {
 						prNumber: checks.prNumber,
 						headSha: facts.headSha,
 					});
-				} else if (facts?.headSha && checks === undefined && facts.pushed === true && this.#options.checkStatusClient) {
+				} else if (
+					facts?.headSha &&
+					checks === undefined &&
+					facts.pushed !== false &&
+					this.#options.checkStatusClient
+				) {
 					job = transitionToAwaitingChecks({ record: job, at, prNumber: null, headSha: facts.headSha });
 				}
 			}
@@ -2753,12 +2758,17 @@ export function reportText(
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
 ): string {
+	const checks = facts?.checkStatus;
+	const checksVerified =
+		!facts ||
+		checks === null ||
+		(facts.pushed === false && checks === undefined) ||
+		(checks?.status === "green" &&
+			facts.pushed === true &&
+			facts.remoteHeadSha === facts.headSha &&
+			checks.headSha === facts.remoteHeadSha);
 	const label =
-		endState === "completed" && facts?.checkStatus?.status !== "red"
-			? "completed"
-			: endState === "failed"
-				? "failed"
-				: "attempt_ended";
+		endState === "completed" && checksVerified ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
 	const head = `[lane ${name}] ${label}: ${lead}`;
 	let body =
@@ -2780,34 +2790,37 @@ export function reportText(
 		body = parts.join(" ");
 	}
 
-	// Append repository facts if available
+	// Reserve the suffix for repository facts so large output excerpts cannot hide check evidence.
 	const factsLines: string[] = [];
 	if (facts?.headSha) {
 		factsLines.push(`head=${facts.headSha.slice(0, 12)}`);
 	}
 	if (facts?.pushed !== undefined) {
-		factsLines.push(`pushed=${facts.pushed}`);
+		factsLines.push(`pushed=${facts.pushed === null ? "unknown" : facts.pushed}`);
+	}
+	if (facts?.remoteHeadSha) {
+		factsLines.push(`remoteHead=${facts.remoteHeadSha.slice(0, 12)}`);
 	}
 	if (facts?.checkStatus) {
-		const checks = facts.checkStatus;
-		factsLines.push(`pr=${checks.prNumber}`);
+		const checkStatus = facts.checkStatus;
+		factsLines.push(`pr=${checkStatus.prNumber}`);
 		const checkStr =
-			checks.status === "green"
+			checkStatus.status === "green"
 				? "checks=green"
-				: checks.status === "red"
-					? `checks=red(${checks.failingChecks.slice(0, 3).join(",")})`
+				: checkStatus.status === "red"
+					? `checks=red(${checkStatus.failingChecks
+							.slice(0, 3)
+							.map((name) => utf8Prefix(name, 96))
+							.join(",")})`
 					: "checks=pending";
 		factsLines.push(checkStr);
+		factsLines.push(`prHead=${checkStatus.headSha.slice(0, 12)}`);
 	}
-
-	if (factsLines.length > 0 && body) {
-		body = body + " " + factsLines.join(" ");
-	} else if (factsLines.length > 0) {
-		body = factsLines.join(" ");
-	}
-
-	const content = utf8Prefix(body, 2048 - Buffer.byteLength(head, "utf8"));
-	const text = head + content;
+	const factsText = factsLines.join(" ");
+	const factsSuffix = factsText ? ` ${factsText}` : "";
+	const bodyBudget = Math.max(0, 2048 - Buffer.byteLength(head, "utf8") - Buffer.byteLength(factsSuffix, "utf8"));
+	const content = utf8Prefix(body, bodyBudget);
+	const text = head + content + factsSuffix;
 	if (Buffer.byteLength(text, "utf8") > 2048) throw new Error("lane report exceeded its UTF-8 byte budget");
 	return text;
 }
@@ -2825,6 +2838,11 @@ function checksOutcome(
 ): ChecksOutcome {
 	if (facts?.headSha && facts.headSha !== cycle.headSha)
 		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.headSha.slice(0, 12)}` };
+	if (facts?.remoteHeadSha && facts.remoteHeadSha !== cycle.headSha)
+		return {
+			kind: "ended",
+			reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.remoteHeadSha.slice(0, 12)}`,
+		};
 	const checks = facts?.checkStatus;
 	if (cycle.prNumber === null) {
 		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
@@ -2833,6 +2851,11 @@ function checksOutcome(
 				kind: "ended",
 				reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}`,
 			};
+		if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+			if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+				return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+			return { kind: "wait" };
+		}
 		if (checks?.status === "green") return { kind: "passed" };
 		if (checks?.status === "red")
 			return {
@@ -2849,6 +2872,11 @@ function checksOutcome(
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	if (checks && checks.headSha !== cycle.headSha)
 		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}` };
+	if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+		return { kind: "wait" };
+	}
 	if (checks?.status === "green") return { kind: "passed" };
 	if (checks?.status === "red")
 		return {
@@ -2870,12 +2898,14 @@ interface ChecksReportEffects {
 
 /** The parent's report for a concluded checks cycle. */
 function checksReportText(name: string, cycle: AwaitingChecks, outcome: ChecksSettlement): string {
-	const facts = `head=${cycle.headSha.slice(0, 12)} pr=${cycle.prNumber ?? "unknown"}`;
-	const text =
+	const lead =
 		outcome.kind === "passed"
-			? `[lane ${name}] checks passed: ${facts} checks=green`
-			: `[lane ${name}] ${outcome.kind === "failed" ? "failed" : "attempt_ended"}: awaiting_checks ${outcome.reason} ${facts}`;
-	return utf8Prefix(text, 2048);
+			? `[lane ${name}] checks passed:`
+			: `[lane ${name}] ${outcome.kind === "failed" ? "failed" : "attempt_ended"}: awaiting_checks ${outcome.reason}`;
+	const checks = outcome.kind === "passed" ? " checks=green" : "";
+	const facts = `head=${cycle.headSha.slice(0, 12)} pr=${cycle.prNumber ?? "unknown"}${checks} prHead=${cycle.headSha.slice(0, 12)}`;
+	const suffix = ` ${facts}`;
+	return utf8Prefix(lead, 2048 - Buffer.byteLength(suffix, "utf8")) + suffix;
 }
 
 async function collectRepoFacts(
@@ -2888,7 +2918,10 @@ async function collectRepoFacts(
 			headSha?: string;
 			dirtyFiles: number;
 			branch?: string;
-			pushed?: boolean;
+			/** true/false when known; null when remote probes were unavailable. */
+			pushed?: boolean | null;
+			/** Known branch head shared by every configured push URL. */
+			remoteHeadSha?: string;
 			/** null: no open PR for the branch; absent: not pushed, no client, or the lookup failed. */
 			checkStatus?: CheckStatusSnapshot | null;
 	  }
@@ -2916,6 +2949,10 @@ async function collectRepoFacts(
 				.filter((line) => line.trim()).length,
 			branch: branchName,
 		};
+		const checksBeforeRemoteProbe =
+			checkWhenUnpushed && branchName && branchName !== "HEAD" && checkClient
+				? await checkClient.getCheckStatus(branchName, worktreePath)
+				: undefined;
 
 		// Bare clones do not create remote-tracking refs, so verify every configured push URL directly.
 		if (includePushStatus && branchName && branchName !== "HEAD") {
@@ -2928,12 +2965,25 @@ async function collectRepoFacts(
 				.split(/\r?\n/)
 				.map((url) => url.trim())
 				.filter(Boolean);
-			const upstreamShas =
-				pushUrlsResult.exitCode === 0 ? await Promise.all(pushUrls.map((url) => remoteBranchSha(url, branchName))) : [];
-			result.pushed = pushUrls.length > 0 && upstreamShas.every((sha) => sha === headSha);
+			if (pushUrlsResult.exitCode !== 0) {
+				result.pushed = null;
+			} else if (pushUrls.length === 0) {
+				result.pushed = false;
+			} else {
+				const upstreamHeads = await Promise.all(pushUrls.map((url) => remoteBranchSha(url, branchName)));
+				if (upstreamHeads.some((probe) => probe.kind === "missing")) result.pushed = false;
+				else if (upstreamHeads.some((probe) => probe.kind === "unknown")) result.pushed = null;
+				else {
+					const shas = upstreamHeads.map((probe) => (probe.kind === "found" ? probe.sha : undefined));
+					if (shas.every((sha) => sha !== undefined && sha === shas[0])) result.remoteHeadSha = shas[0];
+					result.pushed = shas.every((sha) => sha === headSha);
+				}
+			}
 
 			// Try to get PR number and check status via check client
-			if ((result.pushed || checkWhenUnpushed) && checkClient) {
+			if (checkWhenUnpushed && checkClient) {
+				if (checksBeforeRemoteProbe !== undefined) result.checkStatus = checksBeforeRemoteProbe;
+			} else if (result.pushed !== false && checkClient) {
 				const checkStatus = await checkClient.getCheckStatus(branchName, worktreePath);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
@@ -2945,7 +2995,12 @@ async function collectRepoFacts(
 	}
 }
 
-async function remoteBranchSha(remoteUrl: string, branchName: string): Promise<string | null> {
+type RemoteBranchProbe =
+	| { readonly kind: "found"; readonly sha: string }
+	| { readonly kind: "missing" }
+	| { readonly kind: "unknown" };
+
+async function remoteBranchSha(remoteUrl: string, branchName: string): Promise<RemoteBranchProbe> {
 	try {
 		const child = Bun.spawn(["git", "ls-remote", "--exit-code", "--heads", remoteUrl, `refs/heads/${branchName}`], {
 			stdout: "pipe",
@@ -2954,10 +3009,12 @@ async function remoteBranchSha(remoteUrl: string, branchName: string): Promise<s
 		});
 		const [exitCode, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
 		const [sha, ref] = output.trim().split(/\s+/, 2);
-		if (exitCode === 0 && ref === `refs/heads/${branchName}` && /^[0-9a-f]{40}$/.test(sha ?? "")) return sha ?? null;
-		return null;
+		if (exitCode === 2 && output.trim() === "") return { kind: "missing" };
+		if (exitCode === 0 && ref === `refs/heads/${branchName}` && /^[0-9a-f]{40}$/.test(sha ?? ""))
+			return { kind: "found", sha: sha! };
+		return { kind: "unknown" };
 	} catch {
-		return null;
+		return { kind: "unknown" };
 	}
 }
 

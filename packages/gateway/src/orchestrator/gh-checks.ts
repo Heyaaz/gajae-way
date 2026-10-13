@@ -15,7 +15,7 @@ interface RollupEntry {
 const FAILED_LOG_LIMIT_BYTES = 1_600;
 
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
-const SUCCESS_CONCLUSIONS = new Set(["SUCCESS"]);
+const SUCCESS_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 const FAILED_STATES = new Set(["FAILURE", "ERROR"]);
 
 /**
@@ -99,7 +99,7 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 	};
 }
 
-function failedCheckLogTargets(rollup: readonly RollupEntry[]): Array<{ runId: string; jobId?: string }> {
+export function failedCheckLogTargets(rollup: readonly RollupEntry[]): Array<{ runId: string; jobId?: string }> {
 	const targets = new Map<string, { runId: string; jobId?: string }>();
 	for (const entry of rollup) {
 		if (entry.status?.toUpperCase() !== "COMPLETED" || !FAILED_CONCLUSIONS.has(entry.conclusion?.toUpperCase() ?? ""))
@@ -108,7 +108,7 @@ function failedCheckLogTargets(rollup: readonly RollupEntry[]): Array<{ runId: s
 		try {
 			const url = new URL(entry.detailsUrl);
 			if (url.hostname !== "github.com") continue;
-			const match = url.pathname.match(/^\/[^/]+\/[^/]+\/actions\/runs\/(\d+)(?:\/job\/(\d+))?/);
+			const match = url.pathname.match(/^\/[^/]+\/[^/]+\/actions\/runs\/(\d+)(?:\/job\/(\d+))?\/?$/);
 			if (!match?.[1]) continue;
 			const target = match[2] ? { runId: match[1], jobId: match[2] } : { runId: match[1] };
 			targets.set(`${target.runId}/${target.jobId ?? ""}`, target);
