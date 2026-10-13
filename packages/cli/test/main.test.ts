@@ -32,7 +32,19 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 	const originalLog = console.log;
 	const originalError = console.error;
 	const previousExit = process.exitCode;
-	console.log = (line: unknown) => output.push(String(line));
+	console.log = (line: unknown) => {
+		const text = String(line);
+		if (text.startsWith("SLO ")) {
+			output.push(text);
+			return;
+		}
+		try {
+			const value = JSON.parse(text) as { days?: unknown; windows?: unknown; ok?: unknown };
+			if (Array.isArray(value.days) && Array.isArray(value.windows) && typeof value.ok === "boolean") output.push(text);
+		} catch {
+			// Another concurrently running test may write to the shared console.
+		}
+	};
 	console.error = (line: unknown) => errors.push(String(line));
 	process.exitCode = 0;
 	const listener = Bun.listen<{ buffer: string }>({
