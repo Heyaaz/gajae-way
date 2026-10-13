@@ -1114,6 +1114,7 @@ export interface OpsDeliveryRow {
 	readonly conversationId: string;
 	readonly state: string;
 	readonly createdAt: string;
+	readonly lastError: DeliveryErrorCode | null;
 	readonly textPrefix: string;
 }
 

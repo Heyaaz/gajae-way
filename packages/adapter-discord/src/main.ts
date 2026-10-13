@@ -1035,9 +1035,10 @@ async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise
  * so an archived thread is explicitly unarchived first. When that fails the
  * reply goes to the parent channel with a visible notice and a log line: a
  * monitor result that silently vanishes behind an archived thread is the worst
- * outcome, because its schedule still looks healthy. Only explicitly public
- * threads may fall back to their parent; private or unknown threads must never
- * leak their replies into a channel they were not intended for.
+ * outcome, because its schedule still looks healthy. Public threads may fall
+ * back to their parent. Synthetic handoff/work ids are not Discord thread ids,
+ * so they also fall back when visibility is unknown; explicitly private threads
+ * never fall back into a broader channel.
  */
 async function resolveDeliveryChannel(
 	discord: DiscordClientLike,
@@ -1048,19 +1049,23 @@ async function resolveDeliveryChannel(
 	try {
 		channel = await fetchTextChannel(discord, origin.conversationId);
 	} catch (error) {
+		const syntheticThread = isSyntheticDiscordThreadId(origin.conversationId);
 		if (
 			origin.kind !== "thread" ||
-			origin.threadVisibility !== "public" ||
+			(origin.threadVisibility !== "public" && !(syntheticThread && origin.threadVisibility !== "private")) ||
 			!origin.parentId ||
 			!isChannelNotFoundError(error)
 		)
 			throw error;
-		const reason = `thread ${origin.conversationId} does not exist`;
+		const reason = `${syntheticThread ? "synthetic " : ""}thread ${origin.conversationId} does not exist`;
+		const noticeThread = syntheticThread
+			? `synthetic thread ${origin.conversationId}`
+			: `thread <#${origin.conversationId}>`;
 		const parent = await fetchTextChannel(discord, origin.parentId);
 		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
 		return {
 			channel: parent,
-			notice: `[thread <#${origin.conversationId}> does not exist; posting here instead]`,
+			notice: `[${noticeThread} does not exist; posting here instead]`,
 		};
 	}
 	if (origin.kind !== "thread" || !origin.parentId || !isArchivedThread(channel)) return { channel };
@@ -1077,6 +1082,11 @@ async function resolveDeliveryChannel(
 			notice: `[thread <#${origin.conversationId}> is archived and could not be unarchived (${errorMessage(error)}); posting here instead]`,
 		};
 	}
+}
+
+/** Synthetic work/handoff ids name internal origins, not Discord thread snowflakes. */
+function isSyntheticDiscordThreadId(conversationId: string): boolean {
+	return /^handoff:[0-9a-f]{32}$/.test(conversationId) || /^lane-report-[0-9a-f]{64}$/.test(conversationId);
 }
 
 /**

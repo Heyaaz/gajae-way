@@ -522,6 +522,35 @@ test("a missing public thread falls back to its parent channel and drops the thr
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
+test("missing synthetic handoff and lane-report threads fall back to their parent channel", async () => {
+	for (const conversationId of [`handoff:${"a".repeat(32)}`, `lane-report-${"b".repeat(64)}`]) {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const fetched: string[] = [];
+		const sent: Array<[string, unknown]> = [];
+		const origin: ChatMessagePayload["origin"] = {
+			platform: "discord",
+			kind: "thread",
+			conversationId,
+			parentId: "channel-1",
+		};
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async (id: string) => {
+					fetched.push(id);
+					if (id === conversationId) throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
+					return { send: async (payload: unknown) => void sent.push([id, payload]) };
+				},
+			},
+		};
+		await settleDiscordDelivery(mockGateway(requests), discord, { ...delivery("work result"), origin });
+		expect(fetched).toEqual([conversationId, "channel-1"]);
+		expect(sent).toEqual([
+			["channel-1", `[synthetic thread ${conversationId} does not exist; posting here instead]\nwork result`],
+		]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	}
+});
+
 test("missing private or unclassified threads never leak replies into the parent channel", async () => {
 	const origins: Array<ChatMessagePayload["origin"]> = [
 		{
@@ -532,6 +561,13 @@ test("missing private or unclassified threads never leak replies into the parent
 			threadVisibility: "private",
 		},
 		{ platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" },
+		{
+			platform: "discord",
+			kind: "thread",
+			conversationId: `handoff:${"a".repeat(32)}`,
+			parentId: "channel-1",
+			threadVisibility: "private",
+		},
 	];
 	for (const origin of origins) {
 		const requests: Array<{ verb: string; params: unknown }> = [];
@@ -541,13 +577,13 @@ test("missing private or unclassified threads never leak replies into the parent
 			channels: {
 				fetch: async (id: string) => {
 					fetched.push(id);
-					if (id === "thread-1") throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
+					if (id !== "channel-1") throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
 					return { send: async (payload: unknown) => void sent.push([id, payload]) };
 				},
 			},
 		};
 		await settleDiscordDelivery(mockGateway(requests), discord, { ...delivery("private reply"), origin });
-		expect(fetched).toEqual(["thread-1"]);
+		expect(fetched).toEqual([origin.conversationId]);
 		expect(sent).toEqual([]);
 		expect(requests).toEqual([
 			{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Unknown Channel", ambiguous: false } },
