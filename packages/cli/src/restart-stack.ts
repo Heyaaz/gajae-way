@@ -13,6 +13,7 @@ import {
 } from "@gajae-gateway/home";
 
 import {
+	adapterConfigPath,
 	BROKER_UNIT,
 	currentPlatform,
 	launchAgentPlistPath,
@@ -332,6 +333,20 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 			if (!installed) {
 				step.result = "skipped";
 				step.detail = "service is not installed";
+				await writeReceipt(options.home, receipt);
+				continue;
+			}
+			// An installed unit can still be unable to start: an adapter whose
+			// `adapter-<platform>.json` is absent exits on the credential read, and
+			// launchd KeepAlive turns that into a crash loop. Skip it the same way an
+			// uninstalled service is skipped — the rule `gajaeway update` already
+			// applies when it renders adapter units — so one unconfigured adapter
+			// cannot abort the rest of the sequence.
+			const adapterSpec = serviceSpecs().find((candidate) => candidate.label === step.label);
+			const adapterConfig = adapterSpec === undefined ? undefined : adapterConfigPath(options.home, adapterSpec.id);
+			if (adapterConfig !== undefined && !(await Bun.file(adapterConfig).exists())) {
+				step.result = "skipped";
+				step.detail = "adapter is not configured";
 				await writeReceipt(options.home, receipt);
 				continue;
 			}

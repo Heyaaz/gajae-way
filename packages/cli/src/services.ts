@@ -106,6 +106,16 @@ export function serviceSpecs(): readonly ServiceSpec[] {
 	return SERVICE_SPECS;
 }
 
+/**
+ * The `adapter-<platform>.json` an adapter reads at startup, or undefined for services
+ * that are not adapters. A unit whose file is absent can never come up — the adapter
+ * exits on the credential read — so supervisors skip it instead of looping on it.
+ */
+export function adapterConfigPath(home: string, specId: string): string | undefined {
+	if (!specId.startsWith("adapter-")) return undefined;
+	return join(home, `adapter-${specId.slice("adapter-".length)}.json`);
+}
+
 function homeForEnvironment(env: NodeJS.ProcessEnv): string {
 	return env.GAJAEWAY_HOME || join(env.HOME || homedir(), ".gajaeway");
 }
@@ -376,10 +386,9 @@ export async function installServices(options: InstallServicesOptions): Promise<
 	const specs: ServiceSpec[] = [];
 	for (const spec of SERVICE_SPECS) {
 		if (!(await Bun.file(join(binDir, spec.binary)).exists())) continue;
-		if (options.configuredAdaptersOnly && spec.id.startsWith("adapter-")) {
-			const adapter = spec.id.slice("adapter-".length);
-			if (!(await Bun.file(join(home, `adapter-${adapter}.json`)).exists())) continue;
-		}
+		const adapterConfig = adapterConfigPath(home, spec.id);
+		if (options.configuredAdaptersOnly && adapterConfig !== undefined && !(await Bun.file(adapterConfig).exists()))
+			continue;
 		specs.push(spec);
 	}
 	const definitions = specs.map((spec) =>
