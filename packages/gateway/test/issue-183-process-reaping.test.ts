@@ -245,10 +245,11 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 	).toEqual([401, 403]);
 });
 
-test("Unix ps parser preserves spaced gateway paths so their workers stay owned", () => {
+test("Unix ps parser preserves spaced gateway and Bun launcher paths", () => {
 	const spacedAgentDir = "/home/user/gajae way/agent";
 	const spacedPrefix = "/home/user/gajae way/.gajaeway/gjc";
 	const spacedGjc = `${spacedPrefix}/0.18.11/bin/gjc`;
+	const spacedPreviousGjc = `${spacedPrefix}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
 	const spacedBun = "/home/user/gajae way/.bun/bin/bun";
 	const spacedSource = "/home/user/gajae way/packages/gateway/src/main.ts";
 	const spacedGateway = "/home/user/gajae way/.gajaeway/bin/gajaeway-gateway";
@@ -258,18 +259,28 @@ test("Unix ps parser preserves spaced gateway paths so their workers stay owned"
 		`501 601 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
 		`300 502 Mon Oct 13 03:20:00 2026 ${spacedGateway} daemon`,
 		`502 602 Mon Oct 13 03:20:00 2026 ${spacedGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
+		`300 603 Mon Oct 13 03:20:00 2026 ${spacedBun} ${spacedPreviousGjc} sdk serve --stdio --session ${SESSION} GJC_CODING_AGENT_DIR=${spacedAgentDir}`,
 	].join("\n");
-	const table = parseUnixProcessTable(output, spacedAgentDir);
+	const table = parseUnixProcessTable(output, spacedAgentDir, { gjcPath: spacedGjc, gjcPrefix: spacedPrefix });
 
 	expect(table[1]?.argv).toEqual([spacedBun, spacedSource, "daemon"]);
 	expect(table[3]?.argv).toEqual([spacedGateway, "daemon"]);
+	expect(table[5]?.argv).toEqual([
+		"/home/user/gajae way/.bun/bin/bun",
+		spacedPreviousGjc,
+		"sdk",
+		"serve",
+		"--stdio",
+		"--session",
+		SESSION,
+	]);
 	expect(
 		select(table, {
 			gjcPath: spacedGjc,
 			gjcPrefix: spacedPrefix,
 			brokerAgentDir: spacedAgentDir,
 		}),
-	).toEqual([]);
+	).toEqual([603]);
 });
 
 test("injected process tables require isolated signal and liveness seams", async () => {

@@ -80,7 +80,7 @@ export async function reapLeftoverWorkers(home: string, options: ProcessReaperOp
 				: await canonicalizePath(options.gjcPrefix);
 		const brokerAgentDir = await canonicalizePath(options.brokerAgentDir ?? layout.brokerAgentDir);
 		const matchOptions: WorkerMatchOptions = { gjcPath, gjcPrefix, brokerAgentDir, selfPid: process.pid };
-		const processTable = options.processTable ?? (await readProcessTable(options.procRoot, brokerAgentDir));
+		const processTable = options.processTable ?? (await readProcessTable(options.procRoot, matchOptions));
 		const foundPids = selectOrphanedWorkers(processTable, matchOptions);
 		found = foundPids.length;
 		if (foundPids.length === 0) return { found, killed, failed };
@@ -97,7 +97,7 @@ export async function reapLeftoverWorkers(home: string, options: ProcessReaperOp
 					isCurrentWorker:
 						options.isCurrentWorker ??
 						(async (original) => {
-							const currentTable = options.processTable ?? (await readProcessTable(options.procRoot, brokerAgentDir));
+							const currentTable = options.processTable ?? (await readProcessTable(options.procRoot, matchOptions));
 							const current = currentTable.find((entry) => entry.pid === original.pid);
 							if (!sameProcessIdentity(original, current, options.processTable !== undefined)) return false;
 							return selectOrphanedWorkers(currentTable, matchOptions).includes(original.pid);
@@ -207,9 +207,9 @@ async function canonicalizePath(path: string): Promise<string> {
 	}
 }
 
-async function readProcessTable(procRoot?: string, brokerAgentDir?: string): Promise<ProcessTableEntry[]> {
+async function readProcessTable(procRoot?: string, matchOptions?: WorkerMatchOptions): Promise<ProcessTableEntry[]> {
 	if (procRoot !== undefined || process.platform === "linux") return await readProcessTableLinux(procRoot);
-	return await readProcessTableUnix(brokerAgentDir);
+	return await readProcessTableUnix(matchOptions);
 }
 
 async function readProcessTableLinux(procRoot = "/proc"): Promise<ProcessTableEntry[]> {
@@ -272,7 +272,11 @@ function parseLinuxStat(stat: string): LinuxStat | undefined {
 }
 
 /** Parses BSD-style ps rows with explicit PPID, PID, lstart, and command columns. */
-export function parseUnixProcessTable(output: string, expectedAgentDir?: string): ProcessTableEntry[] {
+export function parseUnixProcessTable(
+	output: string,
+	expectedAgentDir?: string,
+	workerPathOptions?: Pick<WorkerMatchOptions, "gjcPath" | "gjcPrefix">,
+): ProcessTableEntry[] {
 	const result: ProcessTableEntry[] = [];
 	for (const line of output.split(/\r?\n/)) {
 		const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
@@ -289,7 +293,7 @@ export function parseUnixProcessTable(output: string, expectedAgentDir?: string)
 			environmentStart === undefined
 				? commandAndEnvironment
 				: commandAndEnvironment.slice(0, environmentStart).trimEnd();
-		const argv = parseUnixCommandArgv(command);
+		const argv = parseUnixCommandArgv(command, workerPathOptions);
 		if (argv.length === 0) continue;
 		result.push({
 			pid,
@@ -302,22 +306,39 @@ export function parseUnixProcessTable(output: string, expectedAgentDir?: string)
 	return result;
 }
 
-function parseUnixCommandArgv(command: string): string[] {
+function parseUnixCommandArgv(
+	command: string,
+	workerPathOptions?: Pick<WorkerMatchOptions, "gjcPath" | "gjcPrefix">,
+): string[] {
 	const marker = " sdk serve --stdio --session ";
 	const markerIndex = command.lastIndexOf(marker);
 	if (markerIndex < 0) return parseUnixGatewayArgv(command) ?? command.split(/\s+/).filter(Boolean);
 
 	const executable = command.slice(0, markerIndex);
-	const firstSpace = executable.indexOf(" ");
-	const launcher =
-		firstSpace > 0 && basename(executable.slice(0, firstSpace)) === "bun"
-			? [executable.slice(0, firstSpace), executable.slice(firstSpace + 1)]
-			: [executable];
+	const bunArgv = parseUnixBunLauncher(executable, workerPathOptions);
+	const launcher = bunArgv ?? [executable];
 	const args = command
 		.slice(markerIndex + 1)
 		.split(/\s+/)
 		.filter(Boolean);
 	return [...launcher, ...args];
+}
+
+function parseUnixBunLauncher(
+	command: string,
+	workerPathOptions?: Pick<WorkerMatchOptions, "gjcPath" | "gjcPrefix">,
+): string[] | undefined {
+	for (let separator = command.indexOf(" "); separator >= 0; separator = command.indexOf(" ", separator + 1)) {
+		const launcher = command.slice(0, separator);
+		if (basename(launcher) !== "bun") continue;
+
+		const executable = command.slice(separator + 1);
+		const matchesGjc = workerPathOptions
+			? isGjcExecutable(executable, workerPathOptions.gjcPath, workerPathOptions.gjcPrefix)
+			: basename(executable) === "gjc" || basename(executable) === "gjc.js";
+		if (matchesGjc) return [launcher, executable];
+	}
+	return undefined;
 }
 
 function parseUnixGatewayArgv(command: string): string[] | undefined {
@@ -396,7 +417,7 @@ function findUnixEnvironmentStart(commandAndEnvironment: string, agentDirIndex: 
 	return firstVariable ? sessionEnd + firstVariable.index : agentDirIndex;
 }
 
-async function readProcessTableUnix(expectedAgentDir?: string): Promise<ProcessTableEntry[]> {
+async function readProcessTableUnix(matchOptions?: WorkerMatchOptions): Promise<ProcessTableEntry[]> {
 	const proc = Bun.spawn(["ps", "-A", "-ww", "eww", "-o", "ppid=,pid=,lstart=,command="], {
 		stdout: "pipe",
 		stderr: "ignore",
@@ -404,7 +425,7 @@ async function readProcessTableUnix(expectedAgentDir?: string): Promise<ProcessT
 	const output = await new Response(proc.stdout as ReadableStream).text();
 	const exitCode = await proc.exited;
 	if (exitCode !== 0) throw new Error(`ps process-table scan exited with status ${exitCode}`);
-	return parseUnixProcessTable(output, expectedAgentDir);
+	return parseUnixProcessTable(output, matchOptions?.brokerAgentDir, matchOptions);
 }
 
 async function isProcessAlive(pid: number, procRoot?: string): Promise<boolean> {
