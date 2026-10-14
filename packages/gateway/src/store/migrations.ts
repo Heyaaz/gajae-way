@@ -767,9 +767,11 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 	if (current < 36) {
 		// Issue #567: durable journal of work-attempt, lane-job and outbox row snapshots. Existing
 		// rows are seeded as baseline events so replay from the journal alone covers pre-v36 state.
+		// A database whose v36 record was removed restarts its journal from the current projections.
 		host.withTransaction(() => {
 			host.database.execute(
-				`CREATE TABLE work_journal (
+				`DROP TABLE IF EXISTS work_journal;
+				CREATE TABLE work_journal (
 					seq INTEGER PRIMARY KEY AUTOINCREMENT,
 					entity TEXT NOT NULL CHECK(entity IN ('attempt','lane_job','delivery')),
 					entity_key TEXT NOT NULL,
