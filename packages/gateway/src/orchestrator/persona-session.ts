@@ -3206,11 +3206,13 @@ class OriginActor {
 					failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
 					failedTurnEvidenceChecked = true;
 				}
-				// A saved 402 transcript is a billing/quota failure, not a transient transport error.
+				// A saved 402 transcript is a billing/quota failure, not a transient
+				// transport error, and a policy refusal answers the same way every time.
 				if (
 					retryEligible &&
 					failedTurnEvidence?.reason !== "provider_quota_exhausted" &&
-					failedTurnEvidence?.reason !== "provider_rate_limited"
+					failedTurnEvidence?.reason !== "provider_rate_limited" &&
+					failedTurnEvidence?.reason !== "provider_refusal"
 				) {
 					const retryDelayMs = Math.min(
 						AGENT_ERROR_RETRY_MAX_MS,
@@ -3830,7 +3832,8 @@ class OriginActor {
 	/**
 	 * Exact context/request failures, a wedged prompt submission and repeated
 	 * submission failures reset only the next binding; the failed trigger is
-	 * completed, never resent. Quota failures never reset.
+	 * completed, never resent. Quota, rate-limit and policy-refusal failures
+	 * never reset: the session is fine, the request (or the account) is not.
 	 */
 	#resetFailedTurn(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
 		const wedged = isWedgedSubmission(report);
@@ -3880,7 +3883,7 @@ class OriginActor {
 				report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs)
 		)
 			return false;
-		if (reason === "provider_quota_exhausted" || reason === "provider_rate_limited") {
+		if (reason === "provider_quota_exhausted" || reason === "provider_rate_limited" || reason === "provider_refusal") {
 			this.#submissionFailures.delete(bound.sessionId);
 			return false;
 		}
@@ -3974,6 +3977,13 @@ function terminalError(
 			code: "provider_quota_exhausted",
 			message,
 		});
+	}
+	if (evidence?.reason === "provider_refusal") {
+		// The category is the provider's own policy token; the request itself is
+		// what was declined, so resending it unchanged would fail the same way.
+		const category = evidence.refusalCategory ? ` (${evidence.refusalCategory})` : "";
+		const message = `the model provider refused this request under its usage policy${category}; rephrase or narrow the request`;
+		return new GjcRuntimeError(`provider_refusal: ${message}`, { code: "provider_refusal", message });
 	}
 	const failure = status.status.error;
 	const outcome = status.status.outcome;
