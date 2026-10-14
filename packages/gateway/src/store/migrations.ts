@@ -8,7 +8,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 35;
+export const LATEST_SCHEMA_VERSION = 36;
 
 export interface MigrationHost {
 	readonly database: {
@@ -761,6 +761,23 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(35, new Date().toISOString());
+		});
+	}
+	if (current < 36) {
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE broker_operation_idempotency (
+					operation_key TEXT PRIMARY KEY,
+					operation_type TEXT NOT NULL,
+					result_json TEXT NOT NULL,
+					created_at TEXT NOT NULL,
+					expiresAt TEXT NOT NULL
+				);
+				CREATE INDEX broker_operation_idempotency_expiry ON broker_operation_idempotency(expiresAt);
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(36, new Date().toISOString());
 		});
 	}
 }
