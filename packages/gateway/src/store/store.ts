@@ -3,6 +3,7 @@ import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { StoreCore, type StoreOpenOptions } from "./core";
 import { BindingsGroup, type BrokerAuthority } from "./groups/bindings";
 import { InboxGroup, RETENTION_BATCH_ROWS } from "./groups/inbox";
+import { JournalGroup } from "./groups/journal";
 import { MemoryGroup } from "./groups/memory";
 import { MonitorsGroup } from "./groups/monitors";
 import { OutboxGroup } from "./groups/outbox";
@@ -16,6 +17,12 @@ export const CONFIRMED_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export interface RetentionSweepResult {
 	readonly deleted: Readonly<Record<string, number>>;
 	readonly more: boolean;
+}
+
+export interface JournalReplayResult {
+	readonly attempts: number;
+	readonly laneJobs: number;
+	readonly deliveries: number;
 }
 
 export interface BrokerAuthorityCensus {
@@ -35,6 +42,7 @@ export class Store {
 	readonly work: WorkGroup;
 	readonly monitors: MonitorsGroup;
 	readonly memory: MemoryGroup;
+	readonly journal: JournalGroup;
 
 	constructor(core: StoreCore) {
 		this.core = core;
@@ -44,6 +52,7 @@ export class Store {
 		this.work = new WorkGroup(core);
 		this.monitors = new MonitorsGroup(core);
 		this.memory = new MemoryGroup(core);
+		this.journal = new JournalGroup(core);
 	}
 
 	static async open(path: string, options: StoreOpenOptions = {}): Promise<Store> {
@@ -68,6 +77,17 @@ export class Store {
 
 	transaction<T>(fn: (tx: WriteTx) => T): T {
 		return this.core.transaction(fn);
+	}
+
+	/**
+	 * Rebuild the work-attempt, lane-job and outbox projections from the journal alone. Rows that
+	 * already equal their latest journaled snapshot are left untouched; the counts are rows rewritten.
+	 */
+	replayJournal(): JournalReplayResult {
+		return this.transaction((tx) => {
+			const work = this.work.replayProjection(tx, this.journal.latest("attempt"), this.journal.latest("lane_job"));
+			return { ...work, deliveries: this.outbox.replayProjection(tx, this.journal.latest("delivery")) };
+		});
 	}
 
 	reconcileWorkAttempts(log: (line: string) => void = console.error): number {
@@ -188,6 +208,7 @@ export class Store {
 			note("monitor_slots", monitors.slots);
 			note("deliveries", this.outbox.sweep(tx, cutoffs));
 			note("lane_reports", this.work.sweep(tx, cutoffs));
+			note("work_journal", this.journal.sweep(tx, cutoffs));
 			return { deleted, more };
 		});
 	}

@@ -170,7 +170,7 @@ test("administrative cutover refuses a non-latest schema without migrating it", 
 	expect(await readSnapshot(f.layout.db)).toEqual(before);
 	const readonly = await Store.openReadonly(f.layout.db);
 	try {
-		expect(readonly.schemaVersion).toBe(35);
+		expect(readonly.schemaVersion).toBe(36);
 	} finally {
 		readonly.close();
 	}

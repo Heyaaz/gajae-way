@@ -10,6 +10,7 @@ import {
 	assertValidOpRef,
 	closeAttempt,
 	type LaneJobRecord,
+	type LaneJobState,
 	type PromptStatusBody,
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
@@ -18,6 +19,7 @@ import type { GroupDb, StoreCore } from "../core";
 import { BrokerAuthorityError } from "../errors";
 import type { OpenWorkRows, OpenWorkScope } from "../open-work";
 import type { WriteTx } from "../tx";
+import { JOURNAL_PROJECTIONS, JournalGroup, type JournalRows, staleJournalKeys } from "./journal";
 
 export type WorkAttemptMode = "start" | "run" | "historical";
 export type WorkAttemptDecision =
@@ -492,6 +494,28 @@ function validateLaneReportRow(row: LaneReportRow): void {
 	laneReportRoot(row);
 }
 
+export interface WorkAttemptDbRow {
+	readonly op_ref: string;
+	readonly job_id: string;
+	readonly lane_key: string;
+	readonly session_id: string;
+	readonly version: number;
+	readonly settled_at: string | null;
+	readonly delivery_id: string;
+	readonly record_json: string;
+}
+
+export interface LaneJobDbRow {
+	readonly job_id: string;
+	readonly lane_key: string;
+	readonly branch: string;
+	readonly worktree_path: string;
+	readonly state: string;
+	readonly record_json: string;
+	readonly created_at: string;
+	readonly updated_at: string;
+}
+
 export interface WorkLaneJobInput {
 	readonly jobId: string;
 	readonly laneKey: string;
@@ -505,10 +529,12 @@ export interface WorkLaneJobInput {
 export class WorkGroup {
 	readonly #core: StoreCore;
 	readonly #db: GroupDb;
+	readonly #journal: JournalGroup;
 
 	constructor(core: StoreCore) {
 		this.#core = core;
 		this.#db = core.groupDb("work");
+		this.#journal = new JournalGroup(core);
 	}
 
 	get instanceId(): string {
@@ -521,16 +547,9 @@ export class WorkGroup {
 	}
 
 	workAttemptGet(opRef: string): WorkAttemptRuntime | undefined {
-		const row = this.#db.prepare("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(opRef) as {
-			op_ref: string;
-			job_id: string;
-			lane_key: string;
-			session_id: string;
-			version: number;
-			settled_at: string | null;
-			delivery_id: string;
-			record_json: string;
-		} | null;
+		const row = this.#db
+			.prepare("SELECT * FROM work_attempt_runtime WHERE op_ref = ?")
+			.get(opRef) as WorkAttemptDbRow | null;
 
 		if (!row) return undefined;
 		try {
@@ -832,6 +851,7 @@ export class WorkGroup {
 				.prepare("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ? WHERE op_ref = ? AND settled_at IS ?")
 				.run(tx, JSON.stringify(next), next.settledAt, runtime.opRef, priorSettledAt).changes;
 			workAssert(changed === 1);
+			this.#journal.record(tx, "attempt", runtime.opRef, "attempt_reconciled");
 			this.#workPutHistory(tx, next, history);
 			let childFallback: ChatMessagePayload | undefined;
 			if (next.wakeReportId !== null) {
@@ -966,6 +986,7 @@ export class WorkGroup {
 				runtime.deliveryId,
 				JSON.stringify(runtime),
 			);
+		this.#journal.record(tx, "attempt", runtime.opRef, "attempt_started");
 	}
 
 	workAttemptUpdate(
@@ -980,6 +1001,16 @@ export class WorkGroup {
 		const next = this.#workPatched(current, patch);
 		workAssert(next.decision === "undecided" && next.settledAt === null);
 		if (!this.#workCas(tx, current, next)) return undefined;
+		this.#journal.record(
+			tx,
+			"attempt",
+			opRef,
+			current.terminal === null && next.terminal !== null
+				? "attempt_terminal"
+				: !workAccepted(current) && workAccepted(next)
+					? "attempt_accepted"
+					: "attempt_updated",
+		);
 		if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(tx, next);
 		return next;
 	}
@@ -1070,6 +1101,7 @@ export class WorkGroup {
 		workAssert(record.attempts.length === previous.attempts.length);
 		workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous.attempts.slice(0, -1)));
 		if (!this.#workCas(tx, current, next)) return undefined;
+		this.#journal.record(tx, "attempt", opRef, "attempt_settled");
 		this.#workPutHistory(tx, next, record);
 		if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(tx, next);
 		if (next.decision === "reported" && admission?.kind === "lane")
@@ -1295,6 +1327,75 @@ export class WorkGroup {
 				job.createdAt,
 				job.updatedAt,
 			);
+		this.#journal.record(tx, "lane_job", job.jobId, `lane_job_${job.state as LaneJobState}`);
+	}
+
+	/** Every column of every attempt and lane-job row, as the journal snapshots them. */
+	projectionRows(): { readonly attempts: WorkAttemptDbRow[]; readonly laneJobs: LaneJobDbRow[] } {
+		return {
+			attempts: this.#db
+				.prepare(`SELECT ${JOURNAL_PROJECTIONS.attempt.columns.join(", ")} FROM work_attempt_runtime ORDER BY op_ref`)
+				.all() as WorkAttemptDbRow[],
+			laneJobs: this.#db
+				.prepare(`SELECT ${JOURNAL_PROJECTIONS.lane_job.columns.join(", ")} FROM lane_jobs ORDER BY job_id`)
+				.all() as LaneJobDbRow[],
+		};
+	}
+
+	/**
+	 * Make the attempt and lane-job projections equal to the journaled snapshots: rows that differ
+	 * or have no journal entry are removed, then journaled rows are written back verbatim.
+	 */
+	replayProjection(
+		tx: WriteTx,
+		attempts: ReadonlyMap<string, JournalRows["attempt"] | null>,
+		laneJobs: ReadonlyMap<string, JournalRows["lane_job"] | null>,
+	): { readonly attempts: number; readonly laneJobs: number } {
+		const current = this.projectionRows();
+		const staleAttempts = staleJournalKeys("attempt", current.attempts, attempts);
+		const staleJobs = staleJournalKeys("lane_job", current.laneJobs, laneJobs);
+		for (const opRef of staleAttempts)
+			this.#db.prepare("DELETE FROM work_attempt_runtime WHERE op_ref = ?").run(tx, opRef);
+		for (const jobId of staleJobs) this.#db.prepare("DELETE FROM lane_jobs WHERE job_id = ?").run(tx, jobId);
+		for (const jobId of staleJobs) {
+			const row = laneJobs.get(jobId);
+			if (row)
+				this.#db
+					.prepare(
+						"INSERT INTO lane_jobs (job_id, lane_key, branch, worktree_path, state, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+					)
+					.run(
+						tx,
+						row.job_id,
+						row.lane_key,
+						row.branch,
+						row.worktree_path,
+						row.state,
+						row.record_json,
+						row.created_at,
+						row.updated_at,
+					);
+		}
+		for (const opRef of staleAttempts) {
+			const row = attempts.get(opRef);
+			if (row)
+				this.#db
+					.prepare(
+						"INSERT INTO work_attempt_runtime (op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+					)
+					.run(
+						tx,
+						row.op_ref,
+						row.job_id,
+						row.lane_key,
+						row.session_id,
+						row.version,
+						row.settled_at,
+						row.delivery_id,
+						row.record_json,
+					);
+		}
+		return { attempts: staleAttempts.length, laneJobs: staleJobs.length };
 	}
 
 	laneJobJson(jobId: string): string | undefined {
