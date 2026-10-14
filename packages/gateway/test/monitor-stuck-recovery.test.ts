@@ -346,7 +346,6 @@ test("an ambiguous send-stage relay close does not roll the session", async () =
 		database: db,
 		authority: authority!,
 		cli: (async () => ({ exitCode: 0, stdout: "", stderr: "" })) as CliRunner,
-		instanceId: "monitor-stuck-recovery-test",
 		tailRunner: new TailRunner({ stream: noRelay, repo: process.cwd() }),
 	});
 	let step: string | undefined;

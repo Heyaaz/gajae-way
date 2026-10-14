@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { containsSilenceToken, isSilenceToken } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
@@ -24,7 +24,7 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
-import type { BrokerAuthority } from "../store/groups/bindings";
+import type { BrokerAuthority, BrokerOperationKind, BrokerOperationRecord } from "../store/groups/bindings";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -425,7 +425,6 @@ export class ModelNotSelectedError extends Error {
 export interface BrokerSessionPortOptions {
 	readonly database: Store;
 	readonly cli: CliRunner;
-	readonly instanceId: string;
 	readonly tailRunner: TailRunner;
 	readonly authority: BrokerAuthority;
 	readonly now?: () => number;
@@ -439,6 +438,14 @@ const SESSION_CREATE_READINESS_MS = 60_000;
 const SESSION_READY_TIMEOUT_MS = 60_000;
 const SESSION_READY_POLL_MS = 250;
 const SESSION_CREATE_RETRY_MS = 1_000;
+/**
+ * How long a completed broker operation answers a retry of the same op ref.
+ * Keys are per-attempt, so this bounds the journal's size, not its correctness:
+ * no other operation can ever read the row.
+ */
+const BROKER_OPERATION_RETENTION_MS = 60 * 60_000;
+/** A pending intent this old belongs to no live retry; it is dropped rather than replayed. */
+const BROKER_INTENT_RETENTION_MS = 24 * 60 * 60_000;
 /** Maximum poisoned-create-key epoch rotations permitted per origin. */
 export const MAX_POISONED_CREATE_ROTATIONS = 3;
 
@@ -469,7 +476,6 @@ const COMPACTION_TIMEOUT_MS = 5 * 60_000;
 export class BrokerSessionPort implements SessionPort {
 	readonly #database: Store;
 	readonly #cli: CliRunner;
-	readonly #instanceId: string;
 	readonly #tailRunner: TailRunner;
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
@@ -489,7 +495,6 @@ export class BrokerSessionPort implements SessionPort {
 			// failed transport to a definitive rejection merely because stdout is JSON.
 			return args.includes("turn.steer") ? result : normalizeSdkEnvelopeFailure(result);
 		};
-		this.#instanceId = options.instanceId;
 		this.#tailRunner = options.tailRunner;
 		this.#now = options.now ?? (() => Date.now());
 		this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
@@ -575,13 +580,24 @@ export class BrokerSessionPort implements SessionPort {
 			);
 			return await this.bind({ ...input, epoch: rebound });
 		}
-		const idempotencyKey = sessionCreateRef(this.#instanceId, input.originKey, input.epoch, input.repo);
+		// Intent first: the create is journaled under a fresh per-attempt key
+		// before the broker sees it. A crash or broker restart before the binding
+		// below is recorded leaves the intent pending, and the retry replays that
+		// same key and request, which the broker dedups to the session it already
+		// made. The intent is released in the binding's own transaction, so a
+		// later bind of this origin/epoch never inherits a finished create.
+		const intent = this.#beginOperation("session.create", createScope(input), `gw-bind-${randomUUID()}`, () =>
+			sessionCreateInput(input.repo, input.model),
+		);
 		let created: { readonly sessionId?: unknown };
 		try {
-			created = await this.#createSession(input.repo, idempotencyKey, input.model);
+			created = await this.#createSession(intent.operationRef, intent.requestJson);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			const poisonedCode = poisonedCreateKeyCode(error, idempotencyKey);
+			const poisonedCode = poisonedCreateKeyCode(error, intent.operationRef);
+			// A poisoned key can never succeed; every other failure may have
+			// created the session, so the intent stays for the retry to replay.
+			if (poisonedCode !== undefined) this.#releaseOperation(intent);
 			if (input.epochRecovery === false || poisonedCode === undefined) throw error;
 			const rotations = this.#createRotations(input.originKey);
 			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
@@ -599,23 +615,33 @@ export class BrokerSessionPort implements SessionPort {
 		}
 		const sessionId = created.sessionId;
 		if (typeof sessionId !== "string" || sessionId.length === 0) {
+			this.#releaseOperation(intent);
 			throw new Error("session.create succeeded without a sessionId");
 		}
 		const persistedEpoch = this.#database.bindings.getSessionRecord(input.originKey)?.epoch;
 		if (persistedEpoch !== undefined && persistedEpoch > input.epoch) {
+			this.#releaseOperation(intent);
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to epoch ${persistedEpoch}`);
 		}
-		if (
-			!this.#database.transaction((tx) =>
-				this.#database.bindings.recordOwnedBinding(tx, {
-					authority: this.#authority,
-					sessionId,
-					originKey: input.originKey,
-					epoch: input.epoch,
-					repo: input.repo,
-				}),
-			)
-		) {
+		// Complete: the binding and the intent's release commit together.
+		const recorded = this.#database.transaction((tx) => {
+			const owned = this.#database.bindings.recordOwnedBinding(tx, {
+				authority: this.#authority,
+				sessionId,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: input.repo,
+			});
+			this.#database.bindings.releaseBrokerOperation(
+				tx,
+				this.#authority,
+				intent.operation,
+				intent.scope,
+				intent.operationRef,
+			);
+			return owned;
+		});
+		if (!recorded) {
 			throw new Error(
 				`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`,
 			);
@@ -638,6 +664,54 @@ export class BrokerSessionPort implements SessionPort {
 			repo: input.repo,
 			...(input.model ? { startupModelApplied: true } : {}),
 		};
+	}
+
+	/** Records the intent of a broker mutation (its own committed transaction) or returns the row an earlier attempt left. */
+	#beginOperation(
+		operation: BrokerOperationKind,
+		scope: string,
+		operationRef: string,
+		request: () => string,
+	): BrokerOperationRecord {
+		const now = this.#now();
+		const cutoff = {
+			completedBefore: new Date(now - BROKER_OPERATION_RETENTION_MS).toISOString(),
+			pendingBefore: new Date(now - BROKER_INTENT_RETENTION_MS).toISOString(),
+		};
+		return this.#database.transaction((tx) => {
+			this.#database.bindings.pruneBrokerOperations(tx, cutoff);
+			return this.#database.bindings.beginBrokerOperation(tx, this.#authority, {
+				operation,
+				scope,
+				operationRef,
+				requestJson: request(),
+			});
+		});
+	}
+
+	#completeOperation(intent: BrokerOperationRecord, result: unknown): void {
+		this.#database.transaction((tx) =>
+			this.#database.bindings.completeBrokerOperation(
+				tx,
+				this.#authority,
+				intent.operation,
+				intent.scope,
+				intent.operationRef,
+				JSON.stringify(result),
+			),
+		);
+	}
+
+	#releaseOperation(intent: BrokerOperationRecord): void {
+		this.#database.transaction((tx) =>
+			this.#database.bindings.releaseBrokerOperation(
+				tx,
+				this.#authority,
+				intent.operation,
+				intent.scope,
+				intent.operationRef,
+			),
+		);
 	}
 
 	#createRotations(originKey: string): number {
@@ -686,12 +760,8 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	/** Cold creates are serialized per agent dir: parallel launches starve gjc's lifecycle launcher. */
-	#createSession(
-		repo: string,
-		idempotencyKey: string,
-		model: GjcModelSelection | undefined,
-	): Promise<{ readonly sessionId?: unknown }> {
-		const run = this.#createChain.then(async () => await this.#createSessionUnserialized(repo, idempotencyKey, model));
+	#createSession(idempotencyKey: string, requestJson: string): Promise<{ readonly sessionId?: unknown }> {
+		const run = this.#createChain.then(async () => await this.#createSessionUnserialized(idempotencyKey, requestJson));
 		this.#createChain = run.then(
 			() => undefined,
 			() => undefined,
@@ -700,9 +770,8 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async #createSessionUnserialized(
-		repo: string,
 		idempotencyKey: string,
-		model: GjcModelSelection | undefined,
+		requestJson: string,
 	): Promise<{ readonly sessionId?: unknown }> {
 		let lastFailure: unknown;
 		for (let attempt = 1; attempt <= SESSION_CREATE_ATTEMPTS; attempt++) {
@@ -718,21 +787,7 @@ export class BrokerSessionPort implements SessionPort {
 						"--idempotency-key",
 						idempotencyKey,
 						"--json-input",
-						// A fresh session host boots the full agent (~10s measured on the
-						// persona host); the runtime's 10s default readiness cutoff turns a
-						// slow-but-healthy cold start into spawn_failed. Use the maximum
-						// budget: create is idempotent under this key either way.
-						JSON.stringify({
-							cwd: repo,
-							readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
-							// session.create takes a bare model id; a `:level` suffix is applied
-							// with thinking.set once the host is up (see bind()).
-							...(typeof model === "string"
-								? { modelId: splitThinkingSuffix(model).model }
-								: model
-									? { modelPreset: model.preset }
-									: {}),
-						}),
+						requestJson,
 					]),
 					"session.create",
 				);
@@ -918,50 +973,99 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		assertValidOpRef(input.opRef);
 		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
+		// `turn.prompt` is not idempotent at the broker (a reused clientRef is
+		// refused), so the gateway journals it: intent before the relay call,
+		// receipt after. A retry of a completed op ref gets the stored receipt;
+		// a retry of a pending one (crash or broker restart mid-send) first asks
+		// the broker whether that clientRef was accepted and only sends if not.
+		const requestJson = JSON.stringify({ text: createHash("sha256").update(input.text).digest("hex") });
+		const intent = this.#beginOperation(
+			"turn.prompt",
+			JSON.stringify([input.sessionId, input.opRef]),
+			input.opRef,
+			() => requestJson,
+		);
+		if (intent.requestJson !== requestJson)
+			throw new OpRefError(`op ref ${input.opRef} was already used for a different prompt`);
+		if (intent.state === "complete") return JSON.parse(intent.resultJson!) as SendReceipt;
+		const relay =
+			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+		try {
+			const receipt =
+				(intent.resumed ? await this.#acceptedPrompt(input, relay) : undefined) ??
+				(await this.#submitPrompt(input, relay, intent));
+			this.#completeOperation(intent, receipt);
+			return receipt;
+		} finally {
+			if (!input.relay) await relay.close();
+		}
+	}
+
+	/** The receipt of a prompt the broker already accepted under this clientRef, or undefined when it never saw it. */
+	async #acceptedPrompt(input: SessionSendInput, relay: TailHandle): Promise<SendReceipt | undefined> {
+		const report = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relay });
+		if (report.status.status === "unknown") return undefined;
+		console.info(
+			`session_prompt_replayed session=${input.sessionId} opRef=${input.opRef} status=${report.status.status}`,
+		);
+		return {
+			sessionId: input.sessionId,
+			operationRef: input.opRef,
+			...(report.status.commandId ? { commandId: report.status.commandId } : {}),
+			...(report.status.turnId ? { turnId: report.status.turnId } : {}),
+			acceptedAt: new Date(report.status.acceptedAt ?? this.#now()).toISOString(),
+			taskKey: "gateway",
+		};
+	}
+
+	async #submitPrompt(input: SessionSendInput, relay: TailHandle, intent: BrokerOperationRecord): Promise<SendReceipt> {
 		if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
 		const text = renderPrompt(input.systemPreamble, input.text);
 		// The prompt is submitted on the session's resident relay so that this
 		// connection OWNS the turn: the host streams the turn's content only to
 		// the connection that submitted it. A caller without a relay gets one
 		// for the duration of the send.
-		const relay =
-			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
-		try {
-			const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
-			let waited = false;
-			for (;;) {
-				this.#database.bindings.assertAuthority(this.#authority);
-				const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
-				this.#database.bindings.assertAuthority(this.#authority);
-				if (response.ok) {
-					const result = recordOf(response.result) ?? {};
-					const receipt = recordOf(result.receipt) ?? result;
-					return {
-						sessionId: input.sessionId,
-						operationRef: input.opRef,
-						...(typeof receipt.commandId === "string" ? { commandId: receipt.commandId } : {}),
-						...(typeof receipt.turnId === "string" ? { turnId: receipt.turnId } : {}),
-						acceptedAt: new Date(this.#now()).toISOString(),
-						taskKey: "gateway",
-					};
-				}
-				const error = relayFailure("turn.prompt", response);
-				if (envelopeErrorCode(error.details) === MODEL_NOT_SELECTED_CODE) throw new ModelNotSelectedError(input.opRef);
-				if (envelopeErrorCode(error.details) === CLIENT_REF_CONFLICT_CODE)
-					throw new OpRefRejectedError(input.opRef, CLIENT_REF_CONFLICT_CODE, error.details);
-				if (!isSessionBusy(error)) throw error;
-				// `busy` is occupancy, not failure: the prompt was never accepted and
-				// the op-ref is still unused. Wait for the session to go idle
-				// (bounded) and resend under the same op-ref before giving up.
-				if (this.#now() >= deadline) throw error;
-				if (!waited) {
-					waited = true;
-					console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
-				}
-				await this.#sleep(BUSY_POLL_MS);
+		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
+		let waited = false;
+		for (;;) {
+			this.#database.bindings.assertAuthority(this.#authority);
+			const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
+			this.#database.bindings.assertAuthority(this.#authority);
+			if (response.ok) {
+				const result = recordOf(response.result) ?? {};
+				const receipt = recordOf(result.receipt) ?? result;
+				return {
+					sessionId: input.sessionId,
+					operationRef: input.opRef,
+					...(typeof receipt.commandId === "string" ? { commandId: receipt.commandId } : {}),
+					...(typeof receipt.turnId === "string" ? { turnId: receipt.turnId } : {}),
+					acceptedAt: new Date(this.#now()).toISOString(),
+					taskKey: "gateway",
+				};
 			}
-		} finally {
-			if (!input.relay) await relay.close();
+			const error = relayFailure("turn.prompt", response);
+			const code = envelopeErrorCode(error.details);
+			// The broker answered: nothing was accepted under this clientRef, so the
+			// intent is dropped. A conflict means the ref is held by an op the broker
+			// knows, which only a later reconcile may resolve; it stays pending.
+			if (code === CLIENT_REF_CONFLICT_CODE)
+				throw new OpRefRejectedError(input.opRef, CLIENT_REF_CONFLICT_CODE, error.details);
+			if (code === MODEL_NOT_SELECTED_CODE) {
+				this.#releaseOperation(intent);
+				throw new ModelNotSelectedError(input.opRef);
+			}
+			// `busy` is occupancy, not failure: the prompt was never accepted and
+			// the op-ref is still unused. Wait for the session to go idle
+			// (bounded) and resend under the same op-ref before giving up.
+			if (!isSessionBusy(error) || this.#now() >= deadline) {
+				this.#releaseOperation(intent);
+				throw error;
+			}
+			if (!waited) {
+				waited = true;
+				console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
+			}
+			await this.#sleep(BUSY_POLL_MS);
 		}
 	}
 
@@ -1187,27 +1291,44 @@ export class BrokerSessionPort implements SessionPort {
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
 		this.#assertOwned(input);
 		assertControlAllowed("session.close", { operatorApproval: true });
+		// Journaled per session: a retirement retried after a crash or broker
+		// restart replays the pending close under its original idempotency key,
+		// and a completed one is not issued again. A gateway-closed session is
+		// retired (its origin's epoch rotates), so it is never resumed and closed
+		// a second time.
+		const intent = this.#beginOperation("session.close", input.sessionId, `gw-close-${randomUUID()}`, () =>
+			JSON.stringify({ sessionId: input.sessionId }),
+		);
+		if (intent.state === "complete") return;
 		// Lifecycle op: the per-session `control` route prohibits it for the
 		// daemon CLI (adapter_operation_prohibited on gjc 0.16.x); only the
 		// `global` route carries it, like session.create and session.delete.
-		parseEnvelope(
-			await this.#cli(
-				[
-					"sdk",
-					"session",
-					"raw",
-					"global",
-					"--op",
-					"session.close",
-					"--idempotency-key",
-					`gw-close-${this.#instanceId}-${input.sessionId}-${this.#now()}`,
-					"--json-input",
-					JSON.stringify({ sessionId: input.sessionId }),
-				],
-				{ timeoutMs: 30_000 },
-			),
-			"session.close",
-		);
+		let result: unknown;
+		try {
+			result = parseEnvelope(
+				await this.#cli(
+					[
+						"sdk",
+						"session",
+						"raw",
+						"global",
+						"--op",
+						"session.close",
+						"--idempotency-key",
+						intent.operationRef,
+						"--json-input",
+						intent.requestJson,
+					],
+					{ timeoutMs: 30_000 },
+				),
+				"session.close",
+			);
+		} catch (error) {
+			// The broker answered that nothing was or can be closed: the intent is spent.
+			if (isRefusedOutcome(error)) this.#releaseOperation(intent);
+			throw error;
+		}
+		this.#completeOperation(intent, result ?? null);
 	}
 
 	async fetchAssistantSince(input: {
@@ -1942,6 +2063,12 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
 		: undefined;
 }
 
+/** An authenticated broker answer that the operation was not applied, or that its session is gone. */
+function isRefusedOutcome(error: unknown): boolean {
+	if (!(error instanceof GjcCliError)) return false;
+	return recordOf(error.details)?.outcomeCertainty === "not-applied" || isSessionGoneCode(sdkErrorCode(error));
+}
+
 /**
  * Create failures that are safe to retry under the SAME idempotency key: the
  * runtime either has not created the session (spawn_failed) or cannot yet
@@ -1967,6 +2094,25 @@ export function sessionResumeKey(sessionId: string, epoch: number, hostIncarnati
 	return `gw-resume-${sessionId}-${epoch}-${hostIncarnation ?? "nohost"}`;
 }
 
-function sessionCreateRef(instanceId: string, originKey: string, epoch: number, repo: string): string {
-	return `gw-bind-${createHash("sha256").update(`${instanceId}|${originKey}|${epoch}|${repo}`).digest("hex").slice(0, 32)}`;
+/** One in-flight create per origin, epoch and repository: the retry after a crash finds it. */
+function createScope(input: SessionBindInput): string {
+	return JSON.stringify([input.originKey, input.epoch, input.repo]);
+}
+
+function sessionCreateInput(repo: string, model: GjcModelSelection | undefined): string {
+	return JSON.stringify({
+		cwd: repo,
+		// A fresh session host boots the full agent (~10s measured on the persona
+		// host); the runtime's 10s default readiness cutoff turns a slow-but-healthy
+		// cold start into spawn_failed. Use the maximum budget: create is idempotent
+		// under its key either way.
+		readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
+		// session.create takes a bare model id; a `:level` suffix is applied with
+		// thinking.set once the host is up (see bind()).
+		...(typeof model === "string"
+			? { modelId: splitThinkingSuffix(model).model }
+			: model
+				? { modelPreset: model.preset }
+				: {}),
+	});
 }

@@ -108,6 +108,8 @@ async function fixture(
 		waitTimeoutMs: 2000,
 		deliverFallback: (payload) => notices.push(payload),
 		serviceDirectory,
+		// Bind failures are final unless a test opts into the broker readiness wait.
+		brokerWait: { deadlineMs: 0 },
 		...options,
 	});
 	cleanups.push(async () => {
@@ -156,6 +158,82 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	if (!result.started) throw new Error("unexpected hold");
 	return result;
 }
+
+test("work.start during a broker restart waits for broker readiness and starts the lane", async () => {
+	const logs: string[] = [];
+	const sleeps: number[] = [];
+	let brokerUp = false;
+	const f = await fixture({
+		brokerWait: {
+			initialMs: 100,
+			maxMs: 400,
+			deadlineMs: 10_000,
+			log: (line) => logs.push(line),
+			sleep: async (ms) => {
+				sleeps.push(ms);
+				// The supervisor brings the broker back during the third wait.
+				if (sleeps.length === 3) brokerUp = true;
+			},
+		},
+	});
+	const bind = f.port.bind.bind(f.port);
+	let attempts = 0;
+	f.port.bind = async (input) => {
+		attempts++;
+		if (!brokerUp) throw new GjcCliUnavailableError("broker restarting");
+		return await bind(input);
+	};
+	const result = await f.manager.start({ name: "a", text: "work", cwd: f.directory });
+	expect(result).toMatchObject({ started: true, sessionKey: workSessionKey("a") });
+	expect(attempts).toBe(4);
+	expect(sleeps).toEqual([100, 200, 400]);
+	expect(logs).toHaveLength(3);
+	expect(logs[0]).toStartWith("gateway_waiting_for_broker step=work.bind:a attempt=1 retry_in_ms=100 ");
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("work.start fails bind_failed once the broker readiness wait is exhausted", async () => {
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	let clock = 0;
+	const f = await fixture({
+		brokerWait: {
+			initialMs: 100,
+			maxMs: 100,
+			deadlineMs: 350,
+			now: () => clock,
+			log: () => {},
+			sleep: async (ms) => {
+				clock += ms;
+			},
+		},
+	});
+	let attempts = 0;
+	f.port.bind = async () => {
+		attempts++;
+		throw new Error("gjc sdk request failed: broker_unavailable (broker unavailable)");
+	};
+	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
+		code: "verb_failed",
+		detail: { reasonCode: "bind_failed", cause: "broker_unavailable" },
+	});
+	expect(attempts).toBe(4);
+});
+
+test("a non-broker bind failure is not waited on", async () => {
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	const f = await fixture({ brokerWait: { initialMs: 1, deadlineMs: 10_000, log: () => {}, sleep: async () => {} } });
+	let attempts = 0;
+	f.port.bind = async () => {
+		attempts++;
+		throw new BrokerAuthorityError("unowned_session");
+	};
+	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
+		detail: { reasonCode: "bind_failed", cause: "cwd_rejected" },
+	});
+	expect(attempts).toBe(1);
+});
 
 test("bind failures map causes and emit one redacted diagnostic each", async () => {
 	const errors = spyOn(console, "error").mockImplementation(() => {});

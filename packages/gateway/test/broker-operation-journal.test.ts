@@ -1,0 +1,246 @@
+import { Database } from "bun:sqlite";
+import { afterEach, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
+import { GjcCliUnavailableError } from "../src/orchestrator/broker";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner, type TailStreamSpawner } from "../src/orchestrator/tail-runner";
+import { Store } from "../src/store";
+import type { BrokerAuthority } from "../src/store/groups/bindings";
+import { createOwnedSessionFixture, initializeTestBrokerAuthority, noRelay, scriptedRelay } from "./session-port.fake";
+
+/**
+ * Issue #568: every broker mutation is journaled intent-first, so a broker that
+ * dies mid-operation and a gateway that restarts around it still apply each
+ * operation once and hand the retry the original result. All state lives in a
+ * per-test temp dir; no real broker or agent dir is touched.
+ */
+
+let home = "";
+let database: Store | undefined;
+
+afterEach(async () => {
+	database?.close();
+	database = undefined;
+	if (home) await rm(home, { recursive: true, force: true });
+	home = "";
+});
+
+function ok(result: unknown): CliResult {
+	return { exitCode: 0, stdout: JSON.stringify({ ok: true, result }), stderr: "" };
+}
+
+/** A fake broker that keeps its own state across gateway restarts and can die right after applying an op. */
+class FakeBroker {
+	readonly sessions = new Map<string, string>();
+	readonly closes = new Map<string, number>();
+	readonly createKeys: string[] = [];
+	readonly closeKeys: string[] = [];
+	readonly dead = new Set<string>();
+	dieAfterApply = false;
+	#sessions = 0;
+
+	readonly cli: CliRunner = async (args) => {
+		const key = args[args.indexOf("--idempotency-key") + 1] ?? "";
+		if (args.includes("session.create")) {
+			this.createKeys.push(key);
+			const sessionId = this.sessions.get(key) ?? `broker-session-${++this.#sessions}`;
+			this.sessions.set(key, sessionId);
+			return this.#reply({ sessionId });
+		}
+		if (args.includes("session.close")) {
+			this.closeKeys.push(key);
+			// The broker's own idempotency: one key closes once.
+			if (!this.closes.has(key)) this.closes.set(key, this.closes.size + 1);
+			return this.#reply({ closed: true, closeNumber: this.closes.get(key) });
+		}
+		if (args.includes("inspect")) {
+			const sessionId = args[args.indexOf("inspect") + 1] ?? "";
+			return ok({ session: { live: !this.dead.has(sessionId), deleted: this.dead.has(sessionId) } });
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+
+	#reply(result: unknown): CliResult {
+		if (this.dieAfterApply) {
+			this.dieAfterApply = false;
+			throw new GjcCliUnavailableError("broker exited before replying");
+		}
+		return ok(result);
+	}
+}
+
+async function openGateway(
+	path: string,
+	authority: BrokerAuthority,
+	broker: FakeBroker,
+	relay: TailStreamSpawner = noRelay,
+) {
+	database?.close();
+	database = await Store.open(path);
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: broker.cli,
+		tailRunner: new TailRunner({ stream: relay, repo: join(home, "workspace"), requestTimeoutMs: 50 }),
+		sleep: async () => {},
+	});
+	return { database, port };
+}
+
+async function setup() {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-broker-journal-"));
+	const path = join(home, "gateway.db");
+	database = await Store.open(path);
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	return { path, authority, repo: join(home, "workspace") };
+}
+
+test("session.create interrupted after the broker applied it: the restarted gateway replays the same key and binds the one session", async () => {
+	const { path, authority, repo } = await setup();
+	const broker = new FakeBroker();
+	let gateway = await openGateway(path, authority, broker);
+	broker.dieAfterApply = true;
+	await expect(gateway.port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toThrow("broker_unavailable");
+	expect(broker.sessions.size).toBe(1);
+	// The intent survived the failure; the binding was never recorded.
+	expect(
+		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0, repo])),
+	).toMatchObject({
+		state: "pending",
+		operationRef: broker.createKeys[0],
+	});
+	expect(gateway.database.bindings.getSessionRecord("lane/a")).toBeUndefined();
+
+	gateway = await openGateway(path, authority, broker);
+	const binding = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo });
+
+	expect(broker.createKeys).toEqual([broker.createKeys[0]!, broker.createKeys[0]!]);
+	expect(broker.sessions.size).toBe(1);
+	expect(binding.sessionId).toBe(broker.sessions.get(broker.createKeys[0]!)!);
+	expect(gateway.database.bindings.getSessionRecord("lane/a")).toMatchObject({
+		sessionId: binding.sessionId,
+		epoch: 0,
+	});
+	// Complete released the intent in the binding's transaction.
+	expect(
+		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0, repo])),
+	).toBeUndefined();
+});
+
+test("a finished create is never served to a later bind after the lane's session died", async () => {
+	const { path, authority, repo } = await setup();
+	const broker = new FakeBroker();
+	const gateway = await openGateway(path, authority, broker);
+	const first = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo });
+	broker.dead.add(first.sessionId);
+	const second = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo });
+	expect(broker.createKeys).toHaveLength(2);
+	expect(broker.createKeys[1]).not.toBe(broker.createKeys[0]);
+	expect(second.sessionId).not.toBe(first.sessionId);
+	expect(second.epoch).toBe(1);
+	const rows = new Database(path, { readonly: true });
+	try {
+		expect(rows.query("SELECT COUNT(*) AS n FROM broker_operations").get()).toEqual({ n: 0 });
+	} finally {
+		rows.close();
+	}
+});
+
+test("turn.prompt accepted by the broker before the relay died is reconciled, not resent, and answers the same receipt", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/p", epoch: 0 });
+	const accepted = new Map<string, { commandId: string; turnId: string }>();
+	let dieOnPrompt = true;
+	const relay = scriptedRelay((request) => {
+		const clientRef = String(request.input.clientRef);
+		if (request.operation === "turn.prompt") {
+			if (accepted.has(clientRef)) return { ok: false, error: { code: "client_ref_conflict" } };
+			const ids = { commandId: `cmd-${accepted.size + 1}`, turnId: `turn-${accepted.size + 1}` };
+			accepted.set(clientRef, ids);
+			if (dieOnPrompt) {
+				dieOnPrompt = false;
+				return new Promise(() => {});
+			}
+			return { ok: true, result: { accepted: true, clientRef, ...ids } };
+		}
+		if (request.operation === "turn.result") {
+			const ids = accepted.get(clientRef);
+			return { ok: true, result: ids ? { status: "in_flight", clientRef, ...ids } : { status: "unknown" } };
+		}
+		return { ok: false, error: { code: "unsupported_operation" } };
+	});
+	const broker = new FakeBroker();
+	let gateway = await openGateway(path, authority, broker, relay.spawn);
+	const send = { sessionId: "sdk-1", repo, text: "do the work", opRef: "gw-work-a-1" };
+	await expect(gateway.port.send(send)).rejects.toThrow();
+	expect(accepted.size).toBe(1);
+
+	gateway = await openGateway(path, authority, broker, relay.spawn);
+	const replayed = await gateway.port.send(send);
+	expect(replayed).toMatchObject({
+		sessionId: "sdk-1",
+		operationRef: "gw-work-a-1",
+		commandId: "cmd-1",
+		turnId: "turn-1",
+	});
+	expect(accepted.size).toBe(1);
+	const prompts = relay.requests.filter((request) => request.operation === "turn.prompt");
+	expect(prompts).toHaveLength(1);
+
+	const before = relay.requests.length;
+	expect(await gateway.port.send(send)).toEqual(replayed);
+	expect(relay.requests).toHaveLength(before);
+	await expect(gateway.port.send({ ...send, text: "something else" })).rejects.toThrow("already used");
+});
+
+test("turn.prompt lost before the broker saw it is sent once on retry", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/q", epoch: 0 });
+	const accepted = new Set<string>();
+	let dropFirst = true;
+	const relay = scriptedRelay((request) => {
+		const clientRef = String(request.input.clientRef);
+		if (request.operation === "turn.prompt") {
+			if (dropFirst) {
+				dropFirst = false;
+				return new Promise(() => {});
+			}
+			accepted.add(clientRef);
+			return { ok: true, result: { accepted: true, clientRef, commandId: "cmd-1", turnId: "turn-1" } };
+		}
+		if (request.operation === "turn.result") return { ok: true, result: { status: "unknown" } };
+		return { ok: false, error: { code: "unsupported_operation" } };
+	});
+	const broker = new FakeBroker();
+	let gateway = await openGateway(path, authority, broker, relay.spawn);
+	const send = { sessionId: "sdk-1", repo, text: "do the work", opRef: "gw-work-q-1" };
+	await expect(gateway.port.send(send)).rejects.toThrow();
+	gateway = await openGateway(path, authority, broker, relay.spawn);
+	await expect(gateway.port.send(send)).resolves.toMatchObject({ commandId: "cmd-1", turnId: "turn-1" });
+	expect(accepted).toEqual(new Set(["gw-work-q-1"]));
+	expect(relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result", "turn.prompt"]);
+});
+
+test("session.close interrupted after the broker applied it replays its key once, then answers from the journal", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/c", epoch: 0 });
+	const broker = new FakeBroker();
+	let gateway = await openGateway(path, authority, broker);
+	broker.dieAfterApply = true;
+	await expect(gateway.port.close({ sessionId: "sdk-1", repo })).rejects.toThrow("broker_unavailable");
+
+	gateway = await openGateway(path, authority, broker);
+	await gateway.port.close({ sessionId: "sdk-1", repo });
+	expect(broker.closeKeys).toEqual([broker.closeKeys[0]!, broker.closeKeys[0]!]);
+	expect(broker.closes.size).toBe(1);
+
+	await gateway.port.close({ sessionId: "sdk-1", repo });
+	expect(broker.closeKeys).toHaveLength(2);
+	expect(gateway.database.bindings.brokerOperation(authority, "session.close", "sdk-1")).toMatchObject({
+		state: "complete",
+		resultJson: JSON.stringify({ closed: true, closeNumber: 1 }),
+	});
+});

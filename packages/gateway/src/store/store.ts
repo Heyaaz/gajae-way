@@ -1,7 +1,6 @@
 import { type ChatMessagePayload, originKey } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { StoreCore, type StoreOpenOptions } from "./core";
-import { BrokerIdempotencyGroup } from "./groups/broker-idempotency";
 import { BindingsGroup, type BrokerAuthority } from "./groups/bindings";
 import { InboxGroup, RETENTION_BATCH_ROWS } from "./groups/inbox";
 import { MemoryGroup } from "./groups/memory";
@@ -31,7 +30,6 @@ export interface BrokerAuthorityCensus {
 export class Store {
 	readonly core: StoreCore;
 	readonly bindings: BindingsGroup;
-	readonly brokerIdempotency: BrokerIdempotencyGroup;
 	readonly outbox: OutboxGroup;
 	readonly inbox: InboxGroup;
 	readonly work: WorkGroup;
@@ -41,7 +39,6 @@ export class Store {
 	constructor(core: StoreCore) {
 		this.core = core;
 		this.bindings = new BindingsGroup(core);
-		this.brokerIdempotency = new BrokerIdempotencyGroup(core);
 		this.outbox = new OutboxGroup(core);
 		this.inbox = new InboxGroup(core);
 		this.work = new WorkGroup(core);

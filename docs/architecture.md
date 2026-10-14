@@ -51,6 +51,7 @@ SQLite records one active private broker authority and immutable gateway-created
 | `broker_retired_sessions` | `bindings` | `store/groups/bindings.ts` |
 | `broker_quarantine` | `bindings` | `store/groups/bindings.ts` |
 | `broker_cutovers` | `bindings` | `store/groups/bindings.ts` |
+| `broker_operations` | `bindings` | `store/groups/bindings.ts` |
 | `deliveries` | `outbox` | `store/groups/outbox.ts` |
 | `inbound_messages` | `inbox` | `store/groups/inbox.ts` |
 | `cross_session_watches` | `inbox` | `store/groups/inbox.ts` |
@@ -68,7 +69,7 @@ SQLite records one active private broker authority and immutable gateway-created
 | `dispatch_leases` | `monitors` | `store/groups/monitors.ts` |
 | `memory_intents` | `memory` | `store/groups/memory.ts` |
 
-The current schema is version 35 and still contains `broker_quarantine` and `broker_cutovers`. Cross-session watches are owned by the inbox group and migrate in schema 34.
+The current schema is version 36 and still contains `broker_quarantine` and `broker_cutovers`. Cross-session watches are owned by the inbox group and migrate in schema 34.
 
 ### Transaction boundary
 
@@ -180,6 +181,8 @@ Bootstrap completion is durable in schema 14. An epoch is pending while `epoch >
 Before an outbound reply is emitted, the gateway creates a durable ledger item. States are `pending`, `inflight`, `confirmed`, `failed_ambiguous`, and `expired`. Adapters mark an item inflight before attempting platform delivery and confirm it after success. A non-ambiguous failure returns to `pending` with exponential backoff (2 seconds, doubling to a 5-minute cap); the fifth definitive failure expires it. An ambiguous failure stays `failed_ambiguous` regardless of its failure count. Any unsettled item older than the 24-hour freshness window expires during a delivery sweep.
 
 At negotiated connection time and every 15 seconds while an adapter is connected, adapters receive due unsettled deliveries. This is deliberately at-least-once delivery: an `inflight` or `failed_ambiguous` item is reissued with `redelivered: true` and `duplicateWarning: true`. Platform adapters must display the duplicate warning. Confirmed or expired records are not replayed automatically; expired counts and the five most recent identifiers/origins are exposed by `gateway.status`, and the admin console raises attention. Expiry is logged and an owner-target notice is sent once per delivery when configured. Operators can requeue eligible rows with `gajaeway ops redeliver <deliveryId>` or `gajaeway ops redeliver --since <iso>` (selecting rows updated since that timestamp). Confirmed records are never requeued; old confirmed records are pruned after seven days.
+
+Broker mutations are journaled in `broker_operations`, intent first. `session.create`, `turn.prompt`, and `session.close` each write a `pending` row in its own transaction before the broker call, carrying the broker-side reference (`--idempotency-key`, or the prompt's `clientRef`) and the exact request. A crash or broker restart between the call and its completion leaves that row, and the retry replays the same reference: the broker dedups a create or close under its key, and a pending prompt is reconciled with `turn.result` for its `clientRef` before anything is resent, because `turn.prompt` itself is not idempotent. A completed prompt or close returns its stored result without calling the broker. Create keys are fresh per attempt (`gw-bind-<uuid>`), and the intent is released in the same transaction that records the binding, so a later bind of the same origin, epoch and repository never inherits a finished create. Completed rows are pruned after an hour and abandoned intents after a day. A `work.start` issued while the supervisor restarts the broker waits for it (`waitForBroker`, the same bounded backoff boot uses, capped at two minutes) instead of failing `work lane bind failed`; only an unavailable broker is waited on.
 
 ## Engagement and safety floors
 
