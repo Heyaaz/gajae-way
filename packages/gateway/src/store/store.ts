@@ -3,6 +3,7 @@ import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { StoreCore, type StoreOpenOptions } from "./core";
 import { BindingsGroup, type BrokerAuthority } from "./groups/bindings";
 import { InboxGroup, RETENTION_BATCH_ROWS } from "./groups/inbox";
+import { JournalGroup } from "./groups/journal";
 import { MemoryGroup } from "./groups/memory";
 import { MonitorsGroup } from "./groups/monitors";
 import { OutboxGroup } from "./groups/outbox";
@@ -35,6 +36,7 @@ export class Store {
 	readonly work: WorkGroup;
 	readonly monitors: MonitorsGroup;
 	readonly memory: MemoryGroup;
+	readonly journal: JournalGroup;
 
 	constructor(core: StoreCore) {
 		this.core = core;
@@ -44,6 +46,7 @@ export class Store {
 		this.work = new WorkGroup(core);
 		this.monitors = new MonitorsGroup(core);
 		this.memory = new MemoryGroup(core);
+		this.journal = new JournalGroup(core);
 	}
 
 	static async open(path: string, options: StoreOpenOptions = {}): Promise<Store> {

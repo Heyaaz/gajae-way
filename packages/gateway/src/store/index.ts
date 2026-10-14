@@ -39,6 +39,7 @@ export {
 	terminalDeliveryIds,
 	type WatchRegistration,
 } from "./groups/inbox";
+export { JournalGroup, type WorkJournalEvent, type WorkJournalEventType } from "./groups/journal";
 export { MemoryGroup, type MemoryIntentDbRow } from "./groups/memory";
 export {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,

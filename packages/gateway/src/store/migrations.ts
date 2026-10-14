@@ -8,7 +8,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 35;
+export const LATEST_SCHEMA_VERSION = 36;
 
 export interface MigrationHost {
 	readonly database: {
@@ -761,6 +761,29 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(35, new Date().toISOString());
+		});
+	}
+	if (current < 36) {
+		// Issue #567: Add durable work journal for crash recovery and replay.
+		host.withTransaction(() => {
+			host.database.execute(
+				`CREATE TABLE IF NOT EXISTS work_journal (
+					event_id TEXT PRIMARY KEY,
+					op_ref TEXT NOT NULL,
+					job_id TEXT NOT NULL,
+					event_type TEXT NOT NULL CHECK(event_type IN ('attempt_started','attempt_accepted','attempt_settled','attempt_terminal','delivery_queued','delivery_sent','delivery_confirmed','delivery_failed')),
+					payload_json TEXT NOT NULL,
+					recorded_at TEXT NOT NULL
+				)`,
+			);
+			host.database.execute(
+				`CREATE INDEX IF NOT EXISTS work_journal_op_ref ON work_journal(op_ref, recorded_at);
+				CREATE INDEX IF NOT EXISTS work_journal_job_id ON work_journal(job_id, recorded_at);
+				CREATE INDEX IF NOT EXISTS work_journal_recorded_at ON work_journal(recorded_at)`,
+			);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(36, new Date().toISOString());
 		});
 	}
 }

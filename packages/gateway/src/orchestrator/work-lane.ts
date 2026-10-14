@@ -394,6 +394,13 @@ export class WorkLaneManager {
 			};
 			const settled = this.#db.work.workAttemptSettle(tx, opRef, expectedVersion, record, patch, admission, checks);
 			if (!settled) return undefined;
+			// Append journal event for crash recovery and replay
+			const eventId = `work-event-${crypto.randomUUID()}`;
+			this.#db.journal.appendEvent(tx, eventId, settled.runtime.opRef, settled.runtime.jobId, "attempt_settled", {
+				decision: settled.runtime.decision,
+				version: settled.runtime.version,
+				terminal: settled.runtime.terminal,
+			});
 			this.#refreshWorkSession(tx, settled.runtime, settled.runtime.settledAt!);
 			if (settled.runtime.decision === "reported" && admission?.kind === "persona") {
 				workAssert(
@@ -415,6 +422,12 @@ export class WorkLaneManager {
 					turnId: payload.turnId,
 					originKey: originKey(payload.origin),
 					payloadJson: JSON.stringify(payload),
+				});
+				// Append delivery journal event
+				const deliveryEventId = `delivery-event-${crypto.randomUUID()}`;
+				this.#db.journal.appendEvent(tx, deliveryEventId, settled.runtime.opRef, settled.runtime.jobId, "delivery_queued", {
+					deliveryId: payload.deliveryId,
+					turnId: payload.turnId,
 				});
 			}
 			return settled;
