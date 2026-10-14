@@ -39,6 +39,13 @@ export {
 	terminalDeliveryIds,
 	type WatchRegistration,
 } from "./groups/inbox";
+export {
+	JOURNAL_PROJECTIONS,
+	type JournalEntity,
+	JournalGroup,
+	type JournalRows,
+	type WorkJournalEventType,
+} from "./groups/journal";
 export { MemoryGroup, type MemoryIntentDbRow } from "./groups/memory";
 export {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
@@ -74,6 +81,7 @@ export {
 	type BrokerAuthorityCensus,
 	CONFIRMED_DELIVERY_RETENTION_MS,
 	HISTORY_RETENTION_MS,
+	type JournalReplayResult,
 	type RetentionSweepResult,
 	Store,
 } from "./store";

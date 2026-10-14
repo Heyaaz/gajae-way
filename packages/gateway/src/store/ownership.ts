@@ -1,4 +1,4 @@
-export type OwnerGroup = "core" | "bindings" | "outbox" | "inbox" | "work" | "monitors" | "memory";
+export type OwnerGroup = "core" | "bindings" | "outbox" | "inbox" | "work" | "monitors" | "memory" | "journal";
 
 export const TABLE_OWNER = {
 	meta: "core",
@@ -28,6 +28,7 @@ export const TABLE_OWNER = {
 	monitor_slots: "monitors",
 	dispatch_leases: "monitors",
 	memory_intents: "memory",
+	work_journal: "journal",
 } as const satisfies Record<string, OwnerGroup>;
 
 export type OwnedTable = keyof typeof TABLE_OWNER;
@@ -40,4 +41,5 @@ export const OWNER_FILE: Readonly<Record<OwnerGroup, string>> = {
 	work: "store/groups/work.ts",
 	monitors: "store/groups/monitors.ts",
 	memory: "store/groups/memory.ts",
+	journal: "store/groups/journal.ts",
 };
