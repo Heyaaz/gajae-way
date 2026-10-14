@@ -782,8 +782,8 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 					row_json TEXT CHECK(row_json IS NULL OR json_valid(row_json)),
 					recorded_at TEXT NOT NULL
 				);
-				CREATE INDEX IF NOT EXISTS work_journal_entity_key ON work_journal(entity, entity_key, seq);
-				CREATE INDEX IF NOT EXISTS work_journal_recorded_at ON work_journal(recorded_at);`,
+				CREATE INDEX work_journal_entity_key ON work_journal(entity, entity_key, seq);
+				CREATE INDEX work_journal_recorded_at ON work_journal(recorded_at);`,
 			);
 			const seededAt = new Date().toISOString();
 			for (const entity of ["lane_job", "attempt", "delivery"] as const satisfies readonly JournalEntity[]) {
