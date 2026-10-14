@@ -25,6 +25,7 @@ import {
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
 import type { BrokerAuthority, BrokerOperationKind, BrokerOperationRecord } from "../store/groups/bindings";
+import { GjcCliUnavailableError, isBrokerUnavailable } from "./broker";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -444,7 +445,10 @@ const SESSION_CREATE_RETRY_MS = 1_000;
  * no other operation can ever read the row.
  */
 const BROKER_OPERATION_RETENTION_MS = 60 * 60_000;
-/** A pending intent this old belongs to no live retry; it is dropped rather than replayed. */
+/**
+ * A pending prompt or close intent this old belongs to no live retry; it is
+ * dropped rather than replayed. Pending creates are exempt (see pruneBrokerOperations).
+ */
 const BROKER_INTENT_RETENTION_MS = 24 * 60 * 60_000;
 /** Maximum poisoned-create-key epoch rotations permitted per origin. */
 export const MAX_POISONED_CREATE_ROTATIONS = 3;
@@ -536,16 +540,21 @@ export class BrokerSessionPort implements SessionPort {
 			// Only owned bindings may be inspected, resumed, or replaced.
 			let indexed = true;
 			try {
-				// Judge the raw envelope: a persisted id is reusable only when the
-				// A persisted id is reusable if live, and resumable if it still has
-				// saved authority. Monitor authoring reaches SessionPort directly, so
-				// resume here before paying for a cold replacement session.
+				// Judge the raw envelope: a persisted id is reusable if live, and
+				// resumable if it still has saved authority. Monitor authoring reaches
+				// SessionPort directly, so resume here before paying for a cold
+				// replacement session.
 				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId]);
 				const envelope = JSON.parse(result.stdout) as {
 					ok?: unknown;
 					result?: { session?: { live?: unknown; deleted?: unknown } };
-					error?: { code?: unknown };
+					error?: { code?: unknown; message?: unknown };
 				};
+				if (envelope.ok === false && envelope.error?.code === "broker_unavailable")
+					throw new GjcCliUnavailableError(
+						sanitizeDiagnostic(typeof envelope.error.message === "string" ? envelope.error.message : "") ||
+							"broker unavailable",
+					);
 				if (envelope.ok === false) indexed = !isSessionGoneCode(envelope.error?.code);
 				if (envelope.ok === true && envelope.result?.session?.live === false) {
 					if (envelope.result.session.deleted !== true) {
@@ -557,7 +566,10 @@ export class BrokerSessionPort implements SessionPort {
 								epoch: input.epoch,
 							});
 						} catch (error) {
-							if (error instanceof BrokerAuthorityError) throw error;
+							// A broker that went away mid-resume says nothing about the
+							// session: the caller waits for it rather than replacing a
+							// resumable session with a cold one.
+							if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
 							// Saved authority cannot be resumed: replace it below.
 							console.error(
 								`session_resume_failed origin=${input.originKey} epoch=${input.epoch} session=${existing.sessionId} path=bind detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
@@ -567,7 +579,11 @@ export class BrokerSessionPort implements SessionPort {
 					indexed = false;
 				}
 			} catch (error) {
-				if (error instanceof BrokerAuthorityError) throw error;
+				// An unavailable broker cannot vouch for the persisted session; reusing
+				// it would only move the failure to the first send, where it is no
+				// longer retryable. Surface it so the caller can wait for readiness.
+				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
+				// Any other inspect failure (unparsable output, timeout) keeps the binding.
 				indexed = true;
 			}
 			if (indexed) {
@@ -978,7 +994,13 @@ export class BrokerSessionPort implements SessionPort {
 		// receipt after. A retry of a completed op ref gets the stored receipt;
 		// a retry of a pending one (crash or broker restart mid-send) first asks
 		// the broker whether that clientRef was accepted and only sends if not.
-		const requestJson = JSON.stringify({ text: createHash("sha256").update(input.text).digest("hex") });
+		// The hash covers every field that shapes the turn, so an op ref reused
+		// with the same text but another preamble or model is a different prompt.
+		const requestJson = JSON.stringify({
+			prompt: createHash("sha256")
+				.update(JSON.stringify([input.text, input.systemPreamble ?? null, input.model ?? null]))
+				.digest("hex"),
+		});
 		const intent = this.#beginOperation(
 			"turn.prompt",
 			JSON.stringify([input.sessionId, input.opRef]),

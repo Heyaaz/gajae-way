@@ -130,6 +130,65 @@ test("session.create interrupted after the broker applied it: the restarted gate
 	).toBeUndefined();
 });
 
+test("a pending create outlives the intent age cutoff: a bind after a >24h outage replays its key, not a new session", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/c", epoch: 0 });
+	const broker = new FakeBroker();
+	let gateway = await openGateway(path, authority, broker);
+	broker.dieAfterApply = true;
+	await expect(gateway.port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toThrow("broker_unavailable");
+	const key = broker.createKeys[0]!;
+
+	// The gateway returns 25h later; its first broker operation prunes the journal.
+	database?.close();
+	database = await Store.open(path);
+	const later = new BrokerSessionPort({
+		database,
+		authority,
+		cli: broker.cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+		now: () => Date.now() + 25 * 60 * 60_000,
+	});
+	gateway = { database, port: later };
+	await gateway.port.close({ sessionId: "sdk-1", repo });
+	expect(
+		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0, repo])),
+	).toMatchObject({ state: "pending", operationRef: key });
+
+	const binding = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo });
+	expect(broker.createKeys).toEqual([key, key]);
+	expect(broker.sessions.size).toBe(1);
+	expect(binding.sessionId).toBe(broker.sessions.get(key)!);
+});
+
+test("bind of a persisted binding surfaces an unavailable broker instead of reusing the session unchecked", async () => {
+	const { authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/a", epoch: 0 });
+	const calls: string[] = [];
+	const down: CliRunner = async (args) => {
+		calls.push(args.join(" "));
+		if (calls.length === 1) throw new GjcCliUnavailableError("broker restarting");
+		return {
+			exitCode: 1,
+			stdout: JSON.stringify({ ok: false, error: { code: "broker_unavailable", message: "restarting" } }),
+			stderr: "",
+		};
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: down,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+	await expect(port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toBeInstanceOf(GjcCliUnavailableError);
+	await expect(port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toBeInstanceOf(GjcCliUnavailableError);
+	expect(calls).toEqual(["sdk session inspect sdk-1", "sdk session inspect sdk-1"]);
+	// Neither a replacement create nor an epoch rotation happened.
+	expect(database!.bindings.getSessionRecord("lane/a")).toMatchObject({ sessionId: "sdk-1", epoch: 0 });
+});
+
 test("a finished create is never served to a later bind after the lane's session died", async () => {
 	const { path, authority, repo } = await setup();
 	const broker = new FakeBroker();
@@ -194,6 +253,12 @@ test("turn.prompt accepted by the broker before the relay died is reconciled, no
 	expect(await gateway.port.send(send)).toEqual(replayed);
 	expect(relay.requests).toHaveLength(before);
 	await expect(gateway.port.send({ ...send, text: "something else" })).rejects.toThrow("already used");
+	// Same text, but a different preamble or model is a different turn: the
+	// journal must refuse it rather than answer it with the stored receipt.
+	await expect(gateway.port.send({ ...send, systemPreamble: "policy v2" })).rejects.toThrow("already used");
+	await expect(gateway.port.send({ ...send, model: "anthropic/claude-opus" })).rejects.toThrow("already used");
+	await expect(gateway.port.send({ ...send, model: { preset: "deep" } })).rejects.toThrow("already used");
+	expect(relay.requests).toHaveLength(before);
 });
 
 test("turn.prompt lost before the broker saw it is sent once on retry", async () => {
@@ -242,5 +307,194 @@ test("session.close interrupted after the broker applied it replays its key once
 	expect(gateway.database.bindings.brokerOperation(authority, "session.close", "sdk-1")).toMatchObject({
 		state: "complete",
 		resultJson: JSON.stringify({ closed: true, closeNumber: 1 }),
+	});
+});
+
+// Store group: the bindings.ts broker-operation methods, driven directly.
+
+const at = (offsetMs: number) => new Date(Date.now() + offsetMs).toISOString();
+
+function journalRows(path: string): Array<{ operation: string; scope: string; state: string }> {
+	const rows = new Database(path, { readonly: true });
+	try {
+		return rows
+			.query("SELECT operation, scope, state FROM broker_operations ORDER BY operation, scope")
+			.all() as Array<{ operation: string; scope: string; state: string }>;
+	} finally {
+		rows.close();
+	}
+}
+
+test("beginBrokerOperation records the intent once and hands every later begin the original row", async () => {
+	const { authority } = await setup();
+	const store = database!;
+	const first = store.transaction((tx) =>
+		store.bindings.beginBrokerOperation(tx, authority, {
+			operation: "turn.prompt",
+			scope: "s/1",
+			operationRef: "ref-1",
+			requestJson: '{"prompt":"a"}',
+		}),
+	);
+	expect(first).toEqual({
+		operation: "turn.prompt",
+		scope: "s/1",
+		operationRef: "ref-1",
+		requestJson: '{"prompt":"a"}',
+		state: "pending",
+		resumed: false,
+	});
+	const again = store.transaction((tx) =>
+		store.bindings.beginBrokerOperation(tx, authority, {
+			operation: "turn.prompt",
+			scope: "s/1",
+			operationRef: "ref-2",
+			requestJson: '{"prompt":"b"}',
+		}),
+	);
+	expect(again).toEqual({ ...first, resumed: true });
+	// The same scope under another operation kind is a separate row.
+	expect(
+		store.transaction((tx) =>
+			store.bindings.beginBrokerOperation(tx, authority, {
+				operation: "session.close",
+				scope: "s/1",
+				operationRef: "ref-3",
+				requestJson: "{}",
+			}),
+		).resumed,
+	).toBe(false);
+	const foreign = { canonicalAgentDir: "/elsewhere", identity: "gjc:/elsewhere" };
+	expect(() =>
+		store.transaction((tx) =>
+			store.bindings.beginBrokerOperation(tx, foreign, {
+				operation: "turn.prompt",
+				scope: "s/9",
+				operationRef: "ref-9",
+				requestJson: "{}",
+			}),
+		),
+	).toThrow();
+	expect(store.bindings.brokerOperation(authority, "turn.prompt", "s/9")).toBeUndefined();
+});
+
+test("completeBrokerOperation stores the result only for the pending row of the same ref", async () => {
+	const { authority } = await setup();
+	const store = database!;
+	const begin = () =>
+		store.transaction((tx) =>
+			store.bindings.beginBrokerOperation(tx, authority, {
+				operation: "session.close",
+				scope: "sdk-1",
+				operationRef: "gw-close-1",
+				requestJson: "{}",
+			}),
+		);
+	begin();
+	expect(() =>
+		store.transaction((tx) =>
+			store.bindings.completeBrokerOperation(tx, authority, "session.close", "sdk-1", "gw-close-other", "{}"),
+		),
+	).toThrow("is not pending");
+	store.transaction((tx) =>
+		store.bindings.completeBrokerOperation(tx, authority, "session.close", "sdk-1", "gw-close-1", '{"closed":true}'),
+	);
+	expect(store.bindings.brokerOperation(authority, "session.close", "sdk-1")).toEqual({
+		operation: "session.close",
+		scope: "sdk-1",
+		operationRef: "gw-close-1",
+		requestJson: "{}",
+		state: "complete",
+		resultJson: '{"closed":true}',
+		resumed: true,
+	});
+	expect(begin()).toMatchObject({ state: "complete", resultJson: '{"closed":true}', resumed: true });
+	// A completed row cannot be completed again with another answer.
+	expect(() =>
+		store.transaction((tx) =>
+			store.bindings.completeBrokerOperation(tx, authority, "session.close", "sdk-1", "gw-close-1", '{"closed":false}'),
+		),
+	).toThrow("is not pending");
+	expect(store.bindings.brokerOperation(authority, "session.close", "sdk-1")?.resultJson).toBe('{"closed":true}');
+});
+
+test("releaseBrokerOperation drops only the row of the exact ref, pending or complete", async () => {
+	const { authority } = await setup();
+	const store = database!;
+	for (const [operation, scope, ref] of [
+		["session.create", "c/1", "gw-bind-1"],
+		["turn.prompt", "p/1", "ref-p"],
+	] as const)
+		store.transaction((tx) =>
+			store.bindings.beginBrokerOperation(tx, authority, { operation, scope, operationRef: ref, requestJson: "{}" }),
+		);
+	store.transaction((tx) =>
+		store.bindings.completeBrokerOperation(tx, authority, "turn.prompt", "p/1", "ref-p", '{"ok":1}'),
+	);
+	store.transaction((tx) => store.bindings.releaseBrokerOperation(tx, authority, "session.create", "c/1", "gw-bind-2"));
+	expect(store.bindings.brokerOperation(authority, "session.create", "c/1")?.operationRef).toBe("gw-bind-1");
+	store.transaction((tx) => store.bindings.releaseBrokerOperation(tx, authority, "session.create", "c/1", "gw-bind-1"));
+	store.transaction((tx) => store.bindings.releaseBrokerOperation(tx, authority, "turn.prompt", "p/1", "ref-p"));
+	expect(store.bindings.brokerOperation(authority, "session.create", "c/1")).toBeUndefined();
+	expect(store.bindings.brokerOperation(authority, "turn.prompt", "p/1")).toBeUndefined();
+	// After release the scope takes a fresh intent.
+	expect(
+		store.transaction((tx) =>
+			store.bindings.beginBrokerOperation(tx, authority, {
+				operation: "session.create",
+				scope: "c/1",
+				operationRef: "gw-bind-3",
+				requestJson: "{}",
+			}),
+		),
+	).toMatchObject({ operationRef: "gw-bind-3", resumed: false });
+});
+
+test("pruneBrokerOperations honors each cutoff by state and never age-prunes a pending create", async () => {
+	const { path, authority } = await setup();
+	const store = database!;
+	const begin = (operation: "session.create" | "turn.prompt" | "session.close", scope: string) =>
+		store.transaction((tx) =>
+			store.bindings.beginBrokerOperation(tx, authority, {
+				operation,
+				scope,
+				operationRef: `ref-${scope}`,
+				requestJson: "{}",
+			}),
+		);
+	begin("session.create", "create-pending");
+	begin("turn.prompt", "prompt-pending");
+	begin("session.close", "close-pending");
+	begin("turn.prompt", "prompt-done");
+	begin("session.close", "close-done");
+	for (const [operation, scope] of [
+		["turn.prompt", "prompt-done"],
+		["session.close", "close-done"],
+	] as const)
+		store.transaction((tx) =>
+			store.bindings.completeBrokerOperation(tx, authority, operation, scope, `ref-${scope}`, "{}"),
+		);
+	const prune = (completedBefore: string, pendingBefore: string) =>
+		store.transaction((tx) => store.bindings.pruneBrokerOperations(tx, { completedBefore, pendingBefore }));
+
+	// Cutoffs before every row: nothing is old enough.
+	expect(prune(at(-60_000), at(-60_000))).toBe(0);
+	expect(journalRows(path)).toHaveLength(5);
+
+	// Only the completed cutoff has passed: completed rows go, every pending intent stays.
+	expect(prune(at(60_000), at(-60_000))).toBe(2);
+	expect(journalRows(path)).toEqual([
+		{ operation: "session.close", scope: "close-pending", state: "pending" },
+		{ operation: "session.create", scope: "create-pending", state: "pending" },
+		{ operation: "turn.prompt", scope: "prompt-pending", state: "pending" },
+	]);
+
+	// The pending cutoff has passed: prompt and close intents go; the create survives any age.
+	expect(prune(at(60_000), at(60_000))).toBe(2);
+	expect(journalRows(path)).toEqual([{ operation: "session.create", scope: "create-pending", state: "pending" }]);
+	expect(prune(at(365 * 24 * 60 * 60_000), at(365 * 24 * 60 * 60_000))).toBe(0);
+	expect(store.bindings.brokerOperation(authority, "session.create", "create-pending")).toMatchObject({
+		state: "pending",
+		operationRef: "ref-create-pending",
 	});
 });

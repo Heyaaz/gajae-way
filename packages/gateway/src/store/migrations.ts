@@ -8,7 +8,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 36;
+export const LATEST_SCHEMA_VERSION = 37;
 
 export interface MigrationHost {
 	readonly database: {
@@ -763,7 +763,9 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 				.run(35, new Date().toISOString());
 		});
 	}
-	if (current < 36) {
+	if (current < 37) {
+		// Schema 36 is reserved for the work_journal migration (#572); it must land
+		// before this one so no database records 37 while 36 is still unapplied.
 		// Issue #568: broker mutation journal. A row is written as `pending` in its
 		// own transaction BEFORE the broker call and resolved after it, so a crash
 		// between the two leaves an intent that the retry replays under the same
@@ -787,7 +789,7 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-				.run(36, new Date().toISOString());
+				.run(37, new Date().toISOString());
 		});
 	}
 }
