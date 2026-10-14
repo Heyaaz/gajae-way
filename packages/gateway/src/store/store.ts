@@ -19,6 +19,12 @@ export interface RetentionSweepResult {
 	readonly more: boolean;
 }
 
+export interface JournalReplayResult {
+	readonly attempts: number;
+	readonly laneJobs: number;
+	readonly deliveries: number;
+}
+
 export interface BrokerAuthorityCensus {
 	readonly authority: BrokerAuthority | null;
 	readonly populated: boolean;
@@ -71,6 +77,17 @@ export class Store {
 
 	transaction<T>(fn: (tx: WriteTx) => T): T {
 		return this.core.transaction(fn);
+	}
+
+	/**
+	 * Rebuild the work-attempt, lane-job and outbox projections from the journal alone. Rows that
+	 * already equal their latest journaled snapshot are left untouched; the counts are rows rewritten.
+	 */
+	replayJournal(): JournalReplayResult {
+		return this.transaction((tx) => {
+			const work = this.work.replayProjection(tx, this.journal.latest("attempt"), this.journal.latest("lane_job"));
+			return { ...work, deliveries: this.outbox.replayProjection(tx, this.journal.latest("delivery")) };
+		});
 	}
 
 	reconcileWorkAttempts(log: (line: string) => void = console.error): number {
@@ -191,6 +208,7 @@ export class Store {
 			note("monitor_slots", monitors.slots);
 			note("deliveries", this.outbox.sweep(tx, cutoffs));
 			note("lane_reports", this.work.sweep(tx, cutoffs));
+			note("work_journal", this.journal.sweep(tx, cutoffs));
 			return { deleted, more };
 		});
 	}

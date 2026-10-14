@@ -1,6 +1,7 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type OriginRef, originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import { DatabaseStartupError } from "./errors";
+import { JOURNAL_PROJECTIONS, type JournalEntity, journalSnapshotSql } from "./groups/journal";
 import type { WorkAttemptRuntime, WorkParent } from "./groups/work";
 import { validateWorkRuntime, workAssert, workAttemptReportId } from "./groups/work";
 
@@ -764,23 +765,35 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 		});
 	}
 	if (current < 36) {
-		// Issue #567: Add durable work journal for crash recovery and replay.
+		// Issue #567: durable journal of work-attempt, lane-job and outbox row snapshots. Existing
+		// rows are seeded as baseline events so replay from the journal alone covers pre-v36 state.
 		host.withTransaction(() => {
 			host.database.execute(
-				`CREATE TABLE IF NOT EXISTS work_journal (
-					event_id TEXT PRIMARY KEY,
-					op_ref TEXT NOT NULL,
-					job_id TEXT NOT NULL,
-					event_type TEXT NOT NULL CHECK(event_type IN ('attempt_started','attempt_accepted','attempt_settled','attempt_terminal','delivery_queued','delivery_sent','delivery_confirmed','delivery_failed')),
-					payload_json TEXT NOT NULL,
+				`CREATE TABLE work_journal (
+					seq INTEGER PRIMARY KEY AUTOINCREMENT,
+					entity TEXT NOT NULL CHECK(entity IN ('attempt','lane_job','delivery')),
+					entity_key TEXT NOT NULL,
+					event_type TEXT NOT NULL CHECK(event_type IN (
+						'baseline',
+						'attempt_started','attempt_accepted','attempt_terminal','attempt_updated','attempt_settled','attempt_reconciled',
+						'lane_job_running','lane_job_attempt_ended','lane_job_awaiting_operator','lane_job_awaiting_checks','lane_job_stalled','lane_job_done','lane_job_aborted',
+						'delivery_queued','delivery_inflight','delivery_confirmed','delivery_failed','delivery_expired','delivery_requeued','delivery_deleted'
+					)),
+					row_json TEXT CHECK(row_json IS NULL OR json_valid(row_json)),
 					recorded_at TEXT NOT NULL
-				)`,
+				);
+				CREATE INDEX work_journal_entity_key ON work_journal(entity, entity_key, seq);
+				CREATE INDEX work_journal_recorded_at ON work_journal(recorded_at);`,
 			);
-			host.database.execute(
-				`CREATE INDEX IF NOT EXISTS work_journal_op_ref ON work_journal(op_ref, recorded_at);
-				CREATE INDEX IF NOT EXISTS work_journal_job_id ON work_journal(job_id, recorded_at);
-				CREATE INDEX IF NOT EXISTS work_journal_recorded_at ON work_journal(recorded_at)`,
-			);
+			const seededAt = new Date().toISOString();
+			for (const entity of ["lane_job", "attempt", "delivery"] as const satisfies readonly JournalEntity[]) {
+				const { table, key } = JOURNAL_PROJECTIONS[entity];
+				host.database
+					.statement(
+						`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at) SELECT ?, ${key}, 'baseline', ${journalSnapshotSql(entity)}, ? FROM ${table} ORDER BY ${key}`,
+					)
+					.run(entity, seededAt);
+			}
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(36, new Date().toISOString());
