@@ -266,7 +266,7 @@ test("failed send after proven startup model remains uncertain without retry or 
 	await expect(
 		f.manager.start({ name: "a", text: "work", cwd: f.directory, model: "startup-model" }),
 	).rejects.toMatchObject({ detail: { reasonCode: "send_acceptance_uncertain" } });
-	const opRef = f.job().attempts[0]!.opRef;
+	const opRef = f.job().attempts[0]?.opRef;
 	expect(f.db.work.workAttemptGet(opRef)?.sendPhase).toBe("uncertain");
 	await f.manager.recover();
 	await f.restart();
@@ -292,12 +292,12 @@ test("start acknowledges before terminal, one observer survives caller-free comp
 	await until(() => attaches === 1);
 	await Promise.all([f.manager.recover(), f.manager.recover()]);
 	expect(attaches).toBe(1);
-	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
+	const activity = f.db.bindings.workLaneRows()[0]?.last_activity_at;
 	await Bun.sleep(10);
 	f.port.complete(result.opRef, "done");
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at! > activity!).toBe(true);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at! > activity!).toBe(true);
 	expect(f.notices).toHaveLength(1);
 	expect(f.notices[0]).toMatchObject({ turnId: result.opRef, origin, text: "[lane a] completed: done" });
 	expect(f.db.outbox.rows()).toHaveLength(1);
@@ -327,13 +327,13 @@ test("status is pure during a run wait and steer returns the exact supplied clie
 	const owner = {};
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, owner);
 	await until(() => f.port.sends.length === 1);
-	const op = f.port.sends[0]!.opRef;
+	const op = f.port.sends[0]?.opRef;
 	const before = f.db.work.laneJobJson(laneJobIdentity("a").jobId);
-	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
+	const activity = f.db.bindings.workLaneRows()[0]?.last_activity_at;
 	const snapshot = await f.manager.status({ name: "a" });
 	expect(snapshot).toMatchObject({ attempt: { opRef: op }, op: { status: "in_flight" } });
 	expect(f.db.work.laneJobJson(snapshot.jobId)).toBe(before);
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(activity);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBe(activity);
 	const steer = await f.manager.steer({ name: "a", text: "correction" });
 	expect(steer.steered).toBe(true);
 	if (steer.steered) expect(f.port.steers[0]?.clientRef).toBe(steer.clientRef);
@@ -404,7 +404,7 @@ test("caller timeout only detaches and a later completion settles the same opera
 	const f = await fixture({ waitTimeoutMs: 25, ownerTarget: () => origin });
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
 	await expect(run).rejects.toMatchObject({ detail: { reasonCode: "work_wait_timeout" } });
-	const op = f.port.sends[0]!.opRef;
+	const op = f.port.sends[0]?.opRef;
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 	f.port.complete(op, "late answer");
 	await until(() => f.db.work.workAttemptGet(op)?.settledAt !== null);
@@ -479,7 +479,7 @@ test("proven original silence suppresses before prefix and UTF8 clipping, and su
 	await f.restart();
 	expect(f.notices).toHaveLength(0);
 	expect(f.db.outbox.rows()).toHaveLength(0);
-	expect(utf8Prefix("HEAD" + "가".repeat(1000) + "TAIL")).toBe("HEAD" + "가".repeat(681));
+	expect(utf8Prefix(`HEAD${"가".repeat(1000)}TAIL`)).toBe(`HEAD${"가".repeat(681)}`);
 	expect(utf8Prefix("😀가tail", 6)).toBe("😀");
 	expect(utf8Prefix("😀가tail", 7)).toBe("😀가");
 });
@@ -487,7 +487,7 @@ test("proven original silence suppresses before prefix and UTF8 clipping, and su
 for (const [label, text] of [
 	["preamble", "Nothing to report. [SILENT]"],
 	["lowercase", "Nothing to report. [silent]"],
-	["beyond excerpt", "HEAD:" + "가".repeat(1000) + "[SILENT]"],
+	["beyond excerpt", `HEAD:${"가".repeat(1000)}[SILENT]`],
 ] as const) {
 	test(`proven original ${label} silence persists before clipping and suppresses start delivery`, async () => {
 		const f = await fixture();
@@ -522,7 +522,7 @@ for (const [label, text] of [
 		const f = await fixture({ ownerTarget: () => origin });
 		const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
 		await until(() => f.port.sends.length === 1);
-		const opRef = f.port.sends[0]!.opRef;
+		const opRef = f.port.sends[0]?.opRef;
 		f.port.complete(opRef, text);
 		expect(await run).toMatchObject({ held: false, text, opRef });
 		const runtime = f.db.work.workAttemptGet(opRef)!;
@@ -548,7 +548,7 @@ test("unavailable output preserves completed outcome without prior assistant fal
 	};
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
 	await until(() => f.port.sends.length === 1);
-	f.port.complete(f.port.sends[0]!.opRef, "untrusted");
+	f.port.complete(f.port.sends[0]?.opRef, "untrusted");
 	await expect(run).rejects.toMatchObject({ detail: { reasonCode: "output_unavailable" } });
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 	expect(f.notices).toHaveLength(0);
@@ -599,7 +599,7 @@ for (const [reason, state] of [
 		});
 		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 		expect(f.job().attempts[0]?.endState).toBe(state);
-		const suffix = f.notices[0]!.text.slice("[lane a] attempt_ended: ".length);
+		const suffix = f.notices[0]?.text.slice("[lane a] attempt_ended: ".length);
 		expect(suffix.startsWith(`${reason === "unknown_reason" ? "stopped_incomplete" : reason}: `)).toBe(true);
 		expect(Buffer.byteLength(suffix)).toBeLessThanOrEqual(2048);
 	});
@@ -889,7 +889,7 @@ test("an inconsistent runtime is quarantined and not re-logged on subsequent rec
 	// Verify that recovery doesn't re-log the same error on subsequent calls
 	const errorCountBefore = errors.mock.calls.length;
 	await f.manager.recover();
-	const errorCountAfter = errors.mock.calls.length;
+	const _errorCountAfter = errors.mock.calls.length;
 	// Should not have new work_recovery_invalid_attempt logs
 	const newInvalidLogs = [...errors.mock.calls.slice(errorCountBefore)].filter((call) => {
 		const line = String(call[0]);
@@ -1038,7 +1038,7 @@ test("stop releases run before draining a blocked finite output read and preserv
 	};
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {}).catch((e: unknown) => e);
 	await until(() => f.port.sends.length === 1);
-	const op = f.port.sends[0]!.opRef;
+	const op = f.port.sends[0]?.opRef;
 	f.port.complete(op, "answer");
 	await until(() => reading);
 	const stop = f.manager.stop();
@@ -1287,7 +1287,7 @@ test("run from a lane with nesting allowed remains response-only", async () => {
 		{},
 	);
 	await until(() => f.port.sends.length === 2);
-	const opRef = f.port.sends[1]!.opRef;
+	const opRef = f.port.sends[1]?.opRef;
 	f.port.complete(opRef, "response only");
 	expect(await run).toMatchObject({ held: false, text: "response only", opRef });
 	const runtime = f.db.work.workAttemptGet(opRef)!;
@@ -1542,11 +1542,11 @@ test("CAS loss does not fan out or perform a separate history/activity update", 
 	await until(() => calls > 0);
 	// Streamed frames may refresh activity before settlement; a lost settlement
 	// CAS must not write it (or history) again on any later retry.
-	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
+	const activity = f.db.bindings.workLaneRows()[0]?.last_activity_at;
 	const seen = calls;
 	await until(() => calls > seen);
 	expect(f.db.work.laneJobJson(result.jobId)).toBe(history);
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(activity);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBe(activity);
 	expect(f.notices).toHaveLength(0);
 	expect(f.db.outbox.rows()).toHaveLength(0);
 	f.db.work.workAttemptSettle = settle;
@@ -1665,9 +1665,9 @@ for (const status of ["terminal_ok", "failed"] as const) {
 				if (observedAtSend && receiptState === "present") expect(response).toMatchObject({ started: true });
 				else
 					expect(response).toMatchObject({ code: "verb_failed", detail: { reasonCode: "send_acceptance_uncertain" } });
-				const opRef = f.job().attempts[0]!.opRef;
+				const opRef = f.job().attempts[0]?.opRef;
 				if (receiptState === "missing")
-					f.port.emitTurnEnd(f.job().attempts[0]!.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
+					f.port.emitTurnEnd(f.job().attempts[0]?.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
 				await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
 				const runtime = f.db.work.workAttemptGet(opRef)!;
 				expect(runtime.sendPhase).toBe(receiptState === "present" ? "accepted" : "uncertain");
@@ -1688,7 +1688,7 @@ for (const status of ["terminal_ok", "failed"] as const) {
 test("completion excerpt retains the leading marker and scalar-safe prefix, not the tail", async () => {
 	const f = await fixture();
 	const result = await started(f, "a", origin);
-	const source = "HEAD:" + "😀".repeat(1000) + ":TAIL";
+	const source = `HEAD:${"😀".repeat(1000)}:TAIL`;
 	f.port.complete(result.opRef, source);
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
 	const head = "[lane a] completed: ";
@@ -1720,7 +1720,7 @@ test("report and fallback text stay within 2048 UTF-8 bytes including the lane h
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
 	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	expect(f.notices[0]?.text).toBe(reportText(name, "completed", "end_turn", result.opRef, runtime.output));
-	expect(Buffer.byteLength(f.notices[0]!.text, "utf8")).toBeLessThanOrEqual(2048);
+	expect(Buffer.byteLength(f.notices[0]?.text, "utf8")).toBeLessThanOrEqual(2048);
 });
 
 test("repository and PR head facts survive a large completion excerpt", () => {
@@ -1833,7 +1833,7 @@ test("AC-K parent change in the same epoch re-prepends the notice", async () => 
 	await until(() => f.db.work.workAttemptGet(first.opRef)?.settledAt !== null);
 	const changedOrigin = { ...origin, conversationId: "different-parent" };
 	f.setOwnerTarget(changedOrigin);
-	const second = await started(f);
+	const _second = await started(f);
 	expect(f.port.sends[1]?.systemPreamble).toContain(`persona conversation ${originKey(changedOrigin)}`);
 });
 
@@ -1847,7 +1847,7 @@ test("AC-K nested-refused notice is prepended to start sends and run sends carry
 	const run = f.manager.run({ name: "a", text: "run text", cwd: f.directory }, {});
 	await until(() => f.port.sends.length === 2);
 	expect(f.port.sends[1]?.systemPreamble).toBeUndefined();
-	f.port.complete(f.port.sends[1]!.opRef, "run result");
+	f.port.complete(f.port.sends[1]?.opRef, "run result");
 	expect(await run).toMatchObject({ held: false, text: "run result" });
 });
 
@@ -2475,12 +2475,12 @@ test("#308 streamed turn frames advance lane activity past the attempt start", a
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
 	const result = await started(f);
-	const startedAt = f.db.bindings.workLaneRows()[0]!.last_activity_at!;
-	expect(startedAt).toBe(f.db.work.workAttemptGet(result.opRef)!.startedAt);
+	const startedAt = f.db.bindings.workLaneRows()[0]?.last_activity_at!;
+	expect(startedAt).toBe(f.db.work.workAttemptGet(result.opRef)?.startedAt);
 	now += 5_000;
 	f.port.emitTool(result.sessionId, { toolName: "bash" });
-	await until(() => f.db.bindings.workLaneRows()[0]!.last_activity_at !== startedAt);
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(new Date(now).toISOString());
+	await until(() => f.db.bindings.workLaneRows()[0]?.last_activity_at !== startedAt);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBe(new Date(now).toISOString());
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
 
@@ -2532,7 +2532,7 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
 	f.port.fail(result.opRef, "private failure", { code: "sdk_failed" });
 	await until(() => f.db.work.workAttemptOpen().length === 0);
-	const attempt = f.db.work.workAttemptGet(result.opRef);
+	const _attempt = f.db.work.workAttemptGet(result.opRef);
 	const notice = f.notices[0]?.text ?? "";
 	// Private error messages must never appear in lane notice
 	expect(notice).not.toContain("secret");

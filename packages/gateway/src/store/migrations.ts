@@ -769,7 +769,7 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 		// rows are seeded as baseline events so replay from the journal alone covers pre-v36 state.
 		host.withTransaction(() => {
 			host.database.execute(
-				`CREATE TABLE work_journal (
+				`CREATE TABLE IF NOT EXISTS work_journal (
 					seq INTEGER PRIMARY KEY AUTOINCREMENT,
 					entity TEXT NOT NULL CHECK(entity IN ('attempt','lane_job','delivery')),
 					entity_key TEXT NOT NULL,
