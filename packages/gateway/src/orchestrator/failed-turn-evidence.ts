@@ -189,7 +189,8 @@ async function readFailedAssistantMessage(
 		const rows = lines.map((line) => record(JSON.parse(line)));
 		const header = rows.shift();
 		if (
-			header?.type !== "session" ||
+			!header ||
+			header.type !== "session" ||
 			header.version !== 5 ||
 			header.id !== input.sessionId ||
 			typeof header.cwd !== "string" ||
@@ -305,7 +306,7 @@ export async function readFailedTransportCause(
 	const message = await readFailedAssistantMessage(agentDir, input);
 	if (!message) return undefined;
 	const facts = record(message.transportFailure);
-	if (facts?.kind !== "transport") return undefined;
+	if (!facts || facts.kind !== "transport") return undefined;
 	// Reject if status conflict: if both errorStatus and transport.status are defined, they must match
 	if (message.errorStatus !== undefined && facts.status !== undefined && message.errorStatus !== facts.status)
 		return undefined;

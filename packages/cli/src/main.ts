@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type {
 	MonitorEventOperatorResult,

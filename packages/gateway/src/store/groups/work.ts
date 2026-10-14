@@ -691,12 +691,12 @@ export class WorkGroup {
 		};
 
 		for (const row of rows) {
-			let _runtimeJobId: string | undefined;
+			let runtimeJobId: string | undefined;
 			let conflictingSettlements = false;
 			try {
 				const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
 				validateWorkRuntime(runtime, this.instanceId);
-				_runtimeJobId = runtime.jobId;
+				runtimeJobId = runtime.jobId;
 				workAssert(
 					runtime.opRef === row.op_ref &&
 						runtime.jobId === row.job_id &&
@@ -1606,7 +1606,7 @@ export class WorkGroup {
 		workAssert(kind === "steer" ? targetOpRef !== null : targetOpRef === null);
 		if (targetOpRef !== null) assertValidOpRef(targetOpRef);
 		const current = this.#laneReportGetInside(reportId);
-		if (current?.state !== "pending") return undefined;
+		if (!current || current.state !== "pending") return undefined;
 		const changed = this.#db
 			.prepare(
 				"UPDATE lane_reports SET state = 'claimed', claim_kind = ?, claim_ref = ?, claim_target_op_ref = ?, claim_seq = claim_seq + 1, hold_reason = NULL, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = 'pending' AND claim_seq = ?",
@@ -1659,7 +1659,7 @@ export class WorkGroup {
 
 	laneReportFallback(tx: WriteTx, reportId: string, payload: ChatMessagePayload): boolean {
 		const current = this.#laneReportGetInside(reportId);
-		if (current?.state !== "pending") return false;
+		if (!current || current.state !== "pending") return false;
 		const root = laneReportRoot(current);
 		workAssert(root !== null);
 		const deliveryId = workAttemptDeliveryId(
@@ -1687,7 +1687,7 @@ export class WorkGroup {
 
 	laneReportUndeliverable(tx: WriteTx, reportId: string): boolean {
 		const current = this.#laneReportGetInside(reportId);
-		if (current?.state !== "pending") return false;
+		if (!current || current.state !== "pending") return false;
 		return (
 			this.#db
 				.prepare(

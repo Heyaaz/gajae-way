@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
@@ -318,6 +318,37 @@ export class WorkLaneManager {
 			this.#db.work.workAttemptPrepare(tx, runtime, record, runtime.mode === "historical" || bindingMatches);
 			this.#refreshWorkSession(tx, runtime, runtime.startedAt);
 		});
+	}
+	#rollbackUnpersistedWorktree(
+		name: string,
+		worktree: { readonly repository: string; readonly path: string; readonly branch: string },
+	): void {
+		try {
+			const remove = Bun.spawnSync(["git", "worktree", "remove", "--force", worktree.path], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: worktree.repository,
+			});
+			const deleteBranch = Bun.spawnSync(["git", "branch", "-D", worktree.branch], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: worktree.repository,
+			});
+			const failures = [
+				remove.exitCode === 0
+					? undefined
+					: `git worktree remove failed: ${remove.stderr?.toString().trim() || "unknown error"}`,
+				deleteBranch.exitCode === 0
+					? undefined
+					: `git branch delete failed: ${deleteBranch.stderr?.toString().trim() || "unknown error"}`,
+			].filter((failure): failure is string => failure !== undefined);
+			if (failures.length > 0) throw new Error(failures.join("; "));
+		} catch (error) {
+			const reason = sanitizeDiagnostic(error instanceof Error ? error.message : String(error))
+				.replace(/\s+/gu, " ")
+				.slice(0, 200);
+			console.error(`work_setup_rollback_failed name=${name} reason=${reason || "unknown"}`);
+		}
 	}
 
 	#updateAttempt(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
@@ -1674,7 +1705,8 @@ export class WorkLaneManager {
 			// Another writer moved the lane on while the checks were read.
 			const currentCycle = job?.awaitingChecks;
 			if (
-				job?.state !== "awaiting_checks" ||
+				!job ||
+				job.state !== "awaiting_checks" ||
 				!currentCycle ||
 				currentCycle.since !== cycle.since ||
 				currentCycle.prNumber !== cycle.prNumber ||
@@ -1740,7 +1772,7 @@ export class WorkLaneManager {
 		if (cycle.prNumber === null) throw new Error("cannot re-steer before discovering the open PR");
 		const counted = recordChecksRetry(job, this.#at());
 		this.#putJob(name, counted);
-		const retries = counted.awaitingChecks?.retries;
+		const retries = counted.awaitingChecks!.retries;
 		const names = failingChecks.length > 0 ? failingChecks.join(", ") : "unnamed checks";
 		const log = failureLogTail ? `\nFailed log tail:\n${utf8Prefix(sanitizeDiagnostic(failureLogTail), 3_200)}` : "";
 		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).${log}`;
@@ -2110,7 +2142,7 @@ export class WorkLaneManager {
 		}
 		if (this.#attemptByOpRef(opRef)) return;
 		const fresh = this.#db.work.laneReportGet(row.report_id);
-		if (fresh?.state !== "claimed") return;
+		if (!fresh || fresh.state !== "claimed") return;
 		if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, opRef))) return;
 		this.#logLaneReportTransition(fresh, "claimed", "pending", "wake_unprepared");
 		const parentJob = this.#job(row.parent_name);
@@ -2703,7 +2735,7 @@ function terminalEvidence(status: PromptStatusBody, observedAt: string): WorkAtt
 					: status.receiptState === "present" && status.outcome?.reason === "end_turn"
 						? "end_turn"
 						: ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
-							? status.outcome?.reason!
+							? status.outcome!.reason!
 							: "stopped_incomplete";
 	return { kind: "broker", observedAt, reasonCode, status };
 }
