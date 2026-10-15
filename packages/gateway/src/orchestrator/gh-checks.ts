@@ -85,11 +85,11 @@ export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): Check
 				}>;
 				const matchingPrs = prs.filter((candidate) => candidate.headRefOid === headSha);
 				if (matchingPrs.length === 0) return prs.length >= PR_LOOKUP_LIMIT ? undefined : null;
+				const openMatches = matchingPrs.filter((candidate) => candidate.state.toUpperCase() === "OPEN");
+				// The checks cycle persists a PR number, so do not bind it to an arbitrary open match.
+				if (openMatches.length > 1) return undefined;
 				// A SHA can be shared across PRs; the active PR must outrank stale closed matches.
-				const pr =
-					matchingPrs.find((candidate) => candidate.state.toUpperCase() === "OPEN") ??
-					matchingPrs.find((candidate) => Boolean(candidate.mergedAt)) ??
-					matchingPrs[0];
+				const pr = openMatches[0] ?? matchingPrs.find((candidate) => Boolean(candidate.mergedAt)) ?? matchingPrs[0];
 				if (!pr) return null;
 				const rollup = pr.statusCheckRollup ?? [];
 				const snapshot = classifyCheckRollup(pr.number, headSha, rollup);

@@ -3328,6 +3328,34 @@ test("#595 GH check lookup prefers the open PR when duplicate PR heads match the
 	});
 });
 
+test("#595 GH check lookup retries when multiple open PRs share the requested head SHA", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const headSha = "d".repeat(40);
+	const response = [
+		{
+			number: 572,
+			state: "OPEN",
+			mergedAt: null,
+			headRefOid: headSha,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+		{
+			number: 573,
+			state: "OPEN",
+			mergedAt: null,
+			headRefOid: headSha,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+	];
+	const ghPath = join(directory, "gh");
+	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
+	await chmod(ghPath, 0o755);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory);
+	expect(snapshot).toBeUndefined();
+});
+
 test("#595 GH check lookup keeps a full bounded search retryable when no exact head is found", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
