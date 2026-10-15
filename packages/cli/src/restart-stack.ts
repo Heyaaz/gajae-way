@@ -439,7 +439,15 @@ async function prepareGatewayRestartDrain(
 			if (result.ready !== true || result.drained !== true) throw new Error("gateway restart drain ownership was lost");
 		},
 		cancel: async () => {
-			await client.request("gateway.restart.cancel", { restartId });
+			const result = await client.request<{ cancelled?: unknown; transferred?: unknown }>("gateway.restart.cancel", {
+				restartId,
+			});
+			if (result.cancelled !== true)
+				throw new Error(
+					result.transferred === true
+						? "gateway transferred the restart drain to an owner restart"
+						: "gateway did not confirm restart-drain cancellation",
+				);
 		},
 		close: async () => {
 			offSuperseded();
@@ -536,8 +544,14 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 	} finally {
 		try {
 			const completedReceipt = receipt ?? preparedDrain?.receipt;
-			if (completedReceipt !== undefined)
+			if (completedReceipt !== undefined) {
 				await releaseRestartDrain(preparedDrain?.lease, completedReceipt, options.id, options);
+				if (receipt !== undefined && completedReceipt.state === "running") {
+					completedReceipt.state = "ok";
+					completedReceipt.finishedAt = new Date((options.now ?? Date.now)()).toISOString();
+					await writeReceipt(options.home, completedReceipt);
+				}
+			}
 		} finally {
 			await lease.release();
 		}
@@ -881,8 +895,7 @@ async function runRestartStackWithLease(
 		}
 		await writeReceipt(options.home, receipt);
 	}
-	if (receipt.state === "running") receipt.state = "ok";
-	receipt.finishedAt = new Date(now()).toISOString();
+	if (receipt.state !== "running") receipt.finishedAt = new Date(now()).toISOString();
 	await writeReceipt(options.home, receipt);
 	return receipt;
 
@@ -1001,6 +1014,10 @@ async function releaseRestartDrain(
 		try {
 			await restartDrain.cancel();
 		} catch (error) {
+			receipt.state = "indeterminate";
+			receipt.finishedAt = new Date((options.now ?? Date.now)()).toISOString();
+			receipt.detail = `restart drain cancellation failed: ${error instanceof Error ? error.message : String(error)}`;
+			await writeReceipt(options.home, receipt);
 			console.error(`restart drain cancellation failed id=${restartId} detail=${String(error)}`);
 		}
 	}

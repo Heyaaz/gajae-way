@@ -425,6 +425,54 @@ test("restart-stack retries drain reattachment while the replacement gateway soc
 	}
 });
 
+test("restart-stack stays in progress until the replacement gateway confirms drain release", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	const reattachStarted = Promise.withResolvers<void>();
+	const finishReattach = Promise.withResolvers<void>();
+	try {
+		const running = runRestartStack({
+			...host.options,
+			id: "restart-drain-status",
+			prepareRestartDrain: async (_socketPath, _restartId, _trigger, prepareOptions) => {
+				if (prepareOptions?.mode === "reattach") {
+					reattachStarted.resolve();
+					await finishReattach.promise;
+					return {
+						superseded: new AbortController().signal,
+						assertActive: async () => {},
+						cancel: async () => {},
+						close: async () => {},
+					};
+				}
+				return {
+					superseded: new AbortController().signal,
+					assertActive: async () => {},
+					cancel: async () => {
+						throw new Error("successful gateway restart must not cancel its drain");
+					},
+					close: async () => {},
+				};
+			},
+		});
+		await reattachStarted.promise;
+		const inProgress = await readRestartReceipt(home);
+		if (inProgress === undefined) throw new Error("restart receipt was not persisted before reattachment");
+		expect(inProgress.state).toBe("running");
+		expect(inProgress.finishedAt).toBeUndefined();
+		expect(await effectiveRestartState(inProgress, home)).toBe("running");
+
+		finishReattach.resolve();
+		const receipt = await running;
+		expect(receipt.state).toBe("ok");
+		expect(receipt.finishedAt).toBeDefined();
+	} finally {
+		finishReattach.resolve();
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("restart-stack keeps the receipt indeterminate when the replacement socket never becomes ready", async () => {
 	const { home, cleanup } = await tempHome();
 	const host = await fakeHost({ home });
