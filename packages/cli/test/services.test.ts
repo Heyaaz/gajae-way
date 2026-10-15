@@ -61,7 +61,7 @@ test("a linux install writes one bound systemd user unit per service", async () 
 				expect(unit).toContain(`After=${BROKER_UNIT}`);
 				expect(unit).not.toContain("Requires=");
 				expect(unit).toContain("KillMode=mixed");
-				expect(unit).toContain("TimeoutStopSec=30s");
+				expect(unit).toContain("TimeoutStopSec=40s");
 			} else {
 				expect(unit).toContain(`BindsTo=${GATEWAY_UNIT}`);
 				expect(unit).toContain(`After=${GATEWAY_UNIT}`);

@@ -142,8 +142,9 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
 const DEFAULT_DELIVERY_SWEEP_INTERVAL_MS = 15_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
-/** /restart: hard-exit budget after the ordered stop begins. */
-const RESTART_HARD_EXIT_MS = 15_000;
+const CONNECTION_SETTLE_TIMEOUT_MS = 5_000;
+/** /restart allows the 15s persona drain plus ordered monitor, connection, and storage teardown. */
+const RESTART_HARD_EXIT_MS = 35_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
@@ -498,20 +499,23 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			// quiesce every admitted producer before taking the final writer snapshot.
 			listener.stop(false);
 			runtime.stopBrokerGenerationListener?.();
+			runtime.personaSessions.beginDrain();
 			await runtime.work.stop();
 			await Promise.all([...runtime.requests]);
 			await Promise.all([...runtime.memoryOperationTasks]);
-			await runtime.personaSessions.drain();
-			await runtime.personaSessions.stop();
 			await runtime.monitorRuntime.stop();
-			// Drain claimed monitor writers before broker/database teardown (#64).
-			await runtime.monitors.drain();
+			// Stop persona admission before draining both producers; monitor results
+			// can still persist inbound rows, but they remain queued for the next boot.
+			await Promise.all([runtime.personaSessions.drain(), runtime.monitors.drain()]);
+			await runtime.personaSessions.stop();
 			// The broker has no recovery policy; it is only stopped after all current
 			// producers and monitor/tail-like runtime work have drained.
 			await options.broker?.stop();
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-			await Promise.all([...runtime.connections].map((connection) => settleConnection(connection, 5_000)));
+			await Promise.all(
+				[...runtime.connections].map((connection) => settleConnection(connection, CONNECTION_SETTLE_TIMEOUT_MS)),
+			);
 			listener.stop(true);
 			await settleMemory(runtime);
 			await options.onStop?.();
@@ -583,12 +587,41 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	void runtime.memory.initialize();
 	void runtime.monitors.reconcile();
 	void runtime.monitorRuntime.start();
+	const pendingStdoutWrites = new Set<Promise<void>>();
 	const connection: Connection = {
 		decoder: new FrameDecoder(),
 		negotiated: false,
-		write: (frame) => process.stdout.write(encodeFrame(runtime.secretGuard.guardFrame(frame))),
+		write: (frame) => {
+			const pending = new Promise<void>((resolve, reject) => {
+				process.stdout.write(encodeFrame(runtime.secretGuard.guardFrame(frame)), (error) => {
+					if (error) reject(error);
+					else resolve();
+				});
+			}).catch((error: unknown) => {
+				console.error(`gateway stdio write failed: ${diagnostic(error)}`);
+			});
+			pendingStdoutWrites.add(pending);
+			void pending.finally(() => pendingStdoutWrites.delete(pending));
+		},
 		close: () => process.stdin.pause(),
-		settle: async () => {},
+		settle: async () => {
+			const deadline = Date.now() + CONNECTION_SETTLE_TIMEOUT_MS;
+			while (pendingStdoutWrites.size > 0) {
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) break;
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const settled = await Promise.race([
+					Promise.all([...pendingStdoutWrites]).then(() => true),
+					new Promise<boolean>((resolve) => {
+						timer = setTimeout(() => resolve(false), remainingMs);
+					}),
+				]);
+				if (timer !== undefined) clearTimeout(timer);
+				if (!settled) break;
+			}
+			if (pendingStdoutWrites.size > 0)
+				console.error(`gateway stdio output flush timed out pending=${pendingStdoutWrites.size}`);
+		},
 	};
 	runtime.connections.add(connection);
 	let stopping = false;
@@ -615,22 +648,25 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			clearInterval(runtime.contextMaintenanceTimer);
 			clearInterval(runtime.memoryOpsCleanupTimer);
 			runtime.stopRetention();
+			// Announce the start of stdio shutdown; the stream remains open during teardown.
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			runtime.stopBrokerGenerationListener?.();
+			runtime.personaSessions.beginDrain();
 			await runtime.work.stop();
 			// Same producer quiescence as the Unix server: in-flight stdio requests are
 			// tracked and awaited before persona/tail/broker teardown.
 			await Promise.all([...runtime.requests]);
 			await Promise.all([...runtime.memoryOperationTasks]);
-			await runtime.personaSessions.drain();
-			await runtime.personaSessions.stop();
 			await runtime.monitorRuntime.stop();
-			// Drain claimed monitor writers before broker/database teardown (#64).
-			await runtime.monitors.drain();
+			// Stop persona admission before draining both producers; monitor results
+			// can still persist inbound rows, but they remain queued for the next boot.
+			await Promise.all([runtime.personaSessions.drain(), runtime.monitors.drain()]);
+			await runtime.personaSessions.stop();
 			await options.broker?.stop();
 			connection.close();
 			await settleMemory(runtime);
 			await options.onStop?.();
+			await connection.settle();
 		})();
 		return stopPromise;
 	};

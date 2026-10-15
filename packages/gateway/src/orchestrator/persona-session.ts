@@ -51,6 +51,8 @@ import {
 } from "./tail-runner";
 
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
+/** Graceful shutdown gives accepted persona turns time to finish before their relays close. */
+const PERSONA_SHUTDOWN_DRAIN_MS = 15_000;
 /**
  * How many times a turn may replace its session after the Router disowns it.
  * Each attempt binds a NEW session (bootstrapped with the last 24h of channel
@@ -494,6 +496,7 @@ export class PersonaSessionManager {
 	readonly #actors = new Map<string, OriginActor>();
 	#maxLiveHosts: number;
 	#hostIdleRetireMs: number;
+	#draining = false;
 	#stopped = false;
 
 	constructor(options: PersonaSessionManagerOptions) {
@@ -532,7 +535,7 @@ export class PersonaSessionManager {
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
 	notifyInbound(originKey: string): Promise<void> {
-		if (this.#stopped) return Promise.resolve();
+		if (this.#stopped || this.#draining) return Promise.resolve();
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).admit());
 	}
 
@@ -549,6 +552,10 @@ export class PersonaSessionManager {
 
 	get stopped(): boolean {
 		return this.#stopped;
+	}
+
+	get draining(): boolean {
+		return this.#draining;
 	}
 
 	get onReverseRequest(): PersonaSessionManagerOptions["onReverseRequest"] {
@@ -699,13 +706,19 @@ export class PersonaSessionManager {
 		await Promise.all([...this.#actors.values()].map((actor) => actor.stop()));
 	}
 
+	/** Block new persona triggers and steers before shutdown starts stopping their producers. */
+	beginDrain(): void {
+		if (!this.#stopped) this.#draining = true;
+	}
+
 	/**
-	 * Reconcile accepted work for a bounded shutdown window; an unresolved SDK
-	 * operation stays durable for the next broker generation rather than blocking
-	 * shutdown forever or being aborted.
+	 * Stop admitting persona work and reconcile accepted turns for a bounded
+	 * shutdown window. Unsettled operations stay durable rather than being
+	 * aborted or replayed with potentially duplicated side effects.
 	 */
-	async drain(timeoutMs = 5_000): Promise<void> {
+	async drain(timeoutMs = PERSONA_SHUTDOWN_DRAIN_MS): Promise<void> {
 		if (this.#stopped) return;
+		this.beginDrain();
 		const deadline = this.#now() + Math.max(0, timeoutMs);
 		for (;;) {
 			const unresolved = await Promise.all(
@@ -1062,6 +1075,7 @@ class OriginActor {
 	 * origin sends it as the next turn. No window, no coalescing.
 	 */
 	async admit(): Promise<void> {
+		if (this.#manager.draining) return;
 		if (!this.#recoveryScanned) await this.recover();
 		if (this.#state === "turn-running") {
 			await this.#steerPending();
@@ -1626,7 +1640,7 @@ class OriginActor {
 	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (this.#manager.draining || this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
 		if (this.#modelRefusalPaused) {
 			const pending = this.#manager.database.inbox.pendingOldest(this.originKey);
 			if (pending) {
@@ -2247,6 +2261,7 @@ class OriginActor {
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
 		if (
+			this.#manager.draining ||
 			this.#modelRefusalPaused ||
 			!current ||
 			current.retired ||

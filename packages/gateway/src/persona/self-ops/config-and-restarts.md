@@ -12,7 +12,7 @@ For a restart-required change:
 
 1. Record the configuration file modification time and the intended field change.
 2. Use the service manager or `gajaeway ops restart-stack`; do not start an unmanaged gateway. A normal gateway restart does not restart the broker service.
-3. Allow at least 30 seconds for ordered shutdown. The gateway holds `gateway` then `memory`; the broker service independently holds `broker`. Each adapter holds its own `adapter-<platform>` lease.
+3. Allow at least 40 seconds for ordered shutdown. The gateway holds `gateway` then `memory`; the broker service independently holds `broker`. Each adapter holds its own `adapter-<platform>` lease.
 4. Verify the new process start time is later than the configuration modification time, then verify effective behavior through the status or chat path consuming the field. A healthy PID alone proves neither configuration nor deployment success.
 
 The gateway uses the pinned GJC executable and `gjc.agentDir`, which defaults to `homeLayout(home).brokerAgentDir` under `$GAJAEWAY_HOME/broker/agent`. The broker service owns that directory under the `broker` lease. `gajaeway setup --broker-agent` provisions an allowlisted snapshot from the source profile; it does not link the private directory to the source. Gajaeway never writes the source `~/.gjc/agent` from its setup or runtime paths.
