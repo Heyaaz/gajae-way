@@ -142,8 +142,8 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
 const DEFAULT_DELIVERY_SWEEP_INTERVAL_MS = 15_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
-/** /restart: hard-exit budget after the ordered stop begins. */
-const RESTART_HARD_EXIT_MS = 15_000;
+/** /restart allows the 15s persona drain plus ordered monitor, connection, and storage teardown. */
+const RESTART_HARD_EXIT_MS = 30_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
