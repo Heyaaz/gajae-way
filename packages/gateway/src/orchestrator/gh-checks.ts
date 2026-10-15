@@ -52,21 +52,22 @@ export function classifyCheckRollup(
 }
 
 /** Production client: bounded async PR/check lookups; failed GitHub Actions logs are a best-effort red-check tail. */
-export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
+export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): CheckStatusClient {
 	return {
-		async getCheckStatus(branch, cwd) {
+		async getCheckStatus(headSha, cwd) {
 			try {
+				if (!/^[0-9a-f]{40}$/.test(headSha)) return undefined;
 				const child = Bun.spawn(
 					[
-						"gh",
+						executable,
 						"pr",
 						"list",
-						"--head",
-						branch,
 						"--state",
 						"all",
+						"--search",
+						headSha,
 						"--limit",
-						"1",
+						"100",
 						"--json",
 						"number,headRefOid,state,mergedAt,statusCheckRollup",
 					],
@@ -81,10 +82,8 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 					mergedAt?: string | null;
 					statusCheckRollup?: RollupEntry[] | null;
 				}>;
-				const pr = prs[0];
+				const pr = prs.find((candidate) => candidate.headRefOid === headSha);
 				if (!pr) return null;
-				const headSha = pr.headRefOid;
-				if (!headSha) return undefined;
 				const rollup = pr.statusCheckRollup ?? [];
 				const snapshot = classifyCheckRollup(pr.number, headSha, rollup);
 				const withPrState: CheckStatusSnapshot = {
