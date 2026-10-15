@@ -32,12 +32,19 @@ function ok(result: unknown): CliResult {
 	return { exitCode: 0, stdout: JSON.stringify({ ok: true, result }), stderr: "" };
 }
 
+function required<T>(value: T | undefined, label: string): T {
+	if (value === undefined) throw new Error(`missing ${label}`);
+	return value;
+}
+
 /** A fake broker that keeps its own state across gateway restarts and can die right after applying an op. */
 class FakeBroker {
 	readonly sessions = new Map<string, string>();
 	readonly closes = new Map<string, number>();
 	readonly createKeys: string[] = [];
+	readonly createInputs: string[] = [];
 	readonly closeKeys: string[] = [];
+	readonly closedSessionIds: string[] = [];
 	readonly dead = new Set<string>();
 	dieAfterApply = false;
 	#sessions = 0;
@@ -46,6 +53,7 @@ class FakeBroker {
 		const key = args[args.indexOf("--idempotency-key") + 1] ?? "";
 		if (args.includes("session.create")) {
 			this.createKeys.push(key);
+			this.createInputs.push(args[args.indexOf("--json-input") + 1] ?? "{}");
 			const sessionId = this.sessions.get(key) ?? `broker-session-${++this.#sessions}`;
 			this.sessions.set(key, sessionId);
 			return this.#reply({ sessionId });
@@ -53,7 +61,11 @@ class FakeBroker {
 		if (args.includes("session.close")) {
 			this.closeKeys.push(key);
 			// The broker's own idempotency: one key closes once.
-			if (!this.closes.has(key)) this.closes.set(key, this.closes.size + 1);
+			if (!this.closes.has(key)) {
+				this.closes.set(key, this.closes.size + 1);
+				const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: unknown };
+				if (typeof request.sessionId === "string") this.closedSessionIds.push(request.sessionId);
+			}
 			return this.#reply({ closed: true, closeNumber: this.closes.get(key) });
 		}
 		if (args.includes("inspect")) {
@@ -107,7 +119,7 @@ test("session.create interrupted after the broker applied it: the restarted gate
 	expect(broker.sessions.size).toBe(1);
 	// The intent survived the failure; the binding was never recorded.
 	expect(
-		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0, repo])),
+		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0])),
 	).toMatchObject({
 		state: "pending",
 		operationRef: broker.createKeys[0],
@@ -126,8 +138,79 @@ test("session.create interrupted after the broker applied it: the restarted gate
 	});
 	// Complete released the intent in the binding's transaction.
 	expect(
-		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0, repo])),
+		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0])),
 	).toBeUndefined();
+});
+
+test("a changed repository retires the pending create before binding a replacement session", async () => {
+	const { path, authority, repo } = await setup();
+	const broker = new FakeBroker();
+	const gateway = await openGateway(path, authority, broker);
+	broker.dieAfterApply = true;
+	await expect(gateway.port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toThrow("broker_unavailable");
+	const originalKey = required(broker.createKeys[0], "original create key");
+	const originalSessionId = required(broker.sessions.get(originalKey), "original session id");
+
+	const changedRepo = join(home, "workspace-retargeted");
+	const binding = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo: changedRepo });
+	const replacementKey = required(broker.createKeys[2], "replacement create key");
+	expect(broker.createKeys).toEqual([originalKey, originalKey, replacementKey]);
+	expect(replacementKey).not.toBe(originalKey);
+	expect(broker.closedSessionIds).toEqual([originalSessionId]);
+	expect(binding.sessionId).toBe(required(broker.sessions.get(replacementKey), "replacement session id"));
+	expect(binding.repo).toBe(changedRepo);
+	expect(gateway.database.bindings.getSessionRecord("lane/a")).toMatchObject({
+		sessionId: binding.sessionId,
+		epoch: 0,
+	});
+	expect(broker.createInputs.map((input) => JSON.parse(input).cwd)).toEqual([repo, repo, changedRepo]);
+	expect(
+		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0])),
+	).toBeUndefined();
+});
+
+test("a changed startup model retires the pending create before certifying the replacement model", async () => {
+	const { path, authority, repo } = await setup();
+	const broker = new FakeBroker();
+	const gateway = await openGateway(path, authority, broker);
+	const originalModel = "anthropic/claude-sonnet";
+	broker.dieAfterApply = true;
+	await expect(gateway.port.bind({ originKey: "lane/a", epoch: 0, repo, model: originalModel })).rejects.toThrow(
+		"broker_unavailable",
+	);
+
+	const binding = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo, model: "openai/gpt-4" });
+	const originalKey = required(broker.createKeys[0], "original create key");
+	const originalSessionId = required(broker.sessions.get(originalKey), "original session id");
+	const replacementKey = required(broker.createKeys[2], "replacement create key");
+	expect(broker.createKeys).toEqual([originalKey, originalKey, replacementKey]);
+	expect(replacementKey).not.toBe(originalKey);
+	expect(broker.closedSessionIds).toEqual([originalSessionId]);
+	expect(JSON.parse(required(broker.createInputs[0], "original create request")).modelId).toBe(originalModel);
+	expect(JSON.parse(required(broker.createInputs[2], "replacement create request")).modelId).toBe("openai/gpt-4");
+	expect(binding.startupModelApplied).toBe(true);
+	expect(binding.sessionId).toBe(required(broker.sessions.get(replacementKey), "replacement session id"));
+});
+
+test("a changed startup preset is created with the new preset after retiring the pending create", async () => {
+	const { path, authority, repo } = await setup();
+	const broker = new FakeBroker();
+	const gateway = await openGateway(path, authority, broker);
+	broker.dieAfterApply = true;
+	await expect(gateway.port.bind({ originKey: "lane/a", epoch: 0, repo, model: { preset: "deep" } })).rejects.toThrow(
+		"broker_unavailable",
+	);
+
+	const binding = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo, model: { preset: "fast" } });
+	const originalKey = required(broker.createKeys[0], "original create key");
+	const originalSessionId = required(broker.sessions.get(originalKey), "original session id");
+	const replacementKey = required(broker.createKeys[2], "replacement create key");
+	expect(broker.createKeys).toEqual([originalKey, originalKey, replacementKey]);
+	expect(broker.closedSessionIds).toEqual([originalSessionId]);
+	expect(JSON.parse(required(broker.createInputs[0], "original create request")).modelPreset).toBe("deep");
+	expect(JSON.parse(required(broker.createInputs[2], "replacement create request")).modelPreset).toBe("fast");
+	expect(binding.startupModelApplied).toBe(true);
+	expect(binding.sessionId).toBe(required(broker.sessions.get(replacementKey), "replacement session id"));
 });
 
 test("a pending create outlives the intent age cutoff: a bind after a >24h outage replays its key, not a new session", async () => {
@@ -153,7 +236,7 @@ test("a pending create outlives the intent age cutoff: a bind after a >24h outag
 	gateway = { database, port: later };
 	await gateway.port.close({ sessionId: "sdk-1", repo });
 	expect(
-		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0, repo])),
+		gateway.database.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/a", 0])),
 	).toMatchObject({ state: "pending", operationRef: key });
 
 	const binding = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo });

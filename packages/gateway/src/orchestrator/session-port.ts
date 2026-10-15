@@ -602,9 +602,50 @@ export class BrokerSessionPort implements SessionPort {
 		// same key and request, which the broker dedups to the session it already
 		// made. The intent is released in the binding's own transaction, so a
 		// later bind of this origin/epoch never inherits a finished create.
-		const intent = this.#beginOperation("session.create", createScope(input), `gw-bind-${randomUUID()}`, () =>
-			sessionCreateInput(input.repo, input.model),
+		const requestJson = sessionCreateInput(input.repo, input.model);
+		let intent = this.#beginOperation(
+			"session.create",
+			createScope(input),
+			`gw-bind-${randomUUID()}`,
+			() => requestJson,
 		);
+		if (intent.requestJson !== requestJson) {
+			// Resolve and retire the old create before replacing it. Its request may
+			// already have created a session under the old repo/model; reusing the
+			// old result or minting a second create without closing it would bind the
+			// wrong session or orphan the old one.
+			let previousSessionId: string | undefined;
+			try {
+				const previous = await this.#createSession(intent.operationRef, intent.requestJson);
+				if (typeof previous.sessionId !== "string" || previous.sessionId.length === 0)
+					throw new Error("pending session.create intent did not return a session id");
+				previousSessionId = previous.sessionId;
+			} catch (error) {
+				// A definitively poisoned key cannot have created a session; release it
+				// so the current request can start under a fresh key.
+				if (poisonedCreateKeyCode(error, intent.operationRef) === undefined) throw error;
+				this.#releaseOperation(intent);
+			}
+			if (previousSessionId) {
+				assertControlAllowed("session.close", { operatorApproval: true });
+				// The pending create row is authority for this just-created session;
+				// it is not yet in the durable bindings table for public close().
+				try {
+					await this.#closeSessionOperation(previousSessionId);
+				} catch (error) {
+					// A completed close result may have aged out while the create intent
+					// remained pending. A broker-confirmed missing session is already retired.
+					if (!isSessionGoneCode(sdkErrorCode(error))) throw error;
+				}
+				this.#releaseOperation(intent);
+			}
+			intent = this.#beginOperation("session.create", createScope(input), `gw-bind-${randomUUID()}`, () => requestJson);
+			if (intent.requestJson !== requestJson) {
+				throw new Error(
+					"pending session.create intent changed during replacement; refusing to replay a different request",
+				);
+			}
+		}
 		let created: { readonly sessionId?: unknown };
 		try {
 			created = await this.#createSession(intent.operationRef, intent.requestJson);
@@ -1313,13 +1354,15 @@ export class BrokerSessionPort implements SessionPort {
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
 		this.#assertOwned(input);
 		assertControlAllowed("session.close", { operatorApproval: true });
-		// Journaled per session: a retirement retried after a crash or broker
-		// restart replays the pending close under its original idempotency key,
-		// and a completed one is not issued again. A gateway-closed session is
-		// retired (its origin's epoch rotates), so it is never resumed and closed
-		// a second time.
-		const intent = this.#beginOperation("session.close", input.sessionId, `gw-close-${randomUUID()}`, () =>
-			JSON.stringify({ sessionId: input.sessionId }),
+		await this.#closeSessionOperation(input.sessionId);
+	}
+
+	async #closeSessionOperation(sessionId: string): Promise<void> {
+		// Journaled per session: retries replay a possibly applied close under its
+		// original idempotency key, including cleanup of a mismatched pending create.
+		// A completed close is not issued again.
+		const intent = this.#beginOperation("session.close", sessionId, `gw-close-${randomUUID()}`, () =>
+			JSON.stringify({ sessionId }),
 		);
 		if (intent.state === "complete") return;
 		// Lifecycle op: the per-session `control` route prohibits it for the
@@ -2116,9 +2159,9 @@ export function sessionResumeKey(sessionId: string, epoch: number, hostIncarnati
 	return `gw-resume-${sessionId}-${epoch}-${hostIncarnation ?? "nohost"}`;
 }
 
-/** One in-flight create per origin, epoch and repository: the retry after a crash finds it. */
+/** One in-flight create per origin and epoch: repository/model are request data, not operation identity. */
 function createScope(input: SessionBindInput): string {
-	return JSON.stringify([input.originKey, input.epoch, input.repo]);
+	return JSON.stringify([input.originKey, input.epoch]);
 }
 
 function sessionCreateInput(repo: string, model: GjcModelSelection | undefined): string {
