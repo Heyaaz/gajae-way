@@ -510,10 +510,13 @@ async function waitForRestartTerminalDelivery(runtime: Runtime, terminalDelivery
 	while (!runtime.stopping) {
 		try {
 			const deliveries = runtime.delivery.getMany(deliveryIds);
+			const settled =
+				deliveries.length === deliveryIds.length &&
+				deliveries.every((delivery) => delivery.state === "confirmed" || delivery.state === "expired");
 			for (const delivery of deliveries)
-				if (delivery.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
-			if (deliveries.length === deliveryIds.length && deliveries.every((delivery) => delivery.state === "confirmed"))
-				return;
+				if (delivery.state === "confirmed" || delivery.state === "expired")
+					runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
+			if (settled) return;
 		} catch (error) {
 			if (!probeFailureLogged) {
 				console.error(`restart terminal delivery probe failed: ${diagnostic(error)}`);

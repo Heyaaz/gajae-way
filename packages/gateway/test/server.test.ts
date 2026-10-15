@@ -1544,6 +1544,109 @@ test("restart prepare fails closed until an unconfirmed terminal reply is delive
 	}
 });
 
+test("restart prepare treats an expired terminal delivery as settled", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-expired-delivery-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	let turnEntered!: () => void;
+	let releaseTurn!: () => void;
+	const entered = new Promise<void>((resolve) => (turnEntered = resolve));
+	const turnRelease = new Promise<void>((resolve) => (releaseTurn = resolve));
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => {
+			turnEntered();
+			await turnRelease;
+			return "expired terminal reply";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "turn-with-expiring-reply",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "expiring", peerId: "p1" },
+				text: "complete while restart is draining",
+				engagement: { mentioned: false, group: false, authorId: "p1" },
+			},
+		});
+		await entered;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "prepare-expiring-reply",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "expiring-reply", waitMs: 1_000 },
+		});
+		client.send({ v: "0.1", type: "request", id: "observe-expiring-drain", verb: "gateway.status" });
+		await client.waitForFrame("observe-expiring-drain");
+		releaseTurn();
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some(
+				(frame) =>
+					frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "expired terminal reply",
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		const terminalReply = client.frames.find(
+			(frame) =>
+				frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "expired terminal reply",
+		);
+		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
+			throw new Error("terminal reply was not broadcast");
+		for (let attempt = 1; attempt <= 5; attempt++) {
+			const id = `expire-terminal-${attempt}`;
+			client.send({
+				v: "0.1",
+				type: "request",
+				id,
+				verb: "delivery.fail",
+				params: { deliveryId: terminalReply.payload.deliveryId, reason: "adapter_failure", ambiguous: false },
+			});
+			await client.waitForFrame(id);
+		}
+		expect(database.outbox.rows().find((row) => row.delivery_id === terminalReply.payload.deliveryId)?.state).toBe(
+			"expired",
+		);
+		await client.waitForFrame("prepare-expiring-reply");
+		expect(client.frames.find((frame) => frame.id === "prepare-expiring-reply")?.result).toEqual({
+			ready: true,
+			drained: true,
+		});
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "cancel-expiring-reply",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "expiring-reply" },
+		});
+		await client.waitForFrame("cancel-expiring-reply");
+		expect(client.frames.find((frame) => frame.id === "cancel-expiring-reply")?.result).toEqual({ cancelled: true });
+	} finally {
+		releaseTurn();
+		client.close();
+	}
+});
+
 test("restart prepare waits for a terminal delivery whose actor settled before the drain", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-predrain-delivery-"));
 	const config: GatewayConfig = {
