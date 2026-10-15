@@ -235,6 +235,7 @@ export class MonitorPropagator {
 				readonly at: number;
 		  }) => void)
 		| undefined;
+	readonly #onReadinessSuccess: ((input: { readonly originKey: string; readonly at: number }) => void) | undefined;
 	readonly #now: () => number;
 	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
@@ -286,6 +287,8 @@ export class MonitorPropagator {
 			readonly originKey: string;
 			readonly at: number;
 		}) => void;
+		/** Reports successful monitor dispatches that require no adapter delivery. */
+		onReadinessSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
@@ -329,6 +332,7 @@ export class MonitorPropagator {
 		this.#deliver = options.deliver;
 		this.#notifyInbound = options.notifyInbound;
 		this.#onReadinessFailure = options.onReadinessFailure;
+		this.#onReadinessSuccess = options.onReadinessSuccess;
 		this.#now = options.now ?? (() => Date.now());
 		this.#acquireLease =
 			options.acquireLease ??
@@ -1179,13 +1183,18 @@ export class MonitorPropagator {
 				// instead of pretending a delivery is still pending (issue #29 defect 3).
 				const target = monitor.channelTarget ?? this.#ownerTarget;
 				if (!target) {
+					let noDeliveryRecorded = false;
 					for (const row of fenced) {
 						if (this.#database.monitors.authoredOutput(row.event_id) === undefined) continue;
 						const updated = this.#database.transaction((tx) =>
 							this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "authored_no_delivery", batchId),
 						);
-						if (updated) this.#emitStage(row, "authored_no_delivery");
+						if (updated) {
+							noDeliveryRecorded = true;
+							this.#emitStage(row, "authored_no_delivery");
+						}
 					}
+					if (noDeliveryRecorded) this.#recordReadinessSuccess(sessionOriginKey);
 					return;
 				}
 				// Fenced delivery admission: the ledger insert is conditional on every
@@ -1211,11 +1220,13 @@ export class MonitorPropagator {
 					)
 					.filter((entry) => isSilentOutput(entry.note));
 				// Mark all silent notes as authored_no_delivery
+				let noDeliveryRecorded = false;
 				for (const entry of silentEntries) {
 					if (this.#database.monitors.authoredOutput(entry.eventId) === undefined) continue;
-					this.#database.transaction((tx) =>
+					const updated = this.#database.transaction((tx) =>
 						this.#database.monitors.eventFencedUpdate(tx, entry.eventId, leaseId, "authored_no_delivery", batchId),
 					);
+					if (updated) noDeliveryRecorded = true;
 				}
 				const validDeliveryEntries: typeof nonSilentEntries = [];
 				for (const entry of nonSilentEntries) {
@@ -1277,7 +1288,7 @@ export class MonitorPropagator {
 					// until the next adapter reconnect flushed redeliveries (live finding:
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
-				}
+				} else if (noDeliveryRecorded) this.#recordReadinessSuccess(sessionOriginKey);
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
@@ -1677,6 +1688,13 @@ export class MonitorPropagator {
 		this.#memory.enqueueExistingId(intentId);
 		if (reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
+	}
+	#recordReadinessSuccess(originKey: string): void {
+		try {
+			this.#onReadinessSuccess?.({ originKey, at: this.#now() });
+		} catch {
+			console.error("monitor readiness observer failed");
+		}
 	}
 	#isReportableResult(monitor: MonitorRecord, eventType: string, note: string): boolean {
 		if (isSilentOutput(note)) return false;

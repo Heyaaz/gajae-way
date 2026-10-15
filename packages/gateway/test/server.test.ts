@@ -327,6 +327,106 @@ test("status readiness degrades on sustained delivery failure and recovers after
 	client.close();
 });
 
+test("delivery sweep expirations degrade delivery readiness, including monitor batches", async () => {
+	const { client, config, database } = await startDeliveryServer({ deliverySweepIntervalMs: 20 });
+	const ledger = new DeliveryService(database);
+	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
+	const staleAt = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+	const setStale = (deliveryId: string) => {
+		const raw = new Database(config.dbPath);
+		try {
+			raw.query("UPDATE deliveries SET created_at = ? WHERE delivery_id = ?").run(staleAt, deliveryId);
+		} finally {
+			raw.close();
+		}
+	};
+	const expire = async (deliveryId: string) => {
+		for (let attempt = 0; attempt < 500 && ledger.get(deliveryId)?.state !== "expired"; attempt++) await Bun.sleep(5);
+		expect(ledger.get(deliveryId)?.state).toBe("expired");
+	};
+	const confirm = async (deliveryId: string) => {
+		expect(ledger.prepare(`recovery-${deliveryId}`, origin, "reply", undefined, deliveryId)).toBeDefined();
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `confirm-${deliveryId}`,
+			verb: "delivery.confirm",
+			params: { deliveryId },
+		});
+		await waitFrame(client.frames, `confirm-${deliveryId}`);
+	};
+
+	for (let index = 0; index < 3; index++) {
+		const deliveryId = `readiness-expired-${index}`;
+		expect(
+			ledger.createPending({
+				deliveryId,
+				turnId: `ordinary-${index}`,
+				originKey: originKey(origin),
+				payloadJson: "{}",
+			}),
+		).toBe(true);
+		setStale(deliveryId);
+	}
+	await Promise.all([0, 1, 2].map((index) => expire(`readiness-expired-${index}`)));
+	client.send({ v: "0.1", type: "request", id: "delivery-expiry-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "delivery-expiry-status");
+	expect(client.frames.find((frame) => frame.id === "delivery-expiry-status").result.readiness).toMatchObject({
+		ready: false,
+		failure: { category: "delivery", code: "delivery_expired", consecutiveFailures: 3 },
+	});
+	await confirm("clear-expired-delivery-streak");
+
+	const monitor = new MonitorRegistry(database).add({
+		name: "readiness-expiry-monitor",
+		trigger: { kind: "cron", schedule: "0 */2 * * *" },
+		eventTypes: ["readiness.expiry"],
+		burstPolicy: "serialize",
+		enabled: false,
+	});
+	for (let index = 0; index < 3; index++) {
+		const batchId = `monitor-batch-${index}`;
+		const eventId = `monitor-event-${index}`;
+		const deliveryId = `monitor-readiness-expired-${index}`;
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "readiness.expiry",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			database.monitors.eventUpdate(tx, eventId, "authored", batchId);
+			database.monitors.authoredOutputCreate(tx, eventId, "monitor report");
+		});
+		expect(
+			ledger.createPending({
+				deliveryId,
+				turnId: batchId,
+				originKey: originKey(origin),
+				payloadJson: JSON.stringify({
+					turnId: batchId,
+					origin,
+					role: "assistant",
+					text: "monitor report",
+					final: true,
+					deliveryId,
+				}),
+			}),
+		).toBe(true);
+		setStale(deliveryId);
+		await expire(deliveryId);
+		await confirm(`clear-monitor-delivery-${index}`);
+	}
+	client.send({ v: "0.1", type: "request", id: "monitor-expiry-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "monitor-expiry-status");
+	expect(client.frames.find((frame) => frame.id === "monitor-expiry-status").result.readiness).toMatchObject({
+		ready: false,
+		failure: { category: "monitor_delivery", code: "delivery_expired", consecutiveFailures: 3 },
+	});
+	client.close();
+});
+
 test("inflight rows are not re-broadcast by the timed sweep within ack timeout", async () => {
 	const { client, database } = await startDeliveryServer({ deliverySweepIntervalMs: 50 });
 	const origin = { platform: "discord", kind: "dm", conversationId: "inflight-test", peerId: "owner" };

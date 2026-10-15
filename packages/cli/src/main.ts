@@ -3,7 +3,6 @@
 import { isAbsolute, resolve } from "node:path";
 
 import type {
-	GatewayStatusResult,
 	MonitorEventOperatorResult,
 	MonitorEventRecord,
 	MonitorRecord,
@@ -422,10 +421,6 @@ export function cycleExitCode(cycle: OpsCycleResult): number {
 	return cycle.gates.length > 0 ? 1 : 0;
 }
 
-export function statusExitCode(status: GatewayStatusResult): number {
-	return status.readiness.ready ? 0 : 1;
-}
-
 export function renderSlo(result: OpsSloResult): string[] {
 	const message = result.ok
 		? `SLO ok: ${result.days.length} consecutive UTC days`
@@ -680,9 +675,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "status": {
 				const client = await connectGatewaySocket(parsed.socket);
 				try {
-					const status = await client.status();
-					console.log(JSON.stringify(status));
-					process.exitCode = statusExitCode(status);
+					console.log(JSON.stringify(await client.status()));
 				} finally {
 					await client.close();
 				}

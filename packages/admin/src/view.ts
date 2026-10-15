@@ -335,8 +335,8 @@ function statusRow(
 
 	return {
 		key: "status",
-		tone: status ? (!readiness?.ready || danger ? "danger" : "ok") : "danger",
-		state: status ? (readiness?.ready ? "alive" : "degraded") : "unreachable",
+		tone: status ? (readiness?.ready === false || danger ? "danger" : "ok") : "danger",
+		state: status ? (readiness?.ready === false ? "degraded" : "alive") : "unreachable",
 		fields: {
 			alive: status
 				? startedAt

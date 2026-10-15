@@ -883,6 +883,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				origin: originKey,
 				at,
 			}),
+		onReadinessSuccess: () => readiness.recordSuccess("monitor_delivery"),
 		// AC7: the ONE production compaction seam. Native compaction runs through the
 		// broker-bound SessionPort, whose authenticated control receipt is the only
 		// affirmative compaction observation (logged by the TailRunner); the monitor
@@ -1361,7 +1362,7 @@ async function handleRequest(
 					});
 				}
 				if (failedRow?.state === "expired")
-					reportDeliveryExpired(runtime, options.database, failedRow, safeDiagnosticField(params.reason));
+					reportDeliveryExpired(runtime, options.database, failedRow, safeDiagnosticField(params.reason), true);
 			}
 			// A failed monitor-batch delivery stays distinguishable: its events keep
 			// stage `authored` (or `batched` before authoring) so reconcile and the
@@ -3980,6 +3981,7 @@ function reportDeliveryExpired(
 	database: Store,
 	expired: Pick<ExpiredDeliveryRow, "deliveryId" | "originKey" | "attempts">,
 	reason: string,
+	readinessFailureRecorded = false,
 ): void {
 	const deliveryId = safeDiagnosticField(expired.deliveryId);
 	const origin = safeDiagnosticField(expired.originKey);
@@ -3990,9 +3992,10 @@ function reportDeliveryExpired(
 	// A monitor batch riding on this delivery can never be confirmed now: fail its
 	// events terminally with the delivery evidence instead of leaving them
 	// `authored` forever (#94).
-	database.transaction((tx) => {
+	const expiration = database.transaction((tx) => {
 		const current = database.outbox.get(expired.deliveryId);
-		if (current?.state !== "expired") return;
+		if (current?.state !== "expired") return undefined;
+		const hasMonitorEvents = database.monitors.eventsByBatch(current.turnId).length > 0;
 		database.monitors.eventsFailExpiredDelivery(
 			tx,
 			current.turnId,
@@ -4000,7 +4003,26 @@ function reportDeliveryExpired(
 			current.attempts,
 			safeDiagnosticField(reason),
 		);
+		return { current, hasMonitorEvents };
 	});
+	if (!expiration) return;
+	if (!readinessFailureRecorded) {
+		const code = expiration.current.lastError ?? "delivery_expired";
+		runtime.readiness.recordFailure({
+			category: "delivery",
+			code,
+			detail: `delivery expired before confirmation (${code})`,
+			origin: expiration.current.originKey,
+		});
+		if (expiration.hasMonitorEvents) {
+			runtime.readiness.recordFailure({
+				category: "monitor_delivery",
+				code,
+				detail: `monitor delivery expired before confirmation (${code})`,
+				origin: expiration.current.originKey,
+			});
+		}
+	}
 	if (expired.deliveryId.startsWith("gw-x-")) return;
 	const ownerTarget = runtime.config.ownerTarget?.origin;
 	if (!ownerTarget) return;

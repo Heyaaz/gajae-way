@@ -79,6 +79,17 @@ describe("status bar", () => {
 		});
 	});
 
+	test("missing readiness is shown as unreported without changing process liveness", async () => {
+		const { readiness: _readiness, ...legacyStatus } = STATUS;
+		const state = await snapshot({ "gateway.status": legacyStatus });
+		expect(state.status).toMatchObject({
+			tone: "ok",
+			state: "alive",
+			fields: { readiness: "not reported" },
+			tones: { readiness: "muted" },
+		});
+	});
+
 	test("carries no diagnostics: pid and schemaVersion are not glance-level facts", async () => {
 		const state = await snapshot();
 		const rendered = Object.values(state.status.fields).join(" ");
