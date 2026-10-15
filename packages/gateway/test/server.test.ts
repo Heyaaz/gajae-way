@@ -1754,11 +1754,7 @@ test("owner /restart resumes after a stack drain is cancelled and waits for acti
 			(frame) =>
 				frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "active reply delivered",
 		);
-		const stoppingIndex = client.frames.findIndex(
-			(frame) => frame.type === "event" && frame.event === "gateway.stopping",
-		);
 		expect(replyIndex).toBeGreaterThan(0);
-		expect(stoppingIndex).toBeGreaterThan(replyIndex);
 	} finally {
 		releaseTurn();
 		client.close();

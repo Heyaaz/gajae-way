@@ -558,6 +558,7 @@ test("restart-stack does not stop stale services when persona drain fails", asyn
 			binDir,
 			unitDir,
 			env: { ...process.env, HOME: home },
+			probe: async () => undefined,
 			prepareRestartDrain: async () => {
 				throw new ProtocolError("verb_failed", "persona reply delivery was not confirmed");
 			},
@@ -596,6 +597,7 @@ test("Linux restart-stack preserves a stale unit when systemd cannot stop it", a
 			binDir,
 			unitDir,
 			env: { ...process.env, HOME: home },
+			probe: async () => undefined,
 			prepareRestartDrain: async () => ({
 				assertActive: async () => {},
 				cancel: async () => {
