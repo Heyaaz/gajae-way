@@ -142,6 +142,45 @@ test("session.create interrupted after the broker applied it: the restarted gate
 	).toBeUndefined();
 });
 
+test("session.create success without an ID retains its key so retry recovers the applied session", async () => {
+	const { authority, repo } = await setup();
+	const sessions = new Map<string, string>();
+	const createKeys: string[] = [];
+	let createAttempts = 0;
+	const cli: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			const key = args[args.indexOf("--idempotency-key") + 1] ?? "";
+			createKeys.push(key);
+			createAttempts++;
+			const sessionId = sessions.get(key) ?? "sdk-created-once";
+			sessions.set(key, sessionId);
+			return createAttempts === 1 ? ok({}) : ok({ sessionId });
+		}
+		if (args.includes("inspect")) return ok({ session: { live: true, deleted: false, locator: { repo } } });
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+	const scope = JSON.stringify(["lane/a", 0]);
+
+	await expect(port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toThrow(
+		"session.create succeeded without a sessionId",
+	);
+	expect(database!.bindings.brokerOperation(authority, "session.create", scope)).toMatchObject({ state: "pending" });
+	const binding = await port.bind({ originKey: "lane/a", epoch: 0, repo });
+
+	expect(createKeys).toHaveLength(2);
+	expect(createKeys[1]).toBe(createKeys[0]);
+	expect(sessions.size).toBe(1);
+	expect(binding.sessionId).toBe("sdk-created-once");
+	expect(database!.bindings.brokerOperation(authority, "session.create", scope)).toBeUndefined();
+});
+
 test("a changed repository retires the pending create before binding a replacement session", async () => {
 	const { path, authority, repo } = await setup();
 	const broker = new FakeBroker();

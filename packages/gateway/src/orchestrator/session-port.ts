@@ -672,7 +672,8 @@ export class BrokerSessionPort implements SessionPort {
 		}
 		const sessionId = created.sessionId;
 		if (typeof sessionId !== "string" || sessionId.length === 0) {
-			this.#releaseOperation(intent);
+			// The create may have succeeded even though its result was malformed;
+			// keep the pending key so a retry reconciles instead of creating again.
 			throw new Error("session.create succeeded without a sessionId");
 		}
 		const persistedEpoch = this.#database.bindings.getSessionRecord(input.originKey)?.epoch;
