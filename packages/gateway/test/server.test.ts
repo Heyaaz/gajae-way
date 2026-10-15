@@ -1544,6 +1544,108 @@ test("restart prepare fails closed until an unconfirmed terminal reply is delive
 	}
 });
 
+test("restart prepare waits for a terminal delivery whose actor settled before the drain", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-predrain-delivery-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "terminal reply before drain",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "terminal-before-drain",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "predrain", peerId: "p1" },
+				text: "send a reply before draining",
+				engagement: { mentioned: false, group: false, authorId: "p1" },
+			},
+		});
+		await client.waitForFrame("terminal-before-drain");
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some(
+				(frame) =>
+					frame.type === "event" &&
+					frame.event === "chat.message" &&
+					frame.payload.text === "terminal reply before drain",
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		const terminalReply = client.frames.find(
+			(frame) =>
+				frame.type === "event" &&
+				frame.event === "chat.message" &&
+				frame.payload.text === "terminal reply before drain",
+		);
+		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
+			throw new Error("pre-drain terminal reply was not broadcast");
+		await Bun.sleep(30);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "prepare-predrain-delivery",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "predrain-delivery", waitMs: 40 },
+		});
+		await client.waitForFrame("prepare-predrain-delivery");
+		expect(client.frames.find((frame) => frame.id === "prepare-predrain-delivery")?.error?.code).toBe("verb_failed");
+		expect(client.frames.some((frame) => frame.id === "prepare-predrain-delivery" && frame.result !== undefined)).toBe(
+			false,
+		);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "confirm-predrain-reply",
+			verb: "delivery.confirm",
+			params: { deliveryId: terminalReply.payload.deliveryId },
+		});
+		await client.waitForFrame("confirm-predrain-reply");
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "recheck-predrain-delivery",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "predrain-delivery", waitMs: 1_000 },
+		});
+		await client.waitForFrame("recheck-predrain-delivery");
+		expect(client.frames.find((frame) => frame.id === "recheck-predrain-delivery")?.result).toEqual({
+			ready: true,
+			drained: true,
+		});
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "cancel-predrain-delivery",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "predrain-delivery" },
+		});
+		await client.waitForFrame("cancel-predrain-delivery");
+		expect(client.frames.find((frame) => frame.id === "cancel-predrain-delivery")?.result).toEqual({ cancelled: true });
+	} finally {
+		client.close();
+	}
+});
+
 test("restart prepare settles a silent turn without waiting for a nonexistent delivery", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-silent-turn-"));
 	const config: GatewayConfig = {

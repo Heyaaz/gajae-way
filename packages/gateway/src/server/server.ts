@@ -467,6 +467,8 @@ interface Runtime {
 	readonly requests: Set<Promise<void>>;
 	/** Supervisor socket that owns each restart drain; disconnect cancels an uncommitted drain. */
 	readonly restartDrainOwners: Map<string, Connection>;
+	/** Terminal reply deliveries remain a restart barrier after their actor settles. */
+	readonly restartTerminalDeliveryIds: Set<string>;
 	/** Read-only runtime-cycle projection (ops.cycle); owns no writes. */
 	readonly cycle: RuntimeCycleProjector;
 	/** Admission cap and retirement for `work.run` lanes. */
@@ -498,10 +500,13 @@ async function releaseOrTransferRestartDrain(runtime: Runtime, restartId: string
 async function waitForRestartTerminalDelivery(runtime: Runtime, terminalDeliveryId: string | null): Promise<void> {
 	const deliveryIds = terminalDeliveryId === null ? [] : terminalDeliveryIds(terminalDeliveryId);
 	if (deliveryIds.length === 0) return;
+	for (const id of deliveryIds) runtime.restartTerminalDeliveryIds.add(id);
 	let probeFailureLogged = false;
-	while (runtime.personaSessions.restartDrainActive && !runtime.stopping) {
+	while (!runtime.stopping) {
 		try {
 			const deliveries = runtime.delivery.getMany(deliveryIds);
+			for (const delivery of deliveries)
+				if (delivery.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
 			if (deliveries.length === deliveryIds.length && deliveries.every((delivery) => delivery.state === "confirmed"))
 				return;
 		} catch (error) {
@@ -510,8 +515,34 @@ async function waitForRestartTerminalDelivery(runtime: Runtime, terminalDelivery
 				probeFailureLogged = true;
 			}
 		}
+		if (!runtime.personaSessions.restartDrainActive) return;
 		await Bun.sleep(25);
 	}
+}
+
+async function waitForRestartTerminalDeliveries(runtime: Runtime, waitMs: number): Promise<boolean> {
+	const deadline = Date.now() + waitMs;
+	let probeFailureLogged = false;
+	while (!runtime.stopping) {
+		const deliveryIds = [...runtime.restartTerminalDeliveryIds];
+		if (deliveryIds.length === 0) return true;
+		try {
+			const deliveries = runtime.delivery.getMany(deliveryIds);
+			for (const delivery of deliveries)
+				if (delivery.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
+			if (deliveries.length === deliveryIds.length && deliveries.every((delivery) => delivery.state === "confirmed"))
+				return true;
+		} catch (error) {
+			if (!probeFailureLogged) {
+				console.error(`restart terminal delivery probe failed: ${diagnostic(error)}`);
+				probeFailureLogged = true;
+			}
+		}
+		const remainingMs = deadline - Date.now();
+		if (remainingMs <= 0) return false;
+		await Bun.sleep(Math.min(25, remainingMs));
+	}
+	return false;
 }
 
 function notifyOwnerRestartCancelled(
@@ -854,6 +885,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const sessionPort = options.sessionPort;
 	const connections = new Set<Connection>();
 	const restartDrainOwners = new Map<string, Connection>();
+	const restartTerminalDeliveryIds = new Set<string>();
 	const inbound = new Map<string, InboundContext>();
 	const delivery = new DeliveryService(options.database);
 	const botAudienceTurns = new BotAudienceTurnGuard(options.database.core);
@@ -1157,6 +1189,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		inbound,
 		requests: new Set(),
 		restartDrainOwners,
+		restartTerminalDeliveryIds,
 		permissionPanels,
 		memoryOps: new Map(),
 		memoryOperationTasks: new Set(),
@@ -1372,7 +1405,13 @@ async function handleRequest(
 				throw new ProtocolError("verb_failed", "restart drain ownership is no longer active");
 			runtime.restartDrainOwners.set(restartId, connection);
 			try {
-				const outcome = await runtime.personaSessions.drainForRestart(restartId, waitMs);
+				const deadline = Date.now() + waitMs;
+				let outcome = await runtime.personaSessions.drainForRestart(restartId, waitMs);
+				if (
+					outcome === "drained" &&
+					!(await waitForRestartTerminalDeliveries(runtime, Math.max(0, deadline - Date.now())))
+				)
+					outcome = "timed_out";
 				if (outcome === "stopped") {
 					runtime.restartDrainOwners.delete(restartId);
 					throw new ProtocolError("gateway_shutting_down", "gateway stopped before persona turns drained");
@@ -1436,6 +1475,7 @@ async function handleRequest(
 				: [];
 			const confirmOutcome = confirmAndSettleMonitorDelivery(options.database, id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			if (runtime.delivery.get(id)?.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(id);
 			if (confirmOutcome === "transitioned" && authoredEvents.length > 0) {
 				const authoredEventIds = new Set(authoredEvents);
 				for (const row of options.database.monitors.eventsByIds(authoredEvents)) {
@@ -2405,10 +2445,14 @@ async function sendChat(
 				await Bun.sleep(Math.min(25, Math.max(1, deadline - now)));
 			}
 			if (runtime.stopping) return;
-			const outcome = await runtime.personaSessions.drainForRestart(
-				ownerRestartId,
-				options.ownerRestartDrainWaitMs ?? PERSONA_RESTART_DRAIN_WAIT_MS,
-			);
+			const drainWaitMs = options.ownerRestartDrainWaitMs ?? PERSONA_RESTART_DRAIN_WAIT_MS;
+			const drainDeadline = Date.now() + drainWaitMs;
+			let outcome = await runtime.personaSessions.drainForRestart(ownerRestartId, drainWaitMs);
+			if (
+				outcome === "drained" &&
+				!(await waitForRestartTerminalDeliveries(runtime, Math.max(0, drainDeadline - Date.now())))
+			)
+				outcome = "timed_out";
 			if (outcome === "stopped") return exit(RESTART_EXIT_CODE);
 			if (outcome === "timed_out") {
 				console.warn("owner restart cancelled; persona reply delivery was not confirmed before the drain deadline");
