@@ -3495,7 +3495,7 @@ test("#481 a detached checkout is not parked when no PR lookup can be attempted"
 });
 
 test("#595 completed lane with already-green remote-head checks settles without parking", async () => {
-	const checks = scriptedChecks({ prNumber: 496, status: "green", failingChecks: [] });
+	const checks = scriptedChecks({ prNumber: 496, status: "green", failingChecks: [], prState: "open" });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 	const head = await laneRepo(f.directory, "fix/already-green", true);
 	const result = await started(f, "a", origin);
@@ -3507,6 +3507,28 @@ test("#595 completed lane with already-green remote-head checks settles without 
 		`head=${head.slice(0, 12)} pushed=true remoteHead=${head.slice(0, 12)} pr=496 checks=green`,
 	);
 	expect(checks.calls).toEqual([{ headSha: head, cwd: f.directory }]);
+});
+
+test("#595 green checks on a closed, unmerged PR leave the lane resumable", async () => {
+	const checks = scriptedChecks({
+		prNumber: 598,
+		status: "green",
+		failingChecks: [],
+		prState: "closed",
+		merged: false,
+	});
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/closed-unmerged-green", true);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "closed PR must not finalize lane");
+	await until(() => f.notices.some((notice) => notice.text.includes("[lane a] completed")));
+	expect(f.job().state).toBe("awaiting_checks");
+
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().escalations.at(-1)).toContain("awaiting_checks ended: pr_closed pr=598");
+	const resumed = await f.manager.start({ name: "a", text: "resume closed-PR work", cwd: f.directory });
+	expect(resumed).toMatchObject({ started: true });
 });
 
 test("#481 awaiting_checks: green checks settle the lane done and report the pass", async () => {

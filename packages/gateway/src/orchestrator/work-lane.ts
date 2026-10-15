@@ -1601,6 +1601,7 @@ export class WorkLaneManager {
 				if (
 					job.state === "awaiting_checks" &&
 					checks?.status === "green" &&
+					(checks.prState === "open" || checks.merged === true) &&
 					facts?.pushed === true &&
 					facts.remoteHeadSha === facts.headSha &&
 					checks.headSha === facts.remoteHeadSha
