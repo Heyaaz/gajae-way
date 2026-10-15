@@ -17,7 +17,7 @@ import {
 	supervisorArgv,
 } from "../src/restart-stack";
 
-import { launchAgentPlistPath, serviceSpecs, systemdUnitName, systemdUnitPath } from "../src/services";
+import { launchAgentPlistPath, restartOrder, serviceSpecs, systemdUnitName, systemdUnitPath } from "../src/services";
 
 const DEPLOYED_AT = Date.parse("2026-08-29T06:40:00.000Z");
 const BIN_DIR = "/opt/gajaeway/bin";
@@ -169,10 +169,10 @@ test("restarting the gateway as part of the sequence still completes the remaini
 		}
 		expect(receipt?.state).toBe("ok");
 		expect(receipt?.steps.map((step) => [step.label, step.result])).toEqual(
-			serviceSpecs().map((spec) => [spec.label, "ok"]),
+			restartOrder("darwin").map((spec) => [spec.label, "ok"]),
 		);
 		expect((await Bun.file(join(home, "ran.log")).text()).trim().split("\n")).toEqual(
-			serviceSpecs().map((spec) => spec.label),
+			restartOrder("darwin").map((spec) => spec.label),
 		);
 	} finally {
 		await cleanup();
@@ -288,6 +288,52 @@ test("restart-stack waits for an in-flight service command before releasing a su
 		expect(commands).toHaveLength(1);
 	} finally {
 		finishCommand.resolve();
+		await host.close();
+		await cleanup();
+	}
+});
+
+test("macOS restarts gateway last so the old gateway holds the drain through adapter restarts", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	const order: string[] = [];
+	let drainClosed = false;
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "gateway-last-for-drain",
+			prepareRestartDrain: async () => ({
+				superseded: new AbortController().signal,
+				assertActive: async () => {},
+				cancel: async () => {
+					throw new Error("successful gateway restart must not cancel its drain");
+				},
+				close: async () => {
+					drainClosed = true;
+				},
+			}),
+			runner: async (command) => {
+				const label = command.at(-1)?.split("/").at(-1);
+				if (!label) throw new Error("restart command has no service label");
+				order.push(label);
+				if (label === "dev.gajaeway.gateway") {
+					expect(order).toEqual([
+						"dev.gajaeway.broker",
+						"dev.gajaeway.adapter-discord",
+						"dev.gajaeway.adapter-slack",
+						"dev.gajaeway.adapter-telegram",
+						"dev.gajaeway.admin",
+						"dev.gajaeway.gateway",
+					]);
+					expect(drainClosed).toBe(false);
+				}
+				return await host.options.runner(command);
+			},
+		});
+		expect(receipt.state).toBe("ok");
+		expect(order.at(-1)).toBe("dev.gajaeway.gateway");
+		expect(drainClosed).toBe(true);
+	} finally {
 		await host.close();
 		await cleanup();
 	}
@@ -469,9 +515,16 @@ test("a matching MainPID with a lease owner predating the restart is stale", asy
 		await Bun.sleep(2);
 		const receipt = await runRestartStack({ ...host.options, id: "lease-stale" });
 		expect(receipt.state).toBe("stale");
-		expect(receipt.steps.map((step) => step.result)).toEqual(["ok", "ok", "stale", "skipped", "skipped", "skipped"]);
-		expect(receipt.steps[2]?.detail).toBe("lease owner predates this restart sequence");
-		expect(host.ran).toEqual(["dev.gajaeway.broker", "dev.gajaeway.gateway", "dev.gajaeway.adapter-discord"]);
+		expect(receipt.steps.map((step) => step.result)).toEqual([
+			"ok",
+			"stale",
+			"skipped",
+			"skipped",
+			"skipped",
+			"skipped",
+		]);
+		expect(receipt.steps[1]?.detail).toBe("lease owner predates this restart sequence");
+		expect(host.ran).toEqual(["dev.gajaeway.broker", "dev.gajaeway.adapter-discord"]);
 	} finally {
 		await host.close();
 		await holder.release();
@@ -503,8 +556,8 @@ test("an installed adapter with no adapter config is skipped, not a failed resta
 		await rm(join(home, "adapter-slack.json"));
 		const receipt = await runRestartStack({ ...host.options, id: "unconfigured-adapter" });
 		expect(receipt.state).toBe("ok");
-		expect(receipt.steps.map((step) => step.result)).toEqual(["ok", "ok", "ok", "skipped", "ok", "ok"]);
-		expect(receipt.steps[3]?.detail).toBe("adapter is not configured");
+		expect(receipt.steps.map((step) => step.result)).toEqual(["ok", "ok", "skipped", "ok", "ok", "ok"]);
+		expect(receipt.steps[2]?.detail).toBe("adapter is not configured");
 		expect(host.ran).not.toContain("dev.gajaeway.adapter-slack");
 	} finally {
 		await host.close();
@@ -518,8 +571,8 @@ test("a failed service-manager command fails the receipt and skips later units",
 	try {
 		const receipt = await runRestartStack({ ...host.options, id: "failed-command" });
 		expect(receipt.state).toBe("failed");
-		expect(receipt.steps.map((step) => step.result)).toEqual(["ok", "ok", "ok", "failed", "skipped", "skipped"]);
-		expect(receipt.steps[3]?.detail).toBe(
+		expect(receipt.steps.map((step) => step.result)).toEqual(["ok", "ok", "failed", "skipped", "skipped", "skipped"]);
+		expect(receipt.steps[2]?.detail).toBe(
 			"launchctl kickstart -k gui/501/dev.gajaeway.adapter-slack exited with status 3",
 		);
 	} finally {
@@ -763,7 +816,9 @@ test("restart status reads the persisted lease diagnostics without a gateway con
 		console.log = (line: unknown) => lines.push(String(line));
 		await main(["ops", "restart-stack", "--status"]);
 		expect(lines[0]).toBe("restart-stack status-receipt: stale");
-		expect(lines.some((line) => line.startsWith(`dev.gajaeway.gateway: ok pid=${process.pid} started=`))).toBe(true);
+		expect(lines.some((line) => line.startsWith(`dev.gajaeway.adapter-discord: ok pid=${process.pid} started=`))).toBe(
+			true,
+		);
 		expect(process.exitCode).toBe(1);
 	} finally {
 		console.log = originalLog;

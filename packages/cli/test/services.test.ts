@@ -176,10 +176,13 @@ test("restart-stack is one systemctl call on linux and an ordered kickstart chai
 
 	const darwin = restartStackCommands("darwin", 501);
 	expect(darwin[0]).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.broker"]);
-	expect(darwin[1]).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.gateway"]);
+	expect(darwin.at(-1)).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.gateway"]);
 	expect(darwin).toHaveLength(serviceSpecs().length);
-	for (const spec of serviceSpecs().filter((candidate) => candidate.dependsOnGateway))
+	const gatewayIndex = darwin.findIndex((command) => command[3] === "gui/501/dev.gajaeway.gateway");
+	for (const spec of serviceSpecs().filter((candidate) => candidate.dependsOnGateway)) {
 		expect(darwin).toContainEqual(["launchctl", "kickstart", "-k", `gui/501/${spec.label}`]);
+		expect(darwin.findIndex((command) => command[3] === `gui/501/${spec.label}`)).toBeLessThan(gatewayIndex);
+	}
 	// bootout removes the job and leaves the bot offline with no automatic recovery.
 	expect(darwin.flat()).not.toContain("bootout");
 });

@@ -167,7 +167,7 @@ function newReceipt(
 		state: "queued",
 		platform,
 		requestedAt: new Date(now).toISOString(),
-		steps: restartOrder().map((spec, index) => ({
+		steps: restartOrder(platform).map((spec, index) => ({
 			label: spec.label,
 			...(platform === "darwin"
 				? { command: commands[index] }
@@ -411,7 +411,7 @@ async function runRestartStackWithLease(
 	const binDir = installedBinDir ?? dirname(process.execPath);
 
 	const originalPids = new Map<string, number | undefined>();
-	for (const spec of restartOrder()) {
+	for (const spec of restartOrder(platform)) {
 		if (SERVICE_LEASES[spec.id] === undefined && (await isInstalled(spec.label)))
 			originalPids.set(spec.label, (await probe(spec.label))?.pid);
 	}
