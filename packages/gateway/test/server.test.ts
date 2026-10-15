@@ -1646,6 +1646,132 @@ test("restart prepare waits for a terminal delivery whose actor settled before t
 	}
 });
 
+test("restart prepare includes unconfirmed terminal deliveries persisted by the prior gateway", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-durable-delivery-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const firstDatabase = await Store.open(config.dbPath);
+	const firstSessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "durable terminal reply",
+	});
+	attachTestBrokerOwnership(firstDatabase, firstSessionPort, join(directory, "agent"));
+	server = await startUnixServer({
+		config,
+		database: firstDatabase,
+		sessionPort: firstSessionPort,
+		onStop: () => firstDatabase.close(),
+	});
+	const firstClient = await connect(config.socketPath);
+	let client: Awaited<ReturnType<typeof connect>> | undefined;
+	try {
+		firstClient.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(firstClient.frames, 1);
+		firstClient.send({
+			v: "0.1",
+			type: "request",
+			id: "create-durable-terminal",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "durable", peerId: "p1" },
+				text: "persist a terminal reply",
+				engagement: { mentioned: false, group: false, authorId: "p1" },
+			},
+		});
+		await firstClient.waitForFrame("create-durable-terminal");
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!firstClient.frames.some(
+				(frame) =>
+					frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "durable terminal reply",
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		const terminalReply = firstClient.frames.find(
+			(frame) =>
+				frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "durable terminal reply",
+		);
+		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
+			throw new Error("terminal reply was not persisted by the first gateway");
+		const deliveryId = terminalReply.payload.deliveryId;
+		expect(firstDatabase.inbox.completedTerminalDeliveryIds(new Date(Date.now() - 60_000).toISOString())).toContain(
+			deliveryId,
+		);
+		await Bun.sleep(30);
+		firstClient.close();
+		await server.stop();
+		server = undefined;
+
+		const database = await Store.open(config.dbPath);
+		const sessionPort = sessionPortFromResponder({
+			bind: (key, epoch) => bindWorkFixture(key, epoch),
+			respond: async () => "unused",
+		});
+		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+		client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "prepare-after-gateway-restart",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "durable-terminal", waitMs: 40 },
+		});
+		await client.waitForFrame("prepare-after-gateway-restart");
+		expect(client.frames.find((frame) => frame.id === "prepare-after-gateway-restart")?.error?.code).toBe(
+			"verb_failed",
+		);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "confirm-durable-terminal",
+			verb: "delivery.confirm",
+			params: { deliveryId },
+		});
+		await client.waitForFrame("confirm-durable-terminal");
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "recheck-durable-terminal",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "durable-terminal", waitMs: 1_000 },
+		});
+		await client.waitForFrame("recheck-durable-terminal");
+		expect(client.frames.find((frame) => frame.id === "recheck-durable-terminal")?.result).toEqual({
+			ready: true,
+			drained: true,
+		});
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "cancel-durable-terminal",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "durable-terminal" },
+		});
+		await client.waitForFrame("cancel-durable-terminal");
+		expect(client.frames.find((frame) => frame.id === "cancel-durable-terminal")?.result).toEqual({
+			cancelled: true,
+		});
+	} finally {
+		firstClient.close();
+		client?.close();
+		await server?.stop();
+		server = undefined;
+	}
+});
+
 test("restart prepare settles a silent turn without waiting for a nonexistent delivery", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-silent-turn-"));
 	const config: GatewayConfig = {

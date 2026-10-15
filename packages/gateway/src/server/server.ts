@@ -100,7 +100,12 @@ import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } fro
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
-import { type InboundMessageRow, type TerminalUnlinkedReason, terminalDeliveryIds } from "../store/groups/inbox";
+import {
+	CONVERSATION_CONTEXT_RETENTION_MS,
+	type InboundMessageRow,
+	type TerminalUnlinkedReason,
+	terminalDeliveryIds,
+} from "../store/groups/inbox";
 import type { MonitorEventStage } from "../store/groups/monitors";
 import type { ExpiredDeliveryRow } from "../store/groups/outbox";
 import { deriveActivity } from "./activity";
@@ -520,16 +525,28 @@ async function waitForRestartTerminalDelivery(runtime: Runtime, terminalDelivery
 	}
 }
 
-async function waitForRestartTerminalDeliveries(runtime: Runtime, waitMs: number): Promise<boolean> {
+async function waitForRestartTerminalDeliveries(runtime: Runtime, database: Store, waitMs: number): Promise<boolean> {
 	const deadline = Date.now() + waitMs;
 	let probeFailureLogged = false;
+	try {
+		const since = new Date(Date.now() - CONVERSATION_CONTEXT_RETENTION_MS).toISOString();
+		for (const id of database.inbox.completedTerminalDeliveryIds(since)) runtime.restartTerminalDeliveryIds.add(id);
+		const deliveries = runtime.delivery.getMany([...runtime.restartTerminalDeliveryIds]);
+		for (const delivery of deliveries)
+			if (delivery.state === "confirmed" || delivery.state === "expired")
+				runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
+	} catch (error) {
+		console.error(`restart terminal delivery index failed: ${diagnostic(error)}`);
+		return false;
+	}
 	while (!runtime.stopping) {
 		const deliveryIds = [...runtime.restartTerminalDeliveryIds];
 		if (deliveryIds.length === 0) return true;
 		try {
 			const deliveries = runtime.delivery.getMany(deliveryIds);
 			for (const delivery of deliveries)
-				if (delivery.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
+				if (delivery.state === "confirmed" || delivery.state === "expired")
+					runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
 			if (deliveries.length === deliveryIds.length && deliveries.every((delivery) => delivery.state === "confirmed"))
 				return true;
 		} catch (error) {
@@ -1409,7 +1426,7 @@ async function handleRequest(
 				let outcome = await runtime.personaSessions.drainForRestart(restartId, waitMs);
 				if (
 					outcome === "drained" &&
-					!(await waitForRestartTerminalDeliveries(runtime, Math.max(0, deadline - Date.now())))
+					!(await waitForRestartTerminalDeliveries(runtime, options.database, Math.max(0, deadline - Date.now())))
 				)
 					outcome = "timed_out";
 				if (outcome === "stopped") {
@@ -2450,7 +2467,7 @@ async function sendChat(
 			let outcome = await runtime.personaSessions.drainForRestart(ownerRestartId, drainWaitMs);
 			if (
 				outcome === "drained" &&
-				!(await waitForRestartTerminalDeliveries(runtime, Math.max(0, drainDeadline - Date.now())))
+				!(await waitForRestartTerminalDeliveries(runtime, options.database, Math.max(0, drainDeadline - Date.now())))
 			)
 				outcome = "timed_out";
 			if (outcome === "stopped") return exit(RESTART_EXIT_CODE);
