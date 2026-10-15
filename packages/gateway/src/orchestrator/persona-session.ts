@@ -1783,8 +1783,8 @@ class OriginActor {
 			// No send was attempted. A broker disown code or positive liveness
 			// proof can therefore release this row without replaying accepted work.
 			// A generic failure alone is not authority to replace the session.
-			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
 			this.#manager.recordSessionCreateFailure(this.originKey, "session_attach_failed", safeDiagnostic(error));
+			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
 			const nextEpoch = this.#manager.database.transaction((tx) => {
 				retryInboundTurn(this.#manager.database, tx, opRef);
 				return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);

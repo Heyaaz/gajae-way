@@ -400,6 +400,37 @@ test("create-then-disown attachment failures degrade session-create readiness", 
 	client.close();
 });
 
+test("generic tail attachment failures degrade session-create readiness without rebinding", async () => {
+	let attachmentAttempts = 0;
+	const { client } = await startDeliveryServer({
+		attachTail: async () => {
+			attachmentAttempts += 1;
+			throw new Error("protocol_error: broker tail timeout");
+		},
+	});
+	for (let index = 0; index < 3; index++) {
+		const conversationId = `readiness-generic-attach-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `generic-attach-${index}`,
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, `generic-attach-${index}`);
+		for (let attempt = 0; attempt < 400 && attachmentAttempts < index + 1; attempt++) await Bun.sleep(5);
+	}
+	expect(attachmentAttempts).toBe(3);
+	client.send({ v: "0.1", type: "request", id: "generic-attach-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "generic-attach-status");
+	const readiness = client.frames.find((frame) => frame.id === "generic-attach-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "session_create", code: "session_attach_failed", consecutiveFailures: 3 },
+	});
+	client.close();
+});
+
 test("create-attach-send-disown cycles degrade session-create readiness", async () => {
 	let sendAttempts = 0;
 	const { client } = await startDeliveryServer({
