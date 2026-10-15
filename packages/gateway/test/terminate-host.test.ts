@@ -82,8 +82,9 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
  * SIGTERM. A shell no-op loop carries the tag in its own argv, so
  * `ps -o command=` shows it (`sleep` rejects extra arguments and exits at once).
  */
-function fakeHost(argvTag: string) {
-	return Bun.spawn(["sh", "-c", "while :; do sleep 1; done", argvTag], { stdout: "ignore", stderr: "ignore" });
+function fakeHost(argvTag: string, ignoreTerm = false) {
+	const loop = ignoreTerm ? "trap '' TERM; while :; do sleep 1; done" : "while :; do sleep 1; done";
+	return Bun.spawn(["sh", "-c", loop, argvTag], { stdout: "ignore", stderr: "ignore" });
 }
 
 test("a live session host reported by the broker is SIGTERMed and exits", async () => {
@@ -93,6 +94,21 @@ test("a live session host reported by the broker is SIGTERMed and exits", async 
 		const outcome = await h.port.terminateHost({ sessionId: "s-1", repo: h.repo });
 		expect(outcome).toEqual({ outcome: "terminated", pid: child.pid });
 		expect(await child.exited).not.toBe(0); // signalled, not a clean exit
+	} finally {
+		child.kill();
+		await h.close();
+	}
+});
+
+test("a session host that ignores SIGTERM is escalated and confirmed exited", async () => {
+	const child = fakeHost("sdk session-host-internal", true);
+	const h = await harness(() => child.pid);
+	try {
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo })).toEqual({
+			outcome: "terminated",
+			pid: child.pid,
+		});
+		expect(await child.exited).not.toBe(0);
 	} finally {
 		child.kill();
 		await h.close();
@@ -179,17 +195,25 @@ test("a pid that already exited is already gone, not an error", async () => {
 	}
 });
 
-test("a dead host still checks the final cutoff guard before authorizing turn closure", async () => {
+test("an already-dead host is reported gone without invoking the signal guard", async () => {
 	const child = fakeHost("sdk session-host-internal");
 	const pid = child.pid;
 	child.kill();
 	await child.exited;
 	const h = await harness(() => pid);
 	try {
-		expect(await h.port.terminateHost({ sessionId: "s-8", repo: h.repo, shouldTerminate: () => false })).toEqual({
-			outcome: "refused",
-			reason: "termination_guard_rejected",
-		});
+		let guardCalls = 0;
+		expect(
+			await h.port.terminateHost({
+				sessionId: "s-8",
+				repo: h.repo,
+				shouldTerminate: () => {
+					guardCalls++;
+					return false;
+				},
+			}),
+		).toEqual({ outcome: "already_gone" });
+		expect(guardCalls).toBe(0);
 	} finally {
 		await h.close();
 	}

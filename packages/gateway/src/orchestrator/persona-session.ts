@@ -948,7 +948,7 @@ class OriginActor {
 	/** Active turns count; idle session IDs count only while the broker can manage them. */
 	get hostLive(): boolean {
 		return (
-			this.#current !== undefined ||
+			(this.#current !== undefined && !this.#current.stallHostTerminated) ||
 			this.#retired.size > 0 ||
 			(this.#manager.brokerAvailable && this.#hostSessionId !== undefined)
 		);
@@ -2868,17 +2868,40 @@ class OriginActor {
 			}
 			return false;
 		}
-		this.#manager.log(
-			`stalled_turn_cutoff origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} elapsedMs=${this.#manager.now() - (bound.stallStartedAtMs ?? this.#manager.now())} outcome=${result.outcome}`,
-			"warn",
-		);
 		bound.stallHostTerminated = true;
 		if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
+		this.#manager.hostFreed();
+		this.#manager.log(
+			`stalled_turn_host_terminated origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} outcome=${result.outcome}`,
+			"warn",
+		);
 		if (jobs && result.outcome === "terminated")
 			this.#manager.log(
 				`stalled_turn_jobs_lost origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} ${jobs}`,
 				"warn",
 			);
+		let latest: StatusReport;
+		try {
+			latest = await this.#statusOf(bound);
+		} catch (error) {
+			if (!this.#stopped && !this.#manager.stopped) {
+				this.#manager.log(
+					`stalled_turn_post_stop_status_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+					"warn",
+				);
+				this.#scheduleStatusRecheck(bound);
+			}
+			return false;
+		}
+		if (isTerminalStatus(latest.status.status)) {
+			await this.#reconcileBound(bound, latest);
+			return true;
+		}
+		if (!canTerminate()) return false;
+		this.#manager.log(
+			`stalled_turn_cutoff origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} elapsedMs=${this.#manager.now() - (bound.stallStartedAtMs ?? this.#manager.now())} outcome=${result.outcome} status=${latest.status.status}`,
+			"warn",
+		);
 		await this.#closeAcceptedOnDeadSession(bound, "stalled_no_terminal_event");
 		return true;
 	}
@@ -3149,12 +3172,12 @@ class OriginActor {
 		}
 	}
 
-	async #reconcileBound(bound: BoundTurn): Promise<void> {
+	async #reconcileBound(bound: BoundTurn, knownReport?: StatusReport): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
 		let report: StatusReport;
 		try {
-			report = await this.#statusOf(bound);
+			report = knownReport ?? (await this.#statusOf(bound));
 		} catch (error) {
 			if (this.#stopped || this.#manager.stopped) return;
 			// The broker disowning the id (session_unavailable) with the session

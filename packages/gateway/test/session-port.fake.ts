@@ -239,6 +239,8 @@ export class ScriptedSessionPort implements SessionPort {
 		shouldTerminate?: () => boolean | Promise<boolean>;
 	}): Promise<TerminateHostOutcome> {
 		await this.beforeTerminateHost?.({ sessionId: input.sessionId, repo: input.repo });
+		const state = this.#sessionStates.get(input.sessionId);
+		if (!state || state.live === false) return { outcome: "already_gone" };
 		if (input.shouldTerminate) {
 			try {
 				if (!(await input.shouldTerminate())) return { outcome: "refused", reason: "termination_guard_rejected" };
@@ -246,8 +248,6 @@ export class ScriptedSessionPort implements SessionPort {
 				return { outcome: "refused", reason: `termination_guard_failed:${String(error)}` };
 			}
 		}
-		const state = this.#sessionStates.get(input.sessionId);
-		if (!state || state.live === false) return { outcome: "already_gone" };
 		await this.close(input);
 		return { outcome: "terminated", pid: 40_000 + this.closes.length };
 	}
