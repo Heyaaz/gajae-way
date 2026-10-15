@@ -771,6 +771,11 @@ export class BrokerSessionPort implements SessionPort {
 		);
 	}
 
+	#releaseCompletedCloseOperation(sessionId: string): void {
+		const previous = this.#database.bindings.brokerOperation(this.#authority, "session.close", sessionId);
+		if (previous?.state === "complete") this.#releaseOperation(previous);
+	}
+
 	#createRotations(originKey: string): number {
 		const raw = this.#database.core.metaGet(createRotationMetaKey(originKey));
 		const value = raw === undefined ? Number.NaN : Number(raw);
@@ -1024,6 +1029,7 @@ export class BrokerSessionPort implements SessionPort {
 			}
 		}
 		this.#resetCreateRotations(input.originKey);
+		this.#releaseCompletedCloseOperation(input.sessionId);
 		return { sessionId: input.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 	}
 

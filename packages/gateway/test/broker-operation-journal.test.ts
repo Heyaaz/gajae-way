@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
@@ -361,6 +361,57 @@ test("cold-create readiness surfaces a broker-unavailable envelope after persist
 	});
 	expect(creates).toBe(1);
 	expect(inspects).toBe(2);
+});
+
+test("resuming a session invalidates its completed close before a later retirement", async () => {
+	const { authority, repo } = await setup();
+	const sessionId = "sdk-resumed";
+	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey: "lane/resume", epoch: 0 });
+	const transcriptDir = join(home, "agent", "sessions", "v2-scope");
+	await mkdir(transcriptDir, { recursive: true });
+	await writeFile(join(transcriptDir, "2026-10-01T00-00-00-000Z_sdk-resumed.jsonl"), "{}\n");
+	let live = false;
+	const closeKeys: string[] = [];
+	const cli: CliRunner = async (args) => {
+		if (args.includes("session.close")) {
+			closeKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			return ok({ closed: true });
+		}
+		if (args.includes("session.resume")) {
+			live = true;
+			return ok({ resumed: true });
+		}
+		if (args.includes("inspect"))
+			return ok({
+				session: {
+					sessionId,
+					live,
+					deleted: false,
+					locator: { repo },
+					hostIncarnation: live ? "host-resumed" : "host-closed",
+				},
+			});
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+
+	await port.close({ sessionId, repo });
+	expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toMatchObject({
+		state: "complete",
+	});
+	await expect(port.resume({ sessionId, repo, originKey: "lane/resume", epoch: 0 })).resolves.toMatchObject({
+		sessionId,
+	});
+	expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+	await port.close({ sessionId, repo });
+	expect(closeKeys).toHaveLength(2);
+	expect(closeKeys[1]).not.toBe(closeKeys[0]);
 });
 
 test("a finished create is never served to a later bind after the lane's session died", async () => {
