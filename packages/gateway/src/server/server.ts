@@ -748,6 +748,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
+		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
 		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {

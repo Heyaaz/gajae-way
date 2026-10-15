@@ -396,6 +396,8 @@ export interface PersonaSessionManagerOptions {
 	readonly sessionModel?: GjcModelSelection;
 	readonly stallTimeoutMs?: number;
 	readonly brokerGeneration?: () => number;
+	/** Current broker health; an idle host cannot consume capacity while its broker is unavailable. */
+	readonly brokerAvailable?: () => boolean;
 	readonly now?: () => number;
 	readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
 	readonly clearTimeout?: (timer: unknown) => void;
@@ -473,6 +475,7 @@ export class PersonaSessionManager {
 	readonly #sessionModel: GjcModelSelection | undefined;
 	#stallTimeoutMs: number;
 	readonly #brokerGeneration: () => number;
+	readonly #brokerAvailable: (() => boolean) | undefined;
 	readonly #now: () => number;
 	readonly #setTimeout: (work: () => void, delayMs: number) => unknown;
 	readonly #clearTimeout: (timer: unknown) => void;
@@ -502,6 +505,7 @@ export class PersonaSessionManager {
 		this.#sessionModel = options.sessionModel;
 		this.#stallTimeoutMs = positiveInteger(options.stallTimeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 		this.#brokerGeneration = options.brokerGeneration ?? (() => 0);
+		this.#brokerAvailable = options.brokerAvailable;
 		this.#now = options.now ?? (() => Date.now());
 		this.#setTimeout = options.setTimeout ?? ((work: () => void, delayMs: number) => setTimeout(work, delayMs));
 		this.#clearTimeout =
@@ -580,7 +584,7 @@ export class PersonaSessionManager {
 		return this.#hostIdleRetireMs;
 	}
 
-	/** Origins this gateway currently counts as holding a live session host. */
+	/** Origins this gateway counts as holding a live session host; idle IDs do not count while the broker is unavailable. */
 	liveHostCount(): number {
 		let live = 0;
 		for (const actor of this.#actors.values()) if (actor.hostLive) live++;
@@ -759,6 +763,10 @@ export class PersonaSessionManager {
 		return this.#brokerGeneration();
 	}
 
+	get brokerAvailable(): boolean {
+		return this.#brokerAvailable?.() ?? true;
+	}
+
 	get brokerAgentDir(): string | undefined {
 		return this.#brokerAgentDir;
 	}
@@ -908,14 +916,19 @@ class OriginActor {
 		this.originKey = originKey;
 	}
 
-	/** True while this origin holds a host: a tracked idle binding, or any turn (live or retired) still bound. */
+	/** Active turns count; idle session IDs count only while the broker can manage them. */
 	get hostLive(): boolean {
-		return this.#hostSessionId !== undefined || this.#current !== undefined || this.#retired.size > 0;
+		return (
+			this.#current !== undefined ||
+			this.#retired.size > 0 ||
+			(this.#manager.brokerAvailable && this.#hostSessionId !== undefined)
+		);
 	}
 
-	/** A live host with no turn in flight, nothing retired, and nothing about to dispatch. */
+	/** An available idle host with no turn in flight, nothing retired, and nothing about to dispatch. */
 	get hostIdle(): boolean {
 		return (
+			this.#manager.brokerAvailable &&
 			this.#hostSessionId !== undefined &&
 			this.#state === "idle" &&
 			this.#current === undefined &&
