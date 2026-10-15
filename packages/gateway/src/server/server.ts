@@ -584,12 +584,26 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	void runtime.memory.initialize();
 	void runtime.monitors.reconcile();
 	void runtime.monitorRuntime.start();
+	const pendingStdoutWrites = new Set<Promise<void>>();
 	const connection: Connection = {
 		decoder: new FrameDecoder(),
 		negotiated: false,
-		write: (frame) => process.stdout.write(encodeFrame(runtime.secretGuard.guardFrame(frame))),
+		write: (frame) => {
+			const pending = new Promise<void>((resolve, reject) => {
+				process.stdout.write(encodeFrame(runtime.secretGuard.guardFrame(frame)), (error) => {
+					if (error) reject(error);
+					else resolve();
+				});
+			}).catch((error: unknown) => {
+				console.error(`gateway stdio write failed: ${diagnostic(error)}`);
+			});
+			pendingStdoutWrites.add(pending);
+			void pending.finally(() => pendingStdoutWrites.delete(pending));
+		},
 		close: () => process.stdin.pause(),
-		settle: async () => {},
+		settle: async () => {
+			while (pendingStdoutWrites.size > 0) await Promise.all([...pendingStdoutWrites]);
+		},
 	};
 	runtime.connections.add(connection);
 	let stopping = false;
@@ -634,6 +648,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			connection.close();
 			await settleMemory(runtime);
 			await options.onStop?.();
+			await connection.settle();
 		})();
 		return stopPromise;
 	};
