@@ -43,6 +43,7 @@ async function harness(options: {
 	hostIdleRetireMs?: number;
 	now?: () => number;
 	brokerAvailable?: () => boolean;
+	onFailure?: () => void;
 }) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-host-cap-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -59,6 +60,14 @@ async function harness(options: {
 		...(options.hostIdleRetireMs === undefined ? {} : { hostIdleRetireMs: options.hostIdleRetireMs }),
 		...(options.now ? { now: options.now } : {}),
 		...(options.brokerAvailable ? { brokerAvailable: options.brokerAvailable } : {}),
+		...(options.onFailure
+			? {
+					onTurnStart: ({ trigger }) => ({
+						text: trigger.body,
+						onFailure: () => options.onFailure?.(),
+					}),
+				}
+			: {}),
 		log: (line) => {
 			logs.push(line);
 		},
@@ -164,9 +173,17 @@ test("with every host busy a new origin is held, not spawned, and dispatches whe
 	expect(h.manager.admissionHold(origin("c").key)).toBeUndefined();
 });
 
-test("a stalled-turn cutoff frees its dead host slot without an idle-retirement retry", async () => {
+test("a stalled-turn cutoff frees one host slot once when its failure notice retries", async () => {
 	let clock = 1_000_000;
-	const h = await harness({ maxLiveHosts: 1, now: () => clock });
+	let failureCalls = 0;
+	const h = await harness({
+		maxLiveHosts: 1,
+		now: () => clock,
+		onFailure: () => {
+			failureCalls++;
+			if (failureCalls === 1) throw new Error("cutoff notice persistence failed");
+		},
+	});
 	await h.send("a", "a1");
 	await eventually(() => h.sent("a1") !== undefined, "a1 was not dispatched");
 	const sessionA = h.sessionOf("a1");
@@ -188,7 +205,6 @@ test("a stalled-turn cutoff frees its dead host slot without an idle-retirement 
 	});
 	h.port.terminateHost = async (input) => {
 		terminationCalls++;
-		if (terminationCalls > 1) return { outcome: "refused", reason: "inspect_failed:broker_unavailable" };
 		return await originalTerminate(input);
 	};
 	h.port.bind = async (input) => {
@@ -204,11 +220,15 @@ test("a stalled-turn cutoff frees its dead host slot without an idle-retirement 
 	await eventually(() => h.port.statusReads.length > statusReads, "stalled turn did not reconcile status");
 	clock += STALLED_TURN_TERMINAL_TIMEOUT_MS;
 	try {
-		await h.manager.tick(origin("a").key);
+		await expect(h.manager.tick(origin("a").key)).rejects.toThrow("cutoff notice persistence failed");
 		await eventually(() => bindCalls > 0, "no capacity waiter started binding after the dead host was removed");
 		await Bun.sleep(50);
 		expect(bindCalls).toBe(1);
 		expect(h.manager.admissionHold(origin("c").key)).toBe("host_capacity");
+		await h.manager.tick(origin("a").key);
+		expect(bindCalls).toBe(1);
+		expect(h.manager.admissionHold(origin("c").key)).toBe("host_capacity");
+		expect(failureCalls).toBe(2);
 		releaseBinds();
 		await eventually(
 			() => h.sent("b1") !== undefined,
@@ -216,7 +236,7 @@ test("a stalled-turn cutoff frees its dead host slot without an idle-retirement 
 		);
 		expect(h.manager.admissionHold(origin("b").key)).toBeUndefined();
 		expect(h.sent("c1")).toBeUndefined();
-		expect(terminationCalls).toBe(1);
+		expect(terminationCalls).toBe(2);
 		expect(h.port.closes.map((close) => close.sessionId)).toContain(sessionA);
 		expect(h.manager.liveHostCount()).toBe(1);
 	} finally {

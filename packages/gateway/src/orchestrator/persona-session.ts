@@ -2868,14 +2868,17 @@ class OriginActor {
 			}
 			return false;
 		}
+		const firstHostTermination = !bound.stallHostTerminated;
 		bound.stallHostTerminated = true;
 		if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
-		this.#manager.hostFreed();
-		this.#manager.log(
-			`stalled_turn_host_terminated origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} outcome=${result.outcome}`,
-			"warn",
-		);
-		if (jobs && result.outcome === "terminated")
+		if (firstHostTermination) {
+			this.#manager.hostFreed();
+			this.#manager.log(
+				`stalled_turn_host_terminated origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} outcome=${result.outcome}`,
+				"warn",
+			);
+		}
+		if (firstHostTermination && jobs && result.outcome === "terminated")
 			this.#manager.log(
 				`stalled_turn_jobs_lost origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} ${jobs}`,
 				"warn",
