@@ -604,6 +604,10 @@ export class BrokerSessionPort implements SessionPort {
 							"broker unavailable",
 					);
 				if (envelope.ok === false) indexed = !isSessionGoneCode(envelope.error?.code);
+				// A previous gateway may have resumed this host and crashed before
+				// invalidating the prior incarnation's close intent.
+				if (envelope.ok === true && envelope.result?.session?.live === true)
+					this.#releaseCloseOperation(existing.sessionId);
 				if (envelope.ok === true && envelope.result?.session?.live === false) {
 					if (envelope.result.session.deleted !== true) {
 						try {
@@ -1034,6 +1038,10 @@ export class BrokerSessionPort implements SessionPort {
 			if (sessionPath === undefined)
 				throw new Error(`cannot resume session ${input.sessionId}: no unique saved transcript`);
 			this.#assertOwned(input);
+			// A completed or pending close belongs to the old host incarnation.
+			// Delete it before resume: the broker may create a new live host and
+			// then lose the reply, leaving no safe window for post-resume cleanup.
+			this.#releaseCloseOperation(input.sessionId);
 			let failure: unknown;
 			try {
 				parseEnvelope(

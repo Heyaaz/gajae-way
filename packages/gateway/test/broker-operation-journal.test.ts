@@ -515,6 +515,7 @@ test("resuming a session invalidates pending and completed closes before a later
 		}
 		if (args.includes("session.resume")) {
 			const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: string };
+			expect(database!.bindings.brokerOperation(authority, "session.close", request.sessionId ?? "")).toBeUndefined();
 			if (request.sessionId) live.set(request.sessionId, true);
 			return ok({ resumed: true });
 		}
@@ -553,6 +554,113 @@ test("resuming a session invalidates pending and completed closes before a later
 		expect(keys).toHaveLength(2);
 		expect(keys[1]).not.toBe(keys[0]);
 	}
+});
+
+test("resume removes a close intent before a broker-side resume can lose its reply", async () => {
+	const { authority, repo } = await setup();
+	const sessionId = "sdk-resume-reply-lost";
+	const originKey = "lane/resume-reply-lost";
+	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
+	const transcriptDir = join(home, "agent", "sessions", "v2-scope");
+	await mkdir(transcriptDir, { recursive: true });
+	await writeFile(join(transcriptDir, `2026-10-01T00-00-00-000Z_${sessionId}.jsonl`), "{}\n");
+	database!.transaction((tx) =>
+		database!.bindings.beginBrokerOperation(tx, authority, {
+			operation: "session.close",
+			scope: sessionId,
+			operationRef: "gw-close-stale",
+			requestJson: JSON.stringify({ sessionId }),
+		}),
+	);
+	let live = false;
+	let inspections = 0;
+	let resumeAttempts = 0;
+	const closeKeys: string[] = [];
+	const cli: CliRunner = async (args) => {
+		if (args.includes("session.resume")) {
+			resumeAttempts++;
+			expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+			live = true;
+			throw new GjcCliUnavailableError("broker restarted after applying resume");
+		}
+		if (args.includes("session.close")) {
+			closeKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			return ok({ closed: true });
+		}
+		if (args.includes("inspect")) {
+			inspections++;
+			if (inspections === 2)
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({ ok: false, error: { code: "broker_unavailable", message: "broker restarting" } }),
+					stderr: "",
+				};
+			return ok({
+				session: {
+					sessionId,
+					live,
+					deleted: false,
+					locator: { repo },
+					hostIncarnation: live ? "new-host" : "old-host",
+				},
+			});
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const options = {
+		database: database!,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	};
+	const input = { sessionId, repo, originKey, epoch: 0 };
+
+	await expect(new BrokerSessionPort(options).resume(input)).rejects.toBeInstanceOf(GjcCliUnavailableError);
+	expect(resumeAttempts).toBe(1);
+	expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+	await expect(new BrokerSessionPort(options).resume(input)).resolves.toMatchObject({ sessionId });
+	await new BrokerSessionPort(options).close({ sessionId, repo });
+	expect(resumeAttempts).toBe(1);
+	expect(closeKeys).toHaveLength(1);
+	expect(closeKeys[0]).not.toBe("gw-close-stale");
+});
+
+test("bind clears a stale pending close when inspection confirms a resumed host is live", async () => {
+	const { authority, repo } = await setup();
+	const sessionId = "sdk-live-after-resume";
+	const originKey = "lane/live-after-resume";
+	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
+	database!.transaction((tx) =>
+		database!.bindings.beginBrokerOperation(tx, authority, {
+			operation: "session.close",
+			scope: sessionId,
+			operationRef: "gw-close-stale",
+			requestJson: JSON.stringify({ sessionId }),
+		}),
+	);
+	const closeKeys: string[] = [];
+	const cli: CliRunner = async (args) => {
+		if (args.includes("inspect")) return ok({ session: { sessionId, live: true, deleted: false, locator: { repo } } });
+		if (args.includes("session.close")) {
+			closeKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			return ok({ closed: true });
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+
+	await expect(port.bind({ originKey, epoch: 0, repo })).resolves.toMatchObject({ sessionId, epoch: 0 });
+	expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+	await port.close({ sessionId, repo });
+	expect(closeKeys).toHaveLength(1);
+	expect(closeKeys[0]).not.toBe("gw-close-stale");
 });
 
 test("a finished create is never served to a later bind after the lane's session died", async () => {
