@@ -15,6 +15,7 @@ import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
+import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
 	LastAssistantUnreadableError,
@@ -68,11 +69,7 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
 };
 
-/**
- * Stable, public-safe dispatch failure codes. The raw error message is NEVER
- * persisted or logged — it can carry secrets (tokens, URLs, file paths); the
- * structured code plus the dispatch phase is what the operator gets.
- */
+/** Stable, public-safe dispatch failure codes. */
 type DispatchFailureCode =
 	| "session_bind_failed"
 	| "authoring_turn_failed"
@@ -1718,6 +1715,11 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	// The session port waited for the runtime to go idle and it never did.
 	// Nothing was sent, so the event replays cleanly on the next reconcile.
 	if (isSessionBusy(error)) return "session_busy";
+	// Some SDK prompt-terminal failures arrive wrapped in an ordinary Error,
+	// losing the top-level GjcCliError class while preserving the terminal code
+	// in `cause`. Keep these on the authoring-failure path instead of collapsing
+	// them into an opaque internal_error.
+	if (phase === "request" && hasSdkPromptTerminalFailure(error)) return "authoring_turn_failed";
 	// A structured SDK refusal is classified by the phase it interrupted: the
 	// sanitized message no longer carries the verb name, and "internal_error"
 	// hid every configure/request refusal (live: 169 rows in one day, all
@@ -1732,6 +1734,17 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
 	if (step !== undefined) return "authoring_turn_failed";
 	return "internal_error";
+}
+
+function hasSdkPromptTerminalFailure(error: unknown): boolean {
+	const visit = (value: unknown, depth: number, seen: Set<object>): boolean => {
+		if (depth > 4 || value === null || typeof value !== "object" || seen.has(value)) return false;
+		seen.add(value);
+		const fields = value as Record<string, unknown>;
+		if (fields.code === "sdk_prompt_terminal_failed") return true;
+		return ["cause", "details", "error", "detail"].some((key) => visit(fields[key], depth + 1, seen));
+	};
+	return visit(error, 0, new Set());
 }
 
 /** Only positive evidence that the prompt was not sent can justify rolling a session. */
@@ -1838,7 +1851,7 @@ function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): Origi
 	);
 }
 
-/** Only explicit diagnostic vocabulary crosses the durable boundary, never raw error text. */
+/** Extract a bounded, sanitized lower-level diagnosis without persisting raw error payloads. */
 function failureDetail(error: unknown): string {
 	const object = (value: unknown): Record<string, unknown> =>
 		value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
@@ -1908,11 +1921,47 @@ function failureDetail(error: unknown): string {
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
 	// Codes and classifiers the SDK itself produced (envelope error code, terminal
-	// error code, outcome classifiers) are bounded machine tokens: a lowercase
-	// token crosses the boundary, free text never does. Arbitrary `code` fields on
-	// foreign errors stay on the explicit allowlist.
+	// error code, outcome classifiers) are bounded machine tokens. Top-level
+	// `code` fields on foreign errors stay on the explicit allowlist; nested cause
+	// codes and their redacted, length-bounded message are surfaced separately.
 	const sdkToken = (value: unknown): string | undefined =>
 		typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : undefined;
+	const nestedCauses = (value: unknown): Record<string, unknown>[] => {
+		const found: Record<string, unknown>[] = [];
+		const seen = new Set<object>();
+		const visit = (candidate: unknown, depth: number, inCause: boolean): void => {
+			if (depth > 4 || candidate === null || typeof candidate !== "object" || seen.has(candidate)) return;
+			seen.add(candidate);
+			const fields = object(candidate);
+			if (inCause) found.push(fields);
+			for (const key of ["details", "error", "detail", "status", "outcome", "cause"])
+				visit(fields[key], depth + 1, inCause || key === "cause");
+		};
+		visit(value, 0, false);
+		return found;
+	};
+	const causes = nestedCauses(error);
+	const safeCode = (value: unknown): string | undefined => {
+		const token = sdkToken(value);
+		return token !== undefined && sanitizeDiagnostic(token) === token ? token : undefined;
+	};
+	const causeCode = causes
+		.slice()
+		.reverse()
+		.map((fields) => safeCode(fields.code))
+		.find((candidate) => candidate !== undefined);
+	const safeMessage = (value: unknown): string | undefined => {
+		if (typeof value !== "string") return undefined;
+		const cleaned = sanitizeDiagnosticDetail(value, 128);
+		if (!cleaned || cleaned === causeCode) return undefined;
+		return cleaned;
+	};
+	const message = causes
+		.slice()
+		.reverse()
+		.flatMap((fields) => [fields.runtimeMessage, fields.message, fields.reason])
+		.map(safeMessage)
+		.find((candidate) => candidate !== undefined);
 	const outcomeBody = object(terminal.outcome);
 	// #178: a GjcCliError carries the SDK envelope code in `details`, and a
 	// terminal status carries it in `error.code` or `outcome.code`. Those are the
@@ -1941,12 +1990,12 @@ function failureDetail(error: unknown): string {
 	const lastStatus = sdkToken(object(object(fields.lastStatus).status).status);
 	const signal = fields.signal;
 	const status = terminal.status;
-	const message = error instanceof Error ? error.message : "";
-	const cause = /Database has closed|closed database/i.test(message)
+	const outerMessage = error instanceof Error ? error.message : "";
+	const cause = /Database has closed|closed database/i.test(outerMessage)
 		? "database_closed"
-		: /SQLITE_BUSY|database is locked/i.test(message)
+		: /SQLITE_BUSY|database is locked/i.test(outerMessage)
 			? "database_busy"
-			: /timed out|timeout/i.test(message)
+			: /timed out|timeout/i.test(outerMessage)
 				? "timeout"
 				: undefined;
 	const frameNames = ["withTransaction", "#dispatchBatch", "monitorEventFencedFail", "request", "bind"];
@@ -1973,5 +2022,7 @@ function failureDetail(error: unknown): string {
 		...(lastStatus ? { lastStatus } : {}),
 		...(cause ? { cause } : {}),
 		...(frame ? { frame } : {}),
+		...(causeCode && causeCode !== code ? { causeCode } : {}),
+		...(message ? { message } : {}),
 	});
 }
