@@ -161,7 +161,7 @@ export interface CheckStatusSnapshot {
 export interface CheckStatusClient {
 	/**
 	 * Snapshot the PR whose head is `headSha`: null when no matching PR exists,
-	 * undefined when lookup failed, timed out, or a bounded result could not prove absence. Must not throw.
+	 * undefined when lookup failed, timed out, or results are incomplete or ambiguous. Must not throw.
 	 */
 	getCheckStatus(headSha: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
 }
@@ -1601,6 +1601,7 @@ export class WorkLaneManager {
 				if (
 					job.state === "awaiting_checks" &&
 					checks?.status === "green" &&
+					(job.awaitingChecks?.prNumber === null || job.awaitingChecks?.prNumber === checks.prNumber) &&
 					(checks.prState === "open" || checks.merged === true) &&
 					facts?.pushed === true &&
 					facts.remoteHeadSha === facts.headSha &&

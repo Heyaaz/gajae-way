@@ -83,8 +83,9 @@ export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): Check
 					mergedAt?: string | null;
 					statusCheckRollup?: RollupEntry[] | null;
 				}>;
+				if (prs.length >= PR_LOOKUP_LIMIT) return undefined;
 				const matchingPrs = prs.filter((candidate) => candidate.headRefOid === headSha);
-				if (matchingPrs.length === 0) return prs.length >= PR_LOOKUP_LIMIT ? undefined : null;
+				if (matchingPrs.length === 0) return null;
 				const openMatches = matchingPrs.filter((candidate) => candidate.state.toUpperCase() === "OPEN");
 				// The checks cycle persists a PR number, so do not bind it to an arbitrary open match.
 				if (openMatches.length > 1) return undefined;

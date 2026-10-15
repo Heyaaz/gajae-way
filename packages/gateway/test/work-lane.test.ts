@@ -3356,22 +3356,22 @@ test("#595 GH check lookup retries when multiple open PRs share the requested he
 	expect(snapshot).toBeUndefined();
 });
 
-test("#595 GH check lookup keeps a full bounded search retryable when no exact head is found", async () => {
+test("#595 GH check lookup treats a full result page as ambiguous, with or without a match", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
 	const headSha = "f".repeat(40);
 	const ghPath = join(directory, "gh");
 	const client = ghCheckStatusClient(1_000, ghPath);
-	const nonMatchingPrs = (count: number) =>
+	const prResults = (count: number, includeExactHead = false) =>
 		Array.from({ length: count }, (_, index) => ({
 			number: index + 1,
 			state: "CLOSED",
 			mergedAt: null,
-			headRefOid: (index + 1).toString(16).padStart(40, "0"),
+			headRefOid: includeExactHead && index === 0 ? headSha : (index + 1).toString(16).padStart(40, "0"),
 			statusCheckRollup: [],
 		}));
-	const lookup = async (count: number) => {
-		const response = JSON.stringify(nonMatchingPrs(count));
+	const lookup = async (count: number, includeExactHead = false) => {
+		const response = JSON.stringify(prResults(count, includeExactHead));
 		await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(response)}\n`);
 		await chmod(ghPath, 0o755);
 		return client.getCheckStatus(headSha, directory);
@@ -3379,6 +3379,7 @@ test("#595 GH check lookup keeps a full bounded search retryable when no exact h
 
 	expect(await lookup(99)).toBeNull();
 	expect(await lookup(100)).toBeUndefined();
+	expect(await lookup(100, true)).toBeUndefined();
 });
 
 /** A check client whose answer the test changes between polls. */
@@ -3601,6 +3602,28 @@ test("#595 completed lane with already-green remote-head checks settles without 
 		`head=${head.slice(0, 12)} pushed=true remoteHead=${head.slice(0, 12)} pr=496 checks=green`,
 	);
 	expect(checks.calls).toEqual([{ headSha: head, cwd: f.directory }]);
+});
+
+test("#595 a green fast path cannot settle a different PR than the persisted checks cycle", async () => {
+	const checks = scriptedChecks({ prNumber: 596, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/fast-path-pr-mismatch");
+	checks.set({ prNumber: 596, status: "red", failingChecks: ["lint"], prState: "open" });
+	await pollUntil(f, () => f.port.sends.length === 2);
+	expect(f.job().awaitingChecks?.prNumber).toBe(596);
+	checks.set({ prNumber: 597, status: "green", failingChecks: [], prState: "open" });
+	const repair = f.port.sends[1];
+	if (!repair) throw new Error("red checks did not start a repair attempt");
+	const noticesBefore = f.notices.length;
+	f.port.complete(repair.opRef, "finished repair");
+	await until(() => f.notices.length > noticesBefore);
+	expect(f.job().state).toBe("awaiting_checks");
+
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().escalations.at(-1)).toContain("awaiting_checks ended: pr_closed pr=596");
+	const resumed = await f.manager.start({ name: "a", text: "resume after PR changed", cwd: f.directory });
+	expect(resumed).toMatchObject({ started: true });
 });
 
 test("#595 green checks on a closed, unmerged PR leave the lane resumable", async () => {
