@@ -2307,6 +2307,45 @@ test("tail activity that resumes after the stall deadline cancels the cutoff", a
 	expect(port.closes).toHaveLength(0);
 });
 
+test("resumed activity clears an unknown-status recovery hold before a later stall", async () => {
+	class UnknownStatusPort extends ScriptedSessionPort {
+		unknown = false;
+
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			const report = await super.status(input);
+			return this.unknown ? { ...report, status: { status: "unknown" as const }, summaryCompleted: false } : report;
+		}
+	}
+	const port = new UnknownStatusPort();
+	let assistantFrames = 0;
+	await harness(port, {
+		onFrame: (frame) => {
+			if (frame.assistantText) assistantFrames++;
+		},
+	});
+	enqueue("unknown-stall-trigger", "keep working");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const first = port.sends[0]!;
+	port.unknown = true;
+
+	let statusReads = port.statusReads.length;
+	port.emitStall(first.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "first stall did not reconcile unknown status");
+	enqueue("unknown-stall-queued", "wait for the current turn", "lane_report");
+	await manager!.notifyInbound(KEY);
+	port.emitAssistant(first.sessionId, "The operation resumed", "unknown-resumed", first.opRef);
+	await eventually(() => assistantFrames === 1, "resumed tail activity was not delivered");
+
+	statusReads = port.statusReads.length;
+	port.emitStall(first.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "second stall did not reconcile the current turn");
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(port.sends).toHaveLength(1);
+	expect(port.closes).toHaveLength(0);
+	expect(database!.inbox.pendingCount(KEY)).toBe(2);
+});
+
 test("an unanswerable liveness probe is not wedge evidence: the turn stays held", async () => {
 	class UnanswerablePort extends WedgedSessionPort {
 		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {

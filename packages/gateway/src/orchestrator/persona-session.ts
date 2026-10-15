@@ -3921,6 +3921,9 @@ class OriginActor {
 		bound.stallStartedAtMs = undefined;
 		bound.stallActivityVersion = undefined;
 		bound.stallTerminationWarningLogged = false;
+		// Unknown-status sweeps are also the legacy recovery-hold signal checked
+		// by the next stall. Resumed activity invalidates that hold as well.
+		this.#holdSweeps.delete(bound.turn.opRef);
 		if (!bound.tailEvidenceUnavailable) this.#cancelStatusRecheck(bound);
 	}
 
