@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, type Lease, type LeaseName, leaseHeld } from "@gajae-gateway/home";
+import { ProtocolError } from "@gajae-gateway/protocol";
 
 import { main } from "../src/main";
 import {
@@ -256,6 +257,52 @@ test("restart-stack cancels the persona drain when a service restart fails befor
 		expect(cancelled).toBe(true);
 		expect(closed).toBe(true);
 		expect(host.ran).toEqual(["dev.gajaeway.broker"]);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
+test("the first update from a pre-drain gateway records its durable-recovery bootstrap", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home, installed: async (label) => label === "dev.gajaeway.gateway" });
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "legacy-gateway-update",
+			trigger: "update",
+			prepareRestartDrain: async (_socketPath, _restartId, trigger) => {
+				expect(trigger).toBe("update");
+				throw new ProtocolError("unknown_verb", "gateway restart drain is not supported");
+			},
+		});
+		expect(receipt.state).toBe("ok");
+		expect(receipt.warning).toBe("running gateway lacks restart draining; this update relies on durable turn recovery");
+		expect(renderRestartReceipt(receipt)).toContain(
+			"warning: running gateway lacks restart draining; this update relies on durable turn recovery",
+		);
+		expect(receipt.steps.find((step) => step.label === "dev.gajaeway.gateway")?.result).toBe("ok");
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
+test("manual restart refuses to bypass the drain on a pre-drain gateway", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "legacy-manual-restart",
+			prepareRestartDrain: async () => {
+				throw new ProtocolError("unknown_verb", "gateway restart drain is not supported");
+			},
+		});
+		expect(receipt.state).toBe("failed");
+		expect(receipt.detail).toContain("gateway restart drain is not supported");
+		expect(receipt.steps.every((step) => step.result === "skipped")).toBe(true);
+		expect(host.ran).toEqual([]);
 	} finally {
 		await host.close();
 		await cleanup();
@@ -842,12 +889,14 @@ test("an uninstalled service is skipped and does not abort the remaining stack",
 test("supervisorArgv escapes the gateway cgroup on systemd without bootout", () => {
 	const worker = ["/opt/bin/gajaeway", "ops", "restart-stack", "--run", "r1"];
 	expect(supervisorArgv("darwin", worker, "/h", "r1")).toEqual(worker);
-	const linux = supervisorArgv("linux", worker, "/h", "r1", BIN_DIR);
+	const socketPath = "/run/user/1000/gajaeway/custom.sock";
+	const linux = supervisorArgv("linux", worker, "/h", "r1", BIN_DIR, socketPath);
 
 	expect(linux.slice(0, 2)).toEqual(["systemd-run", "--user"]);
 	expect(linux).toContain("--service-type=exec");
 	expect(linux).toContain("--unit=gajaeway-restart-stack-r1");
 	expect(linux).toContain(`--setenv=GAJAEWAY_BIN_DIR=${BIN_DIR}`);
+	expect(linux).toContain(`--setenv=GAJAEWAY_SOCKET_PATH=${socketPath}`);
 	expect(linux.slice(-worker.length)).toEqual(worker);
 	expect([...linux, ...worker]).not.toContain("bootout");
 });

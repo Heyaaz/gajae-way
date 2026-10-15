@@ -11,6 +11,7 @@ import {
 	leaseHeld,
 	readLeaseOwner,
 } from "@gajae-gateway/home";
+import { ProtocolError } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 
 import {
@@ -47,6 +48,8 @@ export interface RestartDrainLease {
 	close(): Promise<void>;
 }
 
+export type RestartTrigger = "update" | "manual";
+
 export interface RestartStep {
 	readonly label: string;
 	/** The final service-manager command; update broker receipts separately record agent sync. */
@@ -63,7 +66,7 @@ export interface RestartStep {
 
 export interface RestartReceipt {
 	readonly id: string;
-	readonly trigger: "update" | "manual";
+	readonly trigger: RestartTrigger;
 	state: RestartState;
 	readonly platform: ServicePlatform;
 	readonly requestedAt: string;
@@ -71,6 +74,8 @@ export interface RestartReceipt {
 	finishedAt?: string;
 	/** Why the sequence never ran, e.g. the supervisor could not be started. */
 	detail?: string;
+	/** Warning for a safe, narrowly-scoped transition from a pre-drain gateway release. */
+	warning?: string;
 	readonly steps: RestartStep[];
 }
 
@@ -90,8 +95,12 @@ export interface RunRestartOptions {
 	/** Gateway socket override passed through the detached supervisor. */
 	readonly gatewaySocketPath?: string;
 	/** Test seam for the gateway's durable persona-turn drain. */
-	readonly prepareRestartDrain?: (socketPath: string, restartId: string) => Promise<RestartDrainLease | undefined>;
-	readonly trigger?: "update" | "manual";
+	readonly prepareRestartDrain?: (
+		socketPath: string,
+		restartId: string,
+		trigger: RestartTrigger,
+	) => Promise<RestartDrainLease | undefined>;
+	readonly trigger?: RestartTrigger;
 	readonly platform?: ServicePlatform;
 	readonly uid?: number;
 	readonly runner?: CommandRunner;
@@ -208,6 +217,7 @@ async function defaultBinaryModifiedAt(path: string): Promise<number> {
 async function prepareGatewayRestartDrain(
 	socketPath: string,
 	restartId: string,
+	_trigger: RestartTrigger,
 ): Promise<RestartDrainLease | undefined> {
 	let client: GajaewayClient;
 	try {
@@ -232,6 +242,7 @@ async function prepareGatewayRestartDrain(
 			// closing the socket also releases an uncommitted hold.
 		}
 		await client.close();
+		if (error instanceof ProtocolError && error.code === "unknown_verb") throw error;
 		throw new Error(`gateway restart drain failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	return {
@@ -387,14 +398,20 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 		restartDrain = await (options.prepareRestartDrain ?? prepareGatewayRestartDrain)(
 			options.gatewaySocketPath ?? env.GAJAEWAY_SOCKET_PATH ?? join(options.home, "gateway.sock"),
 			options.id,
+			receipt.trigger,
 		);
 	} catch (error) {
-		receipt.state = "failed";
-		receipt.finishedAt = new Date(now()).toISOString();
-		receipt.detail = `persona turn drain failed: ${error instanceof Error ? error.message : String(error)}`;
-		for (const step of receipt.steps) step.result = "skipped";
-		await writeReceipt(options.home, receipt);
-		return receipt;
+		if (receipt.trigger === "update" && error instanceof ProtocolError && error.code === "unknown_verb") {
+			receipt.warning = "running gateway lacks restart draining; this update relies on durable turn recovery";
+			await writeReceipt(options.home, receipt);
+		} else {
+			receipt.state = "failed";
+			receipt.finishedAt = new Date(now()).toISOString();
+			receipt.detail = `persona turn drain failed: ${error instanceof Error ? error.message : String(error)}`;
+			for (const step of receipt.steps) step.result = "skipped";
+			await writeReceipt(options.home, receipt);
+			return receipt;
+		}
 	}
 
 	let issuedAt = now();
@@ -629,14 +646,16 @@ export async function launchRestartStack(
 	const receipt = newReceipt(randomUUID(), platform, options.uid, Date.now(), options.trigger ?? "manual");
 	await writeReceipt(options.home, receipt);
 	const worker = [...(options.worker ?? [...cliCommand(), "ops", "restart-stack"]), "--run", receipt.id];
-	const argv = supervisorArgv(platform, worker, options.home, receipt.id, options.binDir);
+	const workerEnv = options.env ?? process.env;
+	const gatewaySocketPath = options.gatewaySocketPath ?? workerEnv.GAJAEWAY_SOCKET_PATH;
+	const argv = supervisorArgv(platform, worker, options.home, receipt.id, options.binDir, gatewaySocketPath);
 	const spawnOptions = {
 		detached: true,
 		stdin: "ignore" as const,
 		stdout: "ignore" as const,
 		stderr: "ignore" as const,
 		env: {
-			...(options.env ?? process.env),
+			...workerEnv,
 			GAJAEWAY_HOME: options.home,
 			...(options.gatewaySocketPath === undefined ? {} : { GAJAEWAY_SOCKET_PATH: options.gatewaySocketPath }),
 			...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
@@ -712,6 +731,7 @@ export function supervisorArgv(
 	home: string,
 	id: string,
 	binDir?: string,
+	gatewaySocketPath?: string,
 ): string[] {
 	if (platform === "darwin") return [...worker];
 	return [
@@ -723,6 +743,7 @@ export function supervisorArgv(
 		`--unit=gajaeway-restart-stack-${id}`,
 		`--setenv=GAJAEWAY_HOME=${home}`,
 		...(binDir === undefined ? [] : [`--setenv=GAJAEWAY_BIN_DIR=${binDir}`]),
+		...(gatewaySocketPath === undefined ? [] : [`--setenv=GAJAEWAY_SOCKET_PATH=${gatewaySocketPath}`]),
 		"--",
 		...worker,
 	];
@@ -749,6 +770,7 @@ export function renderRestartReceipt(
 		`requestedAt: ${receipt.requestedAt}`,
 		`finishedAt: ${receipt.finishedAt ?? "-"}`,
 		...(receipt.detail === undefined ? [] : [`detail: ${receipt.detail}`]),
+		...(receipt.warning === undefined ? [] : [`warning: ${receipt.warning}`]),
 	];
 	for (const step of receipt.steps) {
 		const facts = [
