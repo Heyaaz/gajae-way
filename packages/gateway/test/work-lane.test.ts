@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
@@ -19,6 +19,7 @@ import {
 	type WorkerOutputResult,
 } from "../src/orchestrator/session-port";
 import {
+	assertOutsideServiceDirectory,
 	type CheckStatusClient,
 	type CheckStatusSnapshot,
 	getServiceDirectory,
@@ -2811,3 +2812,24 @@ test("issue #480: the production service directory is this source checkout, not 
 	expect(getServiceDirectory()).toBe(root);
 	expect(getServiceDirectory()).not.toBe(dirname(process.execPath));
 });
+
+test("issue #579: a compiled binary resolves the service directory from its own path, not the virtual module root", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gw-579-"));
+	try {
+		const entry = join(dir, "entry.ts");
+		await writeFile(
+			entry,
+			`import { getServiceDirectory } from ${JSON.stringify(join(import.meta.dir, "../src/orchestrator/work-lane"))};\nconsole.log(getServiceDirectory());\n`,
+		);
+		const outfile = join(dir, "probe");
+		const build = Bun.spawnSync([process.execPath, "build", "--compile", entry, "--outfile", outfile]);
+		expect(build.exitCode).toBe(0);
+		const run = Bun.spawnSync([outfile], { cwd: dir });
+		expect(run.exitCode).toBe(0);
+		const resolved = run.stdout.toString().trim();
+		expect(resolved).toBe(await realpath(dir));
+		expect(() => assertOutsideServiceDirectory(resolved, join(tmpdir(), "elsewhere"), "probe")).not.toThrow();
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+}, 60_000);
