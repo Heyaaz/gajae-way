@@ -23,6 +23,7 @@ test("Slack entities survive escaping; everything else in angle brackets is esca
 		["<https://example.com/path?a=1&b=2>", "<https://example.com/path?a=1&b=2>"],
 		["<https://example.com/a*b*c>", "<https://example.com/a*b*c>"],
 		["<https://example.com/~~gone~~|details>", "<https://example.com/~~gone~~|details>"],
+		["<https://example.com|run `cmd`>", "<https://example.com|run `cmd`>"],
 		["**<https://example.com/a*b*c|details>**", "*<https://example.com/a*b*c|details>*"],
 		// Markdown around a mention still converts.
 		["**cc** <@U0C2GSKTA6M> & <@U0BT1S5UGS1>", "*cc* <@U0C2GSKTA6M> &amp; <@U0BT1S5UGS1>"],

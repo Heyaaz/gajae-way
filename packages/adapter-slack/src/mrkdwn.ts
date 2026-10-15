@@ -1,11 +1,21 @@
 export const SLACK_MESSAGE_LIMIT = 4000;
 
-/** Protect code before escaping text: Slack code must retain literal markup and language tags. */
+/** Protect Slack links before parsing code spans; code then retains literal markup and language tags. */
 export function markdownToMrkdwn(text: string): string {
-	const segments = text.split(
+	const links: string[] = [];
+	let markerPrefix = "\u0000SLACKLINK";
+	while (text.includes(markerPrefix)) markerPrefix += "X";
+	const protectedText = text.replace(SLACK_LINK, (link) => {
+		const index = links.push(link) - 1;
+		return `${markerPrefix}${index}\u0000`;
+	});
+	const segments = protectedText.split(
 		/(^[ \t]*```[^\n]*\n[\s\S]*?^[ \t]*```[^\n]*(?:\n|$)|^[ \t]*```[^\n]*(?:\n[\s\S]*)?$|`+[^`\n]*`+)/gm,
 	);
-	return segments.map((segment, index) => (index % 2 === 1 ? segment : convertText(segment))).join("");
+	const converted = segments.map((segment, index) => (index % 2 === 1 ? segment : convertText(segment))).join("");
+	if (links.length === 0) return converted;
+	const linkMarkers = new RegExp(`${markerPrefix}(\\d+)\\u0000`, "g");
+	return converted.replace(linkMarkers, (marker, index: string) => links[Number(index)] ?? marker);
 }
 
 /**
@@ -17,7 +27,7 @@ export function markdownToMrkdwn(text: string): string {
 const SLACK_ENTITY =
 	/<(?:@[UW][A-Z0-9]+(?:\|[^>\n]*)?|#C[A-Z0-9]+(?:\|[^>\n]*)?|!(?:here|channel|everyone)(?:\|[^>\n]*)?|!subteam\^[A-Z0-9]+(?:\|[^>\n]*)?)>/g;
 
-/** Slack links need protection during both escaping and Markdown conversion. */
+/** Slack URLs and labels are protected before code-span and Markdown parsing. */
 const SLACK_LINK = /<(?:https?:\/\/|mailto:)[^\s<>|]+(?:\|[^<>\n]*)?>/gi;
 
 function escapeKeepingEntities(text: string): string {
@@ -36,16 +46,9 @@ function escapeHtml(text: string): string {
 }
 
 function convertText(text: string): string {
-	const links: string[] = [];
-	let markerPrefix = "\u0000SLACKLINK";
-	while (text.includes(markerPrefix)) markerPrefix += "X";
-	const protectedText = text.replace(SLACK_LINK, (link) => {
-		const index = links.push(link) - 1;
-		return `${markerPrefix}${index}\u0000`;
-	});
-	const escaped = escapeKeepingEntities(protectedText);
+	const escaped = escapeKeepingEntities(text);
 	// One pass prevents the bold tokens we emit from being converted again as italics.
-	const converted = escaped.replace(
+	return escaped.replace(
 		/\[([^\]\n]+)\]\(([^)\n]+)\)|^(#{1,6})[ \t]+(.+)$|^([ \t]*)[-*][ \t]+|\*\*([^\n]+?)\*\*|__([^\n]+?)__|~~([^\n]+?)~~|\*([^*\n]+)\*|_([^_\n]+)_/gm,
 		(
 			_match,
@@ -68,9 +71,6 @@ function convertText(text: string): string {
 			return `_${italic ?? underItalic}_`;
 		},
 	);
-	if (links.length === 0) return converted;
-	const linkMarkers = new RegExp(`${markerPrefix}(\\d+)\\u0000`, "g");
-	return converted.replace(linkMarkers, (marker, index: string) => links[Number(index)] ?? marker);
 }
 
 type Fence = { readonly start: number; readonly end: number; readonly opener: string; readonly open: boolean };
