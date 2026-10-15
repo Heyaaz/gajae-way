@@ -498,6 +498,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			// quiesce every admitted producer before taking the final writer snapshot.
 			listener.stop(false);
 			runtime.stopBrokerGenerationListener?.();
+			runtime.personaSessions.beginDrain();
 			await runtime.work.stop();
 			await Promise.all([...runtime.requests]);
 			await Promise.all([...runtime.memoryOperationTasks]);
@@ -616,6 +617,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			clearInterval(runtime.memoryOpsCleanupTimer);
 			runtime.stopRetention();
 			runtime.stopBrokerGenerationListener?.();
+			runtime.personaSessions.beginDrain();
 			await runtime.work.stop();
 			// Same producer quiescence as the Unix server: in-flight stdio requests are
 			// tracked and awaited before persona/tail/broker teardown.

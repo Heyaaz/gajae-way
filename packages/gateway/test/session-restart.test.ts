@@ -131,6 +131,7 @@ test("bounded shutdown keeps an accepted turn alive past the old cutoff and defe
 	if (!first) throw new Error("accepted send disappeared during shutdown test");
 
 	let drainFinished = false;
+	manager.beginDrain();
 	const draining = manager.drain().then(() => {
 		drainFinished = true;
 	});

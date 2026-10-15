@@ -706,6 +706,11 @@ export class PersonaSessionManager {
 		await Promise.all([...this.#actors.values()].map((actor) => actor.stop()));
 	}
 
+	/** Block new persona triggers and steers before shutdown starts stopping their producers. */
+	beginDrain(): void {
+		if (!this.#stopped) this.#draining = true;
+	}
+
 	/**
 	 * Stop admitting persona work and reconcile accepted turns for a bounded
 	 * shutdown window. Unsettled operations stay durable rather than being
@@ -713,7 +718,7 @@ export class PersonaSessionManager {
 	 */
 	async drain(timeoutMs = PERSONA_SHUTDOWN_DRAIN_MS): Promise<void> {
 		if (this.#stopped) return;
-		this.#draining = true;
+		this.beginDrain();
 		const deadline = this.#now() + Math.max(0, timeoutMs);
 		for (;;) {
 			const unresolved = await Promise.all(
