@@ -826,6 +826,7 @@ export class MonitorPropagator {
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) {
 			if (resumeTurn) return;
+			let transitionedFailure = false;
 			for (const row of rows) {
 				const failed = this.#database.transaction((tx) =>
 					this.#database.monitors.eventTerminalFail(
@@ -835,8 +836,18 @@ export class MonitorPropagator {
 						"dispatch setup failed (monitor_invalid)",
 					),
 				);
-				if (failed) this.#emitStage(row, "failed_no_retry");
+				if (failed) {
+					transitionedFailure = true;
+					this.#emitStage(row, "failed_no_retry");
+				}
 			}
+			if (transitionedFailure)
+				this.#recordReadinessFailure({
+					code: "monitor_invalid",
+					detail: "monitor dispatch failed during setup",
+					originKey: monitorReadinessOriginKey(rows[0]?.monitor_id ?? "unknown"),
+					at: this.#now(),
+				});
 			console.error(
 				`monitor dispatch rejected missing or invalid monitor: events ${rows.map((row) => row.event_id).join(",")}`,
 			);
@@ -895,7 +906,8 @@ export class MonitorPropagator {
 			sessionOrigin = monitorOriginForEvent(monitor, claimedEventType);
 			sessionOriginKey = originKey(sessionOrigin);
 		} catch {
-			this.#database.transaction((tx) => {
+			const transitionedFailure = this.#database.transaction((tx) => {
+				let transitioned = false;
 				for (const row of claimed) {
 					const failed = this.#database.monitors.eventFencedFail(
 						tx,
@@ -907,10 +919,21 @@ export class MonitorPropagator {
 						now(),
 						true,
 					);
-					if (failed) this.#emitStage(row, "failed_no_retry");
+					if (failed) {
+						transitioned = true;
+						this.#emitStage(row, "failed_no_retry");
+					}
 				}
 				for (const row of leased) this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId);
+				return transitioned;
 			});
+			if (transitionedFailure)
+				this.#recordReadinessFailure({
+					code: "event_type_invalid",
+					detail: "monitor dispatch failed during event setup",
+					originKey: monitorReadinessOriginKey(monitor.monitorId),
+					at: now(),
+				});
 			console.error(
 				`monitor dispatch rejected invalid event type: events ${claimed.map((row) => row.event_id).join(",")}`,
 			);
@@ -1918,6 +1941,10 @@ function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): Origi
 		monitor.monitorId,
 		monitor.eventTypes.includes(eventType) ? eventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
 	);
+}
+
+function monitorReadinessOriginKey(monitorId: string): string {
+	return originKey(monitorSessionOrigin(monitorId, CATCH_ALL_EVENT_ORIGIN.conversationId));
 }
 
 /** Extract a bounded, sanitized lower-level diagnosis without persisting raw error payloads. */
