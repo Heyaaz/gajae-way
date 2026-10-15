@@ -87,7 +87,12 @@ import {
 	type PersonaTurnSettledInput,
 	type PersonaTurnStartInput,
 } from "../orchestrator/persona-session";
-import { formatFailureChatNotice, formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
+import {
+	formatFailureChatNotice,
+	formatFailureNotice,
+	sanitizeDiagnostic,
+	sanitizeDiagnosticDetail,
+} from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
 import {
 	deterministicHeldPostDeliveryId,
@@ -849,7 +854,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			readiness.recordFailure({
 				category: "session_create",
 				code: "persona_bind_failed",
-				detail: sanitizeDiagnostic(detail),
+				detail: sanitizeDiagnosticDetail(detail, 200) || "session creation failed",
 				origin: originKey,
 				at,
 			}),
@@ -3664,7 +3669,7 @@ async function createInboundTurnLifecycle(
 		runtime.readiness.recordFailure({
 			category: "turn",
 			code: "model_not_selected",
-			detail: sanitizeDiagnostic(error.message) || "model not selected",
+			detail: sanitizeDiagnosticDetail(error.message, 200) || "model not selected",
 			origin: key,
 		});
 		const notice = `${formatFailureNotice(error)} Send /model <id> or /new`;
@@ -3696,7 +3701,7 @@ async function createInboundTurnLifecycle(
 		runtime.readiness.recordFailure({
 			category: "turn",
 			code: "turn_failed",
-			detail: sanitizeDiagnostic(error.message) || "turn failed",
+			detail: sanitizeDiagnosticDetail(error.message, 200) || "turn failed",
 			origin: key,
 		});
 		try {

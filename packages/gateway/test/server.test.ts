@@ -111,7 +111,12 @@ async function waitFrame(frames: any[], id: string): Promise<void> {
 }
 
 async function startDeliveryServer(
-	options: { ownerTarget?: GatewayConfig["ownerTarget"]; deliverySweepIntervalMs?: number } = {},
+	options: {
+		ownerTarget?: GatewayConfig["ownerTarget"];
+		deliverySweepIntervalMs?: number;
+		bind?: Parameters<typeof sessionPortFromResponder>[0]["bind"];
+		respond?: Parameters<typeof sessionPortFromResponder>[0]["respond"];
+	} = {},
 ) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-delivery-server-"));
 	const config: GatewayConfig = {
@@ -127,8 +132,8 @@ async function startDeliveryServer(
 	};
 	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
-		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		respond: async () => "the single reply body",
+		bind: options.bind ?? ((key, epoch) => bindWorkFixture(key, epoch)),
+		respond: options.respond ?? (async () => "the single reply body"),
 	});
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
@@ -324,6 +329,78 @@ test("status readiness degrades on sustained delivery failure and recovers after
 		reason: null,
 		failure: null,
 	});
+	client.close();
+});
+
+test("session-create readiness details redact absolute paths", async () => {
+	const { client } = await startDeliveryServer({
+		bind: () => {
+			throw new Error("broker bind failed at /private/gajaeway/workspace");
+		},
+	});
+	for (let index = 0; index < 3; index++) {
+		const conversationId = `readiness-bind-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `bind-failure-${index}`,
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, `bind-failure-${index}`);
+	}
+	client.send({ v: "0.1", type: "request", id: "bind-failure-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "bind-failure-status");
+	const readiness = client.frames.find((frame) => frame.id === "bind-failure-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "session_create", code: "persona_bind_failed", consecutiveFailures: 3 },
+	});
+	expect(readiness.failure.detail).toContain("[path]");
+	expect(readiness.failure.detail).not.toContain("/private/gajaeway/workspace");
+	client.close();
+});
+
+test("turn readiness details redact broker URLs", async () => {
+	const { client } = await startDeliveryServer({
+		respond: async () => {
+			throw new Error("turn failed via https://broker.example/private/session");
+		},
+	});
+	for (let index = 0; index < 3; index++) {
+		const conversationId = `readiness-turn-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `turn-failure-${index}`,
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, `turn-failure-${index}`);
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some(
+				(frame) => frame.event === "chat.message" && frame.payload?.origin?.conversationId === conversationId,
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		expect(
+			client.frames.some(
+				(frame) => frame.event === "chat.message" && frame.payload?.origin?.conversationId === conversationId,
+			),
+		).toBe(true);
+	}
+	client.send({ v: "0.1", type: "request", id: "turn-failure-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "turn-failure-status");
+	const readiness = client.frames.find((frame) => frame.id === "turn-failure-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "turn", code: "turn_failed", consecutiveFailures: 3 },
+	});
+	expect(readiness.failure.detail).toContain("[url]");
+	expect(readiness.failure.detail).not.toContain("broker.example");
 	client.close();
 });
 
