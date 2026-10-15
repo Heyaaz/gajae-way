@@ -957,6 +957,7 @@ export class MonitorPropagator {
 			let protocolResponseByteLength: number | undefined;
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
+			let readinessFailure: { readonly code: string; readonly detail: string } | undefined;
 			try {
 				// A completed saved turn must be harvested before a pending roll changes
 				// its session ID. Fresh dispatches still roll at this boundary (#68).
@@ -1247,7 +1248,13 @@ export class MonitorPropagator {
 							this.#now(),
 						),
 					);
-					if (updated && eventRow) this.#emitStage(eventRow, "contract_unmet");
+					if (updated) {
+						readinessFailure ??= {
+							code: "authored_echo_suspected",
+							detail: "monitor authoring result echoed its contract",
+						};
+						if (eventRow) this.#emitStage(eventRow, "contract_unmet");
+					}
 				}
 				// Deliver only non-silent notes that contain information beyond the contract.
 				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
@@ -1307,7 +1314,7 @@ export class MonitorPropagator {
 							}
 						: undefined;
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
-				let readinessFailureRecorded = false;
+				let transitionedFailure = false;
 				this.#database.transaction((tx) => {
 					for (const row of leased) {
 						const failed = this.#database.monitors.eventFencedFail(
@@ -1322,23 +1329,12 @@ export class MonitorPropagator {
 							protocolFailure,
 						);
 						if (failed) {
-							readinessFailureRecorded = true;
+							transitionedFailure = true;
 							this.#emitStage(row, "failed");
 						}
 					}
 				});
-				if (readinessFailureRecorded) {
-					try {
-						this.#onReadinessFailure?.({
-							code,
-							detail: `monitor dispatch failed during ${dispatchPhase}`,
-							originKey: sessionOriginKey,
-							at: now(),
-						});
-					} catch {
-						console.error("monitor readiness observer failed");
-					}
-				}
+				if (transitionedFailure) readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 				await this.#recordAuthoringFailure({
 					sessionOriginKey,
@@ -1352,6 +1348,12 @@ export class MonitorPropagator {
 					monitor,
 				});
 			} finally {
+				if (readinessFailure)
+					this.#recordReadinessFailure({
+						...readinessFailure,
+						originKey: sessionOriginKey,
+						at: this.#now(),
+					});
 				stopHeartbeat();
 				for (const row of claimed) this.#claims.delete(row.event_id);
 				// Release the leases this attempt holds. Lease-guarded: if this attempt
@@ -1692,6 +1694,18 @@ export class MonitorPropagator {
 	#recordReadinessSuccess(originKey: string): void {
 		try {
 			this.#onReadinessSuccess?.({ originKey, at: this.#now() });
+		} catch {
+			console.error("monitor readiness observer failed");
+		}
+	}
+	#recordReadinessFailure(input: {
+		readonly code: string;
+		readonly detail: string;
+		readonly originKey: string;
+		readonly at: number;
+	}): void {
+		try {
+			this.#onReadinessFailure?.(input);
 		} catch {
 			console.error("monitor readiness observer failed");
 		}

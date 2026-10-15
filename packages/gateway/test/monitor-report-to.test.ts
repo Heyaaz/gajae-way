@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
+import { FunctionalReadiness } from "../src/functional-readiness";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -191,6 +192,7 @@ test("reportTo omits silent and contract-only notes rejected by the delivery pat
 			reportTo: target,
 		});
 		const notifications: string[] = [];
+		const readiness = new FunctionalReadiness();
 		const sessionPort = sessionPortFromScript({
 			bind: async () => ({ sessionId: "monitor-session" }),
 			respond: async (_sessionId, text) =>
@@ -211,14 +213,24 @@ test("reportTo omits silent and contract-only notes rejected by the delivery pat
 			notifyInbound: async (key) => {
 				notifications.push(key);
 			},
+			onReadinessFailure: ({ code, detail, originKey, at }) =>
+				readiness.recordFailure({ category: "monitor_delivery", code, detail, origin: originKey, at }),
 		});
 
 		const silentEventId = await propagator.submitAwaitable(monitor.monitorId, "deploy.silent", {});
 		expect(database.monitors.eventGet(silentEventId)?.stage).toBe("authored_no_delivery");
 		expect(database.inbox.pendingByOrigin()).toEqual([]);
-		const echoEventId = await propagator.submitAwaitable(monitor.monitorId, "deploy.echo", {});
-		expect(database.monitors.eventGet(echoEventId)?.stage).toBe("contract_unmet");
-		expect(database.monitors.failure(echoEventId)?.code).toBe("authored_echo_suspected");
+		for (let index = 0; index < 3; index++) {
+			const echoEventId = await propagator.submitAwaitable(monitor.monitorId, "deploy.echo", { index });
+			expect(database.monitors.eventGet(echoEventId)?.stage).toBe("contract_unmet");
+			expect(database.monitors.failure(echoEventId)?.code).toBe("authored_echo_suspected");
+		}
+		expect(readiness.snapshot().ready).toBe(false);
+		expect(readiness.snapshot().failure).toMatchObject({
+			category: "monitor_delivery",
+			code: "authored_echo_suspected",
+			consecutiveFailures: 3,
+		});
 		expect(database.inbox.pendingByOrigin()).toEqual([]);
 
 		const recoveryEventId = crypto.randomUUID();
