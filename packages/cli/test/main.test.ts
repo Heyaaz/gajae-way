@@ -838,6 +838,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		memoryIntents: { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 },
 		memoryGitIndexLock: null,
 		monitorEvents: [],
+		monitorFailures: [],
 		monitorAuthoringLost: [],
 		deliveries: { pending: 0, inflight: 0, confirmed: 0, failedAmbiguous: 0, expired: 0 },
 		inFlightInbound: 0,
@@ -976,6 +977,29 @@ describe("cycle rendering", () => {
 		expect(lines).toContain(
 			"monitor authoring lost: backlog.watch=3 (last 2026-09-04T07:00:00.000Z) memory.audit=1 (last 2026-09-04T06:00:00.000Z)",
 		);
+	});
+
+	test("recent monitor failures render their bounded sanitized detail", () => {
+		const lines = renderCycle(
+			cycleResult({
+				monitorFailures: [
+					{
+						eventId: "event-1",
+						monitorId: "monitor-1",
+						eventType: "memory.audit",
+						stage: "failed",
+						failedAt: "2026-10-15T12:30:00.000Z",
+						code: "authoring_turn_failed",
+						detail: '{"causeCode":"sdk_prompt_terminal_failed","message":"The model is temporarily unavailable"}',
+					},
+				],
+			}),
+		);
+		expect(lines).toContain("monitor failures (newest 1):");
+		expect(lines.join("\n")).toContain(
+			'2026-10-15T12:30:00.000Z authoring_turn_failed event=event-1 monitor=monitor-1 type=memory.audit stage=failed detail={"causeCode":"sdk_prompt_terminal_failed","message":"The model is temporarily unavailable"}',
+		);
+		expect(renderCycle(cycleResult())).toContain("monitor failures: none");
 	});
 
 	test("agent-directory headroom renders free/total, or unobservable when the probe failed", () => {

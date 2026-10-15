@@ -1027,6 +1027,17 @@ export interface OpsSloResult {
 	readonly ok: boolean;
 }
 
+/** Bounded, sanitized diagnosis for a recent monitor dispatch failure. */
+export interface MonitorFailureDiagnostic {
+	readonly eventId: string;
+	readonly monitorId: string;
+	readonly eventType: string;
+	readonly stage: string;
+	readonly failedAt: string;
+	readonly code: string;
+	readonly detail: string;
+}
+
 export interface OpsSloParams {
 	readonly days?: number;
 }
@@ -1074,6 +1085,8 @@ export interface OpsCycleResult {
 	readonly memoryGitIndexLock: { readonly path: string; readonly ageMs: number } | null;
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
+	/** Most recent monitor dispatch failure records, including their sanitized cause details. */
+	readonly monitorFailures: readonly MonitorFailureDiagnostic[];
 	/**
 	 * Event types whose most recent terminal events (last 24h) exhausted retries
 	 * with no authored output: `consecutive` lost slots, newest at `lastFiredAt`.

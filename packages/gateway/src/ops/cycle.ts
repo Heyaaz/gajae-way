@@ -7,6 +7,7 @@ import {
 	type CyclePhase,
 	type CycleSessionView,
 	LOOPBACK_ORIGIN,
+	type MonitorFailureDiagnostic,
 	monitorSessionOrigin,
 	OPS_CYCLE_DEFAULT_LIMIT,
 	type OpsCycleParams,
@@ -73,6 +74,7 @@ export const MONITOR_AUTHORING_LOSS_CONSECUTIVE = 2;
  * while every liveness signal stayed green; three in a row is already an outage.
  */
 export const MONITOR_TERMINAL_STREAK_THRESHOLD = 3;
+export const MONITOR_FAILURE_DIAGNOSTIC_LIMIT = 5;
 /**
  * Agent-directory headroom floor (issue #15). GJC keeps sessions, blobs and
  * recovery snapshots under its agent directory with no retention or reaper
@@ -148,6 +150,7 @@ export interface RuntimeCycleSources {
 	readonly memoryIntents: ReadonlyMap<string, number>;
 	readonly memoryGitIndexLock: { readonly path: string; readonly ageMs: number } | null;
 	readonly monitorStages: ReadonlyMap<string, number>;
+	readonly monitorFailures: readonly MonitorFailureDiagnostic[];
 	/** Event types whose latest terminal slots in the loss window were lost before authoring. */
 	readonly monitorAuthoringLost: ReturnType<MonitorsGroup["authoringLossStreaks"]>;
 	readonly memoryClosing: boolean;
@@ -249,6 +252,15 @@ export class RuntimeCycleProjector {
 		);
 		const memory = this.#database.memory.intentCounts();
 		const monitors = this.#database.monitors.eventStageCounts();
+		const monitorFailures = this.#database.monitors.recentFailures(MONITOR_FAILURE_DIAGNOSTIC_LIMIT).map((row) => ({
+			eventId: row.event_id,
+			monitorId: row.monitor_id,
+			eventType: row.event_type,
+			stage: row.stage,
+			failedAt: row.failed_at,
+			code: row.code,
+			detail: row.detail,
+		}));
 		const inboundMap = new Map(inbound.map((r) => [r.state, r.n]));
 		const unknownInbound = inbound.map((r) => r.state).filter((state) => !KNOWN_INBOUND_STATES.has(state));
 		const unknownDeliveries = deliveries.map((r) => r.state).filter((state) => !KNOWN_DELIVERY_STATES.has(state));
@@ -265,6 +277,7 @@ export class RuntimeCycleProjector {
 			memoryIntents: new Map(memory.map((r) => [r.state, r.n])),
 			memoryGitIndexLock: observeMemoryGitIndexLock(this.#memoryRoot, nowMs),
 			monitorStages: new Map(monitors.map((r) => [r.stage, r.n])),
+			monitorFailures,
 			monitorAuthoringLost: this.#database.monitors.authoringLossStreaks(
 				new Date(nowMs - MONITOR_AUTHORING_LOSS_WINDOW_MS).toISOString(),
 			),
@@ -476,6 +489,7 @@ export function projectRuntimeCycle(
 		monitorEvents: [...sources.monitorStages.entries()]
 			.map(([stage, count]) => ({ stage, count }))
 			.sort((a, b) => a.stage.localeCompare(b.stage)),
+		monitorFailures: sources.monitorFailures,
 		monitorAuthoringLost: sources.monitorAuthoringLost,
 		deliveries: {
 			pending: sources.deliveryCounts.get("pending") ?? 0,

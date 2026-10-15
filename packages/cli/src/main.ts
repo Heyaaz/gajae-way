@@ -374,6 +374,14 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(
 		`monitors: ${cycle.monitorEvents.length ? cycle.monitorEvents.map((m) => `${m.stage}=${m.count}`).join(" ") : "none"}`,
 	);
+	if (cycle.monitorFailures.length === 0) lines.push("monitor failures: none");
+	else {
+		lines.push(`monitor failures (newest ${cycle.monitorFailures.length}):`);
+		for (const failure of cycle.monitorFailures)
+			lines.push(
+				`  ${failure.failedAt} ${failure.code} event=${failure.eventId} monitor=${failure.monitorId} type=${failure.eventType} stage=${failure.stage} detail=${failure.detail}`,
+			);
+	}
 	if (cycle.monitorAuthoringLost.length > 0)
 		lines.push(
 			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,
