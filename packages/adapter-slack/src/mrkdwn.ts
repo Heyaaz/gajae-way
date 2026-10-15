@@ -4,6 +4,7 @@ const CODE_SEGMENTS =
 	/(^[ \t]*```[^\n]*\n[\s\S]*?^[ \t]*```[^\n]*(?:\n|$)|^[ \t]*```[^\n]*(?:\n[\s\S]*)?$|`+[^`\n]*`+)/gm;
 const UNICODE_WORD_CHARACTER = /[\p{L}\p{N}_$]/u;
 const UNICODE_LETTER = /\p{L}/u;
+type AngleOpener = { readonly markup: boolean; quote?: '"' | "'" };
 
 /** Protect Slack links before parsing code spans; code then retains literal markup and language tags. */
 export function markdownToMrkdwn(text: string): string {
@@ -20,7 +21,7 @@ export function markdownToMrkdwn(text: string): string {
 	const linkMarkers = new RegExp(`${markerPrefix}(\\d+)\\u0000`, "g");
 	const keepLink = links.map(() => false);
 	const scanSegments = protectedText.split(CODE_SEGMENTS);
-	const angleOpeners: boolean[] = [];
+	const angleOpeners: AngleOpener[] = [];
 	let markupDepth = 0;
 	const updateAngleDepth = (segment: string, ignoreBrackets = false, linkFollows = false): void => {
 		for (let index = 0; index < segment.length; index++) {
@@ -28,7 +29,17 @@ export function markdownToMrkdwn(text: string): string {
 			if (character === "\n" || character === "\r") {
 				angleOpeners.length = 0;
 				markupDepth = 0;
-			} else if (!ignoreBrackets && character === "<") {
+			} else if (ignoreBrackets) continue;
+			const currentOpener = angleOpeners[angleOpeners.length - 1];
+			if (currentOpener?.quote !== undefined) {
+				if (character === currentOpener.quote) currentOpener.quote = undefined;
+				continue;
+			}
+			if (currentOpener && (character === '"' || character === "'")) {
+				currentOpener.quote = character;
+				continue;
+			}
+			if (character === "<") {
 				const next = segment[index + 1];
 				const previous = segment[index - 1];
 				const previousIsWord = previous !== undefined && UNICODE_WORD_CHARACTER.test(previous);
@@ -38,12 +49,27 @@ export function markdownToMrkdwn(text: string): string {
 					next === "<" ||
 					(nextIsLetter && !previousIsWord) ||
 					(next !== undefined && "!/?@#:".includes(next));
-				angleOpeners.push(looksLikeMarkup);
+				angleOpeners.push({ markup: looksLikeMarkup });
 				if (looksLikeMarkup) markupDepth++;
-			} else if (!ignoreBrackets && character === ">") {
-				if (angleOpeners.pop()) markupDepth--;
+			} else if (character === ">") {
+				if (angleOpeners.pop()?.markup) markupDepth--;
+			} else if (markupDepth === 0 && ";,.!?".includes(character)) {
+				for (let openerIndex = angleOpeners.length - 1; openerIndex >= 0; openerIndex--) {
+					if (!angleOpeners[openerIndex]?.markup) angleOpeners.splice(openerIndex, 1);
+				}
 			}
 		}
+	};
+	const hasOuterCloser = (suffix: string): boolean => {
+		let quote = angleOpeners[angleOpeners.length - 1]?.quote;
+		for (const character of suffix) {
+			if (character === "\n" || character === "\r") return false;
+			if (quote !== undefined) {
+				if (character === quote) quote = undefined;
+			} else if (character === '"' || character === "'") quote = character;
+			else if (character === ">") return true;
+		}
+		return false;
 	};
 	// Ignore code brackets and reset at line boundaries, including newlines within code segments.
 	for (let segmentIndex = 0; segmentIndex < scanSegments.length; segmentIndex++) {
@@ -58,8 +84,7 @@ export function markdownToMrkdwn(text: string): string {
 		for (const match of segment.matchAll(linkMarkers)) {
 			updateAngleDepth(segment.slice(last, match.index), false, true);
 			const afterLink = segment.slice(match.index + match[0].length);
-			const hasOuterCloser = /^[ \t]*>/.test(afterLink);
-			keepLink[Number(match[1])] = markupDepth === 0 && !(angleOpeners.length > 0 && hasOuterCloser);
+			keepLink[Number(match[1])] = markupDepth === 0 && !(angleOpeners.length > 0 && hasOuterCloser(afterLink));
 			last = match.index + match[0].length;
 		}
 		updateAngleDepth(segment.slice(last));
