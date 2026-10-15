@@ -148,6 +148,32 @@ test("a signaled host stays tracked when escalation is canceled until its proces
 	}
 });
 
+test("a signaled host is force-retired after a canceled escalation outlives its grace", async () => {
+	const child = fakeHost("sdk session-host-internal", true);
+	const h = await harness(() => child.pid);
+	let guardCalls = 0;
+	try {
+		expect(
+			await h.port.terminateHost({
+				sessionId: "s-1",
+				repo: h.repo,
+				shouldTerminate: () => ++guardCalls === 1,
+			}),
+		).toEqual({ outcome: "terminating", pid: child.pid });
+		expect(guardCalls).toBe(2);
+		await Bun.sleep(1_100);
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo, shouldTerminate: () => false })).toEqual({
+			outcome: "terminated",
+			pid: child.pid,
+		});
+		expect(guardCalls).toBe(2);
+		expect(await child.exited).not.toBe(0);
+	} finally {
+		child.kill();
+		await h.close();
+	}
+});
+
 test("a pid that is not a session host is never signalled - broker, daemon, or anything else", async () => {
 	for (const tag of ["sdk broker-internal", "sdk daemon-internal", "some-other-program"]) {
 		const child = fakeHost(tag);

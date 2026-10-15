@@ -7,6 +7,7 @@ import {
 	PersonaSessionManager,
 	STALLED_TURN_TERMINAL_TIMEOUT_MS,
 } from "../src/orchestrator/persona-session";
+import type { SessionBindInput } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
@@ -45,10 +46,15 @@ async function harness(options: {
 	now?: () => number;
 	brokerAvailable?: () => boolean;
 	onFailure?: () => void;
+	sessionIdForBind?: (input: SessionBindInput) => string | Promise<string>;
 }) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-host-cap-"));
 	database = await Store.open(join(home, "gateway.db"));
-	const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(home, "agent"));
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort(options.sessionIdForBind ? { onBind: options.sessionIdForBind } : {}),
+		join(home, "agent"),
+	);
 	const logs: string[] = [];
 	const holds: PersonaBindHoldInput[] = [];
 	manager = new PersonaSessionManager({
@@ -174,6 +180,104 @@ test("with every host busy a new origin is held, not spawned, and dispatches whe
 	expect(h.manager.admissionHold(origin("c").key)).toBeUndefined();
 });
 
+test("concurrent binds reserve all available host slots without exceeding the cap", async () => {
+	const h = await harness({ maxLiveHosts: 2 });
+	const originalBind = h.port.bind.bind(h.port);
+	let bindCalls = 0;
+	let releaseBinds!: () => void;
+	const bindGate = new Promise<void>((resolve) => {
+		releaseBinds = resolve;
+	});
+	h.port.bind = async (input) => {
+		bindCalls++;
+		await bindGate;
+		return await originalBind(input);
+	};
+	const admissions = Promise.all([h.send("a", "a1"), h.send("b", "b1"), h.send("c", "c1")]);
+	try {
+		await eventually(() => bindCalls === 2, "both available host slots were not reserved concurrently");
+		await eventually(() => h.manager.admissionHold(origin("c").key) === "host_capacity", "c1 was not held at capacity");
+		expect(bindCalls).toBe(2);
+		expect(h.sent("a1")).toBeUndefined();
+		expect(h.sent("b1")).toBeUndefined();
+		expect(h.sent("c1")).toBeUndefined();
+	} finally {
+		releaseBinds();
+	}
+	await admissions;
+	await eventually(
+		() => h.sent("a1") !== undefined && h.sent("b1") !== undefined,
+		"the reserved binds did not start their turns",
+	);
+	expect(h.manager.liveHostCount()).toBe(2);
+	expect(h.sent("c1")).toBeUndefined();
+	await h.complete("a", "a1");
+	await eventually(() => h.sent("c1") !== undefined, "c1 did not claim the slot freed by a1");
+	expect(h.manager.liveHostCount()).toBe(2);
+});
+
+test("a cutoff reserves the freed host slot for its awakened capacity waiter", async () => {
+	let clock = 1_000_000;
+	const h = await harness({
+		maxLiveHosts: 1,
+		now: () => clock,
+		sessionIdForBind: (input) => `${input.originKey.split("/").at(-1)}-e${input.epoch}`,
+	});
+	await h.send("a", "a1");
+	await eventually(() => h.sent("a1") !== undefined, "a1 was not dispatched");
+	const sessionA = h.sessionOf("a1");
+	const queued = origin("a");
+	h.database.transaction((tx) =>
+		h.database.inbox.enqueue(tx, {
+			messageId: "a:a2",
+			originKey: queued.key,
+			originRefJson: queued.ref,
+			body: "a2",
+			source: "platform",
+		}),
+	);
+	await h.send("b", "b1");
+	await eventually(() => h.manager.admissionHold(origin("b").key) === "host_capacity", "b1 was not held at capacity");
+
+	const originalBind = h.port.bind.bind(h.port);
+	let bBindCalls = 0;
+	let releaseBind!: () => void;
+	const bindGate = new Promise<void>((resolve) => {
+		releaseBind = resolve;
+	});
+	h.port.bind = async (input) => {
+		if (input.originKey === origin("b").key) {
+			bBindCalls++;
+			await bindGate;
+		}
+		return await originalBind(input);
+	};
+
+	h.port.setActivity(sessionA, "tool", clock);
+	const statusReads = h.port.statusReads.length;
+	h.port.emitStall(sessionA);
+	await eventually(() => h.port.statusReads.length > statusReads, "stalled turn did not reconcile status");
+	clock += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	try {
+		await h.manager.tick(origin("a").key);
+		await eventually(() => bBindCalls === 1, "awakened capacity waiter did not start binding");
+		await Bun.sleep(30);
+		expect(bBindCalls).toBe(1);
+		expect(h.sent("a2")).toBeUndefined();
+		expect(h.sent("b1")).toBeUndefined();
+		expect(h.manager.liveHostCount()).toBeLessThanOrEqual(1);
+		releaseBind();
+		await eventually(() => h.sent("b1") !== undefined, "the reserved waiter did not dispatch");
+		expect(h.manager.liveHostCount()).toBe(1);
+		expect(h.sent("a2")).toBeUndefined();
+		await h.complete("b", "b1");
+		await eventually(() => h.sent("a2") !== undefined, "a2 did not dispatch after the reserved host became idle");
+		expect(h.manager.liveHostCount()).toBe(1);
+	} finally {
+		releaseBind();
+	}
+});
+
 test("a stalled-turn cutoff frees one host slot once when its failure notice retries", async () => {
 	let clock = 1_000_000;
 	let failureCalls = 0;
@@ -264,7 +368,8 @@ test("a terminal result does not make a signaled host reusable before its proces
 			await close(input);
 			return { outcome: "already_gone" };
 		}
-		if (!(await input.shouldTerminate?.())) return { outcome: "refused", reason: "termination_guard_rejected" };
+		if (input.shouldTerminate && !(await input.shouldTerminate()))
+			return { outcome: "refused", reason: "termination_guard_rejected" };
 		signalSent = true;
 		h.port.complete(first.opRef, "answer completed during host shutdown");
 		return { outcome: "terminating", pid: 40_001 };
@@ -304,6 +409,33 @@ test("idle hosts past the retire window are ended by the sweep and busy ones are
 	expect(h.manager.liveHostCount()).toBe(1);
 	expect(h.logs.some((line) => line.includes("reason=host_idle"))).toBe(true);
 	expect(await h.manager.sweepIdleHosts()).toBe(0);
+});
+
+test("an idle host remains unavailable until asynchronous termination is confirmed", async () => {
+	const h = await harness({ maxLiveHosts: 1 });
+	await h.send("a", "a1");
+	await h.complete("a", "a1");
+	const sessionA = h.sessionOf("a1");
+	let terminationCalls = 0;
+	const close = h.port.close.bind(h.port);
+	h.port.terminateHost = async (input) => {
+		terminationCalls++;
+		if (terminationCalls === 1) return { outcome: "terminating", pid: 40_001 };
+		await close(input);
+		return { outcome: "terminated", pid: 40_001 };
+	};
+
+	await h.send("b", "b1");
+	await eventually(() => h.manager.admissionHold(origin("b").key) === "host_capacity", "b1 was not held");
+	expect(h.sent("b1")).toBeUndefined();
+	expect(h.port.binds.map((bind) => bind.originKey)).not.toContain(origin("b").key);
+	expect(h.manager.liveHostCount()).toBe(1);
+	expect(h.logs.some((line) => line.startsWith("persona_host_terminating") && line.includes(sessionA))).toBe(true);
+
+	await eventually(() => h.sent("b1") !== undefined, "capacity did not free after host exit confirmation", 5_000);
+	expect(terminationCalls).toBeGreaterThanOrEqual(2);
+	expect(h.port.closes.map((entry) => entry.sessionId)).toContain(sessionA);
+	expect(h.manager.liveHostCount()).toBe(1);
 });
 
 test("an idle host refused during broker outage stops consuming host capacity", async () => {

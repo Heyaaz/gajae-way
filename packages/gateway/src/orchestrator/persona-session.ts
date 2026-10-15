@@ -499,6 +499,10 @@ export class PersonaSessionManager {
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
+	/** Host slots claimed by bind attempts that have not yet become live actors. */
+	readonly #hostAdmissionReservations = new Map<OriginActor, "free" | "replacement">();
+	/** At most one reserved admission may concurrently retire an idle host to make room. */
+	#hostReplacementAdmissionOwner: OriginActor | undefined;
 	#maxLiveHosts: number;
 	#hostIdleRetireMs: number;
 	#draining = false;
@@ -611,16 +615,42 @@ export class PersonaSessionManager {
 	 * cannot afford.
 	 */
 	async admitHost(requester: OriginActor): Promise<HostAdmission> {
+		const reservation = this.#hostAdmissionReservations.get(requester);
+		if (reservation === "free") return { admitted: true };
 		const live = [...this.#actors.values()].filter((actor) => actor !== requester && actor.hostLive);
-		if (live.length < this.#maxLiveHosts) return { admitted: true };
+		const otherReservations = this.#hostAdmissionReservations.size - (this.#hostReplacementAdmissionOwner ? 1 : 0);
+		if (reservation === undefined && live.length + otherReservations < this.#maxLiveHosts) {
+			this.#hostAdmissionReservations.set(requester, "free");
+			return { admitted: true };
+		}
+		if (this.#hostReplacementAdmissionOwner !== undefined && this.#hostReplacementAdmissionOwner !== requester)
+			return { admitted: false, live: live.length };
 		const idle = live.filter((actor) => actor.hostIdle).sort((a, b) => a.hostLastActiveAt - b.hostLastActiveAt);
+		if (reservation === undefined && idle.length > 0) {
+			this.#hostAdmissionReservations.set(requester, "replacement");
+			this.#hostReplacementAdmissionOwner = requester;
+		}
+		if (this.#hostReplacementAdmissionOwner !== requester) return { admitted: false, live: live.length };
 		for (const candidate of idle) {
 			// Retirement runs on the candidate's own mailbox so it cannot race a
-			// turn that is being dispatched there at the same moment.
-			const retired = await candidate.enqueue(async () => await candidate.retireIdleHost("host_capacity"));
-			if (retired) return { admitted: true };
+			// turn that is being dispatched there at the same moment. The waiter
+			// already owns the freed slot, so do not wake a second actor here.
+			const retired = await candidate.enqueue(async () => await candidate.retireIdleHost("host_capacity", false));
+			if (retired) {
+				this.#hostReplacementAdmissionOwner = undefined;
+				this.#hostAdmissionReservations.set(requester, "free");
+				return { admitted: true };
+			}
 		}
+		this.releaseHostAdmission(requester, false);
 		return { admitted: false, live: live.length };
+	}
+
+	/** A reserved bind either became a live host or failed before binding. */
+	releaseHostAdmission(actor: OriginActor, wakeWaiter = true): void {
+		if (!this.#hostAdmissionReservations.delete(actor)) return;
+		if (this.#hostReplacementAdmissionOwner === actor) this.#hostReplacementAdmissionOwner = undefined;
+		if (wakeWaiter) this.hostFreed();
 	}
 
 	/** A host slot opened: wake the longest-waiting capacity hold, if any. */
@@ -632,7 +662,18 @@ export class PersonaSessionManager {
 			if (oldest === undefined || actor.hostHeldSince < (oldest.hostHeldSince ?? Number.POSITIVE_INFINITY))
 				oldest = actor;
 		}
-		oldest?.releaseHostHold();
+		if (!oldest || this.#hostAdmissionReservations.has(oldest)) return;
+		const reserved = this.#hostAdmissionReservations.size - (this.#hostReplacementAdmissionOwner ? 1 : 0);
+		const reservation =
+			this.liveHostCount() + reserved < this.#maxLiveHosts
+				? "free"
+				: this.#hostReplacementAdmissionOwner === undefined
+					? "replacement"
+					: undefined;
+		if (!reservation) return;
+		this.#hostAdmissionReservations.set(oldest, reservation);
+		if (reservation === "replacement") this.#hostReplacementAdmissionOwner = oldest;
+		if (!oldest.releaseHostHold()) this.releaseHostAdmission(oldest, false);
 	}
 
 	/** Ends hosts that have sat idle past `hostIdleRetireMs`; returns how many were ended. */
@@ -984,6 +1025,7 @@ class OriginActor {
 	#touchHost(sessionId?: string): void {
 		if (sessionId !== undefined) this.#hostSessionId = sessionId;
 		this.#hostLastActiveAt = this.#manager.now();
+		if (this.hostLive) this.#manager.releaseHostAdmission(this);
 	}
 
 	/**
@@ -992,7 +1034,7 @@ class OriginActor {
 	 * `session.resume` branch, so conversation history survives. A host with
 	 * background jobs is left alone; ending it would lose them.
 	 */
-	async retireIdleHost(reason: HostRetireReason): Promise<boolean> {
+	async retireIdleHost(reason: HostRetireReason, wakeWaiter = true): Promise<boolean> {
 		if (!this.hostIdle || this.#manager.stopped) return false;
 		const sessionId = this.#hostSessionId;
 		if (sessionId === undefined) return false;
@@ -1029,15 +1071,25 @@ class OriginActor {
 			}${result.outcome === "refused" ? ` detail=${result.reason}` : ""}`,
 			ended ? "info" : "warn",
 		);
-		if (!ended) return false;
+		if (!ended) {
+			if (result.outcome === "terminating") {
+				this.#hostTerminatingSessionId = sessionId;
+				this.#manager.log(
+					`persona_host_terminating origin=${this.originKey} session=${sessionId} reason=${reason} pid=${result.pid}`,
+					"warn",
+				);
+				this.#scheduleHostTerminationRecheck(sessionId);
+			}
+			return false;
+		}
 		this.#hostSessionId = undefined;
-		this.#manager.hostFreed();
+		if (wakeWaiter) this.#manager.hostFreed();
 		return true;
 	}
 
 	/** A slot opened while this origin's trigger was held: dispatch now instead of at the next retry tick. */
-	releaseHostHold(): void {
-		if (this.#hostHeldSince === undefined || this.#stopped || this.#manager.stopped) return;
+	releaseHostHold(): boolean {
+		if (this.#hostHeldSince === undefined || this.#stopped || this.#manager.stopped) return false;
 		this.#hostHeldSince = undefined;
 		if (this.#dispatchRetry) {
 			this.#manager.cancel(this.#dispatchRetry);
@@ -1045,6 +1097,7 @@ class OriginActor {
 			this.#dispatchRetry = undefined;
 		}
 		void this.enqueue(async () => await this.#dispatchNext()).catch(() => {});
+		return true;
 	}
 
 	async #holdForHostCapacity(trigger: InboundMessageRow, epoch: number, live: number): Promise<void> {
@@ -1627,6 +1680,7 @@ class OriginActor {
 
 	async stop(): Promise<void> {
 		this.#stopped = true;
+		this.#manager.releaseHostAdmission(this, false);
 		// Stop is called outside the mailbox: wait for admitted work, never enqueue
 		// a shutdown task that would await its own queue entry.
 		await this.#queue;
@@ -1709,18 +1763,28 @@ class OriginActor {
 			this.#hostHeldSince = undefined;
 			this.#touchHost(binding.sessionId);
 		} catch (error) {
-			await this.#noteBindFailure(trigger, epoch, error);
+			try {
+				await this.#noteBindFailure(trigger, epoch, error);
+			} finally {
+				this.#manager.releaseHostAdmission(this);
+			}
 			return;
 		}
-		const bound = this.#manager.database.transaction((tx) =>
-			this.#manager.database.inbox.bindTurn(tx, {
-				messageId: trigger.message_id,
-				originKey: this.originKey,
-				epoch,
-				opRef,
-				sessionId: binding.sessionId,
-			}),
-		);
+		let bound: InboundMessageRow;
+		try {
+			bound = this.#manager.database.transaction((tx) =>
+				this.#manager.database.inbox.bindTurn(tx, {
+					messageId: trigger.message_id,
+					originKey: this.originKey,
+					epoch,
+					opRef,
+					sessionId: binding.sessionId,
+				}),
+			);
+		} catch (error) {
+			this.#manager.releaseHostAdmission(this);
+			throw error;
+		}
 		const turn: InboundTurn = {
 			originKey: this.originKey,
 			epoch,
@@ -1729,13 +1793,19 @@ class OriginActor {
 			sessionId: binding.sessionId,
 			triggerMessageId: trigger.message_id,
 		};
-		const lifecycle = await this.#manager.startTurn({
-			originKey: this.originKey,
-			epoch,
-			sessionId: binding.sessionId,
-			turn,
-			trigger: bound,
-		});
+		let lifecycle: PersonaTurnLifecycle;
+		try {
+			lifecycle = await this.#manager.startTurn({
+				originKey: this.originKey,
+				epoch,
+				sessionId: binding.sessionId,
+				turn,
+				trigger: bound,
+			});
+		} catch (error) {
+			this.#manager.releaseHostAdmission(this);
+			throw error;
+		}
 		let tail: TailHandle;
 		try {
 			tail = await this.#attachTail(binding.sessionId, epoch, false);
@@ -1751,7 +1821,10 @@ class OriginActor {
 			// No send was attempted. A broker disown code or positive liveness
 			// proof can therefore release this row without replaying accepted work.
 			// A generic failure alone is not authority to replace the session.
-			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
+			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) {
+				this.#manager.releaseHostAdmission(this);
+				throw error;
+			}
 			const nextEpoch = this.#manager.database.transaction((tx) => {
 				retryInboundTurn(this.#manager.database, tx, opRef);
 				return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
@@ -1764,15 +1837,23 @@ class OriginActor {
 			);
 			await this.#terminateRetiredSession(binding.sessionId, "session_gone");
 			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
-			else
+			else {
 				this.#scheduleDispatchRetry(
 					Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
 				);
+				this.#manager.releaseHostAdmission(this);
+			}
 			return;
 		}
 		// Before the turn starts: the stall clock is not running yet and the
 		// actor queue holds every steer and later send until the context is ready.
-		const context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
+		let context: PreparedContext;
+		try {
+			context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
+		} catch (error) {
+			this.#manager.releaseHostAdmission(this);
+			throw error;
+		}
 		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {
 			originKey: this.originKey,
@@ -1801,6 +1882,7 @@ class OriginActor {
 		tail.beginTurn(opRef);
 		this.#current = current;
 		this.#state = "turn-running";
+		this.#manager.releaseHostAdmission(this);
 		tail.setTurnRunning(true);
 		// Session state, rather than a per-send selector, is authoritative for
 		// persona turns. Model selection happens BEFORE send; if it fails, no
@@ -4043,11 +4125,7 @@ class OriginActor {
 		}
 		let result: TerminateHostOutcome;
 		try {
-			result = await port.terminateHost({
-				sessionId,
-				repo: this.#manager.repo,
-				shouldTerminate: () => false,
-			});
+			result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
 		} catch {
 			this.#scheduleHostTerminationRecheck(sessionId);
 			return;
@@ -4064,7 +4142,7 @@ class OriginActor {
 			bound.stallHostTerminated = true;
 		}
 		this.#manager.log(
-			`stalled_turn_host_exit_confirmed origin=${this.originKey} session=${sessionId} outcome=${result.outcome}`,
+			`${bound ? "stalled_turn_host_exit_confirmed" : "persona_host_exit_confirmed"} origin=${this.originKey} session=${sessionId} outcome=${result.outcome}`,
 			"warn",
 		);
 		this.#manager.hostFreed();

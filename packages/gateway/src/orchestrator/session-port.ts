@@ -134,8 +134,10 @@ export interface SessionPort {
 	}): Promise<SessionContextUsage | undefined>;
 	/**
 	 * Ends a gateway-owned session host; the optional final guard revalidates
-	 * operation status before a signal. A process is reported terminated only
-	 * after its inspected identity is confirmed absent.
+	 * operation status before signaling. If it cancels SIGKILL after SIGTERM,
+	 * a later unguarded reconciliation may escalate after a grace period so a
+	 * host that ignores SIGTERM cannot hold capacity indefinitely. A process is
+	 * reported terminated only after its inspected identity is confirmed absent.
 	 */
 	terminateHost?(input: {
 		sessionId: string;
@@ -479,6 +481,15 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
 
+type SignaledHost = {
+	readonly pid: number;
+	readonly identity: string;
+	readonly command: string;
+	readonly signaledAtMs: number;
+	escalationAfterMs?: number;
+	killSentAtMs?: number;
+};
+
 /**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
  * transport: it neither discovers an endpoint nor opens an authenticated socket.
@@ -491,7 +502,7 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
 	readonly #bindings = new Map<string, Promise<SessionBinding>>();
-	readonly #signaledHosts = new Map<string, { readonly pid: number; readonly identity: string }>();
+	readonly #signaledHosts = new Map<string, SignaledHost>();
 	readonly #authority: BrokerAuthority;
 
 	constructor(options: BrokerSessionPortOptions) {
@@ -998,7 +1009,7 @@ export class BrokerSessionPort implements SessionPort {
 			}
 		};
 		const signaledHost = this.#signaledHosts.get(input.sessionId);
-		if (signaledHost) return await this.#checkSignaledHost(input.sessionId, signaledHost);
+		if (signaledHost) return await this.#checkSignaledHost(input, signaledHost, finalGuardRefusal);
 		let pid: number | undefined;
 		let live: boolean | undefined;
 		try {
@@ -1064,10 +1075,13 @@ export class BrokerSessionPort implements SessionPort {
 			if ((error as NodeJS.ErrnoException).code === "ESRCH") return { outcome: "already_gone" };
 			return { outcome: "refused", reason: `kill_failed:${(error as NodeJS.ErrnoException).code ?? "unknown"}` };
 		}
-		this.#signaledHosts.set(input.sessionId, {
+		const signaled = {
 			pid,
 			identity: revalidated.identity,
-		});
+			command: revalidated.command,
+			signaledAtMs: Date.now(),
+		};
+		this.#signaledHosts.set(input.sessionId, signaled);
 		const gracefulExit = await waitForProcessExit(pid, revalidated, HOST_SIGTERM_GRACE_MS);
 		if (gracefulExit === "exited") {
 			this.#signaledHosts.delete(input.sessionId);
@@ -1076,7 +1090,13 @@ export class BrokerSessionPort implements SessionPort {
 		if (gracefulExit === "changed" || gracefulExit === "unreadable") return { outcome: "terminating", pid };
 
 		const escalationRefusal = await finalGuardRefusal();
-		if (escalationRefusal) return { outcome: "terminating", pid };
+		if (escalationRefusal) {
+			this.#signaledHosts.set(input.sessionId, {
+				...signaled,
+				escalationAfterMs: Date.now() + HOST_SIGTERM_ESCALATION_GRACE_MS,
+			});
+			return { outcome: "terminating", pid };
+		}
 		const beforeKill = await processCommand(pid);
 		if (beforeKill.outcome === "gone") {
 			this.#signaledHosts.delete(input.sessionId);
@@ -1089,37 +1109,68 @@ export class BrokerSessionPort implements SessionPort {
 			beforeKill.command !== command
 		)
 			return { outcome: "terminating", pid };
-		try {
-			process.kill(pid, "SIGKILL");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-				this.#signaledHosts.delete(input.sessionId);
-				return { outcome: "already_gone" };
-			}
-			return { outcome: "terminating", pid };
-		}
-		const forcedExit = await waitForProcessExit(pid, beforeKill, HOST_SIGKILL_GRACE_MS);
-		if (forcedExit === "exited") {
-			this.#signaledHosts.delete(input.sessionId);
-			return { outcome: "terminated", pid };
-		}
-		return { outcome: "terminating", pid };
+		return await this.#signalKillAndConfirm(input.sessionId, signaled, beforeKill);
 	}
 
 	async #checkSignaledHost(
-		sessionId: string,
-		expected: { readonly pid: number; readonly identity: string },
+		input: { sessionId: string; shouldTerminate?: () => boolean | Promise<boolean> },
+		expected: SignaledHost,
+		finalGuardRefusal: () => Promise<{ readonly outcome: "refused"; readonly reason: string } | undefined>,
 	): Promise<TerminateHostOutcome> {
 		const inspection = await processCommand(expected.pid);
 		if (inspection.outcome === "gone") {
-			this.#signaledHosts.delete(sessionId);
+			this.#signaledHosts.delete(input.sessionId);
 			return { outcome: "already_gone" };
 		}
 		if (inspection.outcome === "unreadable")
 			return { outcome: "refused", reason: `process_inspection_failed:${inspection.reason}` };
-		if (inspection.identity !== expected.identity) {
-			this.#signaledHosts.delete(sessionId);
+		if (inspection.identity !== expected.identity || inspection.command !== expected.command) {
+			this.#signaledHosts.delete(input.sessionId);
 			return { outcome: "already_gone" };
+		}
+		if (expected.killSentAtMs !== undefined)
+			return await this.#signalKillAndConfirm(input.sessionId, expected, inspection);
+		const now = Date.now();
+		if (now - expected.signaledAtMs < HOST_SIGTERM_GRACE_MS) return { outcome: "terminating", pid: expected.pid };
+		if (expected.escalationAfterMs !== undefined && now < expected.escalationAfterMs)
+			return { outcome: "terminating", pid: expected.pid };
+		if (expected.escalationAfterMs === undefined) {
+			const refusal = await finalGuardRefusal();
+			if (refusal) {
+				this.#signaledHosts.set(input.sessionId, {
+					...expected,
+					escalationAfterMs: Date.now() + HOST_SIGTERM_ESCALATION_GRACE_MS,
+				});
+				return { outcome: "terminating", pid: expected.pid };
+			}
+		}
+		return await this.#signalKillAndConfirm(input.sessionId, expected, inspection);
+	}
+
+	async #signalKillAndConfirm(
+		sessionId: string,
+		expected: SignaledHost,
+		inspection: Extract<ProcessCommandInspection, { readonly outcome: "live" }>,
+	): Promise<TerminateHostOutcome> {
+		try {
+			process.kill(expected.pid, "SIGKILL");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+				this.#signaledHosts.delete(sessionId);
+				return { outcome: "already_gone" };
+			}
+			this.#signaledHosts.set(sessionId, {
+				...expected,
+				escalationAfterMs: Date.now() + HOST_SIGTERM_ESCALATION_GRACE_MS,
+			});
+			return { outcome: "terminating", pid: expected.pid };
+		}
+		const killSent = { ...expected, killSentAtMs: Date.now() };
+		this.#signaledHosts.set(sessionId, killSent);
+		const forcedExit = await waitForProcessExit(expected.pid, inspection, HOST_SIGKILL_GRACE_MS);
+		if (forcedExit === "exited") {
+			this.#signaledHosts.delete(sessionId);
+			return { outcome: "terminated", pid: expected.pid };
 		}
 		return { outcome: "terminating", pid: expected.pid };
 	}
@@ -2201,6 +2252,8 @@ function normalizeSdkEnvelopeFailure(result: CliResult): CliResult {
 }
 
 const HOST_SIGTERM_GRACE_MS = 1_000;
+/** Extra time after terminal status cancels SIGKILL before a signaled host is force-retired. */
+const HOST_SIGTERM_ESCALATION_GRACE_MS = 1_000;
 const HOST_SIGKILL_GRACE_MS = 1_000;
 const HOST_EXIT_POLL_MS = 100;
 
