@@ -227,6 +227,15 @@ export class MonitorPropagator {
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
 	readonly #notifyInbound: ((originKey: string) => Promise<void>) | undefined;
+	readonly #onReadinessFailure:
+		| ((input: {
+				readonly code: string;
+				readonly detail: string;
+				readonly originKey: string;
+				readonly at: number;
+		  }) => void)
+		| undefined;
+	readonly #onReadinessSuccess: ((input: { readonly originKey: string; readonly at: number }) => void) | undefined;
 	readonly #now: () => number;
 	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
@@ -271,6 +280,15 @@ export class MonitorPropagator {
 		deliver?: (payload: ChatMessagePayload) => void;
 		/** Wakes the persona actor after a durable monitor report is enqueued. */
 		notifyInbound?: (originKey: string) => Promise<void>;
+		/** Reports a monitor dispatch failure to process-local functional readiness. */
+		onReadinessFailure?: (input: {
+			readonly code: string;
+			readonly detail: string;
+			readonly originKey: string;
+			readonly at: number;
+		}) => void;
+		/** Reports successful monitor dispatches that require no adapter delivery. */
+		onReadinessSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
@@ -313,6 +331,8 @@ export class MonitorPropagator {
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
 		this.#notifyInbound = options.notifyInbound;
+		this.#onReadinessFailure = options.onReadinessFailure;
+		this.#onReadinessSuccess = options.onReadinessSuccess;
 		this.#now = options.now ?? (() => Date.now());
 		this.#acquireLease =
 			options.acquireLease ??
@@ -806,6 +826,7 @@ export class MonitorPropagator {
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) {
 			if (resumeTurn) return;
+			let transitionedFailure = false;
 			for (const row of rows) {
 				const failed = this.#database.transaction((tx) =>
 					this.#database.monitors.eventTerminalFail(
@@ -815,8 +836,18 @@ export class MonitorPropagator {
 						"dispatch setup failed (monitor_invalid)",
 					),
 				);
-				if (failed) this.#emitStage(row, "failed_no_retry");
+				if (failed) {
+					transitionedFailure = true;
+					this.#emitStage(row, "failed_no_retry");
+				}
 			}
+			if (transitionedFailure)
+				this.#recordReadinessFailure({
+					code: "monitor_invalid",
+					detail: "monitor dispatch failed during setup",
+					originKey: monitorReadinessOriginKey(rows[0]?.monitor_id ?? "unknown"),
+					at: this.#now(),
+				});
 			console.error(
 				`monitor dispatch rejected missing or invalid monitor: events ${rows.map((row) => row.event_id).join(",")}`,
 			);
@@ -875,7 +906,8 @@ export class MonitorPropagator {
 			sessionOrigin = monitorOriginForEvent(monitor, claimedEventType);
 			sessionOriginKey = originKey(sessionOrigin);
 		} catch {
-			this.#database.transaction((tx) => {
+			const transitionedFailure = this.#database.transaction((tx) => {
+				let transitioned = false;
 				for (const row of claimed) {
 					const failed = this.#database.monitors.eventFencedFail(
 						tx,
@@ -887,10 +919,21 @@ export class MonitorPropagator {
 						now(),
 						true,
 					);
-					if (failed) this.#emitStage(row, "failed_no_retry");
+					if (failed) {
+						transitioned = true;
+						this.#emitStage(row, "failed_no_retry");
+					}
 				}
 				for (const row of leased) this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId);
+				return transitioned;
 			});
+			if (transitionedFailure)
+				this.#recordReadinessFailure({
+					code: "event_type_invalid",
+					detail: "monitor dispatch failed during event setup",
+					originKey: monitorReadinessOriginKey(monitor.monitorId),
+					at: now(),
+				});
 			console.error(
 				`monitor dispatch rejected invalid event type: events ${claimed.map((row) => row.event_id).join(",")}`,
 			);
@@ -937,6 +980,16 @@ export class MonitorPropagator {
 			let protocolResponseByteLength: number | undefined;
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
+			let readinessFailure: { readonly code: string; readonly detail: string } | undefined;
+			const flushReadinessFailure = () => {
+				if (!readinessFailure) return;
+				this.#recordReadinessFailure({
+					...readinessFailure,
+					originKey: sessionOriginKey,
+					at: this.#now(),
+				});
+				readinessFailure = undefined;
+			};
 			try {
 				// A completed saved turn must be harvested before a pending roll changes
 				// its session ID. Fresh dispatches still roll at this boundary (#68).
@@ -1163,13 +1216,18 @@ export class MonitorPropagator {
 				// instead of pretending a delivery is still pending (issue #29 defect 3).
 				const target = monitor.channelTarget ?? this.#ownerTarget;
 				if (!target) {
+					let noDeliveryRecorded = false;
 					for (const row of fenced) {
 						if (this.#database.monitors.authoredOutput(row.event_id) === undefined) continue;
 						const updated = this.#database.transaction((tx) =>
 							this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "authored_no_delivery", batchId),
 						);
-						if (updated) this.#emitStage(row, "authored_no_delivery");
+						if (updated) {
+							noDeliveryRecorded = true;
+							this.#emitStage(row, "authored_no_delivery");
+						}
 					}
+					if (noDeliveryRecorded) this.#recordReadinessSuccess(sessionOriginKey);
 					return;
 				}
 				// Fenced delivery admission: the ledger insert is conditional on every
@@ -1195,11 +1253,13 @@ export class MonitorPropagator {
 					)
 					.filter((entry) => isSilentOutput(entry.note));
 				// Mark all silent notes as authored_no_delivery
+				let noDeliveryRecorded = false;
 				for (const entry of silentEntries) {
 					if (this.#database.monitors.authoredOutput(entry.eventId) === undefined) continue;
-					this.#database.transaction((tx) =>
+					const updated = this.#database.transaction((tx) =>
 						this.#database.monitors.eventFencedUpdate(tx, entry.eventId, leaseId, "authored_no_delivery", batchId),
 					);
+					if (updated) noDeliveryRecorded = true;
 				}
 				const validDeliveryEntries: typeof nonSilentEntries = [];
 				for (const entry of nonSilentEntries) {
@@ -1220,7 +1280,13 @@ export class MonitorPropagator {
 							this.#now(),
 						),
 					);
-					if (updated && eventRow) this.#emitStage(eventRow, "contract_unmet");
+					if (updated) {
+						readinessFailure ??= {
+							code: "authored_echo_suspected",
+							detail: "monitor authoring result echoed its contract",
+						};
+						if (eventRow) this.#emitStage(eventRow, "contract_unmet");
+					}
 				}
 				// Deliver only non-silent notes that contain information beyond the contract.
 				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
@@ -1261,7 +1327,7 @@ export class MonitorPropagator {
 					// until the next adapter reconnect flushed redeliveries (live finding:
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
-				}
+				} else if (noDeliveryRecorded && !readinessFailure) this.#recordReadinessSuccess(sessionOriginKey);
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
@@ -1280,6 +1346,7 @@ export class MonitorPropagator {
 							}
 						: undefined;
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
+				let transitionedFailure = false;
 				this.#database.transaction((tx) => {
 					for (const row of leased) {
 						const failed = this.#database.monitors.eventFencedFail(
@@ -1293,9 +1360,14 @@ export class MonitorPropagator {
 							false,
 							protocolFailure,
 						);
-						if (failed) this.#emitStage(row, "failed");
+						if (failed) {
+							transitionedFailure = true;
+							this.#emitStage(row, "failed");
+						}
 					}
 				});
+				if (transitionedFailure) readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
+				flushReadinessFailure();
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 				await this.#recordAuthoringFailure({
 					sessionOriginKey,
@@ -1309,6 +1381,7 @@ export class MonitorPropagator {
 					monitor,
 				});
 			} finally {
+				flushReadinessFailure();
 				stopHeartbeat();
 				for (const row of claimed) this.#claims.delete(row.event_id);
 				// Release the leases this attempt holds. Lease-guarded: if this attempt
@@ -1646,6 +1719,25 @@ export class MonitorPropagator {
 		if (reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
 	}
+	#recordReadinessSuccess(originKey: string): void {
+		try {
+			this.#onReadinessSuccess?.({ originKey, at: this.#now() });
+		} catch {
+			console.error("monitor readiness observer failed");
+		}
+	}
+	#recordReadinessFailure(input: {
+		readonly code: string;
+		readonly detail: string;
+		readonly originKey: string;
+		readonly at: number;
+	}): void {
+		try {
+			this.#onReadinessFailure?.(input);
+		} catch {
+			console.error("monitor readiness observer failed");
+		}
+	}
 	#isReportableResult(monitor: MonitorRecord, eventType: string, note: string): boolean {
 		if (isSilentOutput(note)) return false;
 		if (!monitor.channelTarget && !this.#ownerTarget) return true;
@@ -1849,6 +1941,10 @@ function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): Origi
 		monitor.monitorId,
 		monitor.eventTypes.includes(eventType) ? eventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
 	);
+}
+
+function monitorReadinessOriginKey(monitorId: string): string {
+	return originKey(monitorSessionOrigin(monitorId, CATCH_ALL_EVENT_ORIGIN.conversationId));
 }
 
 /** Extract a bounded, sanitized lower-level diagnosis without persisting raw error payloads. */

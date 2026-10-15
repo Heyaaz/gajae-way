@@ -442,6 +442,27 @@ export interface PersonaSessionManagerOptions {
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
 	/** Records a failed persona bind in the durable SLO journal. */
 	readonly onSloEvent?: (code: "persona_bind_failed", at: number) => void;
+	/** Readiness observers receive bind outcomes separately from the durable SLO event stream. */
+	readonly onBindFailure?: (input: {
+		readonly originKey: string;
+		readonly detail: string;
+		readonly at: number;
+	}) => void;
+	/** Reports a session failure before an inbound turn is accepted. */
+	readonly onSessionCreateFailure?: (input: {
+		readonly originKey: string;
+		readonly code: string;
+		readonly detail: string;
+		readonly at: number;
+	}) => void;
+	/** Reports failures applying model or service-tier settings before a turn is sent. */
+	readonly onPreSendFailure?: (input: {
+		readonly originKey: string;
+		readonly detail: string;
+		readonly at: number;
+	}) => void;
+	/** Reports a session as ready after it accepts an inbound turn. */
+	readonly onSessionReady?: (input: { readonly originKey: string; readonly at: number }) => void;
 	/** Cap on concurrently live persona session hosts; default DEFAULT_SESSIONS_MAX_LIVE_HOSTS. */
 	readonly maxLiveHosts?: number;
 	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
@@ -492,6 +513,10 @@ export class PersonaSessionManager {
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
+	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
+	readonly #onSessionCreateFailure: PersonaSessionManagerOptions["onSessionCreateFailure"];
+	readonly #onPreSendFailure: PersonaSessionManagerOptions["onPreSendFailure"];
+	readonly #onSessionReady: PersonaSessionManagerOptions["onSessionReady"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#maxLiveHosts: number;
@@ -531,6 +556,10 @@ export class PersonaSessionManager {
 		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
+		this.#onBindFailure = options.onBindFailure;
+		this.#onSessionCreateFailure = options.onSessionCreateFailure;
+		this.#onPreSendFailure = options.onPreSendFailure;
+		this.#onSessionReady = options.onSessionReady;
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -735,8 +764,41 @@ export class PersonaSessionManager {
 		}
 	}
 
-	recordBindFailure(): void {
-		this.#onSloEvent?.("persona_bind_failed", this.#now());
+	recordBindFailure(originKey: string, detail: string): void {
+		const at = this.#now();
+		try {
+			this.#onSloEvent?.("persona_bind_failed", at);
+		} finally {
+			try {
+				this.#onBindFailure?.({ originKey, detail, at });
+			} catch (error) {
+				this.#log(`persona bind readiness observer failed: ${safeDiagnostic(error)}`, "error");
+			}
+		}
+	}
+
+	recordSessionReady(originKey: string): void {
+		try {
+			this.#onSessionReady?.({ originKey, at: this.#now() });
+		} catch (error) {
+			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
+		}
+	}
+
+	recordSessionCreateFailure(originKey: string, code: string, detail: string): void {
+		try {
+			this.#onSessionCreateFailure?.({ originKey, code, detail, at: this.#now() });
+		} catch (error) {
+			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
+		}
+	}
+
+	recordPreSendFailure(originKey: string, detail: string): void {
+		try {
+			this.#onPreSendFailure?.({ originKey, detail, at: this.#now() });
+		} catch (error) {
+			this.#log(`persona pre-send readiness observer failed: ${safeDiagnostic(error)}`, "error");
+		}
 	}
 
 	#actor(originKey: string): OriginActor {
@@ -1721,6 +1783,7 @@ class OriginActor {
 			// No send was attempted. A broker disown code or positive liveness
 			// proof can therefore release this row without replaying accepted work.
 			// A generic failure alone is not authority to replace the session.
+			this.#manager.recordSessionCreateFailure(this.originKey, "session_attach_failed", safeDiagnostic(error));
 			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
 			const nextEpoch = this.#manager.database.transaction((tx) => {
 				retryInboundTurn(this.#manager.database, tx, opRef);
@@ -1821,6 +1884,7 @@ class OriginActor {
 			await this.#notifyReleased(current);
 			this.#preSendFailures += 1;
 			const failures = this.#preSendFailures;
+			this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
 			this.#manager.log(
 				`persona_model_failed origin=${this.originKey} epoch=${epoch}${nextEpoch === undefined ? "" : ` nextEpoch=${nextEpoch}`} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
 				"error",
@@ -1846,6 +1910,7 @@ class OriginActor {
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
+			this.#manager.recordSessionReady(this.originKey);
 			if (preamble.next) this.#personaPreamble.set(binding.sessionId, preamble.next);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
@@ -1885,6 +1950,7 @@ class OriginActor {
 			// not land. A session_not_found returned after port.send is ambiguous:
 			// the broker may have accepted the operation before the CLI failed.
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
+				this.#manager.recordSessionCreateFailure(this.originKey, "session_send_disowned", safeDiagnostic(error));
 				await tail.close();
 				const nextEpoch = this.#manager.database.transaction((tx) => {
 					retryInboundTurn(this.#manager.database, tx, opRef);
@@ -2099,7 +2165,7 @@ class OriginActor {
 			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${attempts} detail=${detail}`,
 			"error",
 		);
-		this.#manager.recordBindFailure();
+		this.#manager.recordBindFailure(this.originKey, detail);
 		if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 			this.#manager.log(
 				`persona_send_unrecoverable origin=${this.originKey} message=${trigger.message_id} attempts=${attempts} reason=bind_failed`,
