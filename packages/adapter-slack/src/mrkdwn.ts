@@ -19,17 +19,19 @@ export function markdownToMrkdwn(text: string): string {
 	const keepLink = links.map(() => false);
 	const scanSegments = protectedText.split(CODE_SEGMENTS);
 	let angleDepth = 0;
-	const updateAngleDepth = (segment: string): void => {
+	const updateAngleDepth = (segment: string, ignoreBrackets = false): void => {
 		for (const character of segment) {
-			if (character === "<") angleDepth++;
-			else if (character === ">" && angleDepth > 0) angleDepth--;
+			if (character === "\n" || character === "\r") angleDepth = 0;
+			else if (!ignoreBrackets && character === "<") angleDepth++;
+			else if (!ignoreBrackets && character === ">" && angleDepth > 0) angleDepth--;
 		}
 	};
-	// Ignore literal angle brackets in code while retaining unmatched prose brackets across code segments.
+	// Ignore code brackets and reset at line boundaries, including newlines within code segments.
 	for (let segmentIndex = 0; segmentIndex < scanSegments.length; segmentIndex++) {
 		const segment = scanSegments[segmentIndex] ?? "";
 		linkMarkers.lastIndex = 0;
 		if (segmentIndex % 2 === 1) {
+			updateAngleDepth(segment, true);
 			for (const match of segment.matchAll(linkMarkers)) keepLink[Number(match[1])] = true;
 			continue;
 		}

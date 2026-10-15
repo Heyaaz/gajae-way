@@ -26,6 +26,7 @@ test("Slack entities survive escaping; everything else in angle brackets is esca
 		["<https://example.com/~~gone~~|details>", "<https://example.com/~~gone~~|details>"],
 		["<https://example.com|run `cmd`>", "<https://example.com|run `cmd`>"],
 		["`x < y` <https://example.com>", "`x < y` <https://example.com>"],
+		["a < b\n<https://example.com>", "a &lt; b\n<https://example.com>"],
 		["```ts\nx < y\n```\n<https://example.com>", "```ts\nx < y\n```\n<https://example.com>"],
 		["**<https://example.com/a*b*c|details>**", "*<https://example.com/a*b*c|details>*"],
 		// Markdown around a mention still converts.
