@@ -243,6 +243,8 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
 }
 
 function processGroupExists(pid: number): boolean {
+	// `pid` is the broker's private process-group id; this only waits for that
+	// group to drain and is never used as proof of session or lease ownership.
 	try {
 		process.kill(-pid, 0);
 		return true;
