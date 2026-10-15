@@ -58,6 +58,7 @@ import {
 	threadFollowUpEngaged,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
+import { FunctionalReadiness } from "../functional-readiness";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
@@ -422,6 +423,7 @@ interface Runtime {
 	readonly persona: PersonaLoader;
 	readonly sessionPort: SessionPort;
 	readonly personaSessions: PersonaSessionManager;
+	readonly readiness: FunctionalReadiness;
 	/** Ordered shutdown, wired after construction; owner `/restart` uses it. */
 	stop?: (reason?: string) => Promise<void>;
 	readonly connections: Set<Connection>;
@@ -767,6 +769,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const botAudienceTurns = new BotAudienceTurnGuard(options.database.core);
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
+	const readiness = new FunctionalReadiness();
 	let runtime!: Runtime;
 	const workspacePath = options.workspace ?? join(options.config.home, "workspace");
 	// gjc rejects a session cwd that is a symlink: `session.create` comes back
@@ -842,6 +845,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			});
 		},
 		onSloEvent: (code, at) => options.slo?.note(code, at),
+		onBindFailure: ({ originKey, detail, at }) =>
+			readiness.recordFailure({
+				category: "session_create",
+				code: "persona_bind_failed",
+				detail: sanitizeDiagnostic(detail),
+				origin: originKey,
+				at,
+			}),
+		onSessionCreateSuccess: () => readiness.recordSuccess("session_create"),
 	});
 	const permissionPanels = new PermissionPanels({
 		deliver: (payload) => {
@@ -863,6 +875,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
 		repo: workspace,
+		onReadinessFailure: ({ code, detail, originKey, at }) =>
+			readiness.recordFailure({
+				category: "monitor_delivery",
+				code,
+				detail,
+				origin: originKey,
+				at,
+			}),
 		// AC7: the ONE production compaction seam. Native compaction runs through the
 		// broker-bound SessionPort, whose authenticated control receipt is the only
 		// affirmative compaction observation (logged by the TailRunner); the monitor
@@ -1035,6 +1055,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		sessionPort,
 		personaSessions,
+		readiness,
 		connections,
 		memory,
 		registry,
@@ -1241,6 +1262,7 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
+					readiness: runtime.readiness.snapshot(),
 					sessions: { active: options.database.bindings.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.inbox.contextDiagnostics(),
@@ -1274,14 +1296,14 @@ async function handleRequest(
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
 			const delivery = options.database.outbox.get(id);
-			const authoredEvents = delivery
-				? options.database.monitors
-						.eventsByBatch(delivery.turnId)
-						.filter((row) => row.stage === "authored")
-						.map((row) => row.event_id)
-				: [];
+			const batchEvents = delivery ? options.database.monitors.eventsByBatch(delivery.turnId) : [];
+			const authoredEvents = batchEvents.filter((row) => row.stage === "authored").map((row) => row.event_id);
 			const confirmOutcome = confirmAndSettleMonitorDelivery(options.database, id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			if (confirmOutcome === "transitioned") {
+				runtime.readiness.recordSuccess("delivery");
+				if (batchEvents.length > 0) runtime.readiness.recordSuccess("monitor_delivery");
+			}
 			if (confirmOutcome === "transitioned" && authoredEvents.length > 0) {
 				const authoredEventIds = new Set(authoredEvents);
 				for (const row of options.database.monitors.eventsByIds(authoredEvents)) {
@@ -1317,10 +1339,27 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack (the
 			// adapter may be retrying a stale outcome).
+			const pendingDelivery = runtime.delivery.get(params.deliveryId);
+			const batchEvents = pendingDelivery ? options.database.monitors.eventsByBatch(pendingDelivery.turnId) : [];
 			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous, params.reason);
 			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);
+				const code = failedRow?.lastError ?? "other";
+				runtime.readiness.recordFailure({
+					category: "delivery",
+					code,
+					detail: `delivery failed (${code})`,
+					...(failedRow ? { origin: failedRow.originKey } : {}),
+				});
+				if (batchEvents.length > 0) {
+					runtime.readiness.recordFailure({
+						category: "monitor_delivery",
+						code,
+						detail: `monitor delivery failed (${code})`,
+						...(failedRow ? { origin: failedRow.originKey } : {}),
+					});
+				}
 				if (failedRow?.state === "expired")
 					reportDeliveryExpired(runtime, options.database, failedRow, safeDiagnosticField(params.reason));
 			}
@@ -3540,6 +3579,7 @@ async function createInboundTurnLifecycle(
 		acknowledgeSteer(runtime, steered, turnId);
 	};
 	const onTerminal = async ({ text, alreadyPosted }: PersonaTerminalInput) => {
+		runtime.readiness.recordSuccess("turn");
 		let threw = false;
 		try {
 			const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
@@ -3620,6 +3660,12 @@ async function createInboundTurnLifecycle(
 	};
 
 	const onModelRefusal = ({ error }: PersonaFailureInput) => {
+		runtime.readiness.recordFailure({
+			category: "turn",
+			code: "model_not_selected",
+			detail: sanitizeDiagnostic(error.message) || "model not selected",
+			origin: key,
+		});
 		const notice = `${formatFailureNotice(error)} Send /model <id> or /new`;
 		console.error(notice);
 		if (nonLoopback) {
@@ -3646,6 +3692,12 @@ async function createInboundTurnLifecycle(
 	};
 
 	const onFailure = async ({ error, recoveredText }: PersonaFailureInput) => {
+		runtime.readiness.recordFailure({
+			category: "turn",
+			code: "turn_failed",
+			detail: sanitizeDiagnostic(error.message) || "turn failed",
+			origin: key,
+		});
 		try {
 			const failureNotice = formatFailureNotice(error);
 			console.error(failureNotice);

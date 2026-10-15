@@ -183,6 +183,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	await waitFor(client.frames, 3);
 	expect(client.frames[2].result.schemaVersion).toBe(37);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
+	expect(client.frames[2].result.readiness).toMatchObject({ ready: true, state: "ready", reason: null, failure: null });
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
 		expired: 0,
@@ -279,6 +280,50 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	expect(
 		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId),
 	).toHaveLength(2);
+	client.close();
+});
+
+test("status readiness degrades on sustained delivery failure and recovers after a confirmed delivery", async () => {
+	const { client, database } = await startDeliveryServer();
+	const origin = { platform: "discord", kind: "dm", conversationId: "readiness-test", peerId: "owner" } as const;
+	const delivery = new DeliveryService(database);
+	for (let index = 0; index < 3; index++) {
+		const deliveryId = `readiness-failed-${index}`;
+		expect(delivery.prepare(`turn-${index}`, origin, "reply", undefined, deliveryId)).toBeDefined();
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `fail-${index}`,
+			verb: "delivery.fail",
+			params: { deliveryId, reason: "upstream rejected token=secret-value", ambiguous: false },
+		});
+		await waitFrame(client.frames, `fail-${index}`);
+	}
+	client.send({ v: "0.1", type: "request", id: "degraded-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "degraded-status");
+	const degraded = client.frames.find((frame) => frame.id === "degraded-status").result.readiness;
+	expect(degraded).toMatchObject({ ready: false, state: "degraded", failureThreshold: 3 });
+	expect(degraded.reason).toContain("delivery: other");
+	expect(degraded.failure).toMatchObject({ category: "delivery", code: "other", consecutiveFailures: 3 });
+	expect(JSON.stringify(degraded)).not.toContain("secret-value");
+
+	expect(delivery.prepare("recovered-turn", origin, "reply", undefined, "readiness-recovered")).toBeDefined();
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "confirm-recovered",
+		verb: "delivery.confirm",
+		params: { deliveryId: "readiness-recovered" },
+	});
+	await waitFrame(client.frames, "confirm-recovered");
+	client.send({ v: "0.1", type: "request", id: "recovered-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "recovered-status");
+	expect(client.frames.find((frame) => frame.id === "recovered-status").result.readiness).toMatchObject({
+		ready: true,
+		state: "ready",
+		reason: null,
+		failure: null,
+	});
 	client.close();
 });
 

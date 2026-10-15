@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
+import type { GatewayStatusResult, OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -19,10 +19,62 @@ import {
 	renderSlo,
 	sloExitCode,
 	socketPath,
+	statusExitCode,
 	USAGE_EXIT_CODE,
 	usageFor,
 } from "../src/main";
 import { installServices, resolvePath, serviceSpecs } from "../src/services";
+
+for (const ready of [true, false]) {
+	test(`status exits ${ready ? "successfully" : "non-zero"} for readiness=${ready}`, async () => {
+		const status: GatewayStatusResult = {
+			profileVersion: "v0.1",
+			capabilities: [],
+			pid: 1,
+			startedAt: "2026-01-01T00:00:00.000Z",
+			schemaVersion: 1,
+			readiness: {
+				ready,
+				state: ready ? "ready" : "degraded",
+				windowMs: 5 * 60_000,
+				failureThreshold: 3,
+				reason: ready ? null : "delivery: network (3 consecutive failures within 5m)",
+				failure: ready
+					? null
+					: {
+							category: "delivery",
+							code: "network",
+							detail: "delivery failed (network)",
+							at: "2026-01-01T00:00:00.000Z",
+							consecutiveFailures: 3,
+						},
+			},
+			sessions: { active: 0 },
+		};
+		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
+		client.request = async <T>(verb: string): Promise<T> => {
+			expect(verb).toBe("gateway.status");
+			return status as T;
+		};
+		client.close = async () => {};
+		const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockResolvedValue(client);
+		const log = spyOn(console, "log").mockImplementation(() => {});
+		const error = spyOn(console, "error").mockImplementation(() => {});
+		const previousExitCode = process.exitCode;
+		try {
+			await main(["--socket", "/test/status.sock", "status"]);
+			expect(statusExitCode(status)).toBe(ready ? 0 : 1);
+			expect(process.exitCode).toBe(ready ? 0 : 1);
+			expect(log).toHaveBeenCalledWith(JSON.stringify(status));
+			expect(error).not.toHaveBeenCalled();
+		} finally {
+			connect.mockRestore();
+			log.mockRestore();
+			error.mockRestore();
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+}
 
 async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-slo-"));

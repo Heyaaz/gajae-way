@@ -227,6 +227,14 @@ export class MonitorPropagator {
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
 	readonly #notifyInbound: ((originKey: string) => Promise<void>) | undefined;
+	readonly #onReadinessFailure:
+		| ((input: {
+				readonly code: string;
+				readonly detail: string;
+				readonly originKey: string;
+				readonly at: number;
+		  }) => void)
+		| undefined;
 	readonly #now: () => number;
 	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
@@ -271,6 +279,13 @@ export class MonitorPropagator {
 		deliver?: (payload: ChatMessagePayload) => void;
 		/** Wakes the persona actor after a durable monitor report is enqueued. */
 		notifyInbound?: (originKey: string) => Promise<void>;
+		/** Reports a monitor dispatch failure to process-local functional readiness. */
+		onReadinessFailure?: (input: {
+			readonly code: string;
+			readonly detail: string;
+			readonly originKey: string;
+			readonly at: number;
+		}) => void;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
@@ -313,6 +328,7 @@ export class MonitorPropagator {
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
 		this.#notifyInbound = options.notifyInbound;
+		this.#onReadinessFailure = options.onReadinessFailure;
 		this.#now = options.now ?? (() => Date.now());
 		this.#acquireLease =
 			options.acquireLease ??
@@ -1280,6 +1296,7 @@ export class MonitorPropagator {
 							}
 						: undefined;
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
+				let readinessFailureRecorded = false;
 				this.#database.transaction((tx) => {
 					for (const row of leased) {
 						const failed = this.#database.monitors.eventFencedFail(
@@ -1293,9 +1310,24 @@ export class MonitorPropagator {
 							false,
 							protocolFailure,
 						);
-						if (failed) this.#emitStage(row, "failed");
+						if (failed) {
+							readinessFailureRecorded = true;
+							this.#emitStage(row, "failed");
+						}
 					}
 				});
+				if (readinessFailureRecorded) {
+					try {
+						this.#onReadinessFailure?.({
+							code,
+							detail: `monitor dispatch failed during ${dispatchPhase}`,
+							originKey: sessionOriginKey,
+							at: now(),
+						});
+					} catch {
+						console.error("monitor readiness observer failed");
+					}
+				}
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 				await this.#recordAuthoringFailure({
 					sessionOriginKey,
