@@ -118,7 +118,7 @@ async function harness(
 		submissionRetryDelayMs?: number;
 		onSloEvent?: (code: "persona_bind_failed", at: number) => void;
 		onBindFailure?: (input: { originKey: string; detail: string; at: number }) => void;
-		onSessionCreateSuccess?: (input: { originKey: string; at: number }) => void;
+		onSessionReady?: (input: { originKey: string; at: number }) => void;
 		now?: () => number;
 	} = {},
 ) {
@@ -212,7 +212,7 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	const terminal: string[] = [];
 	const sessionCreateSuccesses: Array<{ originKey: string; at: number }> = [];
 	await harness(port, { terminal: (text) => terminal.push(text) }, undefined, {
-		onSessionCreateSuccess: (input) => sessionCreateSuccesses.push(input),
+		onSessionReady: (input) => sessionCreateSuccesses.push(input),
 	});
 	enqueue("m-1", "hello");
 	await manager?.notifyInbound(KEY);
@@ -233,7 +233,7 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	await manager?.notifyInbound(KEY);
 	await eventually(() => terminal.length === 2, "reused session turn did not complete");
 	expect(port.sends).toHaveLength(2);
-	expect(sessionCreateSuccesses).toHaveLength(1);
+	expect(sessionCreateSuccesses).toHaveLength(2);
 });
 
 for (const outcome of ["complete", "incomplete", "in_flight"] as const)

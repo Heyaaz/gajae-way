@@ -461,8 +461,8 @@ export interface PersonaSessionManagerOptions {
 		readonly detail: string;
 		readonly at: number;
 	}) => void;
-	/** Reports a newly created session; reusing a stored binding is not a create success. */
-	readonly onSessionCreateSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
+	/** Reports a session as ready after it accepts an inbound turn. */
+	readonly onSessionReady?: (input: { readonly originKey: string; readonly at: number }) => void;
 	/** Cap on concurrently live persona session hosts; default DEFAULT_SESSIONS_MAX_LIVE_HOSTS. */
 	readonly maxLiveHosts?: number;
 	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
@@ -516,7 +516,7 @@ export class PersonaSessionManager {
 	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
 	readonly #onSessionCreateFailure: PersonaSessionManagerOptions["onSessionCreateFailure"];
 	readonly #onPreSendFailure: PersonaSessionManagerOptions["onPreSendFailure"];
-	readonly #onSessionCreateSuccess: PersonaSessionManagerOptions["onSessionCreateSuccess"];
+	readonly #onSessionReady: PersonaSessionManagerOptions["onSessionReady"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#maxLiveHosts: number;
@@ -559,7 +559,7 @@ export class PersonaSessionManager {
 		this.#onBindFailure = options.onBindFailure;
 		this.#onSessionCreateFailure = options.onSessionCreateFailure;
 		this.#onPreSendFailure = options.onPreSendFailure;
-		this.#onSessionCreateSuccess = options.onSessionCreateSuccess;
+		this.#onSessionReady = options.onSessionReady;
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -777,9 +777,9 @@ export class PersonaSessionManager {
 		}
 	}
 
-	recordSessionCreateSuccess(originKey: string): void {
+	recordSessionReady(originKey: string): void {
 		try {
-			this.#onSessionCreateSuccess?.({ originKey, at: this.#now() });
+			this.#onSessionReady?.({ originKey, at: this.#now() });
 		} catch (error) {
 			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
 		}
@@ -1910,7 +1910,7 @@ class OriginActor {
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
-			if (!stored) this.#manager.recordSessionCreateSuccess(this.originKey);
+			this.#manager.recordSessionReady(this.originKey);
 			if (preamble.next) this.#personaPreamble.set(binding.sessionId, preamble.next);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;

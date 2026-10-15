@@ -874,7 +874,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				origin: originKey,
 				at,
 			}),
-		onSessionCreateSuccess: () => readiness.recordSuccess("session_create"),
+		onSessionReady: () => readiness.recordSuccess("session_create"),
 	});
 	const permissionPanels = new PermissionPanels({
 		deliver: (payload) => {
