@@ -82,8 +82,12 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
  * SIGTERM. A shell no-op loop carries the tag in its own argv, so
  * `ps -o command=` shows it (`sleep` rejects extra arguments and exits at once).
  */
-function fakeHost(argvTag: string, ignoreTerm = false) {
-	const loop = ignoreTerm ? "trap '' TERM; while :; do sleep 1; done" : "while :; do sleep 1; done";
+function fakeHost(argvTag: string, ignoreTerm = false, delayedTerm = false) {
+	const loop = delayedTerm
+		? "trap 'sleep 2; exit 0' TERM; while :; do sleep 1; done"
+		: ignoreTerm
+			? "trap '' TERM; while :; do sleep 1; done"
+			: "while :; do sleep 1; done";
 	return Bun.spawn(["sh", "-c", loop, argvTag], { stdout: "ignore", stderr: "ignore" });
 }
 
@@ -115,6 +119,35 @@ test("a session host that ignores SIGTERM is escalated and confirmed exited", as
 	}
 });
 
+test("a signaled host stays tracked when escalation is canceled until its process exits", async () => {
+	const child = fakeHost("sdk session-host-internal", false, true);
+	const h = await harness(() => child.pid);
+	let guardCalls = 0;
+	try {
+		expect(
+			await h.port.terminateHost({
+				sessionId: "s-1",
+				repo: h.repo,
+				shouldTerminate: () => ++guardCalls === 1,
+			}),
+		).toEqual({ outcome: "terminating", pid: child.pid });
+		expect(guardCalls).toBe(2);
+		expect(await Promise.race([child.exited.then(() => "exited"), Bun.sleep(100).then(() => "alive")])).toBe("alive");
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo, shouldTerminate: () => false })).toEqual({
+			outcome: "terminating",
+			pid: child.pid,
+		});
+		expect(guardCalls).toBe(2);
+		expect(await child.exited).toBe(0);
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo, shouldTerminate: () => false })).toEqual({
+			outcome: "already_gone",
+		});
+	} finally {
+		child.kill();
+		await h.close();
+	}
+});
+
 test("a pid that is not a session host is never signalled - broker, daemon, or anything else", async () => {
 	for (const tag of ["sdk broker-internal", "sdk daemon-internal", "some-other-program"]) {
 		const child = fakeHost(tag);
@@ -132,10 +165,13 @@ test("a pid that is not a session host is never signalled - broker, daemon, or a
 	}
 });
 
-test("a session the broker no longer knows, or reports not live, is already gone", async () => {
+test("broker absence alone does not prove a session host process is gone", async () => {
 	const gone = await harness(() => undefined);
 	try {
-		expect(await gone.port.terminateHost({ sessionId: "s-3", repo: gone.repo })).toEqual({ outcome: "already_gone" });
+		expect(await gone.port.terminateHost({ sessionId: "s-3", repo: gone.repo })).toEqual({
+			outcome: "refused",
+			reason: "inspect_failed:session_gone_without_process_identity",
+		});
 	} finally {
 		await gone.close();
 	}
@@ -143,7 +179,8 @@ test("a session the broker no longer knows, or reports not live, is already gone
 	const notLive = await harness(() => child.pid, false);
 	try {
 		expect(await notLive.port.terminateHost({ sessionId: "s-4", repo: notLive.repo })).toEqual({
-			outcome: "already_gone",
+			outcome: "refused",
+			reason: "session_not_live_but_process_live",
 		});
 		expect(child.killed).toBe(false);
 	} finally {

@@ -74,6 +74,7 @@ const STATUS_TERMINAL_GRACE_MS = 250;
 /** `turn.result` recheck cadence for a running turn whose end no relay will announce: 250 ms doubling to 5 s. */
 const STATUS_RECHECK_MIN_MS = 250;
 const STATUS_RECHECK_MAX_MS = 5_000;
+const HOST_TERMINATION_RECHECK_MS = 1_000;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
  * slack: the host stamps rows and the gateway stamps dispatched_at on two
@@ -887,6 +888,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	stallTerminationWarningLogged?: boolean;
 	/** The host was stopped by the terminal-event cutoff; retry durable failure closure if needed. */
 	stallHostTerminated?: boolean;
+	/** SIGTERM was accepted, but the host process has not yet been confirmed exited. */
+	stallHostTerminating?: boolean;
 	/** A stalled retired hold already attempted its one allowed host termination. */
 	retiredHostTerminationAttempted?: boolean;
 	/** Repeated output discarded from a retired turn is summarized once per discard interval. */
@@ -934,6 +937,8 @@ class OriginActor {
 	#recoveryScanned = false;
 	/** The session whose host this origin counts as holding; cleared when that host is ended. */
 	#hostSessionId: string | undefined;
+	/** A signalled host remains counted but cannot be reused until its process exits. */
+	#hostTerminatingSessionId: string | undefined;
 	#hostLastActiveAt = 0;
 	/** Set while the oldest pending trigger waits for a host slot. */
 	#hostHeldSince: number | undefined;
@@ -950,6 +955,7 @@ class OriginActor {
 		return (
 			(this.#current !== undefined && !this.#current.stallHostTerminated) ||
 			this.#retired.size > 0 ||
+			this.#hostTerminatingSessionId !== undefined ||
 			(this.#manager.brokerAvailable && this.#hostSessionId !== undefined)
 		);
 	}
@@ -959,6 +965,7 @@ class OriginActor {
 		return (
 			this.#manager.brokerAvailable &&
 			this.#hostSessionId !== undefined &&
+			this.#hostTerminatingSessionId === undefined &&
 			this.#state === "idle" &&
 			this.#current === undefined &&
 			this.#retired.size === 0 &&
@@ -1681,6 +1688,10 @@ class OriginActor {
 			trigger.message_id,
 		);
 		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, turnAttempt);
+		if (this.#hostTerminatingSessionId !== undefined) {
+			await this.#holdForHostCapacity(trigger, epoch, this.#manager.liveHostCount());
+			return;
+		}
 		if (!this.hostLive) {
 			const admission = await this.#manager.admitHost(this);
 			if (!admission.admitted) {
@@ -2854,6 +2865,36 @@ class OriginActor {
 			}
 			return false;
 		}
+		if (result.outcome === "terminating") {
+			bound.stallHostTerminating = true;
+			if (this.#hostTerminatingSessionId !== bound.sessionId) {
+				this.#hostTerminatingSessionId = bound.sessionId;
+				this.#manager.log(
+					`stalled_turn_host_terminating origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} pid=${result.pid}`,
+					"warn",
+				);
+			}
+			this.#scheduleHostTerminationRecheck(bound.sessionId);
+			let latest: StatusReport;
+			try {
+				latest = await this.#statusOf(bound);
+			} catch (error) {
+				if (!this.#stopped && !this.#manager.stopped) {
+					this.#manager.log(
+						`stalled_turn_shutdown_status_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+						"warn",
+					);
+					this.#scheduleStatusRecheck(bound);
+				}
+				return false;
+			}
+			if (isTerminalStatus(latest.status.status)) {
+				await this.#reconcileBound(bound, latest);
+				return true;
+			}
+			this.#scheduleStatusRecheck(bound);
+			return false;
+		}
 		if (result.outcome === "refused" && result.reason === "termination_guard_rejected") {
 			if (!canTerminate()) this.#clearStallReconciliation(bound);
 			return false;
@@ -2993,6 +3034,7 @@ class OriginActor {
 			// quiet again, the tail will raise another stall and restart status checks.
 			if (
 				!bound.stallHostTerminated &&
+				!bound.stallHostTerminating &&
 				(!frame.idle || frame.rawKind === "agent_end" || frame.rawKind === "agent_failed")
 			)
 				this.#clearStallReconciliation(bound);
@@ -3685,9 +3727,9 @@ class OriginActor {
 			this.#state = "idle";
 			if (bound.stallHostTerminated) {
 				if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
-			} else this.#touchHost(bound.sessionId);
+			} else if (!bound.stallHostTerminating) this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
-			if (!bound.stallHostTerminated && this.hostIdle) this.#manager.hostFreed();
+			if (!bound.stallHostTerminated && !bound.stallHostTerminating && this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
@@ -3869,9 +3911,9 @@ class OriginActor {
 			this.#state = "idle";
 			if (bound.stallHostTerminated) {
 				if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
-			} else this.#touchHost(bound.sessionId);
+			} else if (!bound.stallHostTerminating) this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
-			if (!bound.stallHostTerminated && this.hostIdle) this.#manager.hostFreed();
+			if (!bound.stallHostTerminated && !bound.stallHostTerminating && this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
@@ -3974,6 +4016,59 @@ class OriginActor {
 		const timer = this.#retiredReattachTimers.get(key);
 		if (timer !== undefined) this.#manager.cancel(timer);
 		this.#retiredReattachTimers.delete(key);
+	}
+
+	#scheduleHostTerminationRecheck(sessionId: string): void {
+		const key = `host-termination:${sessionId}`;
+		if (this.#retiredReattachTimers.has(key)) return;
+		const timer = this.#manager.schedule(() => {
+			this.#retiredReattachTimers.delete(key);
+			if (this.#stopped || this.#manager.stopped) return;
+			void this.enqueue(async () => await this.#reconcileTerminatingHost(sessionId)).catch((error: unknown) =>
+				this.#manager.log(
+					`persona_host_termination_recheck_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+					"warn",
+				),
+			);
+		}, HOST_TERMINATION_RECHECK_MS);
+		this.#retiredReattachTimers.set(key, timer);
+	}
+
+	async #reconcileTerminatingHost(sessionId: string): Promise<void> {
+		if (this.#hostTerminatingSessionId !== sessionId) return;
+		const port = this.#manager.port;
+		if (!port.terminateHost) {
+			this.#scheduleHostTerminationRecheck(sessionId);
+			return;
+		}
+		let result: TerminateHostOutcome;
+		try {
+			result = await port.terminateHost({
+				sessionId,
+				repo: this.#manager.repo,
+				shouldTerminate: () => false,
+			});
+		} catch {
+			this.#scheduleHostTerminationRecheck(sessionId);
+			return;
+		}
+		if (result.outcome !== "terminated" && result.outcome !== "already_gone") {
+			this.#scheduleHostTerminationRecheck(sessionId);
+			return;
+		}
+		this.#hostTerminatingSessionId = undefined;
+		if (this.#hostSessionId === sessionId) this.#hostSessionId = undefined;
+		const bound = this.#current?.sessionId === sessionId ? this.#current : undefined;
+		if (bound) {
+			bound.stallHostTerminating = false;
+			bound.stallHostTerminated = true;
+		}
+		this.#manager.log(
+			`stalled_turn_host_exit_confirmed origin=${this.originKey} session=${sessionId} outcome=${result.outcome}`,
+			"warn",
+		);
+		this.#manager.hostFreed();
+		if (bound) await this.#reconcileBound(bound);
 	}
 
 	/** Bounded status poll for a lost or stalled tail; one timer per turn, backing off. */

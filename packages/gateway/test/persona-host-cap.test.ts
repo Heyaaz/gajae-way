@@ -30,8 +30,9 @@ function origin(name: string) {
 	};
 }
 
-async function eventually(predicate: () => boolean, message: string): Promise<void> {
-	for (let attempt = 0; attempt < 400; attempt++) {
+async function eventually(predicate: () => boolean, message: string, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(5);
 	}
@@ -242,6 +243,51 @@ test("a stalled-turn cutoff frees one host slot once when its failure notice ret
 	} finally {
 		releaseBinds();
 	}
+});
+
+test("a terminal result does not make a signaled host reusable before its process exits", async () => {
+	let clock = 1_000_000;
+	const h = await harness({ maxLiveHosts: 1, now: () => clock });
+	await h.send("a", "a1");
+	await eventually(() => h.sent("a1") !== undefined, "a1 was not dispatched");
+	const first = h.port.sends.find((send) => send.text === "a1")!;
+	await h.send("b", "b1");
+	await eventually(() => h.manager.admissionHold(origin("b").key) === "host_capacity", "b1 was not held at capacity");
+	const close = h.port.close.bind(h.port);
+	let signalSent = false;
+	let hostExited = false;
+	let terminationCalls = 0;
+	h.port.terminateHost = async (input) => {
+		terminationCalls++;
+		if (signalSent && !hostExited) return { outcome: "terminating", pid: 40_001 };
+		if (hostExited) {
+			await close(input);
+			return { outcome: "already_gone" };
+		}
+		if (!(await input.shouldTerminate?.())) return { outcome: "refused", reason: "termination_guard_rejected" };
+		signalSent = true;
+		h.port.complete(first.opRef, "answer completed during host shutdown");
+		return { outcome: "terminating", pid: 40_001 };
+	};
+	h.port.setActivity(first.sessionId, "tool", clock);
+	const statusReads = h.port.statusReads.length;
+	h.port.emitStall(first.sessionId);
+	await eventually(() => h.port.statusReads.length > statusReads, "stalled turn did not reconcile status");
+	clock += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await h.manager.tick(origin("a").key);
+	await eventually(
+		() => h.database.inbox.turnRow(first.opRef)?.turn_state === "done",
+		"terminal result did not settle",
+	);
+	expect(signalSent).toBe(true);
+	expect(h.manager.liveHostCount()).toBe(1);
+	expect(h.manager.admissionHold(origin("b").key)).toBe("host_capacity");
+	expect(h.sent("b1")).toBeUndefined();
+	hostExited = true;
+	await eventually(() => h.sent("b1") !== undefined, "capacity did not free after host exit was confirmed", 10_000);
+	expect(terminationCalls).toBeGreaterThanOrEqual(2);
+	expect(h.port.closes.map((entry) => entry.sessionId)).toContain(first.sessionId);
+	expect(h.manager.liveHostCount()).toBe(1);
 });
 
 test("idle hosts past the retire window are ended by the sweep and busy ones are left alone", async () => {

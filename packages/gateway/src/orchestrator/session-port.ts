@@ -62,7 +62,9 @@ export function splitThinkingSuffix(selection: string): { readonly model: string
  */
 export type TerminateHostOutcome =
 	| { readonly outcome: "terminated"; readonly pid: number }
-	/** Positive evidence that the session or its process is gone; transient inspect errors are `refused`. */
+	/** SIGTERM/SIGKILL was accepted, but the inspected process identity remains live or unverifiable. */
+	| { readonly outcome: "terminating"; readonly pid: number }
+	/** Positive process evidence that the host is gone; broker session absence alone is `refused`. */
 	| { readonly outcome: "already_gone" }
 	| { readonly outcome: "not_a_host"; readonly pid: number; readonly command: string }
 	| { readonly outcome: "refused"; readonly reason: string };
@@ -489,6 +491,7 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
 	readonly #bindings = new Map<string, Promise<SessionBinding>>();
+	readonly #signaledHosts = new Map<string, { readonly pid: number; readonly identity: string }>();
 	readonly #authority: BrokerAuthority;
 
 	constructor(options: BrokerSessionPortOptions) {
@@ -994,6 +997,8 @@ export class BrokerSessionPort implements SessionPort {
 				return { outcome: "refused", reason: `termination_guard_failed:${sanitizeDiagnostic(String(error))}` } as const;
 			}
 		};
+		const signaledHost = this.#signaledHosts.get(input.sessionId);
+		if (signaledHost) return await this.#checkSignaledHost(input.sessionId, signaledHost);
 		let pid: number | undefined;
 		let live: boolean | undefined;
 		try {
@@ -1008,7 +1013,7 @@ export class BrokerSessionPort implements SessionPort {
 			if (envelope.ok !== true) {
 				const code = stableErrorCode(envelope.error?.code);
 				return isSessionGoneCode(code)
-					? { outcome: "already_gone" }
+					? { outcome: "refused", reason: "inspect_failed:session_gone_without_process_identity" }
 					: { outcome: "refused", reason: `inspect_failed:${code ?? "invalid_envelope"}` };
 			}
 			const session = envelope.result?.session;
@@ -1020,10 +1025,17 @@ export class BrokerSessionPort implements SessionPort {
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return isSessionGoneCode(sdkErrorCode(error))
-				? { outcome: "already_gone" }
+				? { outcome: "refused", reason: "inspect_failed:session_gone_without_process_identity" }
 				: { outcome: "refused", reason: `inspect_failed:${sanitizeDiagnostic(String(error))}` };
 		}
-		if (live === false) return { outcome: "already_gone" };
+		if (live === false) {
+			if (pid === undefined) return { outcome: "refused", reason: "inspect_incomplete:missing_host_pid" };
+			const deadCheck = await processCommand(pid);
+			if (deadCheck.outcome === "gone") return { outcome: "already_gone" };
+			if (deadCheck.outcome === "unreadable")
+				return { outcome: "refused", reason: `process_inspection_failed:${deadCheck.reason}` };
+			return { outcome: "refused", reason: "session_not_live_but_process_live" };
+		}
 		if (pid === undefined || live !== true)
 			return { outcome: "refused", reason: "inspect_incomplete:missing_live_host_identity" };
 		const inspection = await processCommand(pid);
@@ -1040,7 +1052,11 @@ export class BrokerSessionPort implements SessionPort {
 		if (revalidated.outcome === "gone") return { outcome: "already_gone" };
 		if (revalidated.outcome === "unreadable")
 			return { outcome: "refused", reason: `process_inspection_failed:${revalidated.reason}` };
-		if (revalidated.identity !== inspection.identity || revalidated.command !== command)
+		if (
+			revalidated.identity !== inspection.identity ||
+			revalidated.context !== inspection.context ||
+			revalidated.command !== command
+		)
 			return { outcome: "refused", reason: "process_identity_changed" };
 		try {
 			process.kill(pid, "SIGTERM");
@@ -1048,30 +1064,64 @@ export class BrokerSessionPort implements SessionPort {
 			if ((error as NodeJS.ErrnoException).code === "ESRCH") return { outcome: "already_gone" };
 			return { outcome: "refused", reason: `kill_failed:${(error as NodeJS.ErrnoException).code ?? "unknown"}` };
 		}
+		this.#signaledHosts.set(input.sessionId, {
+			pid,
+			identity: revalidated.identity,
+		});
 		const gracefulExit = await waitForProcessExit(pid, revalidated, HOST_SIGTERM_GRACE_MS);
-		if (gracefulExit === "exited") return { outcome: "terminated", pid };
-		if (gracefulExit === "changed") return { outcome: "refused", reason: "process_identity_changed" };
-		if (gracefulExit === "unreadable") return { outcome: "refused", reason: "process_exit_unreadable" };
+		if (gracefulExit === "exited") {
+			this.#signaledHosts.delete(input.sessionId);
+			return { outcome: "terminated", pid };
+		}
+		if (gracefulExit === "changed" || gracefulExit === "unreadable") return { outcome: "terminating", pid };
 
 		const escalationRefusal = await finalGuardRefusal();
-		if (escalationRefusal) return escalationRefusal;
+		if (escalationRefusal) return { outcome: "terminating", pid };
 		const beforeKill = await processCommand(pid);
-		if (beforeKill.outcome === "gone") return { outcome: "already_gone" };
-		if (beforeKill.outcome === "unreadable")
-			return { outcome: "refused", reason: `process_inspection_failed:${beforeKill.reason}` };
-		if (beforeKill.identity !== inspection.identity || beforeKill.command !== command)
-			return { outcome: "refused", reason: "process_identity_changed" };
+		if (beforeKill.outcome === "gone") {
+			this.#signaledHosts.delete(input.sessionId);
+			return { outcome: "already_gone" };
+		}
+		if (beforeKill.outcome === "unreadable") return { outcome: "terminating", pid };
+		if (
+			beforeKill.identity !== inspection.identity ||
+			beforeKill.context !== inspection.context ||
+			beforeKill.command !== command
+		)
+			return { outcome: "terminating", pid };
 		try {
 			process.kill(pid, "SIGKILL");
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ESRCH") return { outcome: "already_gone" };
-			return { outcome: "refused", reason: `kill_failed:${(error as NodeJS.ErrnoException).code ?? "unknown"}` };
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+				this.#signaledHosts.delete(input.sessionId);
+				return { outcome: "already_gone" };
+			}
+			return { outcome: "terminating", pid };
 		}
 		const forcedExit = await waitForProcessExit(pid, beforeKill, HOST_SIGKILL_GRACE_MS);
-		if (forcedExit === "exited") return { outcome: "terminated", pid };
-		if (forcedExit === "changed") return { outcome: "refused", reason: "process_identity_changed" };
-		if (forcedExit === "unreadable") return { outcome: "refused", reason: "process_exit_unreadable" };
-		return { outcome: "refused", reason: "process_exit_unconfirmed" };
+		if (forcedExit === "exited") {
+			this.#signaledHosts.delete(input.sessionId);
+			return { outcome: "terminated", pid };
+		}
+		return { outcome: "terminating", pid };
+	}
+
+	async #checkSignaledHost(
+		sessionId: string,
+		expected: { readonly pid: number; readonly identity: string },
+	): Promise<TerminateHostOutcome> {
+		const inspection = await processCommand(expected.pid);
+		if (inspection.outcome === "gone") {
+			this.#signaledHosts.delete(sessionId);
+			return { outcome: "already_gone" };
+		}
+		if (inspection.outcome === "unreadable")
+			return { outcome: "refused", reason: `process_inspection_failed:${inspection.reason}` };
+		if (inspection.identity !== expected.identity) {
+			this.#signaledHosts.delete(sessionId);
+			return { outcome: "already_gone" };
+		}
+		return { outcome: "terminating", pid: expected.pid };
 	}
 
 	/**
@@ -2152,10 +2202,10 @@ function normalizeSdkEnvelopeFailure(result: CliResult): CliResult {
 
 const HOST_SIGTERM_GRACE_MS = 1_000;
 const HOST_SIGKILL_GRACE_MS = 1_000;
-const HOST_EXIT_POLL_MS = 50;
+const HOST_EXIT_POLL_MS = 100;
 
 type ProcessCommandInspection =
-	| { readonly outcome: "live"; readonly command: string; readonly identity: string }
+	| { readonly outcome: "live"; readonly command: string; readonly identity: string; readonly context: string }
 	| { readonly outcome: "gone" }
 	| { readonly outcome: "unreadable"; readonly reason: string };
 
@@ -2200,7 +2250,8 @@ async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 			if (!match || Number(match[1]) !== pid) return { outcome: "unreadable", reason: "ps_pid_mismatch" };
 			return {
 				outcome: "live",
-				identity: `${match[1]}:${match[2]}:${match[3]}:${match[4]}`,
+				identity: `${match[1]}:${match[4]}`,
+				context: `${match[2]}:${match[3]}`,
 				command: match[5]?.trim() ?? "",
 			};
 		}
