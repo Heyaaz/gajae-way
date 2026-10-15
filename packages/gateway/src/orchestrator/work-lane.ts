@@ -160,10 +160,11 @@ export interface CheckStatusSnapshot {
 
 export interface CheckStatusClient {
 	/**
-	 * Snapshot the PR head and its checks for `branch`: null when no matching PR exists,
-	 * undefined when the lookup failed or timed out. Must not throw.
+	 * Snapshot the PR for `headSha`, preferring `prNumber` when supplied. Returns null only when an
+	 * unqualified lookup proves no match exists; returns undefined when lookup failed, timed out, or results are incomplete or ambiguous.
+	 * Must not throw.
 	 */
-	getCheckStatus(branch: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
+	getCheckStatus(headSha: string, cwd: string, prNumber?: number): Promise<CheckStatusSnapshot | null | undefined>;
 }
 
 export interface WorkLaneManagerOptions {
@@ -498,7 +499,15 @@ export class WorkLaneManager {
 		if (!attempt || attempt.opRef !== opRef) return false;
 		const runtime = this.#db.work.workAttemptGet(opRef);
 		if (!runtime) return false;
-		if (runtime.settledAt !== null) return attempt.endedAt === runtime.settledAt;
+		if (runtime.settledAt !== null) {
+			if (attempt.endedAt !== runtime.settledAt) return false;
+			if (record.state === "awaiting_checks")
+				this.#putJob(
+					name,
+					settleAwaitingChecks(record, endedAt, { kind: "ended", reason: "lane force-retired before checks settled" }),
+				);
+			return true;
+		}
 		if (attempt.endedAt !== undefined) return false;
 
 		const recordedTerminal = runtime.terminal;
@@ -1590,6 +1599,14 @@ export class WorkLaneManager {
 				) {
 					job = transitionToAwaitingChecks({ record: job, at, prNumber: null, headSha: facts.headSha });
 				}
+				if (
+					job.state === "awaiting_checks" &&
+					checks?.status === "green" &&
+					(job.awaitingChecks?.prNumber === null || job.awaitingChecks?.prNumber === checks.prNumber) &&
+					(checks.prState === "open" || checks.merged === true) &&
+					checks.headSha === facts?.headSha
+				)
+					job = settleAwaitingChecks(job, at, { kind: "passed" });
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
@@ -1738,7 +1755,13 @@ export class WorkLaneManager {
 		const observed = this.#job(name);
 		const cycle = observed?.awaitingChecks;
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
-		const facts = await collectRepoFacts(observed.lane.worktreePath, client, true, true);
+		const facts = await collectRepoFacts(
+			observed.lane.worktreePath,
+			client,
+			true,
+			cycle.headSha,
+			cycle.prNumber ?? undefined,
+		);
 		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
 			if (this.#stopped) return undefined;
 			let job = this.#job(name);
@@ -2932,6 +2955,9 @@ function checksOutcome(
 			kind: "ended",
 			reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.remoteHeadSha.slice(0, 12)}`,
 		};
+	const headIsPublished =
+		(facts?.pushed === true && facts.remoteHeadSha === cycle.headSha) ||
+		(checks?.headSha === cycle.headSha && (cycle.prNumber === null || checks.prNumber === cycle.prNumber));
 	if (cycle.prNumber === null) {
 		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
 		if (checks?.prState === "closed") {
@@ -2943,7 +2969,7 @@ function checksOutcome(
 			return { kind: "ended", reason: `pr_closed pr=${checks.prNumber}` };
 		}
 		if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-		if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+		if (!headIsPublished) {
 			if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 				return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 			return { kind: "wait" };
@@ -2971,7 +2997,7 @@ function checksOutcome(
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	}
 	if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-	if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+	if (!headIsPublished) {
 		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 		return { kind: "wait" };
@@ -3036,7 +3062,8 @@ async function collectRepoFacts(
 	worktreePath: string,
 	checkClient?: CheckStatusClient,
 	includePushStatus = true,
-	checkWhenUnpushed = false,
+	checkHeadSha?: string,
+	checkPrNumber?: number,
 ): Promise<
 	| {
 			headSha?: string;
@@ -3073,11 +3100,6 @@ async function collectRepoFacts(
 				.filter((line) => line.trim()).length,
 			branch: branchName,
 		};
-		const checksBeforeRemoteProbe =
-			checkWhenUnpushed && branchName && branchName !== "HEAD" && checkClient
-				? await checkClient.getCheckStatus(branchName, worktreePath)
-				: undefined;
-
 		// Bare clones do not create remote-tracking refs, so verify every configured push URL directly.
 		if (includePushStatus && branchName && branchName !== "HEAD") {
 			const pushUrlsResult = Bun.spawnSync(
@@ -3106,10 +3128,11 @@ async function collectRepoFacts(
 
 			// Query even when the source ref is absent: GitHub retains merged PRs after branch deletion.
 			if (checkClient) {
-				const checkStatus =
-					checksBeforeRemoteProbe !== undefined
-						? checksBeforeRemoteProbe
-						: await checkClient.getCheckStatus(branchName, worktreePath);
+				const checkStatus = await checkClient.getCheckStatus(
+					checkHeadSha ?? result.remoteHeadSha ?? headSha,
+					worktreePath,
+					checkPrNumber,
+				);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
 		}
