@@ -10,13 +10,15 @@ export function markdownToMrkdwn(text: string): string {
 
 /**
  * Slack's own angle-bracket syntax, which must survive HTML escaping: user
- * mentions, channel links, broadcast keywords, and HTTP(S)/mailto links.
- * Everything else in angle brackets is text and is escaped. Until this existed
- * every `<@U\u2026>` the persona wrote went out as `&lt;@U\u2026&gt;` and pinged
- * nobody (2026-09-17).
+ * mentions, channel links, and broadcast keywords. Everything else in angle
+ * brackets is text and is escaped. Until this existed every `<@U\u2026>` the
+ * persona wrote went out as `&lt;@U\u2026&gt;` and pinged nobody (2026-09-17).
  */
 const SLACK_ENTITY =
-	/<(?:@[UW][A-Z0-9]+(?:\|[^>\n]*)?|#C[A-Z0-9]+(?:\|[^>\n]*)?|!(?:here|channel|everyone)(?:\|[^>\n]*)?|!subteam\^[A-Z0-9]+(?:\|[^>\n]*)?|(?:https?:\/\/|mailto:)[^\s<>|]+(?:\|[^<>\n]*)?)>/gi;
+	/<(?:@[UW][A-Z0-9]+(?:\|[^>\n]*)?|#C[A-Z0-9]+(?:\|[^>\n]*)?|!(?:here|channel|everyone)(?:\|[^>\n]*)?|!subteam\^[A-Z0-9]+(?:\|[^>\n]*)?)>/g;
+
+/** Slack links need protection during both escaping and Markdown conversion. */
+const SLACK_LINK = /<(?:https?:\/\/|mailto:)[^\s<>|]+(?:\|[^<>\n]*)?>/gi;
 
 function escapeKeepingEntities(text: string): string {
 	const parts: string[] = [];
@@ -34,9 +36,16 @@ function escapeHtml(text: string): string {
 }
 
 function convertText(text: string): string {
-	const escaped = escapeKeepingEntities(text);
+	const links: string[] = [];
+	let markerPrefix = "\u0000SLACKLINK";
+	while (text.includes(markerPrefix)) markerPrefix += "X";
+	const protectedText = text.replace(SLACK_LINK, (link) => {
+		const index = links.push(link) - 1;
+		return `${markerPrefix}${index}\u0000`;
+	});
+	const escaped = escapeKeepingEntities(protectedText);
 	// One pass prevents the bold tokens we emit from being converted again as italics.
-	return escaped.replace(
+	const converted = escaped.replace(
 		/\[([^\]\n]+)\]\(([^)\n]+)\)|^(#{1,6})[ \t]+(.+)$|^([ \t]*)[-*][ \t]+|\*\*([^\n]+?)\*\*|__([^\n]+?)__|~~([^\n]+?)~~|\*([^*\n]+)\*|_([^_\n]+)_/gm,
 		(
 			_match,
@@ -59,6 +68,9 @@ function convertText(text: string): string {
 			return `_${italic ?? underItalic}_`;
 		},
 	);
+	if (links.length === 0) return converted;
+	const linkMarkers = new RegExp(`${markerPrefix}(\\d+)\\u0000`, "g");
+	return converted.replace(linkMarkers, (marker, index: string) => links[Number(index)] ?? marker);
 }
 
 type Fence = { readonly start: number; readonly end: number; readonly opener: string; readonly open: boolean };
