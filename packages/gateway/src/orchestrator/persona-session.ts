@@ -567,6 +567,10 @@ export class PersonaSessionManager {
 		return this.#restartDrainId !== undefined;
 	}
 
+	get restartDrainId(): string | undefined {
+		return this.#restartDrainId;
+	}
+
 	get onReverseRequest(): PersonaSessionManagerOptions["onReverseRequest"] {
 		return this.#onReverseRequest;
 	}
@@ -804,6 +808,15 @@ export class PersonaSessionManager {
 				.catch((error: unknown) =>
 					this.#log(`persona restart resume failed origin=${actor.originKey}: ${safeDiagnostic(error)}`, "error"),
 				);
+		return true;
+	}
+
+	/** Transfer a failed supervisor's dispatch hold to an accepted owner restart. */
+	transferRestartDrain(restartId: string, nextRestartId: string): boolean {
+		if (!/^[A-Za-z0-9_-]{1,128}$/.test(nextRestartId)) throw new Error("invalid restart id");
+		if (this.#restartDrainId !== restartId) return false;
+		this.#restartDrainId = nextRestartId;
+		this.#log(`persona_restart_drain_transferred from=${restartId} to=${nextRestartId}`);
 		return true;
 	}
 

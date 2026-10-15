@@ -426,6 +426,10 @@ interface Runtime {
 	readonly personaSessions: PersonaSessionManager;
 	/** Ordered shutdown, wired after construction; owner `/restart` uses it. */
 	stop?: (reason?: string) => Promise<void>;
+	/** Mirrors producer quiescence so restart paths can defer to a live supervisor. */
+	stopping: boolean;
+	/** Owner restart currently waiting to take over a cancelled stack drain. */
+	pendingOwnerRestartId?: string;
 	readonly connections: Set<Connection>;
 	readonly memory: MemoryClosureQueue;
 	/** Tracked memory operations (autolink, audit) keyed by opRef. */
@@ -467,12 +471,18 @@ function cancelRestartDrainsForConnection(runtime: Runtime, connection: Connecti
 	for (const [restartId, owner] of runtime.restartDrainOwners) {
 		if (owner !== connection) continue;
 		runtime.restartDrainOwners.delete(restartId);
-		void runtime.personaSessions
-			.cancelRestartDrain(restartId)
-			.catch((error: unknown) =>
-				console.error(`restart drain cancellation failed id=${restartId} detail=${diagnostic(error)}`),
-			);
+		void releaseOrTransferRestartDrain(runtime, restartId).catch((error: unknown) =>
+			console.error(`restart drain cancellation failed id=${restartId} detail=${diagnostic(error)}`),
+		);
 	}
+}
+
+async function releaseOrTransferRestartDrain(runtime: Runtime, restartId: string): Promise<boolean> {
+	const ownerRestartId = runtime.pendingOwnerRestartId;
+	if (ownerRestartId && ownerRestartId !== restartId) {
+		if (runtime.personaSessions.transferRestartDrain(restartId, ownerRestartId)) return true;
+	}
+	return runtime.personaSessions.cancelRestartDrain(restartId);
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -502,6 +512,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	const stop = (reason = "shutdown requested") => {
 		if (stopPromise) return stopPromise;
 		stopping = true;
+		runtime.stopping = true;
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
 			clearInterval(runtime.reconcileTimer);
@@ -659,6 +670,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	const stop = (reason = "shutdown requested") => {
 		if (stopPromise) return stopPromise;
 		stopping = true;
+		runtime.stopping = true;
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
 			process.stdin.off("data", onData);
@@ -1057,6 +1069,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			: undefined;
 	runtime = {
 		config: options.config,
+		stopping: false,
 		workspace,
 		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
@@ -1327,7 +1340,7 @@ async function handleRequest(
 			const owner = runtime.restartDrainOwners.get(restartId);
 			if (owner !== undefined && owner !== connection)
 				throw new ProtocolError("verb_failed", "restart drain is owned by another supervisor");
-			const cancelled = await runtime.personaSessions.cancelRestartDrain(restartId);
+			const cancelled = await releaseOrTransferRestartDrain(runtime, restartId);
 			if (owner === connection) runtime.restartDrainOwners.delete(restartId);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { cancelled } });
 			return;
@@ -2286,26 +2299,37 @@ async function sendChat(
 		console.info(`gateway restart requested by owner via ${key}`);
 		// Let the ack leave the socket, then hold new persona dispatches while
 		// active answers drain; the bounded timeout leaves remaining work durable.
+		if (runtime.pendingOwnerRestartId) return;
+		const ownerRestartId = `owner-${crypto.randomUUID()}`;
+		runtime.pendingOwnerRestartId = ownerRestartId;
 		setTimeout(() => {
-			// A stack restart already owns the drain and will restart the gateway.
-			if (runtime.personaSessions.restartDrainActive) return;
 			const exit = options.exitProcess ?? ((code: number) => process.exit(code));
-			void runtime.personaSessions
-				.drainForRestart(`owner-${crypto.randomUUID()}`, PERSONA_RESTART_DRAIN_WAIT_MS)
-				.then((outcome) => {
-					if (outcome === "stopped") return exit(RESTART_EXIT_CODE);
-					if (outcome === "timed_out")
-						console.warn("owner restart drain timed out; active persona turns will recover from durable state");
-					// Exit non-zero on purpose: launchd KeepAlive=true and systemd
-					// Restart=on-failure only relaunch after an unsuccessful exit. The
-					// stop budget begins after the bounded drain or its durable-recovery timeout.
-					void runtime.stop?.("owner /restart").then(
-						() => exit(RESTART_EXIT_CODE),
-						() => exit(RESTART_EXIT_CODE),
-					);
-					setTimeout(() => exit(RESTART_EXIT_CODE), RESTART_HARD_EXIT_MS).unref();
-				})
-				.catch((error: unknown) => console.error(`owner restart drain failed: ${diagnostic(error)}`));
+			void (async () => {
+				// A detached stack restart owns an existing drain. If it fails and
+				// releases the gate, its cancellation atomically transfers the hold.
+				while (!runtime.stopping) {
+					const activeId = runtime.personaSessions.restartDrainId;
+					if (activeId === undefined || activeId === ownerRestartId) break;
+					await Bun.sleep(25);
+				}
+				if (runtime.stopping) return;
+				const outcome = await runtime.personaSessions.drainForRestart(ownerRestartId, PERSONA_RESTART_DRAIN_WAIT_MS);
+				if (outcome === "stopped") return exit(RESTART_EXIT_CODE);
+				if (outcome === "timed_out")
+					console.warn("owner restart drain timed out; active persona turns will recover from durable state");
+				// Exit non-zero on purpose: launchd KeepAlive=true and systemd
+				// Restart=on-failure only relaunch after an unsuccessful exit. The
+				// stop budget begins after the bounded drain or its durable-recovery timeout.
+				void runtime.stop?.("owner /restart").then(
+					() => exit(RESTART_EXIT_CODE),
+					() => exit(RESTART_EXIT_CODE),
+				);
+				setTimeout(() => exit(RESTART_EXIT_CODE), RESTART_HARD_EXIT_MS).unref();
+			})()
+				.catch((error: unknown) => console.error(`owner restart drain failed: ${diagnostic(error)}`))
+				.finally(() => {
+					if (runtime.pendingOwnerRestartId === ownerRestartId) runtime.pendingOwnerRestartId = undefined;
+				});
 		}, 1_500);
 		return;
 	}

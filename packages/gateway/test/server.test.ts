@@ -1406,7 +1406,7 @@ test("restart prepare waits for delivered turns and holds new persona dispatches
 	client.close();
 });
 
-test("owner /restart waits until active persona replies are delivered", async () => {
+test("owner /restart resumes after a stack drain is cancelled and waits for active replies", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-owner-restart-drain-"));
 	const ownerOrigin = { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } as const;
 	const config: GatewayConfig = {
@@ -1465,6 +1465,15 @@ test("owner /restart waits until active persona replies are delivered", async ()
 		client.send({
 			v: "0.1",
 			type: "request",
+			id: "stack-prepare",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "stack-owner-race", waitMs: 120_000 },
+		});
+		client.send({ v: "0.1", type: "request", id: "stack-drain-observed", verb: "gateway.status" });
+		await client.waitForFrame("stack-drain-observed");
+		client.send({
+			v: "0.1",
+			type: "request",
 			id: "owner-restart",
 			verb: "chat.send",
 			params: {
@@ -1489,6 +1498,15 @@ test("owner /restart waits until active persona replies are delivered", async ()
 		});
 		await client.waitForFrame("queued-during-restart");
 		expect(responses).toBe(1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "cancel-stack-drain",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "stack-owner-race" },
+		});
+		await client.waitForFrame("cancel-stack-drain");
+		expect(client.frames.find((frame) => frame.id === "cancel-stack-drain")?.result).toEqual({ cancelled: true });
 		releaseTurn();
 		await waitFrame(client.frames, "active-reply");
 		for (let attempt = 0; attempt < 400 && exitCode === undefined; attempt++) await Bun.sleep(5);
