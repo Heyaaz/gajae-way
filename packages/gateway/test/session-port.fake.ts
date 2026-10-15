@@ -114,7 +114,6 @@ export async function createOwnedSessionFixture(
 		database,
 		authority,
 		cli: run,
-		instanceId: "creation-fixture",
 		tailRunner: new TailRunner({ stream: noRelay, repo: binding.repo }),
 	});
 	return await port.bind(binding);

@@ -44,7 +44,6 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 		database,
 		authority,
 		cli: run,
-		instanceId: "terminate",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 		sleep: async () => {},
 	});

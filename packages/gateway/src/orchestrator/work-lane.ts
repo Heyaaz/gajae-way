@@ -55,6 +55,7 @@ import {
 	workAttemptReportId,
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
+import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import {
 	type LaneForceRetireReason,
@@ -103,6 +104,7 @@ const AWAITING_CHECKS_RETRY_LIMIT = 2;
 const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000;
 /** Bound concurrent GitHub/remote probes so one slow lane does not serialize recovery. */
 const AWAITING_CHECKS_POLL_CONCURRENCY = 16;
+
 const refusalCodes = new Set([
 	"busy",
 	"steer_refused",
@@ -185,7 +187,15 @@ export interface WorkLaneManagerOptions {
 	readonly hostLostGraceMs?: number;
 	readonly now?: () => number;
 	readonly checkStatusClient?: CheckStatusClient;
+	/** Bounded wait for a restarting broker before a lane bind fails; defaults to {@link WORK_BIND_BROKER_WAIT}. */
+	readonly brokerWait?: BrokerWaitOptions;
 }
+/**
+ * A lane bind issued while the supervisor restarts the broker waits for it to
+ * answer again instead of failing `work lane bind failed`. Two minutes covers a
+ * supervised restart with backoff; a broker still down after that is an outage.
+ */
+export const WORK_BIND_BROKER_WAIT = { initialMs: 500, maxMs: 5_000, deadlineMs: 2 * 60_000 } as const;
 interface WorkInput {
 	name: string;
 	text: string;
@@ -878,35 +888,59 @@ export class WorkLaneManager {
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
 		}
-		const worktreePath = job.lane.worktreePath;
+		const initialJob = job;
+		if (!initialJob) throw new Error("work lane record was not initialized");
+		const worktreePath = initialJob.lane.worktreePath;
 		input = { ...input, cwd: worktreePath };
+		let bindAttemptStarted = false;
+		let worktreePersisted = false;
 		let binding: Awaited<ReturnType<SessionPort["bind"]>>;
 		try {
-			binding = await this.#port.runExclusive("work/admission", async () => {
-				this.#live();
-				this.#options.lanes.assertAdmission(input.name);
-				try {
-					return await this.#port.bind({
-						originKey: sessionKey,
-						epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
-						repo: worktreePath,
-						codingRegister: true,
-						...(input.model ? { model: input.model } : {}),
-					});
-				} catch (error) {
-					const cause = workBindFailureCause(error);
-					console.error(
-						`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${worktreePath} cause=${cause} error=${workBindFailureMessage(error)}`,
-					);
-					throw new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
-						reasonCode: "bind_failed",
-						cause,
-						name: input.name,
-					});
-				}
+			// Each try re-takes the admission lock and re-checks capacity, so a
+			// lane waiting out a broker restart does not hold other lanes' admission.
+			// Only an unavailable broker is retried; every other bind failure is final.
+			const bindFailed = (error: unknown): ProtocolError => {
+				const cause = workBindFailureCause(error);
+				console.error(
+					`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${worktreePath} cause=${cause} error=${workBindFailureMessage(error)}`,
+				);
+				return new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
+					reasonCode: "bind_failed",
+					cause,
+					name: input.name,
+				});
+			};
+			binding = await waitForBroker(
+				`work.bind:${input.name}`,
+				() =>
+					this.#port.runExclusive("work/admission", async () => {
+						this.#live();
+						this.#options.lanes.assertAdmission(input.name);
+						if (createdWorktree && !worktreePersisted) {
+							this.#putJob(input.name, initialJob);
+							worktreePersisted = true;
+						}
+						bindAttemptStarted = true;
+						try {
+							return await this.#port.bind({
+								originKey: sessionKey,
+								epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
+								repo: worktreePath,
+								codingRegister: true,
+								...(input.model ? { model: input.model } : {}),
+							});
+						} catch (error) {
+							throw isBrokerUnavailable(error) ? error : bindFailed(error);
+						}
+					}),
+				{ ...WORK_BIND_BROKER_WAIT, ...this.#options.brokerWait },
+			).catch((error: unknown) => {
+				throw isBrokerUnavailable(error) ? bindFailed(error) : error;
 			});
 		} catch (error) {
-			if (createdWorktree) {
+			if (createdWorktree && bindAttemptStarted) {
+				console.error(`worktree_creation_retained name=${input.name} reason=session_bind_may_reference_worktree`);
+			} else if (createdWorktree) {
 				try {
 					await discardCreatedWorktree(input.name, createdWorktree);
 				} catch (cleanupError) {
@@ -933,7 +967,7 @@ export class WorkLaneManager {
 			context.wakeReportId ?? null,
 			notice?.hash ?? null,
 		);
-		job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
+		job = appendAttempt(initialJob, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
 		this.#prepareAttempt(runtime, job);
 
 		const observer = this.#register(runtime);
@@ -2592,9 +2626,7 @@ function workBindFailureCause(error: unknown): WorkBindFailureCause {
 		/\bwas created but never became live\b/.test(message)
 	)
 		return "timeout";
-	// BrokerSessionPort's SDK sanitizer can drop GjcCliUnavailableError.code while
-	// retaining this stable prefix on the plain Error it returns.
-	if (/^gjc sdk request failed: broker_unavailable(?:\s|\(|$)/.test(message)) return "broker_unavailable";
+	if (isBrokerUnavailable(error)) return "broker_unavailable";
 	if (error instanceof BrokerAuthorityError) {
 		if (error.code === "unowned_session") return "cwd_rejected";
 		if (error.code === "authority_mismatch" || error.code === "cutover_required") return "epoch_conflict";
