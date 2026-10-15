@@ -116,6 +116,57 @@ test("restart observes an accepted nonterminal turn on the same live session wit
 	expect(terminal).toEqual(["transcript survived restart"]);
 });
 
+test("bounded shutdown keeps an accepted turn alive past the old cutoff and defers new input until restart", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	manager = makeManager(port, logs, terminal);
+	enqueue("m-drain", "finish before gateway stops");
+	await manager.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "initial turn did not reach an accepted send");
+	const first = port.sends[0];
+	if (!first) throw new Error("accepted send disappeared during shutdown test");
+
+	let drainFinished = false;
+	const draining = manager.drain().then(() => {
+		drainFinished = true;
+	});
+	enqueue("m-during-drain", "dispatch after restart");
+	await manager.notifyInbound(KEY);
+
+	// Exceed the old five-second shutdown window while the accepted operation is still running.
+	await Bun.sleep(5_100);
+	expect(drainFinished).toBe(false);
+	expect(port.sends).toHaveLength(1);
+	expect(database.inbox.pendingOldest(KEY)).toMatchObject({
+		message_id: "m-during-drain",
+		turn_role: null,
+		turn_state: null,
+	});
+	port.complete(first.opRef, "answer completed during shutdown");
+	await draining;
+	await eventually(
+		() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+		"shutdown drain did not settle the accepted turn",
+	);
+	expect(terminal).toEqual(["answer completed during shutdown"]);
+
+	await manager.stop();
+	manager = makeManager(port, logs, terminal);
+	await manager.recover();
+	await eventually(() => port.sends.length === 2, "queued input was not resumed after restart");
+	const second = port.sends[1];
+	if (!second) throw new Error("queued send disappeared during restart test");
+	expect(second.text).toBe("dispatch after restart");
+	port.complete(second.opRef, "queued answer");
+	await eventually(() => terminal.length === 2, "queued input did not finish after restart");
+	expect(terminal).toEqual(["answer completed during shutdown", "queued answer"]);
+	expect(port.sends.filter((send) => send.opRef === first.opRef)).toHaveLength(1);
+}, 15_000);
+
 test("client_ref_conflict reconciles the same deterministic op-ref without a second accepted send, including after restart", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await Store.open(join(home, "gateway.db"));

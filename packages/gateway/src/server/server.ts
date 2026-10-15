@@ -501,11 +501,11 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			await runtime.work.stop();
 			await Promise.all([...runtime.requests]);
 			await Promise.all([...runtime.memoryOperationTasks]);
-			await runtime.personaSessions.drain();
-			await runtime.personaSessions.stop();
 			await runtime.monitorRuntime.stop();
-			// Drain claimed monitor writers before broker/database teardown (#64).
-			await runtime.monitors.drain();
+			// Stop persona admission before draining both producers; monitor results
+			// can still persist inbound rows, but they remain queued for the next boot.
+			await Promise.all([runtime.personaSessions.drain(), runtime.monitors.drain()]);
+			await runtime.personaSessions.stop();
 			// The broker has no recovery policy; it is only stopped after all current
 			// producers and monitor/tail-like runtime work have drained.
 			await options.broker?.stop();
@@ -615,19 +615,19 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			clearInterval(runtime.contextMaintenanceTimer);
 			clearInterval(runtime.memoryOpsCleanupTimer);
 			runtime.stopRetention();
-			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			runtime.stopBrokerGenerationListener?.();
 			await runtime.work.stop();
 			// Same producer quiescence as the Unix server: in-flight stdio requests are
 			// tracked and awaited before persona/tail/broker teardown.
 			await Promise.all([...runtime.requests]);
 			await Promise.all([...runtime.memoryOperationTasks]);
-			await runtime.personaSessions.drain();
-			await runtime.personaSessions.stop();
 			await runtime.monitorRuntime.stop();
-			// Drain claimed monitor writers before broker/database teardown (#64).
-			await runtime.monitors.drain();
+			// Stop persona admission before draining both producers; monitor results
+			// can still persist inbound rows, but they remain queued for the next boot.
+			await Promise.all([runtime.personaSessions.drain(), runtime.monitors.drain()]);
+			await runtime.personaSessions.stop();
 			await options.broker?.stop();
+			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			connection.close();
 			await settleMemory(runtime);
 			await options.onStop?.();
