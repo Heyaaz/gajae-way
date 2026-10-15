@@ -2,7 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type PersonaBindHoldInput, PersonaSessionManager } from "../src/orchestrator/persona-session";
+import {
+	type PersonaBindHoldInput,
+	PersonaSessionManager,
+	STALLED_TURN_TERMINAL_TIMEOUT_MS,
+} from "../src/orchestrator/persona-session";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
@@ -158,6 +162,38 @@ test("with every host busy a new origin is held, not spawned, and dispatches whe
 	expect(h.port.closes.map((close) => close.sessionId)).toEqual([h.sessionOf("a1")]);
 	expect(h.manager.liveHostCount()).toBe(2);
 	expect(h.manager.admissionHold(origin("c").key)).toBeUndefined();
+});
+
+test("a stalled-turn cutoff frees its dead host slot without an idle-retirement retry", async () => {
+	let clock = 1_000_000;
+	const h = await harness({ maxLiveHosts: 1, now: () => clock });
+	await h.send("a", "a1");
+	await eventually(() => h.sent("a1") !== undefined, "a1 was not dispatched");
+	const sessionA = h.sessionOf("a1");
+	await h.send("b", "b1");
+	await eventually(() => h.manager.admissionHold(origin("b").key) === "host_capacity", "b1 was not held at capacity");
+	expect(h.sent("b1")).toBeUndefined();
+	expect(h.manager.liveHostCount()).toBe(1);
+
+	const originalTerminate = h.port.terminateHost.bind(h.port);
+	let terminationCalls = 0;
+	h.port.terminateHost = async (input) => {
+		terminationCalls++;
+		if (terminationCalls > 1) return { outcome: "refused", reason: "inspect_failed:broker_unavailable" };
+		return await originalTerminate(input);
+	};
+	h.port.setActivity(sessionA, "tool", clock);
+	const statusReads = h.port.statusReads.length;
+	h.port.emitStall(sessionA);
+	await eventually(() => h.port.statusReads.length > statusReads, "stalled turn did not reconcile status");
+	clock += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await h.manager.tick(origin("a").key);
+
+	await eventually(() => h.sent("b1") !== undefined, "b1 did not start after the dead host was removed from capacity");
+	expect(terminationCalls).toBe(1);
+	expect(h.port.closes.map((close) => close.sessionId)).toContain(sessionA);
+	expect(h.manager.admissionHold(origin("b").key)).toBeUndefined();
+	expect(h.manager.liveHostCount()).toBe(1);
 });
 
 test("idle hosts past the retire window are ended by the sweep and busy ones are left alone", async () => {

@@ -2873,6 +2873,7 @@ class OriginActor {
 			"warn",
 		);
 		bound.stallHostTerminated = true;
+		if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
 		if (jobs && result.outcome === "terminated")
 			this.#manager.log(
 				`stalled_turn_jobs_lost origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} ${jobs}`,
@@ -3655,9 +3656,11 @@ class OriginActor {
 		if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
-			this.#touchHost(bound.sessionId);
+			if (bound.stallHostTerminated) {
+				if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
+			} else this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
-			if (this.hostIdle) this.#manager.hostFreed();
+			if (bound.stallHostTerminated || this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
@@ -3837,9 +3840,11 @@ class OriginActor {
 		} else if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
-			this.#touchHost(bound.sessionId);
+			if (bound.stallHostTerminated) {
+				if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
+			} else this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
-			if (this.hostIdle) this.#manager.hostFreed();
+			if (bound.stallHostTerminated || this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
