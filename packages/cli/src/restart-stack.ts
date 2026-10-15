@@ -581,10 +581,17 @@ export async function recoverRestartStack(options: RecoverRestartStackOptions): 
 		}
 		if (client !== undefined) {
 			try {
-				await client.request("gateway.restart.cancel", { restartId: receipt.id });
+				const result = await client.request<{ cancelled: boolean }>("gateway.restart.cancel", {
+					restartId: receipt.id,
+				});
+				if (!result.cancelled) throw new Error("gateway did not confirm restart-drain cancellation");
 			} finally {
 				await client.close();
 			}
+		} else if (await leaseHeld(options.home, "gateway")) {
+			throw new Error(
+				"gateway lease is still held but its socket is unavailable; retry recovery when the gateway is ready or stopped",
+			);
 		}
 		receipt.state = "failed";
 		receipt.finishedAt = new Date().toISOString();

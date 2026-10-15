@@ -265,6 +265,15 @@ test("an unverified gateway restart keeps the drain recoverable", async () => {
 		expect(receipt.detail).toContain("gateway restart did not verify");
 		expect(cancelled).toBe(false);
 		expect(await leaseHeld(home, "update")).toBe(false);
+		const gatewayLease = await acquireLease(home, "gateway");
+		try {
+			await expect(recoverRestartStack({ home, confirmServiceManagerSettled: true })).rejects.toThrow(
+				"gateway lease is still held but its socket is unavailable",
+			);
+			expect((await readRestartReceipt(home))?.state).toBe("indeterminate");
+		} finally {
+			await gatewayLease.release();
+		}
 		const recovered = await recoverRestartStack({ home, confirmServiceManagerSettled: true });
 		expect(recovered.state).toBe("failed");
 	} finally {

@@ -1190,7 +1190,7 @@ export interface VerbCatalogV01 {
 	};
 	"gateway.restart.cancel": {
 		params: { readonly restartId: string };
-		result: { readonly cancelled: boolean };
+		result: { readonly cancelled: boolean; readonly transferred?: boolean };
 	};
 	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };

@@ -533,12 +533,14 @@ function persistedRestartDrainId(home: string): string | undefined {
 	}
 }
 
-async function releaseOrTransferRestartDrain(runtime: Runtime, restartId: string): Promise<boolean> {
+type RestartDrainReleaseOutcome = "cancelled" | "transferred" | "not_active";
+
+async function releaseOrTransferRestartDrain(runtime: Runtime, restartId: string): Promise<RestartDrainReleaseOutcome> {
 	const ownerRestartId = runtime.pendingOwnerRestartId;
 	if (ownerRestartId && ownerRestartId !== restartId) {
-		if (runtime.personaSessions.transferRestartDrain(restartId, ownerRestartId)) return true;
+		if (runtime.personaSessions.transferRestartDrain(restartId, ownerRestartId)) return "transferred";
 	}
-	return runtime.personaSessions.cancelRestartDrain(restartId);
+	return (await runtime.personaSessions.cancelRestartDrain(restartId)) ? "cancelled" : "not_active";
 }
 
 async function waitForRestartTerminalDelivery(runtime: Runtime, terminalDeliveryId: string | null): Promise<void> {
@@ -1548,9 +1550,15 @@ async function handleRequest(
 			const owner = runtime.restartDrainOwners.get(restartId);
 			if (owner !== undefined && owner !== connection)
 				throw new ProtocolError("verb_failed", "restart drain is owned by another supervisor");
-			const cancelled = await releaseOrTransferRestartDrain(runtime, restartId);
+			const outcome = await releaseOrTransferRestartDrain(runtime, restartId);
 			if (owner === connection) runtime.restartDrainOwners.delete(restartId);
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { cancelled } });
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result:
+					outcome === "transferred" ? { cancelled: false, transferred: true } : { cancelled: outcome === "cancelled" },
+			});
 			return;
 		}
 		case "gateway.reloadConfig": {

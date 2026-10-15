@@ -2689,7 +2689,10 @@ test("owner /restart resumes after a stack drain is cancelled and waits for acti
 			params: { restartId: "stack-owner-race" },
 		});
 		await client.waitForFrame("cancel-stack-drain");
-		expect(client.frames.find((frame) => frame.id === "cancel-stack-drain")?.result).toEqual({ cancelled: true });
+		expect(client.frames.find((frame) => frame.id === "cancel-stack-drain")?.result).toEqual({
+			cancelled: false,
+			transferred: true,
+		});
 		releaseTurn();
 		for (
 			let attempt = 0;
@@ -2911,7 +2914,8 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 		});
 		await client.waitForFrame("ack-stack-supervisor-cancel");
 		expect(client.frames.find((frame) => frame.id === "ack-stack-supervisor-cancel")?.result).toEqual({
-			cancelled: true,
+			cancelled: false,
+			transferred: true,
 		});
 		for (
 			let attempt = 0;
