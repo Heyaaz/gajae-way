@@ -1031,7 +1031,10 @@ export interface OpsSloParams {
 	readonly days?: number;
 }
 
-/** One bounded page of per-session cycle details; cycle gates cover every session. */
+/**
+ * One bounded page of per-session cycle details; cycle gates cover every session.
+ * A parameterless legacy request errors rather than returning a partial session list.
+ */
 export interface OpsCycleParams {
 	/** 1..OPS_CYCLE_MAX_LIMIT; defaults to OPS_CYCLE_DEFAULT_LIMIT. */
 	readonly limit?: number;

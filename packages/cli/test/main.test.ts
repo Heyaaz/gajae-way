@@ -185,6 +185,8 @@ describe("ops cycle paging CLI", () => {
 		expect(output.lines).toEqual([JSON.stringify(result)]);
 		expect(output.exitCode).toBe(1);
 		expect(output.errors).toEqual([]);
+		const defaultPage = await runOpsCycleCli(result, []);
+		expect(defaultPage.requests).toEqual([{ verb: "ops.cycle", params: {} }]);
 	});
 
 	test("rejects malformed paging options before connecting", async () => {

@@ -609,7 +609,7 @@ test("ops.cycle pages 1200 session rows under the frame cap without hiding whole
 				type?: string;
 				id?: string;
 				result?: OpsCycleResult;
-				error?: { code?: string };
+				error?: { code?: string; message?: string };
 			};
 			bytes: number;
 		}> = [];
@@ -632,7 +632,8 @@ test("ops.cycle pages 1200 session rows under the frame cap without hiding whole
 		try {
 			const send = (frame: unknown) => conn.write(`${JSON.stringify(frame)}\n`);
 			send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-			send({ v: "0.1", type: "request", id: "default", verb: "ops.cycle" });
+			send({ v: "0.1", type: "request", id: "default", verb: "ops.cycle", params: {} });
+			send({ v: "0.1", type: "request", id: "legacy", verb: "ops.cycle" });
 			for (const [id, offset] of [
 				["page-0", 0],
 				["page-500", 500],
@@ -652,7 +653,7 @@ test("ops.cycle pages 1200 session rows under the frame cap without hiding whole
 				verb: "ops.cycle",
 				params: { limit: OPS_CYCLE_MAX_LIMIT + 1 },
 			});
-			const responseIds = ["default", "page-0", "page-500", "page-1000", "invalid-limit"];
+			const responseIds = ["default", "legacy", "page-0", "page-500", "page-1000", "invalid-limit"];
 			for (
 				let attempt = 0;
 				attempt < 600 && responseIds.some((id) => !frames.some((entry) => entry.frame.id === id));
@@ -669,12 +670,16 @@ test("ops.cycle pages 1200 session rows under the frame cap without hiding whole
 			return frame.result;
 		};
 		const defaultPage = resultFor("default");
+		const legacy = frames.find((entry) => entry.frame.id === "legacy")?.frame;
 		const pages = [resultFor("page-0"), resultFor("page-500"), resultFor("page-1000")];
 		expect(defaultPage.sessions).toHaveLength(OPS_CYCLE_DEFAULT_LIMIT);
 		expect(defaultPage.sessionsTotal).toBe(1_200);
 		expect(defaultPage.sessionsOffset).toBe(0);
 		expect(defaultPage.sessions.every((session) => session.sessionId !== "")).toBe(true);
 		expect(defaultPage.gates).toContain("stale_session_identity");
+		expect(legacy?.type).toBe("error");
+		expect(legacy?.error?.code).toBe("invalid_params");
+		expect(legacy?.error?.message).toContain("request limit/offset paging");
 		expect(pages.map((page) => page.sessions.length)).toEqual([500, 500, 200]);
 		expect(pages.map((page) => page.sessionsOffset)).toEqual([0, 500, 1_000]);
 		expect(pages.every((page) => page.sessionsTotal === 1_200 && page.gates.includes("stale_session_identity"))).toBe(

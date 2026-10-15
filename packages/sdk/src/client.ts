@@ -329,7 +329,7 @@ export class GajaewayClient {
 	workRun(params: WorkRunParams): Promise<WorkRunResult> {
 		return this.request("work.run", params);
 	}
-	opsCycle(params: OpsCycleParams = {}): Promise<OpsCycleResult> {
+	opsCycle(params?: OpsCycleParams): Promise<OpsCycleResult> {
 		return this.request("ops.cycle", params);
 	}
 	opsSlo(params: OpsSloParams = {}): Promise<OpsSloResult> {

@@ -139,7 +139,7 @@ gajaeway ops cycle --offset 100                     # next session page
 gajaeway ops cycle --limit 500 --offset 1000 --json # typed page and summary for scripting
 ```
 
-The `sessions` details are paged (`--limit` 1–500, default 100; `--offset` defaults to 0). JSON includes `sessionsTotal` and `sessionsOffset`; aggregate counts, phase, and gates always cover the full home, not just the displayed session page.
+The `sessions` details are paged (`--limit` 1–500, default 100; `--offset` defaults to 0). JSON includes `sessionsTotal` and `sessionsOffset`; aggregate counts, phase, and gates always cover the full home, not just the displayed session page. Older parameterless protocol clients receive an explicit error when the result has more than one page rather than a silently incomplete session list.
 
 Phases are `idle`, `dispatching` (turn work accepted or claimed from the durable queue), `delivering` (unsettled ledger deliveries), `draining` (memory closure in flight or durable unsettled intents), and `degraded`. A session shown as `(rebinding)` has a bumped epoch with no bound session yet — the next turn rebinds it.
 

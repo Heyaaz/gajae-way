@@ -1518,7 +1518,8 @@ async function handleRequest(
 			return;
 		}
 		case "ops.cycle": {
-			const value = request.params ?? {};
+			const parameterless = request.params === undefined;
+			const value = parameterless ? {} : request.params;
 			if (typeof value !== "object" || value === null || Array.isArray(value))
 				throw new ProtocolError("invalid_params", "ops.cycle parameters must be an object");
 			const { limit = OPS_CYCLE_DEFAULT_LIMIT, offset = 0 } = value as { limit?: unknown; offset?: unknown };
@@ -1526,11 +1527,17 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", `limit must be an integer from 1 to ${OPS_CYCLE_MAX_LIMIT}`);
 			if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0)
 				throw new ProtocolError("invalid_params", "offset must be a non-negative integer");
+			const result = runtime.cycle.project(new Date(), { limit, offset });
+			if (parameterless && result.sessionsTotal > result.sessions.length)
+				throw new ProtocolError(
+					"invalid_params",
+					`ops.cycle has ${result.sessionsTotal} sessions; request limit/offset paging to retrieve a complete session list`,
+				);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: runtime.cycle.project(new Date(), { limit, offset }),
+				result,
 			});
 			return;
 		}
