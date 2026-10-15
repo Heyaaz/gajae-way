@@ -2068,6 +2068,152 @@ test("restart prepare treats an expired terminal delivery as settled", async () 
 	}
 });
 
+test("expired terminal delivery IDs do not poison later restarts after outbox retention", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-expired-retention-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "terminal reply that expires before a restart",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "create-idle-expiring-terminal",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "expired-before-restart", peerId: "p1" },
+				text: "finish before the restart begins",
+				engagement: { mentioned: false, group: false, authorId: "p1" },
+			},
+		});
+		await client.waitForFrame("create-idle-expiring-terminal");
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some(
+				(frame) =>
+					frame.type === "event" &&
+					frame.event === "chat.message" &&
+					frame.payload.text === "terminal reply that expires before a restart",
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		const terminalReply = client.frames.find(
+			(frame) =>
+				frame.type === "event" &&
+				frame.event === "chat.message" &&
+				frame.payload.text === "terminal reply that expires before a restart",
+		);
+		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
+			throw new Error("terminal reply was not broadcast");
+		const deliveryId = terminalReply.payload.deliveryId;
+		const triggerRowQuery = database.core
+			.groupDb("inbox")
+			.prepare(
+				"SELECT turn_state, terminal_delivery_id FROM inbound_messages WHERE origin_key = ? AND body = ? ORDER BY received_at DESC LIMIT 1",
+			);
+		let triggerRow: { turn_state: string; terminal_delivery_id: string | null } | null = null;
+		for (let attempt = 0; attempt < 400; attempt++) {
+			triggerRow = triggerRowQuery.get(
+				"discord/dm/expired-before-restart/peer=p1",
+				"finish before the restart begins",
+			) as { turn_state: string; terminal_delivery_id: string | null } | null;
+			if (triggerRow?.turn_state === "done" && triggerRow.terminal_delivery_id !== null) break;
+			await Bun.sleep(5);
+		}
+		if (!triggerRow || triggerRow.turn_state !== "done" || triggerRow.terminal_delivery_id === null)
+			throw new Error("terminal trigger did not finish with a delivery link");
+		expect(Object.values(JSON.parse(triggerRow.terminal_delivery_id) as Record<string, string>)).toContain(deliveryId);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "blocked-before-expiry",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "blocked-before-expiry", waitMs: 0 },
+		});
+		await client.waitForFrame("blocked-before-expiry");
+		expect(client.frames.find((frame) => frame.id === "blocked-before-expiry")?.error?.code).toBe("verb_failed");
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "cancel-blocked-before-expiry",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "blocked-before-expiry" },
+		});
+		await client.waitForFrame("cancel-blocked-before-expiry");
+		expect(client.frames.find((frame) => frame.id === "cancel-blocked-before-expiry")?.result).toEqual({
+			cancelled: true,
+		});
+
+		for (let attempt = 1; attempt <= 5; attempt++) {
+			const id = `expire-idle-terminal-${attempt}`;
+			client.send({
+				v: "0.1",
+				type: "request",
+				id,
+				verb: "delivery.fail",
+				params: { deliveryId, reason: "adapter_failure", ambiguous: false },
+			});
+			await client.waitForFrame(id);
+		}
+		expect(database.outbox.get(deliveryId)?.state).toBe("expired");
+		const retentionCutoff = new Date(Date.now() + 1_000).toISOString();
+		expect(
+			database.transaction((tx) =>
+				database.outbox.sweep(tx, {
+					deliveryCutoff: retentionCutoff,
+					historyCutoff: retentionCutoff,
+					batch: 100,
+				}),
+			),
+		).toBe(1);
+		expect(database.outbox.get(deliveryId)).toBeUndefined();
+
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "restart-after-expired-retention",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "restart-after-expired-retention", waitMs: 0 },
+		});
+		await client.waitForFrame("restart-after-expired-retention");
+		expect(client.frames.find((frame) => frame.id === "restart-after-expired-retention")?.result).toEqual({
+			ready: true,
+			drained: true,
+		});
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "cancel-after-expired-retention",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "restart-after-expired-retention" },
+		});
+		await client.waitForFrame("cancel-after-expired-retention");
+		expect(client.frames.find((frame) => frame.id === "cancel-after-expired-retention")?.result).toEqual({
+			cancelled: true,
+		});
+	} finally {
+		client.close();
+	}
+});
+
 test("restart prepare waits for a terminal delivery whose actor settled before the drain", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-predrain-delivery-"));
 	const config: GatewayConfig = {

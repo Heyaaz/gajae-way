@@ -4322,6 +4322,8 @@ function reportDeliveryExpired(
 	reason: string,
 	readinessFailureRecorded = false,
 ): void {
+	// The expired row is terminal and will eventually be pruned from the outbox.
+	runtime.restartTerminalDeliveryIds.delete(expired.deliveryId);
 	const deliveryId = safeDiagnosticField(expired.deliveryId);
 	const origin = safeDiagnosticField(expired.originKey);
 	const attempts = Number.isSafeInteger(expired.attempts) && expired.attempts >= 0 ? expired.attempts : 0;
