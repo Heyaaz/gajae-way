@@ -616,6 +616,8 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			clearInterval(runtime.contextMaintenanceTimer);
 			clearInterval(runtime.memoryOpsCleanupTimer);
 			runtime.stopRetention();
+			// Announce the start of stdio shutdown; the stream remains open during teardown.
+			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			runtime.stopBrokerGenerationListener?.();
 			runtime.personaSessions.beginDrain();
 			await runtime.work.stop();
@@ -629,7 +631,6 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			await Promise.all([runtime.personaSessions.drain(), runtime.monitors.drain()]);
 			await runtime.personaSessions.stop();
 			await options.broker?.stop();
-			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			connection.close();
 			await settleMemory(runtime);
 			await options.onStop?.();
