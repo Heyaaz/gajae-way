@@ -1016,19 +1016,11 @@ export class BrokerSessionPort implements SessionPort {
 		if (live === false) return { outcome: "already_gone" };
 		if (pid === undefined || live !== true)
 			return { outcome: "refused", reason: "inspect_incomplete:missing_live_host_identity" };
-		const command = await processCommand(pid);
-		if (command === undefined) {
-			try {
-				process.kill(pid, 0);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ESRCH") return { outcome: "already_gone" };
-				return {
-					outcome: "refused",
-					reason: `process_probe_failed:${(error as NodeJS.ErrnoException).code ?? "unknown"}`,
-				};
-			}
-			return { outcome: "refused", reason: "process_command_unreadable" };
-		}
+		const inspection = await processCommand(pid);
+		if (inspection.outcome === "gone") return { outcome: "already_gone" };
+		if (inspection.outcome === "unreadable")
+			return { outcome: "refused", reason: `process_inspection_failed:${inspection.reason}` };
+		const command = inspection.command;
 		// The only process shape this gateway may end. The broker, daemon, and anything else are someone else's.
 		if (!/\bsdk session-host-internal\b/.test(command) || /\b(broker|daemon)-internal\b/.test(command))
 			return { outcome: "not_a_host", pid, command: command.slice(0, 160) };
@@ -2124,15 +2116,30 @@ function normalizeSdkEnvelopeFailure(result: CliResult): CliResult {
 	return result;
 }
 
-/** The command line of a live pid, or undefined when it is gone. `ps` is the portable read on macOS and Linux. */
-async function processCommand(pid: number): Promise<string | undefined> {
+type ProcessCommandInspection =
+	| { readonly outcome: "live"; readonly command: string }
+	| { readonly outcome: "gone" }
+	| { readonly outcome: "unreadable"; readonly reason: string };
+
+/** `ps` is the portable process read on macOS and Linux; only a clean no-match proves the pid is gone. */
+async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 	try {
-		const proc = Bun.spawn(["ps", "-o", "command=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
-		const out = (await new Response(proc.stdout).text()).trim();
-		await proc.exited;
-		return out.length > 0 ? out : undefined;
-	} catch {
-		return undefined;
+		const proc = Bun.spawn(["ps", "-o", "pid=,command=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		const line = stdout.trim();
+		if (exitCode === 0 && line.length > 0) {
+			const match = /^(\d+)(?:\s+(.*))?$/.exec(line);
+			if (!match || Number(match[1]) !== pid) return { outcome: "unreadable", reason: "ps_pid_mismatch" };
+			return { outcome: "live", command: match[2]?.trim() ?? "" };
+		}
+		if (exitCode === 1 && line.length === 0 && stderr.trim().length === 0) return { outcome: "gone" };
+		return { outcome: "unreadable", reason: `ps_exit_${exitCode}` };
+	} catch (error) {
+		return { outcome: "unreadable", reason: sanitizeDiagnostic(String(error)) };
 	}
 }
 
