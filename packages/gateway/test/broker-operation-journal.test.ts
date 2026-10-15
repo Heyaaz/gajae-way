@@ -360,7 +360,7 @@ test("bind preserves thrown and enveloped broker outages from saved-session resu
 	});
 });
 
-test("cold-create readiness surfaces a broker-unavailable envelope after persisting the binding", async () => {
+test("cold-create readiness keeps the create intent until Router indexing catches up", async () => {
 	const { authority, repo } = await setup();
 	let creates = 0;
 	let inspects = 0;
@@ -375,6 +375,12 @@ test("cold-create readiness surfaces a broker-unavailable envelope after persist
 				return {
 					exitCode: 1,
 					stdout: JSON.stringify({ ok: false, error: { code: "broker_unavailable", message: "broker restarted" } }),
+					stderr: "",
+				};
+			if (inspects === 2)
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({ ok: false, error: { code: "session_unavailable", message: "not indexed yet" } }),
 					stderr: "",
 				};
 			return ok({ session: { live: true, deleted: false } });
@@ -394,12 +400,80 @@ test("cold-create readiness surfaces a broker-unavailable envelope after persist
 		sessionId: "cold-created-session",
 		epoch: 0,
 	});
+	expect(
+		database!.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/cold", 0])),
+	).toMatchObject({ state: "pending" });
 	await expect(port.bind({ originKey: "lane/cold", epoch: 0, repo })).resolves.toMatchObject({
 		sessionId: "cold-created-session",
 		epoch: 0,
 	});
 	expect(creates).toBe(1);
-	expect(inspects).toBe(2);
+	expect(inspects).toBe(3);
+	expect(database!.bindings.getSessionRecord("lane/cold")).toMatchObject({ epoch: 0 });
+	expect(
+		database!.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/cold", 0])),
+	).toBeUndefined();
+});
+
+test("a changed startup model retires a pending cold binding before rotating its epoch", async () => {
+	const { authority, repo } = await setup();
+	const createKeys: string[] = [];
+	const createInputs: string[] = [];
+	const sessions = new Map<string, string>();
+	const closed: string[] = [];
+	let inspections = 0;
+	const cli: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			const key = args[args.indexOf("--idempotency-key") + 1] ?? "";
+			createKeys.push(key);
+			createInputs.push(args[args.indexOf("--json-input") + 1] ?? "{}");
+			const sessionId = sessions.get(key) ?? `cold-session-${sessions.size + 1}`;
+			sessions.set(key, sessionId);
+			return ok({ sessionId });
+		}
+		if (args.includes("session.close")) {
+			const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: string };
+			if (request.sessionId) closed.push(request.sessionId);
+			return ok({ closed: true });
+		}
+		if (args.includes("inspect")) {
+			inspections++;
+			if (inspections === 1)
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({ ok: false, error: { code: "broker_unavailable", message: "broker restarted" } }),
+					stderr: "",
+				};
+			return ok({ session: { live: true, deleted: false } });
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+	const originalModel = "anthropic/claude-sonnet";
+
+	await expect(
+		port.bind({ originKey: "lane/cold-model", epoch: 0, repo, model: originalModel }),
+	).rejects.toBeInstanceOf(GjcCliUnavailableError);
+	const originalSessionId = required(sessions.get(createKeys[0]!), "original cold session id");
+	const binding = await port.bind({ originKey: "lane/cold-model", epoch: 0, repo, model: "openai/gpt-4" });
+
+	expect(binding).toMatchObject({ epoch: 1 });
+	expect(binding.sessionId).toBe(required(sessions.get(createKeys[1]!), "replacement cold session id"));
+	expect(createKeys).toHaveLength(2);
+	expect(createKeys[1]).not.toBe(createKeys[0]);
+	expect(closed).toEqual([originalSessionId]);
+	expect(createInputs.map((input) => JSON.parse(input).modelId)).toEqual([originalModel, "openai/gpt-4"]);
+	expect(inspections).toBe(2);
+	expect(database!.bindings.getSessionRecord("lane/cold-model")).toMatchObject({
+		epoch: 1,
+		sessionId: binding.sessionId,
+	});
 });
 
 test("resuming a session invalidates pending and completed closes before a later retirement", async () => {
@@ -543,6 +617,98 @@ test("turn.prompt accepted by the broker before the relay died is reconciled, no
 	await expect(gateway.port.send({ ...send, model: "anthropic/claude-opus" })).rejects.toThrow("already used");
 	await expect(gateway.port.send({ ...send, model: { preset: "deep" } })).rejects.toThrow("already used");
 	expect(relay.requests).toHaveLength(before);
+});
+
+test("a fresh prompt intent is released when relay attachment fails before submission", async () => {
+	const { authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, {
+		sessionId: "sdk-1",
+		repo,
+		originKey: "lane/attach",
+		epoch: 0,
+	});
+	let failFirstAttach = true;
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt")
+			return { ok: true, result: { accepted: true, clientRef: request.input.clientRef, commandId: "cmd-1" } };
+		return { ok: false, error: { code: "unsupported_operation" } };
+	});
+	const stream: TailStreamSpawner = (sessionId) => {
+		if (failFirstAttach) {
+			failFirstAttach = false;
+			throw new Error("relay attachment failed");
+		}
+		return relay.spawn(sessionId);
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: async (args) => {
+			throw new Error(`unexpected CLI command ${args.join(" ")}`);
+		},
+		tailRunner: new TailRunner({ stream, repo, requestTimeoutMs: 50 }),
+		sleep: async () => {},
+	});
+	const send = { sessionId: "sdk-1", repo, text: "do the work", opRef: "gw-work-attach-1" };
+	const scope = JSON.stringify([send.sessionId, send.opRef]);
+
+	await expect(port.send(send)).rejects.toThrow("relay attachment failed");
+	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toBeUndefined();
+	await expect(port.send(send)).resolves.toMatchObject({ operationRef: send.opRef, commandId: "cmd-1" });
+	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "complete" });
+});
+
+test("a fresh prompt intent is released when model selection fails before submission", async () => {
+	const { authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, {
+		sessionId: "sdk-1",
+		repo,
+		originKey: "lane/model",
+		epoch: 0,
+	});
+	let modelSetAttempts = 0;
+	const cli: CliRunner = async (args) => {
+		if (args.includes("model.set")) {
+			modelSetAttempts++;
+			if (modelSetAttempts === 1)
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({ ok: false, error: { code: "broker_unavailable", message: "model control failed" } }),
+					stderr: "",
+				};
+			return ok({ changed: true });
+		}
+		throw new Error(`unexpected CLI command ${args.join(" ")}`);
+	};
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt")
+			return { ok: true, result: { accepted: true, clientRef: request.input.clientRef, commandId: "cmd-1" } };
+		return { ok: false, error: { code: "unsupported_operation" } };
+	});
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+		sleep: async () => {},
+	});
+	const send = {
+		sessionId: "sdk-1",
+		repo,
+		text: "do the work",
+		opRef: "gw-work-model-1",
+		model: "anthropic/claude-sonnet",
+	} as const;
+	const scope = JSON.stringify([send.sessionId, send.opRef]);
+
+	await expect(port.send(send)).rejects.toThrow("broker_unavailable");
+	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toBeUndefined();
+	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(0);
+	await expect(port.send(send)).resolves.toMatchObject({ operationRef: send.opRef, commandId: "cmd-1" });
+	expect(modelSetAttempts).toBe(2);
+	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "complete" });
 });
 
 test("an aged pending turn.prompt with unknown status stays uncertain and is never resent", async () => {

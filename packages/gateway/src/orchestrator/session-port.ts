@@ -537,6 +537,44 @@ export class BrokerSessionPort implements SessionPort {
 		const existing = this.#database.bindings.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
 			this.#assertOwned({ sessionId: existing.sessionId, repo: input.repo });
+			const pendingCreate = this.#database.bindings.brokerOperation(
+				this.#authority,
+				"session.create",
+				createScope(input),
+			);
+			if (pendingCreate?.state === "pending") {
+				if (pendingCreate.requestJson !== sessionCreateInput(input.repo, input.model)) {
+					assertControlAllowed("session.close", { operatorApproval: true });
+					try {
+						await this.#closeSessionOperation(existing.sessionId);
+					} catch (error) {
+						if (!isSessionGoneCode(sdkErrorCode(error))) throw error;
+					}
+					this.#releaseOperation(pendingCreate);
+					const nextEpoch = this.#database.transaction((tx) =>
+						this.#database.bindings.rotateEpoch(tx, input.originKey),
+					);
+					return await this.bind({ ...input, epoch: nextEpoch });
+				}
+				// The binding was durably recorded from this create, but Router
+				// indexing (or startup model configuration) did not finish. Keep
+				// waiting on this known cold session instead of treating an
+				// unindexed ID as a dead reusable binding and rotating the epoch.
+				await this.#awaitIndexed(existing.sessionId, input.repo);
+				if (typeof input.model === "string") {
+					const { thinking } = splitThinkingSuffix(input.model);
+					if (thinking) await this.#setThinking(this.#cliTransport(existing.sessionId), thinking);
+				}
+				this.#releaseOperation(pendingCreate);
+				this.#resetCreateRotations(input.originKey);
+				return {
+					sessionId: existing.sessionId,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+					...(input.model ? { startupModelApplied: true } : {}),
+				};
+			}
 			// Only owned bindings may be inspected, resumed, or replaced.
 			let indexed = true;
 			try {
@@ -597,11 +635,10 @@ export class BrokerSessionPort implements SessionPort {
 			return await this.bind({ ...input, epoch: rebound });
 		}
 		// Intent first: the create is journaled under a fresh per-attempt key
-		// before the broker sees it. A crash or broker restart before the binding
-		// below is recorded leaves the intent pending, and the retry replays that
-		// same key and request, which the broker dedups to the session it already
-		// made. The intent is released in the binding's own transaction, so a
-		// later bind of this origin/epoch never inherits a finished create.
+		// before the broker sees it. A crash or broker restart before readiness
+		// completes leaves the intent pending; retries replay an ambiguous create
+		// or wait on its durably recorded binding. Release it only after the
+		// binding is ready, so a later bind never inherits an unfinished create.
 		const requestJson = sessionCreateInput(input.repo, input.model);
 		let intent = this.#beginOperation(
 			"session.create",
@@ -681,24 +718,18 @@ export class BrokerSessionPort implements SessionPort {
 			this.#releaseOperation(intent);
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to epoch ${persistedEpoch}`);
 		}
-		// Complete: the binding and the intent's release commit together.
-		const recorded = this.#database.transaction((tx) => {
-			const owned = this.#database.bindings.recordOwnedBinding(tx, {
+		// Persist ownership before waiting for Router indexing, but retain the
+		// pending create intent until readiness and startup configuration finish.
+		// A retry can then distinguish this cold binding from a dead old session.
+		const recorded = this.#database.transaction((tx) =>
+			this.#database.bindings.recordOwnedBinding(tx, {
 				authority: this.#authority,
 				sessionId,
 				originKey: input.originKey,
 				epoch: input.epoch,
 				repo: input.repo,
-			});
-			this.#database.bindings.releaseBrokerOperation(
-				tx,
-				this.#authority,
-				intent.operation,
-				intent.scope,
-				intent.operationRef,
-			);
-			return owned;
-		});
+			}),
+		);
 		if (!recorded) {
 			throw new Error(
 				`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`,
@@ -714,6 +745,7 @@ export class BrokerSessionPort implements SessionPort {
 			const { thinking } = splitThinkingSuffix(input.model);
 			if (thinking) await this.#setThinking(this.#cliTransport(sessionId), thinking);
 		}
+		this.#releaseOperation(intent);
 		this.#resetCreateRotations(input.originKey);
 		return {
 			sessionId,
@@ -1059,8 +1091,17 @@ export class BrokerSessionPort implements SessionPort {
 		if (intent.requestJson !== requestJson)
 			throw new OpRefError(`op ref ${input.opRef} was already used for a different prompt`);
 		if (intent.state === "complete") return JSON.parse(intent.resultJson!) as SendReceipt;
-		const relay =
-			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+		let relay: TailHandle;
+		try {
+			relay =
+				input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+		} catch (error) {
+			// A fresh intent has not reached turn.prompt when its relay cannot be
+			// attached. Remove it so a retry can submit rather than reconciling a
+			// clientRef that was never sent.
+			if (!intent.resumed) this.#releaseOperation(intent);
+			throw error;
+		}
 		try {
 			const receipt = intent.resumed
 				? await this.#acceptedPrompt(input, relay)
@@ -1094,7 +1135,15 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async #submitPrompt(input: SessionSendInput, relay: TailHandle, intent: BrokerOperationRecord): Promise<SendReceipt> {
-		if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
+		if (input.model) {
+			try {
+				await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
+			} catch (error) {
+				// Model selection is preflight: no turn.prompt was issued yet.
+				this.#releaseOperation(intent);
+				throw error;
+			}
+		}
 		const text = renderPrompt(input.systemPreamble, input.text);
 		// The prompt is submitted on the session's resident relay so that this
 		// connection OWNS the turn: the host streams the turn's content only to
@@ -1103,7 +1152,12 @@ export class BrokerSessionPort implements SessionPort {
 		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
 		let waited = false;
 		for (;;) {
-			this.#database.bindings.assertAuthority(this.#authority);
+			try {
+				this.#database.bindings.assertAuthority(this.#authority);
+			} catch (error) {
+				this.#releaseOperation(intent);
+				throw error;
+			}
 			const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
 			this.#database.bindings.assertAuthority(this.#authority);
 			if (response.ok) {
