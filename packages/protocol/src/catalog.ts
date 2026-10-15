@@ -1184,6 +1184,14 @@ export interface OpsDeliveriesResult {
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
+	"gateway.restart.prepare": {
+		params: { readonly restartId: string; readonly waitMs?: number };
+		result: { readonly ready: true; readonly drained: boolean };
+	};
+	"gateway.restart.cancel": {
+		params: { readonly restartId: string };
+		result: { readonly cancelled: boolean; readonly transferred?: boolean };
+	};
 	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
 	"chat.edit": { params: ChatEditParams; result: ChatEditResult };
@@ -1252,12 +1260,15 @@ export interface EventCatalogV01 {
 	"chat.message": ChatMessagePayload;
 	"chat.progress": ChatProgressPayload;
 	"gateway.stopping": { readonly reason: string };
+	"gateway.restart.superseded": { readonly restartId: string; readonly ownerRestartId: string };
 	"monitor.event": MonitorEventRecord;
 }
 
 export const VERBS_V01 = [
 	"gateway.status",
 	"gateway.shutdown",
+	"gateway.restart.prepare",
+	"gateway.restart.cancel",
 	"chat.send",
 	"chat.edit",
 	"delivery.confirm",
@@ -1294,7 +1305,13 @@ export const VERBS_V01 = [
 	"ops.slo",
 	"ops.cycle",
 ] as const;
-export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
+export const EVENTS_V01 = [
+	"chat.message",
+	"chat.progress",
+	"gateway.restart.superseded",
+	"gateway.stopping",
+	"monitor.event",
+] as const;
 
 export type VerbName = keyof VerbCatalogV01;
 export type EventName = keyof EventCatalogV01;

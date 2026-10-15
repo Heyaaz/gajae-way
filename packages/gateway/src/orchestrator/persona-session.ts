@@ -278,6 +278,10 @@ const AGENT_ERROR_RETRY_MAX_MS = 10_000;
 
 export type PersonaActorState = "idle" | "turn-running";
 
+export type PersonaRestartDrainOutcome = "drained" | "timed_out" | "stopped";
+export const PERSONA_RESTART_DRAIN_WAIT_MS = 120_000;
+export const PERSONA_RESTART_DRAIN_MAX_WAIT_MS = 300_000;
+
 /**
  * Server-owned chat behavior attached to one durable persona turn. The actor
  * owns session/recovery ordering; this lifecycle owns only presentation,
@@ -531,6 +535,7 @@ export class PersonaSessionManager {
 	#maxLiveHosts: number;
 	#hostIdleRetireMs: number;
 	#draining = false;
+	#restartDrainId: string | undefined;
 	#stopped = false;
 
 	constructor(options: PersonaSessionManagerOptions) {
@@ -594,6 +599,14 @@ export class PersonaSessionManager {
 
 	get draining(): boolean {
 		return this.#draining;
+	}
+
+	get restartDrainActive(): boolean {
+		return this.#restartDrainId !== undefined;
+	}
+
+	get restartDrainId(): string | undefined {
+		return this.#restartDrainId;
 	}
 
 	get onReverseRequest(): PersonaSessionManagerOptions["onReverseRequest"] {
@@ -808,6 +821,78 @@ export class PersonaSessionManager {
 			}
 			await Bun.sleep(10);
 		}
+	}
+
+	/** Pause new dispatches and wait a bounded interval for accepted turns to deliver. */
+	async drainForRestart(
+		restartId: string,
+		waitMs = PERSONA_RESTART_DRAIN_WAIT_MS,
+	): Promise<PersonaRestartDrainOutcome> {
+		if (!/^[A-Za-z0-9_-]{1,128}$/.test(restartId)) throw new Error("invalid restart id");
+		if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > PERSONA_RESTART_DRAIN_MAX_WAIT_MS)
+			throw new Error("restart drain wait must be an integer within the allowed range");
+		if (this.#stopped) return "stopped";
+		if (this.#restartDrainId !== undefined && this.#restartDrainId !== restartId)
+			throw new Error(`restart drain already owned by ${this.#restartDrainId}`);
+		this.#restartDrainId = restartId;
+		const deadline = Date.now() + waitMs;
+		this.#log(`persona_restart_drain_started id=${restartId} waitMs=${waitMs}`);
+		for (;;) {
+			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
+			const actors = [...this.#actors.values()];
+			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timedOut = Symbol("restart drain timed out");
+			let unsettled: (boolean | undefined)[] | typeof timedOut;
+			try {
+				unsettled = await Promise.race([
+					checks,
+					new Promise<typeof timedOut>((resolve) => {
+						const remainingMs = Math.max(0, deadline - Date.now());
+						timer = setTimeout(() => resolve(timedOut), remainingMs);
+					}),
+				]);
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+			}
+			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
+			if (unsettled === timedOut) {
+				this.#log(`persona_restart_drain_timed_out id=${restartId} waitMs=${waitMs}`, "warn");
+				return "timed_out";
+			}
+			if (!unsettled.some(Boolean)) {
+				this.#log(`persona_restart_drain_ready id=${restartId}`);
+				return "drained";
+			}
+			if (Date.now() >= deadline) {
+				this.#log(`persona_restart_drain_timed_out id=${restartId} waitMs=${waitMs}`, "warn");
+				return "timed_out";
+			}
+			await Bun.sleep(10);
+		}
+	}
+
+	/** Resume pending admissions if the detached restart supervisor fails before restarting the gateway. */
+	async cancelRestartDrain(restartId: string): Promise<boolean> {
+		if (this.#restartDrainId !== restartId) return false;
+		this.#restartDrainId = undefined;
+		this.#log(`persona_restart_drain_cancelled id=${restartId}`);
+		for (const actor of this.#actors.values())
+			void actor
+				.enqueue(async () => await actor.admit())
+				.catch((error: unknown) =>
+					this.#log(`persona restart resume failed origin=${actor.originKey}: ${safeDiagnostic(error)}`, "error"),
+				);
+		return true;
+	}
+
+	/** Transfer a failed supervisor's dispatch hold to an accepted owner restart. */
+	transferRestartDrain(restartId: string, nextRestartId: string): boolean {
+		if (!/^[A-Za-z0-9_-]{1,128}$/.test(nextRestartId)) throw new Error("invalid restart id");
+		if (this.#restartDrainId !== restartId) return false;
+		this.#restartDrainId = nextRestartId;
+		this.#log(`persona_restart_drain_transferred from=${restartId} to=${nextRestartId}`);
+		return true;
 	}
 
 	recordBindFailure(originKey: string, detail: string): void {
@@ -1193,6 +1278,10 @@ class OriginActor {
 		return this.#state;
 	}
 
+	hasUnsettledTurns(): boolean {
+		return this.#state !== "idle" || this.#current !== undefined || this.#retired.size > 0;
+	}
+
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {
 		if (this.#stopped || this.#manager.stopped) return Promise.resolve(undefined);
 		const task = this.#queue.then(() => {
@@ -1213,7 +1302,7 @@ class OriginActor {
 	 * origin sends it as the next turn. No window, no coalescing.
 	 */
 	async admit(): Promise<void> {
-		if (this.#manager.draining) return;
+		if (this.#manager.draining || this.#manager.restartDrainActive) return;
 		if (!this.#recoveryScanned) await this.recover();
 		if (this.#state === "turn-running") {
 			await this.#steerPending();
@@ -1782,7 +1871,14 @@ class OriginActor {
 	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#manager.draining || this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (
+			this.#manager.draining ||
+			this.#manager.restartDrainActive ||
+			this.#state !== "idle" ||
+			this.#current ||
+			this.#dispatchRetry
+		)
+			return;
 		if (this.#modelRefusalPaused) {
 			const pending = this.#manager.database.inbox.pendingOldest(this.originKey);
 			if (pending) {
@@ -2442,6 +2538,7 @@ class OriginActor {
 		const current = this.#current;
 		if (
 			this.#manager.draining ||
+			this.#manager.restartDrainActive ||
 			this.#modelRefusalPaused ||
 			!current ||
 			current.retired ||
