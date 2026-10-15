@@ -1729,7 +1729,14 @@ class OriginActor {
 	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#manager.draining || this.#manager.restartDrainActive || this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (
+			this.#manager.draining ||
+			this.#manager.restartDrainActive ||
+			this.#state !== "idle" ||
+			this.#current ||
+			this.#dispatchRetry
+		)
+			return;
 		if (this.#modelRefusalPaused) {
 			const pending = this.#manager.database.inbox.pendingOldest(this.originKey);
 			if (pending) {

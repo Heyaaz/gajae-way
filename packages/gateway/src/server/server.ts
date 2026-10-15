@@ -275,6 +275,8 @@ export interface GatewayServerOptions {
 	readonly exitProcess?: (code: number) => void;
 	/** Test seam for the owner restart's wait on an active stack supervisor. */
 	readonly ownerRestartSupervisorWaitMs?: number;
+	/** Test seam for the owner restart's persona-turn delivery drain. */
+	readonly ownerRestartDrainWaitMs?: number;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
@@ -487,6 +489,49 @@ async function releaseOrTransferRestartDrain(runtime: Runtime, restartId: string
 		if (runtime.personaSessions.transferRestartDrain(restartId, ownerRestartId)) return true;
 	}
 	return runtime.personaSessions.cancelRestartDrain(restartId);
+}
+
+async function waitForRestartTerminalDelivery(runtime: Runtime, terminalDeliveryId: string | null): Promise<void> {
+	const deliveryIds = terminalDeliveryId === null ? [] : terminalDeliveryIds(terminalDeliveryId);
+	let probeFailureLogged = false;
+	while (runtime.personaSessions.restartDrainActive && !runtime.stopping) {
+		if (deliveryIds.length > 0) {
+			try {
+				const deliveries = runtime.delivery.getMany(deliveryIds);
+				if (deliveries.length === deliveryIds.length && deliveries.every((delivery) => delivery.state === "confirmed"))
+					return;
+			} catch (error) {
+				if (!probeFailureLogged) {
+					console.error(`restart terminal delivery probe failed: ${diagnostic(error)}`);
+					probeFailureLogged = true;
+				}
+			}
+		}
+		await Bun.sleep(25);
+	}
+}
+
+function notifyOwnerRestartCancelled(
+	connection: Connection,
+	runtime: Runtime,
+	requestId: string,
+	origin: OriginRef,
+): void {
+	const payload = {
+		turnId: crypto.randomUUID(),
+		origin,
+		role: "assistant" as const,
+		text: "Restart cancelled: a persona reply was not confirmed as delivered before the drain deadline.",
+		final: true,
+	};
+	if (origin.platform === "loopback") {
+		connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: requestId, payload });
+		return;
+	}
+	const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+	if (!delivery) return;
+	runtime.delivery.markInflight(delivery.deliveryId as string);
+	broadcastDelivery(runtime, delivery);
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -1323,16 +1368,24 @@ async function handleRequest(
 				if (outcome === "stopped") {
 					runtime.restartDrainOwners.delete(restartId);
 					throw new ProtocolError("gateway_shutting_down", "gateway stopped before persona turns drained");
-				} else {
-					connection.write({
-						v: PROFILE_VERSION,
-						type: "response",
-						id: request.id,
-						result: { ready: true, drained: outcome === "drained" },
-					});
 				}
+				if (outcome === "timed_out")
+					throw new ProtocolError(
+						"verb_failed",
+						"persona turn delivery was not confirmed before the restart drain deadline",
+					);
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { ready: true, drained: true },
+				});
 			} catch (error) {
-				if (runtime.restartDrainOwners.get(restartId) === connection) runtime.restartDrainOwners.delete(restartId);
+				if (
+					runtime.restartDrainOwners.get(restartId) === connection &&
+					(runtime.stopping || runtime.personaSessions.restartDrainId !== restartId)
+				)
+					runtime.restartDrainOwners.delete(restartId);
 				throw error;
 			}
 			return;
@@ -2301,49 +2354,54 @@ async function sendChat(
 			}
 		}
 		console.info(`gateway restart requested by owner via ${key}`);
-		// Let the ack leave the socket, then hold new persona dispatches while
-		// active answers drain; the bounded timeout leaves remaining work durable.
+		// The acknowledgement is already queued on the socket/outbox; establish
+		// the dispatch fence immediately so no new turn slips into the restart.
 		if (runtime.pendingOwnerRestartId) return;
 		const ownerRestartId = `owner-${crypto.randomUUID()}`;
 		runtime.pendingOwnerRestartId = ownerRestartId;
-		setTimeout(() => {
-			const exit = options.exitProcess ?? ((code: number) => process.exit(code));
-			void (async () => {
-				// A detached stack restart owns an existing drain. If it fails and
-				// releases the gate, its cancellation atomically transfers the hold.
-				const supervisorDeadline =
-					Date.now() + (options.ownerRestartSupervisorWaitMs ?? OWNER_RESTART_SUPERVISOR_WAIT_MS);
-				while (!runtime.stopping) {
-					const activeId = runtime.personaSessions.restartDrainId;
-					if (activeId === undefined || activeId === ownerRestartId) break;
-					if (Date.now() >= supervisorDeadline) {
-						if (runtime.personaSessions.transferRestartDrain(activeId, ownerRestartId)) {
-							console.warn(`owner restart taking over stalled stack supervisor id=${activeId}`);
-							break;
-						}
-						continue;
+		const exit = options.exitProcess ?? ((code: number) => process.exit(code));
+		void (async () => {
+			// A detached stack restart owns an existing drain. If it fails and
+			// releases the gate, its cancellation atomically transfers the hold.
+			const supervisorDeadline =
+				Date.now() + (options.ownerRestartSupervisorWaitMs ?? OWNER_RESTART_SUPERVISOR_WAIT_MS);
+			while (!runtime.stopping) {
+				const activeId = runtime.personaSessions.restartDrainId;
+				if (activeId === undefined || activeId === ownerRestartId) break;
+				if (Date.now() >= supervisorDeadline) {
+					if (runtime.personaSessions.transferRestartDrain(activeId, ownerRestartId)) {
+						console.warn(`owner restart taking over stalled stack supervisor id=${activeId}`);
+						break;
 					}
-					await Bun.sleep(Math.min(25, Math.max(1, supervisorDeadline - Date.now())));
+					continue;
 				}
-				if (runtime.stopping) return;
-				const outcome = await runtime.personaSessions.drainForRestart(ownerRestartId, PERSONA_RESTART_DRAIN_WAIT_MS);
-				if (outcome === "stopped") return exit(RESTART_EXIT_CODE);
-				if (outcome === "timed_out")
-					console.warn("owner restart drain timed out; active persona turns will recover from durable state");
-				// Exit non-zero on purpose: launchd KeepAlive=true and systemd
-				// Restart=on-failure only relaunch after an unsuccessful exit. The
-				// stop budget begins after the bounded drain or its durable-recovery timeout.
-				void runtime.stop?.("owner /restart").then(
-					() => exit(RESTART_EXIT_CODE),
-					() => exit(RESTART_EXIT_CODE),
-				);
-				setTimeout(() => exit(RESTART_EXIT_CODE), RESTART_HARD_EXIT_MS).unref();
-			})()
-				.catch((error: unknown) => console.error(`owner restart drain failed: ${diagnostic(error)}`))
-				.finally(() => {
-					if (runtime.pendingOwnerRestartId === ownerRestartId) runtime.pendingOwnerRestartId = undefined;
-				});
-		}, 1_500);
+				await Bun.sleep(Math.min(25, Math.max(1, supervisorDeadline - Date.now())));
+			}
+			if (runtime.stopping) return;
+			const outcome = await runtime.personaSessions.drainForRestart(
+				ownerRestartId,
+				options.ownerRestartDrainWaitMs ?? PERSONA_RESTART_DRAIN_WAIT_MS,
+			);
+			if (outcome === "stopped") return exit(RESTART_EXIT_CODE);
+			if (outcome === "timed_out") {
+				console.warn("owner restart cancelled; persona reply delivery was not confirmed before the drain deadline");
+				await runtime.personaSessions.cancelRestartDrain(ownerRestartId);
+				notifyOwnerRestartCancelled(connection, runtime, request.id, origin);
+				return;
+			}
+			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
+			// Restart=on-failure only relaunch after an unsuccessful exit. The
+			// stop budget begins after the bounded drain succeeds.
+			void runtime.stop?.("owner /restart").then(
+				() => exit(RESTART_EXIT_CODE),
+				() => exit(RESTART_EXIT_CODE),
+			);
+			setTimeout(() => exit(RESTART_EXIT_CODE), RESTART_HARD_EXIT_MS).unref();
+		})()
+			.catch((error: unknown) => console.error(`owner restart drain failed: ${diagnostic(error)}`))
+			.finally(() => {
+				if (runtime.pendingOwnerRestartId === ownerRestartId) runtime.pendingOwnerRestartId = undefined;
+			});
 		return;
 	}
 	if (params.text === "/new" || params.text === "/reset") {
@@ -3817,8 +3875,9 @@ async function createInboundTurnLifecycle(
 			endProgress();
 		}
 	};
-	const onSettled = ({ terminalDeliveryId }: PersonaTurnSettledInput) => {
+	const onSettled = async ({ terminalDeliveryId }: PersonaTurnSettledInput) => {
 		if (runtime.inbound.get(row.message_id) === context) runtime.inbound.delete(row.message_id);
+		if (nonLoopback) await waitForRestartTerminalDelivery(runtime, terminalDeliveryId);
 		if (engagement?.authorIsBot !== true || terminalDeliveryId !== null) return;
 		// A delivered `[turn failed]` notice is a diagnostic, not an answer: it is
 		// deliberately emitted under a different delivery/turn identity, so it does

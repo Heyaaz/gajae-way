@@ -44,7 +44,6 @@ export type RestartStepResult = "pending" | "ok" | "stale" | "failed" | "skipped
 export type RestartState = "queued" | "running" | "ok" | "stale" | "failed";
 
 export interface RestartDrainLease {
-	readonly warning?: string;
 	cancel(): Promise<void>;
 	close(): Promise<void>;
 }
@@ -234,15 +233,13 @@ async function prepareGatewayRestartDrain(
 			`gateway restart drain connection failed: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
-	let drained: boolean;
 	try {
 		const result = await client.request<{ ready?: unknown; drained?: unknown }>("gateway.restart.prepare", {
 			restartId,
 			waitMs: RESTART_DRAIN_WAIT_MS,
 		});
-		if (result.ready !== true || typeof result.drained !== "boolean")
-			throw new Error("gateway returned an invalid restart-drain receipt");
-		drained = result.drained;
+		if (result.ready !== true || result.drained !== true)
+			throw new Error("gateway did not confirm restart-drain delivery readiness");
 	} catch (error) {
 		try {
 			await client.request("gateway.restart.cancel", { restartId });
@@ -255,9 +252,6 @@ async function prepareGatewayRestartDrain(
 		throw new Error(`gateway restart drain failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	return {
-		...(drained
-			? {}
-			: { warning: "active persona turns exceeded the drain grace; durable turn recovery will resume them" }),
 		cancel: async () => {
 			await client.request("gateway.restart.cancel", { restartId });
 		},
@@ -437,11 +431,6 @@ async function runRestartStackWithLease(
 		}
 	}
 	if (restartDrain !== undefined) onDrainPrepared(restartDrain, receipt);
-	if (restartDrain?.warning !== undefined) {
-		receipt.warning = restartDrain.warning;
-		await writeReceipt(options.home, receipt);
-	}
-
 	let issuedAt = now();
 	for (const step of receipt.steps) {
 		if (receipt.state !== "running") {

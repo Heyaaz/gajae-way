@@ -1380,8 +1380,30 @@ test("restart prepare waits for delivered turns and holds new persona dispatches
 	expect(client.frames.some((frame) => frame.id === "prepare-restart")).toBe(false);
 
 	releaseTurn();
-	await client.waitForFrame("prepare-restart");
 	await waitFrame(client.frames, "active-turn");
+	for (
+		let attempt = 0;
+		attempt < 400 &&
+		!client.frames.some(
+			(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "reply-1",
+		);
+		attempt++
+	)
+		await Bun.sleep(5);
+	const replyDelivery = client.frames.find(
+		(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "reply-1",
+	);
+	if (!replyDelivery || replyDelivery.type !== "event" || !replyDelivery.payload.deliveryId)
+		throw new Error("terminal reply delivery was not broadcast");
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "confirm-active-reply",
+		verb: "delivery.confirm",
+		params: { deliveryId: replyDelivery.payload.deliveryId },
+	});
+	await client.waitForFrame("confirm-active-reply");
+	await client.waitForFrame("prepare-restart");
 	const deliveredIndex = client.frames.findIndex(
 		(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "reply-1",
 	);
@@ -1404,6 +1426,110 @@ test("restart prepare waits for delivered turns and holds new persona dispatches
 	for (let attempt = 0; attempt < 400 && responses < 2; attempt++) await Bun.sleep(5);
 	expect(responses).toBe(2);
 	client.close();
+});
+
+test("restart prepare fails closed until an unconfirmed terminal reply is delivered", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-delivery-timeout-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	let turnEntered!: () => void;
+	let releaseTurn!: () => void;
+	const entered = new Promise<void>((resolve) => (turnEntered = resolve));
+	const turnRelease = new Promise<void>((resolve) => (releaseTurn = resolve));
+	let responses = 0;
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => {
+			responses++;
+			if (responses === 1) {
+				turnEntered();
+				await turnRelease;
+			}
+			return `reply-${responses}`;
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "active-turn",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "active", peerId: "p1" },
+				text: "answer before restart",
+				engagement: { mentioned: false, group: false, authorId: "p1" },
+			},
+		});
+		await entered;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "prepare-timeout",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "unconfirmed-answer", waitMs: 40 },
+		});
+		client.send({ v: "0.1", type: "request", id: "drain-observed", verb: "gateway.status" });
+		await client.waitForFrame("drain-observed");
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "queued-turn",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "queued", peerId: "p2" },
+				text: "resume only after cancellation",
+				engagement: { mentioned: false, group: false, authorId: "p2" },
+			},
+		});
+		await client.waitForFrame("queued-turn");
+		releaseTurn();
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some(
+				(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "reply-1",
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		expect(
+			client.frames.some(
+				(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "reply-1",
+			),
+		).toBe(true);
+		await client.waitForFrame("prepare-timeout");
+		expect(client.frames.find((frame) => frame.id === "prepare-timeout")?.error?.code).toBe("verb_failed");
+		expect(client.frames.some((frame) => frame.type === "response" && frame.id === "prepare-timeout")).toBe(false);
+		expect(responses).toBe(1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "cancel-timeout",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "unconfirmed-answer" },
+		});
+		await client.waitForFrame("cancel-timeout");
+		expect(client.frames.find((frame) => frame.id === "cancel-timeout")?.result).toEqual({ cancelled: true });
+		for (let attempt = 0; attempt < 400 && responses < 2; attempt++) await Bun.sleep(5);
+		expect(responses).toBe(2);
+	} finally {
+		releaseTurn();
+		client.close();
+	}
 });
 
 test("owner /restart resumes after a stack drain is cancelled and waits for active replies", async () => {
@@ -1508,7 +1634,30 @@ test("owner /restart resumes after a stack drain is cancelled and waits for acti
 		await client.waitForFrame("cancel-stack-drain");
 		expect(client.frames.find((frame) => frame.id === "cancel-stack-drain")?.result).toEqual({ cancelled: true });
 		releaseTurn();
-		await waitFrame(client.frames, "active-reply");
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some(
+				(frame) =>
+					frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "active reply delivered",
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		const activeReply = client.frames.find(
+			(frame) =>
+				frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "active reply delivered",
+		);
+		if (!activeReply || activeReply.type !== "event" || !activeReply.payload.deliveryId)
+			throw new Error("owner restart reply was not broadcast");
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "confirm-owner-reply",
+			verb: "delivery.confirm",
+			params: { deliveryId: activeReply.payload.deliveryId },
+		});
+		await client.waitForFrame("confirm-owner-reply");
 		for (let attempt = 0; attempt < 400 && exitCode === undefined; attempt++) await Bun.sleep(5);
 		expect(exitCode).toBe(75);
 		expect(responses).toBe(1);
@@ -1521,6 +1670,106 @@ test("owner /restart resumes after a stack drain is cancelled and waits for acti
 		);
 		expect(replyIndex).toBeGreaterThan(0);
 		expect(stoppingIndex).toBeGreaterThan(replyIndex);
+	} finally {
+		releaseTurn();
+		client.close();
+	}
+});
+
+test("owner /restart cancels instead of restarting before an active reply is confirmed", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-owner-restart-delivery-timeout-"));
+	const ownerOrigin = { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } as const;
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		ownerTarget: { origin: ownerOrigin },
+	};
+	let turnEntered!: () => void;
+	let releaseTurn!: () => void;
+	const entered = new Promise<void>((resolve) => (turnEntered = resolve));
+	const turnRelease = new Promise<void>((resolve) => (releaseTurn = resolve));
+	let responses = 0;
+	let exitCode: number | undefined;
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => {
+			responses++;
+			if (responses === 1) {
+				turnEntered();
+				await turnRelease;
+			}
+			return `reply-${responses}`;
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort,
+		onStop: () => database.close(),
+		exitProcess: (code) => {
+			exitCode = code;
+		},
+		ownerRestartDrainWaitMs: 20,
+	});
+	const client = await connect(config.socketPath);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "active-turn",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "active", peerId: "p1" },
+				text: "do not restart before my answer arrives",
+				engagement: { mentioned: false, group: false, authorId: "p1" },
+			},
+		});
+		await entered;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "owner-restart",
+			verb: "chat.send",
+			params: {
+				origin: ownerOrigin,
+				text: "/restart",
+				engagement: { mentioned: false, group: false, authorId: "owner" },
+			},
+		});
+		await client.waitForFrame("owner-restart");
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "queued-turn",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "queued", peerId: "p2" },
+				text: "keep this queued until restart is cancelled",
+				engagement: { mentioned: false, group: false, authorId: "p2" },
+			},
+		});
+		await client.waitForFrame("queued-turn");
+		await Bun.sleep(5);
+		expect(exitCode).toBeUndefined();
+		expect(client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")).toBe(false);
+		expect(responses).toBe(1);
+		await Bun.sleep(100);
+		expect(exitCode).toBeUndefined();
+		for (let attempt = 0; attempt < 400 && responses < 2; attempt++) await Bun.sleep(5);
+		expect(responses).toBe(2);
+		releaseTurn();
+		await Bun.sleep(20);
+		expect(exitCode).toBeUndefined();
 	} finally {
 		releaseTurn();
 		client.close();

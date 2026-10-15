@@ -265,7 +265,7 @@ test("restart-stack cancels the persona drain when a service restart fails befor
 
 test("restart-stack cancels and closes the persona drain when receipt persistence fails", async () => {
 	const { home, cleanup } = await tempHome();
-	const host = await fakeHost({ home });
+	const host = await fakeHost({ home, installed: async () => false });
 	let cancelled = 0;
 	let closed = 0;
 	try {
@@ -276,7 +276,6 @@ test("restart-stack cancels and closes the persona drain when receipt persistenc
 				prepareRestartDrain: async () => {
 					await mkdir(join(home, `restart-stack.json.${process.pid}.tmp`));
 					return {
-						warning: "force receipt persistence after drain preparation",
 						cancel: async () => {
 							cancelled++;
 						},
@@ -321,23 +320,21 @@ test("the first update from a pre-drain gateway records its durable-recovery boo
 	}
 });
 
-test("restart-stack reports when active turns exceed the bounded drain grace", async () => {
+test("restart-stack fails closed when the Gateway cannot confirm terminal delivery", async () => {
 	const { home, cleanup } = await tempHome();
 	const host = await fakeHost({ home, installed: async (label) => label === "dev.gajaeway.gateway" });
-	const warning = "active persona turns exceeded the drain grace; durable turn recovery will resume them";
 	try {
 		const receipt = await runRestartStack({
 			...host.options,
-			id: "drain-grace-expired",
-			prepareRestartDrain: async () => ({
-				warning,
-				cancel: async () => {},
-				close: async () => {},
-			}),
+			id: "drain-delivery-unconfirmed",
+			prepareRestartDrain: async () => {
+				throw new ProtocolError("verb_failed", "persona turn delivery was not confirmed before the drain deadline");
+			},
 		});
-		expect(receipt.state).toBe("ok");
-		expect(receipt.warning).toBe(warning);
-		expect(receipt.steps.find((step) => step.label === "dev.gajaeway.gateway")?.result).toBe("ok");
+		expect(receipt.state).toBe("failed");
+		expect(receipt.detail).toContain("persona turn delivery was not confirmed");
+		expect(receipt.steps.every((step) => step.result === "skipped")).toBe(true);
+		expect(host.ran).toEqual([]);
 	} finally {
 		await host.close();
 		await cleanup();
