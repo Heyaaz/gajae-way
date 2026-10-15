@@ -26,7 +26,6 @@ export function markdownToMrkdwn(text: string): string {
 			else if (!ignoreBrackets && character === "<") {
 				const next = segment[index + 1];
 				const looksLikeMarkup =
-					segment.startsWith(markerPrefix, index + 1) ||
 					(linkFollows && index === segment.length - 1) ||
 					(next !== undefined &&
 						((next >= "A" && next <= "Z") || (next >= "a" && next <= "z") || "!/?<@#:".includes(next)));
