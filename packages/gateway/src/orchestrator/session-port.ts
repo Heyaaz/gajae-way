@@ -446,8 +446,8 @@ const SESSION_CREATE_RETRY_MS = 1_000;
  */
 const BROKER_OPERATION_RETENTION_MS = 60 * 60_000;
 /**
- * A pending prompt or close intent this old belongs to no live retry; it is
- * dropped rather than replayed. Pending creates are exempt (see pruneBrokerOperations).
+ * Pending close intents this old are pruned. Creates are retained until a
+ * binding is recorded, and prompts are retained until their status is reconciled.
  */
 const BROKER_INTENT_RETENTION_MS = 24 * 60 * 60_000;
 /** Maximum poisoned-create-key epoch rotations permitted per origin. */
@@ -772,9 +772,9 @@ export class BrokerSessionPort implements SessionPort {
 		);
 	}
 
-	#releaseCompletedCloseOperation(sessionId: string): void {
+	#releaseCloseOperation(sessionId: string): void {
 		const previous = this.#database.bindings.brokerOperation(this.#authority, "session.close", sessionId);
-		if (previous?.state === "complete") this.#releaseOperation(previous);
+		if (previous) this.#releaseOperation(previous);
 	}
 
 	#createRotations(originKey: string): number {
@@ -1030,7 +1030,7 @@ export class BrokerSessionPort implements SessionPort {
 			}
 		}
 		this.#resetCreateRotations(input.originKey);
-		this.#releaseCompletedCloseOperation(input.sessionId);
+		this.#releaseCloseOperation(input.sessionId);
 		return { sessionId: input.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 	}
 
@@ -1062,9 +1062,9 @@ export class BrokerSessionPort implements SessionPort {
 		const relay =
 			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
 		try {
-			const receipt =
-				(intent.resumed ? await this.#acceptedPrompt(input, relay) : undefined) ??
-				(await this.#submitPrompt(input, relay, intent));
+			const receipt = intent.resumed
+				? await this.#acceptedPrompt(input, relay)
+				: await this.#submitPrompt(input, relay, intent);
 			this.#completeOperation(intent, receipt);
 			return receipt;
 		} finally {
@@ -1072,10 +1072,14 @@ export class BrokerSessionPort implements SessionPort {
 		}
 	}
 
-	/** The receipt of a prompt the broker already accepted under this clientRef, or undefined when it never saw it. */
-	async #acceptedPrompt(input: SessionSendInput, relay: TailHandle): Promise<SendReceipt | undefined> {
+	/** The receipt of a prompt the broker already accepted under this clientRef. */
+	async #acceptedPrompt(input: SessionSendInput, relay: TailHandle): Promise<SendReceipt> {
 		const report = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relay });
-		if (report.status.status === "unknown") return undefined;
+		if (report.status.status === "unknown")
+			throw new GjcCliError(`prompt ${input.opRef} status is unknown; refusing to resend`, 0, "", {
+				code: "operation_uncertain",
+				opRef: input.opRef,
+			});
 		console.info(
 			`session_prompt_replayed session=${input.sessionId} opRef=${input.opRef} status=${report.status.status}`,
 		);

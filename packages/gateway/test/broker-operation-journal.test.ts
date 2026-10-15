@@ -402,34 +402,52 @@ test("cold-create readiness surfaces a broker-unavailable envelope after persist
 	expect(inspects).toBe(2);
 });
 
-test("resuming a session invalidates its completed close before a later retirement", async () => {
+test("resuming a session invalidates pending and completed closes before a later retirement", async () => {
 	const { authority, repo } = await setup();
-	const sessionId = "sdk-resumed";
-	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey: "lane/resume", epoch: 0 });
+	const cases = [
+		{ sessionId: "sdk-completed", originKey: "lane/completed", replyLost: false },
+		{ sessionId: "sdk-pending", originKey: "lane/pending", replyLost: true },
+	] as const;
 	const transcriptDir = join(home, "agent", "sessions", "v2-scope");
 	await mkdir(transcriptDir, { recursive: true });
-	await writeFile(join(transcriptDir, "2026-10-01T00-00-00-000Z_sdk-resumed.jsonl"), "{}\n");
-	let live = false;
-	const closeKeys: string[] = [];
+	const live = new Map<string, boolean>();
+	const closeAttempts = new Map<string, number>();
+	const closeKeys = new Map<string, string[]>();
+	for (const { sessionId, originKey } of cases) {
+		await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
+		await writeFile(join(transcriptDir, `2026-10-01T00-00-00-000Z_${sessionId}.jsonl`), "{}\n");
+		live.set(sessionId, true);
+		closeKeys.set(sessionId, []);
+	}
 	const cli: CliRunner = async (args) => {
 		if (args.includes("session.close")) {
-			closeKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: string };
+			const sessionId = request.sessionId ?? "";
+			closeKeys.get(sessionId)?.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			const attempts = (closeAttempts.get(sessionId) ?? 0) + 1;
+			closeAttempts.set(sessionId, attempts);
+			live.set(sessionId, false);
+			if (sessionId === "sdk-pending" && attempts === 1)
+				throw new GjcCliUnavailableError("broker restarted after close");
 			return ok({ closed: true });
 		}
 		if (args.includes("session.resume")) {
-			live = true;
+			const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: string };
+			if (request.sessionId) live.set(request.sessionId, true);
 			return ok({ resumed: true });
 		}
-		if (args.includes("inspect"))
+		if (args.includes("inspect")) {
+			const sessionId = args[args.indexOf("inspect") + 1] ?? "";
 			return ok({
 				session: {
 					sessionId,
-					live,
+					live: live.get(sessionId) ?? false,
 					deleted: false,
 					locator: { repo },
-					hostIncarnation: live ? "host-resumed" : "host-closed",
+					hostIncarnation: live.get(sessionId) ? "host-resumed" : "host-closed",
 				},
 			});
+		}
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
@@ -440,17 +458,19 @@ test("resuming a session invalidates its completed close before a later retireme
 		sleep: async () => {},
 	});
 
-	await port.close({ sessionId, repo });
-	expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toMatchObject({
-		state: "complete",
-	});
-	await expect(port.resume({ sessionId, repo, originKey: "lane/resume", epoch: 0 })).resolves.toMatchObject({
-		sessionId,
-	});
-	expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
-	await port.close({ sessionId, repo });
-	expect(closeKeys).toHaveLength(2);
-	expect(closeKeys[1]).not.toBe(closeKeys[0]);
+	for (const { sessionId, originKey, replyLost } of cases) {
+		if (replyLost) await expect(port.close({ sessionId, repo })).rejects.toBeInstanceOf(GjcCliUnavailableError);
+		else await port.close({ sessionId, repo });
+		expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toMatchObject({
+			state: replyLost ? "pending" : "complete",
+		});
+		await expect(port.resume({ sessionId, repo, originKey, epoch: 0 })).resolves.toMatchObject({ sessionId });
+		expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+		await port.close({ sessionId, repo });
+		const keys = closeKeys.get(sessionId) ?? [];
+		expect(keys).toHaveLength(2);
+		expect(keys[1]).not.toBe(keys[0]);
+	}
 });
 
 test("a finished create is never served to a later bind after the lane's session died", async () => {
@@ -525,19 +545,15 @@ test("turn.prompt accepted by the broker before the relay died is reconciled, no
 	expect(relay.requests).toHaveLength(before);
 });
 
-test("turn.prompt lost before the broker saw it is sent once on retry", async () => {
+test("an aged pending turn.prompt with unknown status stays uncertain and is never resent", async () => {
 	const { path, authority, repo } = await setup();
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/q", epoch: 0 });
-	const accepted = new Set<string>();
-	let dropFirst = true;
+	let promptEffects = 0;
 	const relay = scriptedRelay((request) => {
 		const clientRef = String(request.input.clientRef);
 		if (request.operation === "turn.prompt") {
-			if (dropFirst) {
-				dropFirst = false;
-				return new Promise(() => {});
-			}
-			accepted.add(clientRef);
+			promptEffects++;
+			if (promptEffects === 1) return new Promise(() => {});
 			return { ok: true, result: { accepted: true, clientRef, commandId: "cmd-1", turnId: "turn-1" } };
 		}
 		if (request.operation === "turn.result") return { ok: true, result: { status: "unknown" } };
@@ -547,10 +563,23 @@ test("turn.prompt lost before the broker saw it is sent once on retry", async ()
 	let gateway = await openGateway(path, authority, broker, relay.spawn);
 	const send = { sessionId: "sdk-1", repo, text: "do the work", opRef: "gw-work-q-1" };
 	await expect(gateway.port.send(send)).rejects.toThrow();
-	gateway = await openGateway(path, authority, broker, relay.spawn);
-	await expect(gateway.port.send(send)).resolves.toMatchObject({ commandId: "cmd-1", turnId: "turn-1" });
-	expect(accepted).toEqual(new Set(["gw-work-q-1"]));
-	expect(relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result", "turn.prompt"]);
+	expect(promptEffects).toBe(1);
+	database?.close();
+	database = await Store.open(path);
+	const later = new BrokerSessionPort({
+		database,
+		authority,
+		cli: broker.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+		sleep: async () => {},
+		now: () => Date.now() + 25 * 60 * 60_000,
+	});
+	await expect(later.send(send)).rejects.toThrow("status is unknown; refusing to resend");
+	expect(promptEffects).toBe(1);
+	expect(relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result"]);
+	expect(
+		database.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify(["sdk-1", send.opRef])),
+	).toMatchObject({ state: "pending", operationRef: send.opRef });
 });
 
 test("session.close interrupted after the broker applied it replays its key once, then answers from the journal", async () => {
@@ -714,7 +743,7 @@ test("releaseBrokerOperation drops only the row of the exact ref, pending or com
 	).toMatchObject({ operationRef: "gw-bind-3", resumed: false });
 });
 
-test("pruneBrokerOperations honors each cutoff by state and never age-prunes a pending create", async () => {
+test("pruneBrokerOperations honors each cutoff and retains pending creates and prompts at any age", async () => {
 	const { path, authority } = await setup();
 	const store = database!;
 	const begin = (operation: "session.create" | "turn.prompt" | "session.close", scope: string) =>
@@ -753,9 +782,12 @@ test("pruneBrokerOperations honors each cutoff by state and never age-prunes a p
 		{ operation: "turn.prompt", scope: "prompt-pending", state: "pending" },
 	]);
 
-	// The pending cutoff has passed: prompt and close intents go; the create survives any age.
-	expect(prune(at(60_000), at(60_000))).toBe(2);
-	expect(journalRows(path)).toEqual([{ operation: "session.create", scope: "create-pending", state: "pending" }]);
+	// Only pending close intents expire; a prompt's missing reconciliation record never authorizes a resend.
+	expect(prune(at(60_000), at(60_000))).toBe(1);
+	expect(journalRows(path)).toEqual([
+		{ operation: "session.create", scope: "create-pending", state: "pending" },
+		{ operation: "turn.prompt", scope: "prompt-pending", state: "pending" },
+	]);
 	expect(prune(at(365 * 24 * 60 * 60_000), at(365 * 24 * 60 * 60_000))).toBe(0);
 	expect(store.bindings.brokerOperation(authority, "session.create", "create-pending")).toMatchObject({
 		state: "pending",

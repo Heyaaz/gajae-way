@@ -884,11 +884,9 @@ export class BindingsGroup {
 
 	/**
 	 * Bounds the journal: completed operations older than `completedBefore` and
-	 * pending intents older than `pendingBefore`, which no crash-retry still holds.
-	 * A pending `session.create` is never age-pruned: the broker may have created
-	 * the session under its key, and only replaying that key (released when the
-	 * binding is recorded) avoids minting a second session after a long outage.
-	 * There is at most one per origin and epoch, so the exemption stays bounded.
+	 * old pending close intents. Pending creates and prompts are never age-pruned:
+	 * a create may have applied before its binding was recorded, and an unknown
+	 * prompt status never authorizes resending its non-idempotent clientRef.
 	 */
 	pruneBrokerOperations(
 		tx: WriteTx,
@@ -896,7 +894,7 @@ export class BindingsGroup {
 	): number {
 		return this.#db
 			.prepare(
-				"DELETE FROM broker_operations WHERE (state = 'complete' AND completed_at < ?) OR (state = 'pending' AND operation <> 'session.create' AND created_at < ?)",
+				"DELETE FROM broker_operations WHERE (state = 'complete' AND completed_at < ?) OR (state = 'pending' AND operation = 'session.close' AND created_at < ?)",
 			)
 			.run(tx, cutoff.completedBefore, cutoff.pendingBefore).changes;
 	}
