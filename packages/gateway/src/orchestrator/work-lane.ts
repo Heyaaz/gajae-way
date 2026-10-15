@@ -212,13 +212,19 @@ export function getServiceDirectory(): string {
 	// A source checkout runs this module from disk; a compiled binary embeds it under a
 	// virtual root, so fall back to the binary's own directory there. `process.execPath`
 	// alone is the bun runtime in a source checkout, never the service checkout.
+	// `existsSync` reports the virtual root as present, but it has no real path (issue #579).
 	const moduleDir = import.meta.dir;
-	const anchor = existsSync(moduleDir) ? moduleDir : dirname(process.execPath);
+	const anchor = isEmbeddedModuleDir(moduleDir) ? dirname(process.execPath) : moduleDir;
 	try {
 		return execSync("git rev-parse --show-toplevel", { cwd: anchor, encoding: "utf-8" }).trim();
 	} catch {
 		return anchor;
 	}
+}
+
+/** True for the virtual directory a `bun build --compile` binary embeds its modules under. */
+export function isEmbeddedModuleDir(dir: string): boolean {
+	return dir === "/$bunfs/root" || dir.startsWith("/$bunfs/") || /^[A-Z]:[\\/]~BUN[\\/]/i.test(dir);
 }
 
 /** Nearest existing ancestor's realpath with the missing tail re-appended. */
