@@ -1002,6 +1002,13 @@ describe("cycle rendering", () => {
 		expect(renderCycle(cycleResult())).toContain("monitor failures: none");
 	});
 
+	test("cycle renderer explicitly rejects gateways without monitor failure diagnostics", () => {
+		const olderGatewayResult = { ...cycleResult(), monitorFailures: undefined } as unknown as OpsCycleResult;
+		expect(() => renderCycle(olderGatewayResult)).toThrow(
+			"ops.cycle monitor failure diagnostics are unsupported by the running gateway",
+		);
+	});
+
 	test("agent-directory headroom renders free/total, or unobservable when the probe failed", () => {
 		const path = "/home/operator/.gjc/agent";
 		const low = renderCycle(

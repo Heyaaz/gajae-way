@@ -1955,7 +1955,8 @@ function failureDetail(error: unknown): string {
 		if (sdkToken(value.trim()) !== undefined && !/\s/.test(value.trim())) return undefined;
 		const cleaned = sanitizeDiagnostic(value)
 			.replace(/\b(?:https?|wss?):\/\/[^\s"'<>]+/gi, "[url]")
-			.replace(/\/(?:Users|home|root|tmp|private|var|mnt|srv|workspace|workspaces)\/[^\s"'<>;,)}\]]*/g, "[path]")
+			.replace(/(["'])(\/[^"']+)\1/g, "$1[path]$1")
+			.replace(/(^|[\s"'(=:[{,])\/(?:[^/\s"'<>]+\/)*[^/\s"'<>]+/g, "$1[path]")
 			.replace(/[\r\n\t]+/g, " ")
 			.replace(/\s+/g, " ")
 			.trim();

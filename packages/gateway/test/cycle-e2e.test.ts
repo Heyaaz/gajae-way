@@ -679,7 +679,7 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 		const cause = Object.assign(new Error("sdk_prompt_terminal_failed"), {
 			code: "sdk_prompt_terminal_failed",
 			reason:
-				"The model is temporarily unavailable; token=ghp_attacker-secret https://secret.example/path /Users/private/token.json",
+				"The model is temporarily unavailable; token=ghp_attacker-secret https://secret.example/path /Users/private/token.json /opt/app/credentials.json /etc/gajaeway/token",
 		});
 		if (input.originKey?.includes(nestedTerminalMonitor.monitorId))
 			throw new Error("monitor request failed", { cause });
@@ -713,6 +713,8 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 			expect(detail).not.toContain("ghp_");
 			expect(detail).not.toContain("secret.example");
 			expect(detail).not.toContain("/Users/");
+			expect(detail).not.toContain("/opt/");
+			expect(detail).not.toContain("/etc/");
 		}
 		for (const detail of [nestedTerminal?.detail ?? "", turnFailure?.detail ?? ""]) {
 			expect(detail).toContain('"causeCode":"sdk_prompt_terminal_failed"');
