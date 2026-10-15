@@ -10,12 +10,13 @@ export function markdownToMrkdwn(text: string): string {
 
 /**
  * Slack's own angle-bracket syntax, which must survive HTML escaping: user
- * mentions, channel links, and the broadcast keywords. Everything else in
- * angle brackets is text and is escaped. Until this existed every `<@U\u2026>` the
- * persona wrote went out as `&lt;@U\u2026&gt;` and pinged nobody (2026-09-17).
+ * mentions, channel links, broadcast keywords, and HTTP(S)/mailto links.
+ * Everything else in angle brackets is text and is escaped. Until this existed
+ * every `<@U\u2026>` the persona wrote went out as `&lt;@U\u2026&gt;` and pinged
+ * nobody (2026-09-17).
  */
 const SLACK_ENTITY =
-	/<(?:@[UW][A-Z0-9]+(?:\|[^>\n]*)?|#C[A-Z0-9]+(?:\|[^>\n]*)?|!(?:here|channel|everyone)(?:\|[^>\n]*)?|!subteam\^[A-Z0-9]+(?:\|[^>\n]*)?)>/g;
+	/<(?:@[UW][A-Z0-9]+(?:\|[^>\n]*)?|#C[A-Z0-9]+(?:\|[^>\n]*)?|!(?:here|channel|everyone)(?:\|[^>\n]*)?|!subteam\^[A-Z0-9]+(?:\|[^>\n]*)?|(?:https?:\/\/|mailto:)[^\s<>|]+(?:\|[^<>\n]*)?)>/gi;
 
 function escapeKeepingEntities(text: string): string {
 	const parts: string[] = [];

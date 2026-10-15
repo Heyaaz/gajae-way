@@ -19,10 +19,14 @@ test("Slack entities survive escaping; everything else in angle brackets is esca
 		["<@U0C2GSKTA6M|bellman> 확인", "<@U0C2GSKTA6M|bellman> 확인"],
 		["<#C0C2G8N9KQS|selftest> 확인", "<#C0C2G8N9KQS|selftest> 확인"],
 		["<!here> <!channel> <!subteam^S123ABC>", "<!here> <!channel> <!subteam^S123ABC>"],
+		["<https://example.com/path?a=1&b=2|details>", "<https://example.com/path?a=1&b=2|details>"],
+		["<https://example.com/path?a=1&b=2>", "<https://example.com/path?a=1&b=2>"],
 		// Markdown around a mention still converts.
 		["**cc** <@U0C2GSKTA6M> & <@U0BT1S5UGS1>", "*cc* <@U0C2GSKTA6M> &amp; <@U0BT1S5UGS1>"],
 		// Not entities: escaped as before.
 		["<script>x</script>", "&lt;script&gt;x&lt;/script&gt;"],
+		["<javascript:alert(1)|click>", "&lt;javascript:alert(1)|click&gt;"],
+		["<https://example.com|<script>>", "&lt;https://example.com|&lt;script&gt;&gt;"],
 		["<@lowercase> <@> <#notachannel>", "&lt;@lowercase&gt; &lt;@&gt; &lt;#notachannel&gt;"],
 		["a < b and c > d", "a &lt; b and c &gt; d"],
 	])
