@@ -420,6 +420,7 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 export function cycleExitCode(cycle: OpsCycleResult): number {
 	return cycle.gates.length > 0 ? 1 : 0;
 }
+
 export function renderSlo(result: OpsSloResult): string[] {
 	const message = result.ok
 		? `SLO ok: ${result.days.length} consecutive UTC days`

@@ -119,6 +119,8 @@ async function harness(
 		brokerGeneration?: () => number;
 		submissionRetryDelayMs?: number;
 		onSloEvent?: (code: "persona_bind_failed", at: number) => void;
+		onBindFailure?: (input: { originKey: string; detail: string; at: number }) => void;
+		onSessionReady?: (input: { originKey: string; at: number }) => void;
 		now?: () => number;
 	} = {},
 ) {
@@ -173,24 +175,48 @@ async function settleFailedInbound(port: ScriptedSessionPort, messageId: string)
 
 test("persona bind failures are emitted to the SLO recorder", async () => {
 	const failures: Array<{ code: string; at: number }> = [];
+	const readinessFailures: Array<{ originKey: string; detail: string; at: number }> = [];
 	const port = new ScriptedSessionPort({
 		onBind: () => {
 			throw new Error("broker unavailable");
 		},
 	});
-	await harness(port, {}, undefined, { onSloEvent: (code, at) => failures.push({ code, at }) });
+	await harness(port, {}, undefined, {
+		onSloEvent: (code, at) => failures.push({ code, at }),
+		onBindFailure: (input) => readinessFailures.push(input),
+	});
 	enqueue("bind-failure", "exercise the failed bind path");
 	await manager!.notifyInbound(KEY);
 	await eventually(() => failures.length > 0, "bind failure did not reach the SLO recorder");
 	expect(failures[0]?.code).toBe("persona_bind_failed");
 	expect(Number.isFinite(failures[0]?.at)).toBe(true);
+	expect(readinessFailures[0]).toMatchObject({ originKey: KEY, detail: "broker unavailable" });
+	expect(Number.isFinite(readinessFailures[0]?.at)).toBe(true);
 });
+
+test("readiness observes bind failures even when the durable SLO recorder throws", async () => {
+	const readinessFailures: Array<{ originKey: string; detail: string; at: number }> = [];
+	await harness(new ScriptedSessionPort(), {}, undefined, {
+		onSloEvent: () => {
+			throw new Error("SLO storage unavailable");
+		},
+		onBindFailure: (input) => readinessFailures.push(input),
+	});
+
+	expect(() => manager!.recordBindFailure(KEY, "broker unavailable")).toThrow("SLO storage unavailable");
+	expect(readinessFailures).toHaveLength(1);
+	expect(readinessFailures[0]).toMatchObject({ originKey: KEY, detail: "broker unavailable" });
+});
+
 test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
 	const port = new ScriptedSessionPort({
 		onSend: (input, scripted) => scripted.complete(input.opRef, "persona reply"),
 	});
 	const terminal: string[] = [];
-	await harness(port, { terminal: (text) => terminal.push(text) });
+	const sessionCreateSuccesses: Array<{ originKey: string; at: number }> = [];
+	await harness(port, { terminal: (text) => terminal.push(text) }, undefined, {
+		onSessionReady: (input) => sessionCreateSuccesses.push(input),
+	});
 	enqueue("m-1", "hello");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => terminal.length === 1, "tail terminal did not reach lifecycle");
@@ -201,8 +227,16 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	expect(send.opRef).toBe(latestOpRef);
 	expect(send.opRef).toMatch(/^gw-p-[0-9a-f]{32}$/);
 	expect(terminal).toEqual(["persona reply"]);
+	expect(sessionCreateSuccesses[0]?.originKey).toBe(KEY);
+	expect(Number.isFinite(sessionCreateSuccesses[0]?.at)).toBe(true);
 	expect(database?.inbox.pendingCount(KEY)).toBe(0);
 	expect(database?.inbox.turnRow(latestOpRef)).toMatchObject({ state: "done", turn_state: "done" });
+
+	enqueue("m-2", "hello again");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => terminal.length === 2, "reused session turn did not complete");
+	expect(port.sends).toHaveLength(2);
+	expect(sessionCreateSuccesses).toHaveLength(2);
 });
 
 for (const outcome of ["complete", "incomplete", "in_flight"] as const)
