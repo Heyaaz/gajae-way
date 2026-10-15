@@ -1162,6 +1162,14 @@ export interface OpsDeliveriesResult {
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
+	"gateway.restart.prepare": {
+		params: { readonly restartId: string };
+		result: { readonly ready: true };
+	};
+	"gateway.restart.cancel": {
+		params: { readonly restartId: string };
+		result: { readonly cancelled: boolean };
+	};
 	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
 	"chat.edit": { params: ChatEditParams; result: ChatEditResult };
@@ -1236,6 +1244,8 @@ export interface EventCatalogV01 {
 export const VERBS_V01 = [
 	"gateway.status",
 	"gateway.shutdown",
+	"gateway.restart.prepare",
+	"gateway.restart.cancel",
 	"chat.send",
 	"chat.edit",
 	"delivery.confirm",

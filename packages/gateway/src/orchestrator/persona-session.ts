@@ -497,6 +497,7 @@ export class PersonaSessionManager {
 	#maxLiveHosts: number;
 	#hostIdleRetireMs: number;
 	#draining = false;
+	#restartDrainId: string | undefined;
 	#stopped = false;
 
 	constructor(options: PersonaSessionManagerOptions) {
@@ -556,6 +557,10 @@ export class PersonaSessionManager {
 
 	get draining(): boolean {
 		return this.#draining;
+	}
+
+	get restartDrainActive(): boolean {
+		return this.#restartDrainId !== undefined;
 	}
 
 	get onReverseRequest(): PersonaSessionManagerOptions["onReverseRequest"] {
@@ -733,6 +738,36 @@ export class PersonaSessionManager {
 			}
 			await Bun.sleep(10);
 		}
+	}
+
+	/** Pause new dispatches and wait until every accepted persona turn is delivered or settled. */
+	async drainForRestart(restartId: string): Promise<boolean> {
+		if (!/^[A-Za-z0-9_-]{1,128}$/.test(restartId)) throw new Error("invalid restart id");
+		if (this.#stopped) return false;
+		if (this.#restartDrainId !== undefined && this.#restartDrainId !== restartId)
+			throw new Error(`restart drain already owned by ${this.#restartDrainId}`);
+		this.#restartDrainId = restartId;
+		this.#log(`persona_restart_drain_started id=${restartId}`);
+		for (;;) {
+			if (this.#stopped || this.#restartDrainId !== restartId) return false;
+			const actors = [...this.#actors.values()];
+			const unsettled = await Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
+			if (this.#stopped || this.#restartDrainId !== restartId) return false;
+			if (!unsettled.some(Boolean)) {
+				this.#log(`persona_restart_drain_ready id=${restartId}`);
+				return true;
+			}
+			await Bun.sleep(10);
+		}
+	}
+
+	/** Resume pending admissions if the detached restart supervisor fails before restarting the gateway. */
+	async cancelRestartDrain(restartId: string): Promise<boolean> {
+		if (this.#restartDrainId !== restartId) return false;
+		this.#restartDrainId = undefined;
+		this.#log(`persona_restart_drain_cancelled id=${restartId}`);
+		await Promise.all([...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.admit())));
+		return true;
 	}
 
 	recordBindFailure(): void {
@@ -1055,6 +1090,10 @@ class OriginActor {
 		return this.#state;
 	}
 
+	hasUnsettledTurns(): boolean {
+		return this.#state !== "idle" || this.#current !== undefined || this.#retired.size > 0;
+	}
+
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {
 		if (this.#stopped || this.#manager.stopped) return Promise.resolve(undefined);
 		const task = this.#queue.then(() => {
@@ -1075,7 +1114,7 @@ class OriginActor {
 	 * origin sends it as the next turn. No window, no coalescing.
 	 */
 	async admit(): Promise<void> {
-		if (this.#manager.draining) return;
+		if (this.#manager.draining || this.#manager.restartDrainActive) return;
 		if (!this.#recoveryScanned) await this.recover();
 		if (this.#state === "turn-running") {
 			await this.#steerPending();
@@ -1640,7 +1679,7 @@ class OriginActor {
 	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#manager.draining || this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (this.#manager.draining || this.#manager.restartDrainActive || this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
 		if (this.#modelRefusalPaused) {
 			const pending = this.#manager.database.inbox.pendingOldest(this.originKey);
 			if (pending) {
@@ -2262,6 +2301,7 @@ class OriginActor {
 		const current = this.#current;
 		if (
 			this.#manager.draining ||
+			this.#manager.restartDrainActive ||
 			this.#modelRefusalPaused ||
 			!current ||
 			current.retired ||

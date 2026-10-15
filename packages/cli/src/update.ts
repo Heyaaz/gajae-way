@@ -241,6 +241,7 @@ export interface UpdateDeps {
 export interface RunUpdateOptions {
 	readonly args: ParsedUpdateArgs;
 	readonly home: string;
+	readonly gatewaySocketPath?: string;
 	readonly deps?: UpdateDeps;
 }
 
@@ -429,7 +430,9 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 			brokerNotEnabled: installed.brokerNotEnabled,
 			restartSkipped: true,
 		};
-	const receipt = await (deps.queueRestart ?? defaultQueueRestart)(options.home, binDir, "update");
+	const receipt = deps.queueRestart
+		? await deps.queueRestart(options.home, binDir, "update")
+		: await defaultQueueRestart(options.home, binDir, "update", options.gatewaySocketPath);
 
 	return {
 		current,
@@ -536,7 +539,12 @@ async function defaultExtractTarball(tarball: Uint8Array, intoDir: string): Prom
 	await rm(tarballPath, { force: true });
 }
 
-async function defaultQueueRestart(home: string, binDir: string, trigger: "update"): Promise<RestartQueueReceipt> {
-	const { receipt, supervisorPid } = await launchRestartStack({ home, binDir, trigger });
+async function defaultQueueRestart(
+	home: string,
+	binDir: string,
+	trigger: "update",
+	gatewaySocketPath?: string,
+): Promise<RestartQueueReceipt> {
+	const { receipt, supervisorPid } = await launchRestartStack({ home, binDir, trigger, gatewaySocketPath });
 	return { receiptId: receipt.id, supervisorPid };
 }

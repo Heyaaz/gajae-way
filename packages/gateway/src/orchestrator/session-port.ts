@@ -672,9 +672,13 @@ export class BrokerSessionPort implements SessionPort {
 					throw new Error("pending session.create intent did not return a session id");
 				previousSessionId = previous.sessionId;
 			} catch (error) {
-				// A definitively poisoned key cannot have created a session; release it
-				// so the current request can start under a fresh key.
-				if (poisonedCreateKeyCode(error, intent.operationRef) === undefined) throw error;
+				// A rejected model or definitively poisoned key cannot have created a
+				// session; retire it so the current request can start with its input.
+				if (
+					unknownModelCreateError(error) === undefined &&
+					poisonedCreateKeyCode(error, intent.operationRef) === undefined
+				)
+					throw error;
 				this.#releaseOperation(intent);
 			}
 			if (previousSessionId) {
@@ -702,10 +706,12 @@ export class BrokerSessionPort implements SessionPort {
 			created = await this.#createSession(intent.operationRef, intent.requestJson);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			const poisonedCode = poisonedCreateKeyCode(error, intent.operationRef);
-			// A poisoned key can never succeed; every other failure may have
-			// created the session, so the intent stays for the retry to replay.
-			if (poisonedCode !== undefined) this.#releaseOperation(intent);
+			const modelError = unknownModelCreateError(error);
+			const poisonedCode = modelError === undefined ? poisonedCreateKeyCode(error, intent.operationRef) : undefined;
+			// Neither a rejected model nor a poisoned key can create a session. All
+			// other failures may have applied the operation, so keep their key for replay.
+			if (modelError !== undefined || poisonedCode !== undefined) this.#releaseOperation(intent);
+			if (modelError !== undefined) throw modelError;
 			if (input.epochRecovery === false || poisonedCode === undefined) throw error;
 			const rotations = this.#createRotations(input.originKey);
 			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
@@ -2148,6 +2154,31 @@ function poisonedCreateKeyCode(error: unknown, idempotencyKey: string): string |
 		return ref?.kind === "idempotencyKey" && ref.value === idempotencyKey;
 	});
 	return namesKey ? code : undefined;
+}
+
+/** A missing model is rejected before session.create can have any side effect. */
+function unknownModelCreateError(error: unknown): GjcCliError | undefined {
+	const details = recordOf(error instanceof GjcCliError ? error.details : undefined);
+	const candidates = [
+		details?.message,
+		error instanceof GjcCliError ? error.stderr : undefined,
+		error instanceof Error ? error.message : undefined,
+	];
+	for (const candidate of candidates) {
+		if (typeof candidate !== "string") continue;
+		const match =
+			/(?:^|\r?\n)(?:\[Uncaught Exception\]\s*)?(?:Error:\s*)?Model "([^"\r\n]+)" not found(?:\r?\n|$)/i.exec(
+				candidate,
+			);
+		if (!match?.[1]) continue;
+		const model = sanitizeDiagnostic(match[1]).slice(0, 160);
+		const message = `Model "${model}" not found`;
+		return new GjcCliError(`gjc sdk session.create rejected unknown model "${model}"`, 0, "", {
+			code: "model_not_found",
+			message,
+		});
+	}
+	return undefined;
 }
 
 const OUTCOME_CERTAINTIES = new Set(["applied", "not-applied", "unknown"]);

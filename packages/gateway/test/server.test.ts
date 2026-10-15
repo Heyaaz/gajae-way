@@ -1310,6 +1310,205 @@ test("graceful server restart recovers an accepted turn on its original live ses
 	secondClient.close();
 }, 30_000);
 
+test("restart prepare waits for delivered turns and holds new persona dispatches until cancellation", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-drain-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	let turnEntered!: () => void;
+	let releaseTurn!: () => void;
+	const entered = new Promise<void>((resolve) => (turnEntered = resolve));
+	const turnRelease = new Promise<void>((resolve) => (releaseTurn = resolve));
+	let responses = 0;
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => {
+			responses++;
+			if (responses === 1) {
+				turnEntered();
+				await turnRelease;
+			}
+			return `reply-${responses}`;
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "active-turn",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "active", peerId: "p1" },
+			text: "finish before restarting",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	await entered;
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "prepare-restart",
+		verb: "gateway.restart.prepare",
+		params: { restartId: "restart-602" },
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "queued-turn",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "queued", peerId: "p2" },
+			text: "wait through restart",
+			engagement: { mentioned: false, group: false, authorId: "p2" },
+		},
+	});
+	await client.waitForFrame("queued-turn");
+	await Bun.sleep(20);
+	expect(responses).toBe(1);
+	expect(client.frames.some((frame) => frame.id === "prepare-restart")).toBe(false);
+
+	releaseTurn();
+	await client.waitForFrame("prepare-restart");
+	await waitFrame(client.frames, "active-turn");
+	const deliveredIndex = client.frames.findIndex(
+		(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "reply-1",
+	);
+	const preparedIndex = client.frames.findIndex((frame) => frame.id === "prepare-restart");
+	expect(client.frames[preparedIndex]?.result).toEqual({ ready: true });
+	expect(deliveredIndex).toBeGreaterThan(0);
+	expect(preparedIndex).toBeGreaterThan(deliveredIndex);
+	expect(responses).toBe(1);
+
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "cancel-restart",
+		verb: "gateway.restart.cancel",
+		params: { restartId: "restart-602" },
+	});
+	await client.waitForFrame("cancel-restart");
+	expect(client.frames.find((frame) => frame.id === "cancel-restart")?.result).toEqual({ cancelled: true });
+	await waitFrame(client.frames, "queued-turn");
+	for (let attempt = 0; attempt < 400 && responses < 2; attempt++) await Bun.sleep(5);
+	expect(responses).toBe(2);
+	client.close();
+});
+
+test("owner /restart waits until active persona replies are delivered", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-owner-restart-drain-"));
+	const ownerOrigin = { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } as const;
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		ownerTarget: { origin: ownerOrigin },
+	};
+	let turnEntered!: () => void;
+	let releaseTurn!: () => void;
+	const entered = new Promise<void>((resolve) => (turnEntered = resolve));
+	const turnRelease = new Promise<void>((resolve) => (releaseTurn = resolve));
+	let responses = 0;
+	let exitCode: number | undefined;
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => {
+			responses++;
+			turnEntered();
+			await turnRelease;
+			return "active reply delivered";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort,
+		onStop: () => database.close(),
+		exitProcess: (code) => {
+			exitCode = code;
+		},
+	});
+	const client = await connect(config.socketPath);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "active-reply",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "active", peerId: "p1" },
+				text: "finish this reply before restart",
+				engagement: { mentioned: false, group: false, authorId: "p1" },
+			},
+		});
+		await entered;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "owner-restart",
+			verb: "chat.send",
+			params: {
+				origin: ownerOrigin,
+				text: "/restart",
+				engagement: { mentioned: false, group: false, authorId: "owner" },
+			},
+		});
+		await client.waitForFrame("owner-restart");
+		await Bun.sleep(1_600);
+		expect(exitCode).toBeUndefined();
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "queued-during-restart",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "queued", peerId: "p2" },
+				text: "wait for the next gateway generation",
+				engagement: { mentioned: false, group: false, authorId: "p2" },
+			},
+		});
+		await client.waitForFrame("queued-during-restart");
+		expect(responses).toBe(1);
+		releaseTurn();
+		await waitFrame(client.frames, "active-reply");
+		for (let attempt = 0; attempt < 400 && exitCode === undefined; attempt++) await Bun.sleep(5);
+		expect(exitCode).toBe(75);
+		expect(responses).toBe(1);
+		const replyIndex = client.frames.findIndex(
+			(frame) =>
+				frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "active reply delivered",
+		);
+		const stoppingIndex = client.frames.findIndex(
+			(frame) => frame.type === "event" && frame.event === "gateway.stopping",
+		);
+		expect(replyIndex).toBeGreaterThan(0);
+		expect(stoppingIndex).toBeGreaterThan(replyIndex);
+	} finally {
+		releaseTurn();
+		client.close();
+	}
+});
+
 test("unengaged messages before a mention arrive as the unread diff with speaker attribution; the mention is the trigger", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {

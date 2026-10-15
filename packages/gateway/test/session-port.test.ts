@@ -101,6 +101,71 @@ function createSuccess(sessionId: string) {
 	};
 }
 
+test("an unknown startup model fails without poisoning create keys and can be corrected", async () => {
+	let createCalls = 0;
+	const createKeys: string[] = [];
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			createCalls++;
+			const key = args[args.indexOf("--idempotency-key") + 1] ?? "";
+			createKeys.push(key);
+			const input = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { modelId?: string };
+			if (input.modelId === "missing/provider" && createCalls % 2 === 0)
+				return {
+					exitCode: 1,
+					stdout: "",
+					stderr: '[Uncaught Exception] Error: Model "missing/provider" not found',
+				};
+			if (input.modelId === "missing/provider")
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: false,
+						error: {
+							code: "operation_failed",
+							message: 'Model "missing/provider" not found',
+							outcomeCertainty: "unknown",
+							references: [{ kind: "idempotencyKey", value: key }],
+						},
+					}),
+					stderr: "",
+				};
+			return createSuccess("corrected-model-session");
+		}
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { repo: "/tmp/workspace" } },
+					},
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const { port, repo, database } = await brokerPortFixture(run);
+	const originKey = "discord/dm/unknown-startup-model";
+
+	for (let attempt = 0; attempt < MAX_POISONED_CREATE_ROTATIONS + 1; attempt++) {
+		await expect(port.bind({ originKey, epoch: 0, repo, model: "missing/provider" })).rejects.toMatchObject({
+			details: { code: "model_not_found", message: 'Model "missing/provider" not found' },
+		});
+	}
+	expect(createCalls).toBe(MAX_POISONED_CREATE_ROTATIONS + 1);
+	expect(new Set(createKeys).size).toBe(createKeys.length);
+	expect(database.bindings.getSessionRecord(originKey)?.epoch).toBeUndefined();
+	expect(database.core.metaGet(`create_rotation:${originKey}`)).toBeUndefined();
+
+	await expect(port.bind({ originKey, epoch: 0, repo, model: "provider/valid-model" })).resolves.toMatchObject({
+		sessionId: "corrected-model-session",
+		epoch: 0,
+	});
+	expect(database.bindings.getSessionRecord(originKey)?.epoch).toBe(0);
+	expect(database.core.metaGet(`create_rotation:${originKey}`)).toBe("0");
+});
+
 test("poisoned create failures stop rotating epochs at the durable per-origin cap", async () => {
 	let createCalls = 0;
 	const run: CliRunner = async (args) => {

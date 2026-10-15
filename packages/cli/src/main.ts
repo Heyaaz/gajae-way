@@ -97,7 +97,7 @@ export function usageFor(command: string | undefined): string | undefined {
 }
 
 export function parseArgs(args: string[]): { command?: string; rest: string[]; socket: string } {
-	let socket = socketPath();
+	let socket = process.env.GAJAEWAY_SOCKET_PATH ?? socketPath();
 	const rest: string[] = [];
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] === "--socket") socket = args[++i] ?? socket;
@@ -778,6 +778,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							...options.restartStack?.run,
 							home,
 							id: parsed.rest[2],
+							gatewaySocketPath: parsed.socket,
 						});
 						for (const line of renderRestartReceipt(receipt)) console.log(line);
 						if (receipt.state !== "ok") process.exitCode = 1;
@@ -789,7 +790,11 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						// Only a completed, verified sequence exits 0; queued or running is not yet success.
 						if (state !== "ok") process.exitCode = 1;
 					} else if (parsed.rest.length === 1) {
-						const { receipt, supervisorPid } = await launchRestartStack({ ...options.restartStack?.launch, home });
+						const { receipt, supervisorPid } = await launchRestartStack({
+							...options.restartStack?.launch,
+							home,
+							gatewaySocketPath: parsed.socket,
+						});
 						console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
 						console.log("read the outcome with: gajaeway ops restart-stack --status");
 					} else throw new Error(usage);
@@ -1162,6 +1167,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const result = await runUpdate({
 					args: update,
 					home: gatewayHome(),
+					gatewaySocketPath: parsed.socket,
 					...(options.update === undefined ? {} : { deps: options.update }),
 				});
 				for (const line of renderUpdate(result)) console.log(line);

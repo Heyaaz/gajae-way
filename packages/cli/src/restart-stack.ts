@@ -11,6 +11,7 @@ import {
 	leaseHeld,
 	readLeaseOwner,
 } from "@gajae-gateway/home";
+import { GajaewayClient } from "@gajae-gateway/sdk";
 
 import {
 	adapterConfigPath,
@@ -30,17 +31,21 @@ import {
 /**
  * `gajaeway ops restart-stack` (issue #54).
  *
- * A persona turn that restarts the gateway is killed with it, so running the
- * ordered restart inline stopped between the gateway and its adapters and left
- * the adapters on the old binary while the caller reported success. The
- * sequence therefore runs in a detached supervisor (its own session, so the
- * caller's process group and the service manager's job kill do not reach it),
- * verifies every service against its deployed binary, and records a receipt
+ * The sequence runs in a detached supervisor (its own session, so the caller's
+ * process group and the service manager's job kill do not reach it). Before
+ * restarting any service, the supervisor asks the live gateway to hold new
+ * persona dispatches and waits for accepted turns to finish delivery. It then
+ * verifies every service against its deployed binary and records a receipt
  * under `$GAJAEWAY_HOME` that the next turn reads with `--status`.
  */
 
 export type RestartStepResult = "pending" | "ok" | "stale" | "failed" | "skipped";
 export type RestartState = "queued" | "running" | "ok" | "stale" | "failed";
+
+export interface RestartDrainLease {
+	cancel(): Promise<void>;
+	close(): Promise<void>;
+}
 
 export interface RestartStep {
 	readonly label: string;
@@ -82,6 +87,10 @@ export type IsServiceInstalled = (label: string) => Promise<boolean>;
 export interface RunRestartOptions {
 	readonly home: string;
 	readonly id: string;
+	/** Gateway socket override passed through the detached supervisor. */
+	readonly gatewaySocketPath?: string;
+	/** Test seam for the gateway's durable persona-turn drain. */
+	readonly prepareRestartDrain?: (socketPath: string, restartId: string) => Promise<RestartDrainLease | undefined>;
 	readonly trigger?: "update" | "manual";
 	readonly platform?: ServicePlatform;
 	readonly uid?: number;
@@ -107,6 +116,7 @@ export interface RunRestartOptions {
 const RECEIPT_FILE = "restart-stack.json";
 const VERIFY_TIMEOUT_MS = 90_000;
 const POLL_MS = 1_000;
+const RESTART_DRAIN_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;
 
 export function restartReceiptPath(home: string): string {
 	return join(home, RECEIPT_FILE);
@@ -193,6 +203,43 @@ export function defaultServiceProbe(platform: ServicePlatform, uid = process.get
 
 async function defaultBinaryModifiedAt(path: string): Promise<number> {
 	return (await stat(path)).mtimeMs;
+}
+
+async function prepareGatewayRestartDrain(
+	socketPath: string,
+	restartId: string,
+): Promise<RestartDrainLease | undefined> {
+	let client: GajaewayClient;
+	try {
+		client = await GajaewayClient.connectSocket(socketPath, {
+			clientName: "gajaeway-restart-stack",
+			requestTimeoutMs: RESTART_DRAIN_REQUEST_TIMEOUT_MS,
+		});
+	} catch (error) {
+		const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+		if (code === "ENOENT" || code === "ECONNREFUSED" || code === "ENOTSOCK") return undefined;
+		throw new Error(
+			`gateway restart drain connection failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	try {
+		await client.request("gateway.restart.prepare", { restartId });
+	} catch (error) {
+		try {
+			await client.request("gateway.restart.cancel", { restartId });
+		} catch {
+			// The gateway may have stopped or failed after it accepted the drain;
+			// closing the socket also releases an uncommitted hold.
+		}
+		await client.close();
+		throw new Error(`gateway restart drain failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	return {
+		cancel: async () => {
+			await client.request("gateway.restart.cancel", { restartId });
+		},
+		close: async () => await client.close(),
+	};
 }
 
 /** Checks if a service is installed by verifying the service manager's definition file exists. */
@@ -335,6 +382,24 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 	receipt.supervisorPid = process.pid;
 	await writeReceipt(options.home, receipt);
 
+	let restartDrain: RestartDrainLease | undefined;
+	const gatewayInstalled = await isInstalled("dev.gajaeway.gateway");
+	if (gatewayInstalled) {
+		try {
+			restartDrain = await (options.prepareRestartDrain ?? prepareGatewayRestartDrain)(
+				options.gatewaySocketPath ?? env.GAJAEWAY_SOCKET_PATH ?? join(options.home, "gateway.sock"),
+				options.id,
+			);
+		} catch (error) {
+			receipt.state = "failed";
+			receipt.finishedAt = new Date(now()).toISOString();
+			receipt.detail = `persona turn drain failed: ${error instanceof Error ? error.message : String(error)}`;
+			for (const step of receipt.steps) step.result = "skipped";
+			await writeReceipt(options.home, receipt);
+			return receipt;
+		}
+	}
+
 	let issuedAt = now();
 	for (const step of receipt.steps) {
 		if (receipt.state !== "running") {
@@ -450,6 +515,23 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 	if (receipt.state === "running") receipt.state = "ok";
 	receipt.finishedAt = new Date(now()).toISOString();
 	await writeReceipt(options.home, receipt);
+	if (restartDrain !== undefined) {
+		const gatewayRestarted = receipt.steps.some(
+			(step) => step.label === "dev.gajaeway.gateway" && step.result === "ok",
+		);
+		if (!gatewayRestarted) {
+			try {
+				await restartDrain.cancel();
+			} catch (error) {
+				console.error(`restart drain cancellation failed id=${options.id} detail=${String(error)}`);
+			}
+		}
+		try {
+			await restartDrain.close();
+		} catch (error) {
+			console.error(`restart drain socket close failed id=${options.id} detail=${String(error)}`);
+		}
+	}
 	return receipt;
 
 	async function verifyStep(step: RestartStep, since: number): Promise<void> {
@@ -515,6 +597,7 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 
 export interface LaunchRestartOptions {
 	readonly home: string;
+	readonly gatewaySocketPath?: string;
 	readonly trigger?: "update" | "manual";
 	readonly platform?: ServicePlatform;
 	readonly uid?: number;
@@ -558,6 +641,7 @@ export async function launchRestartStack(
 		env: {
 			...(options.env ?? process.env),
 			GAJAEWAY_HOME: options.home,
+			...(options.gatewaySocketPath === undefined ? {} : { GAJAEWAY_SOCKET_PATH: options.gatewaySocketPath }),
 			...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
 		},
 	};

@@ -447,8 +447,10 @@ interface Runtime {
 	readonly botAudienceTurns: BotAudienceTurnGuard;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
 	readonly inbound: Map<string, InboundContext>;
-	/** Every admitted request except the shutdown request itself, so stop() can quiesce all writers. */
+	/** Requests stop() quiesces; shutdown and restart-drain barriers are deliberately excluded. */
 	readonly requests: Set<Promise<void>>;
+	/** Supervisor socket that owns each restart drain; disconnect cancels an uncommitted drain. */
+	readonly restartDrainOwners: Map<string, Connection>;
 	/** Read-only runtime-cycle projection (ops.cycle); owns no writes. */
 	readonly cycle: RuntimeCycleProjector;
 	/** Admission cap and retirement for `work.run` lanes. */
@@ -457,6 +459,18 @@ interface Runtime {
 	readonly permissionPanels: PermissionPanels;
 	/** Redacts secrets from every chat-bound frame at the connection writer; not configurable from chat or config.json. */
 	readonly secretGuard: SecretGuard;
+}
+
+function cancelRestartDrainsForConnection(runtime: Runtime, connection: Connection): void {
+	for (const [restartId, owner] of runtime.restartDrainOwners) {
+		if (owner !== connection) continue;
+		runtime.restartDrainOwners.delete(restartId);
+		void runtime.personaSessions
+			.cancelRestartDrain(restartId)
+			.catch((error: unknown) =>
+				console.error(`restart drain cancellation failed id=${restartId} detail=${diagnostic(error)}`),
+			);
+	}
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -547,7 +561,11 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				try {
 					for (const frame of connection.decoder.feed(socket.data.decoder.decode(data, { stream: true }))) {
 						const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
-						if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
+						if (
+							frame.type === "request" &&
+							(frame.verb === "gateway.shutdown" || frame.verb === "gateway.restart.prepare")
+						)
+							continue;
 						runtime.requests.add(task);
 						void task.then(
 							() => runtime.requests.delete(task),
@@ -569,11 +587,13 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			},
 			close(socket) {
 				runtime.work.detachWaiters(socket.data.connection);
+				if (!stopping) cancelRestartDrainsForConnection(runtime, socket.data.connection);
 				socket.data.writer.close();
 				runtime.connections.delete(socket.data.connection);
 			},
 			error(socket, error) {
 				runtime.work.detachWaiters(socket.data.connection);
+				if (!stopping) cancelRestartDrainsForConnection(runtime, socket.data.connection);
 				socket.data.writer.fail(error);
 				console.error(`gateway socket error: ${error.message}`);
 			},
@@ -671,14 +691,18 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		return stopPromise;
 	};
 	runtime.stop = stop;
-	const onEnd = () => runtime.work.detachWaiters(connection);
+	const onEnd = () => {
+		runtime.work.detachWaiters(connection);
+		if (!stopping) cancelRestartDrainsForConnection(runtime, connection);
+	};
 	const onData = (data: Buffer) => {
 		try {
 			for (const frame of connection.decoder.feed(data.toString())) {
 				const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
-				// Same guard as the Unix server: the shutdown request awaits stop(),
-				// which awaits runtime.requests, so tracking it would self-await forever.
-				if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
+				// Same guard as the Unix server: shutdown awaits stop(), and the
+				// restart-drain barrier owns its own long wait rather than stop's request set.
+				if (frame.type === "request" && (frame.verb === "gateway.shutdown" || frame.verb === "gateway.restart.prepare"))
+					continue;
 				runtime.requests.add(task);
 				task.then(
 					() => runtime.requests.delete(task),
@@ -762,6 +786,7 @@ export async function sweepIdleSessions(
 function createRuntime(options: GatewayServerOptions): Runtime {
 	const sessionPort = options.sessionPort;
 	const connections = new Set<Connection>();
+	const restartDrainOwners = new Map<string, Connection>();
 	const inbound = new Map<string, InboundContext>();
 	const delivery = new DeliveryService(options.database);
 	const botAudienceTurns = new BotAudienceTurnGuard(options.database.core);
@@ -1063,6 +1088,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		work,
 		inbound,
 		requests: new Set(),
+		restartDrainOwners,
 		permissionPanels,
 		memoryOps: new Map(),
 		memoryOperationTasks: new Set(),
@@ -1256,6 +1282,38 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
 			await stop();
 			return;
+		case "gateway.restart.prepare": {
+			const restartId = (request.params as { restartId?: unknown } | undefined)?.restartId;
+			if (typeof restartId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(restartId))
+				throw new ProtocolError("invalid_params", "restartId must be a non-empty safe identifier");
+			const owner = runtime.restartDrainOwners.get(restartId);
+			if (owner !== undefined && owner !== connection)
+				throw new ProtocolError("verb_failed", "restart drain is already owned by another supervisor");
+			runtime.restartDrainOwners.set(restartId, connection);
+			try {
+				if (!(await runtime.personaSessions.drainForRestart(restartId))) {
+					runtime.restartDrainOwners.delete(restartId);
+					throw new ProtocolError("gateway_shutting_down", "gateway stopped before persona turns drained");
+				}
+			} catch (error) {
+				if (runtime.restartDrainOwners.get(restartId) === connection) runtime.restartDrainOwners.delete(restartId);
+				throw error;
+			}
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { ready: true } });
+			return;
+		}
+		case "gateway.restart.cancel": {
+			const restartId = (request.params as { restartId?: unknown } | undefined)?.restartId;
+			if (typeof restartId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(restartId))
+				throw new ProtocolError("invalid_params", "restartId must be a non-empty safe identifier");
+			const owner = runtime.restartDrainOwners.get(restartId);
+			if (owner !== undefined && owner !== connection)
+				throw new ProtocolError("verb_failed", "restart drain is owned by another supervisor");
+			const cancelled = await runtime.personaSessions.cancelRestartDrain(restartId);
+			if (owner === connection) runtime.restartDrainOwners.delete(restartId);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { cancelled } });
+			return;
+		}
 		case "gateway.reloadConfig": {
 			// Same implementation as SIGHUP; the console gets it without signals.
 			const result = await applyConfigReload(runtime, options, `verb ${request.id}`);
@@ -2208,18 +2266,26 @@ async function sendChat(
 			}
 		}
 		console.info(`gateway restart requested by owner via ${key}`);
-		// Let the ack leave the socket, then exit cleanly; the supervisor restarts us.
+		// Let the ack leave the socket, then hold new persona dispatches until all
+		// active answers have been delivered before the supervisor restarts us.
 		setTimeout(() => {
-			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
-			// Restart=on-failure only relaunch after an unsuccessful exit. A wedged
-			// ordered stop still exits within the hard budget. Durable inbound and
-			// session state recover on boot.
+			// A stack restart already owns the drain and will restart the gateway.
+			if (runtime.personaSessions.restartDrainActive) return;
 			const exit = options.exitProcess ?? ((code: number) => process.exit(code));
-			void runtime.stop?.("owner /restart").then(
-				() => exit(RESTART_EXIT_CODE),
-				() => exit(RESTART_EXIT_CODE),
-			);
-			setTimeout(() => exit(RESTART_EXIT_CODE), RESTART_HARD_EXIT_MS).unref();
+			void runtime.personaSessions
+				.drainForRestart(`owner-${crypto.randomUUID()}`)
+				.then((ready) => {
+					if (!ready) return exit(RESTART_EXIT_CODE);
+					// Exit non-zero on purpose: launchd KeepAlive=true and systemd
+					// Restart=on-failure only relaunch after an unsuccessful exit. The
+					// stop budget begins after persona delivery has drained.
+					void runtime.stop?.("owner /restart").then(
+						() => exit(RESTART_EXIT_CODE),
+						() => exit(RESTART_EXIT_CODE),
+					);
+					setTimeout(() => exit(RESTART_EXIT_CODE), RESTART_HARD_EXIT_MS).unref();
+				})
+				.catch((error: unknown) => console.error(`owner restart drain failed: ${diagnostic(error)}`));
 		}, 1_500);
 		return;
 	}

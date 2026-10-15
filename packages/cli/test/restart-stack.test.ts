@@ -195,6 +195,73 @@ test("lease owner PID and start time verify a restarted service", async () => {
 	}
 });
 
+test("restart-stack waits for persona drain before issuing service restarts", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let closed = false;
+	try {
+		const running = runRestartStack({
+			...host.options,
+			id: "drain-before-restart",
+			gatewaySocketPath: join(home, "custom-gateway.sock"),
+			prepareRestartDrain: async (socketPath, restartId) => {
+				expect(socketPath).toBe(join(home, "custom-gateway.sock"));
+				expect(restartId).toBe("drain-before-restart");
+				started.resolve();
+				await release.promise;
+				return {
+					cancel: async () => {
+						throw new Error("successful gateway restart must not cancel its drain");
+					},
+					close: async () => {
+						closed = true;
+					},
+				};
+			},
+		});
+		await started.promise;
+		expect(host.ran).toEqual([]);
+		release.resolve();
+		const receipt = await running;
+		expect(receipt.state).toBe("ok");
+		expect(host.ran).toContain("dev.gajaeway.broker");
+		expect(closed).toBe(true);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
+test("restart-stack cancels the persona drain when a service restart fails before the gateway", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home, fail: "dev.gajaeway.broker" });
+	let cancelled = false;
+	let closed = false;
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "cancel-drain-on-failure",
+			prepareRestartDrain: async () => ({
+				cancel: async () => {
+					cancelled = true;
+				},
+				close: async () => {
+					closed = true;
+				},
+			}),
+		});
+		expect(receipt.state).toBe("failed");
+		expect(cancelled).toBe(true);
+		expect(closed).toBe(true);
+		expect(host.ran).toEqual(["dev.gajaeway.broker"]);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("a matching MainPID with a lease owner predating the restart is stale", async () => {
 	const { home, cleanup } = await tempHome();
 	const holder = await acquireLease(home, "adapter-discord");

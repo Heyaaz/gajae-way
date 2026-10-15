@@ -60,12 +60,22 @@ function makeManager(port: ScriptedSessionPort, logs: string[], terminal: string
 }
 
 function enqueue(messageId: string, body: string, receivedAt = new Date().toISOString()): void {
+	enqueueOrigin(KEY, JSON.stringify(ORIGIN), messageId, body, receivedAt);
+}
+
+function enqueueOrigin(
+	originKey: string,
+	originRefJson: string,
+	messageId: string,
+	body: string,
+	receivedAt = new Date().toISOString(),
+): void {
 	expect(
 		database?.transaction((tx) =>
 			database?.inbox.enqueue(tx, {
 				messageId,
-				originKey: KEY,
-				originRefJson: JSON.stringify(ORIGIN),
+				originKey,
+				originRefJson,
 				body,
 				receivedAt,
 			}),
@@ -167,6 +177,49 @@ test("bounded shutdown keeps an accepted turn alive past the old cutoff and defe
 	expect(terminal).toEqual(["answer completed during shutdown", "queued answer"]);
 	expect(port.sends.filter((send) => send.opRef === first.opRef)).toHaveLength(1);
 }, 15_000);
+
+test("restart drain waits for all active turns and holds new persona dispatches", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-drain-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort({ onBind: ({ originKey, epoch }) => `${originKey}-${epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	manager = makeManager(port, logs, terminal);
+	const otherOrigin = { ...ORIGIN, conversationId: "other" };
+	const otherKey = "loopback/loopback/other";
+	const queuedOrigin = { ...ORIGIN, conversationId: "queued" };
+	const queuedKey = "loopback/loopback/queued";
+
+	enqueue("active-1", "first active turn");
+	enqueueOrigin(otherKey, JSON.stringify(otherOrigin), "active-2", "second active turn");
+	await Promise.all([manager.notifyInbound(KEY), manager.notifyInbound(otherKey)]);
+	await eventually(() => port.sends.length === 2, "both active turns did not start");
+	const [firstSend, secondSend] = port.sends;
+	if (!firstSend || !secondSend) throw new Error("both active sends were not recorded");
+
+	const draining = manager.drainForRestart("restart-602");
+	enqueueOrigin(queuedKey, JSON.stringify(queuedOrigin), "queued-1", "held until restart");
+	await manager.notifyInbound(queuedKey);
+	await Bun.sleep(20);
+	expect(port.sends).toHaveLength(2);
+	expect(await Promise.race([draining.then(() => true), Bun.sleep(10).then(() => false)])).toBe(false);
+
+	port.complete(firstSend.opRef, "first delivered");
+	await eventually(() => database?.inbox.turnRow(firstSend.opRef)?.turn_state === "done", "first turn did not deliver");
+	expect(terminal).toContain("first delivered");
+	expect(await Promise.race([draining.then(() => true), Bun.sleep(10).then(() => false)])).toBe(false);
+
+	port.complete(secondSend.opRef, "second delivered");
+	await expect(draining).resolves.toBe(true);
+	await eventually(() => terminal.length === 2, "restart drain completed before all answers were delivered");
+	expect(terminal).toEqual(expect.arrayContaining(["first delivered", "second delivered"]));
+	expect(port.sends).toHaveLength(2);
+	expect(database.inbox.pendingOldest(queuedKey)?.message_id).toBe("queued-1");
+
+	await expect(manager.cancelRestartDrain("restart-602")).resolves.toBe(true);
+	await eventually(() => port.sends.length === 3, "cancelled restart drain did not resume pending dispatch");
+});
 
 test("client_ref_conflict reconciles the same deterministic op-ref without a second accepted send, including after restart", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
