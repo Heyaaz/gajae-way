@@ -21,6 +21,8 @@ import {
 	type MonitorRecord,
 	type MonitorScheduleProjection,
 	negotiate,
+	OPS_CYCLE_DEFAULT_LIMIT,
+	OPS_CYCLE_MAX_LIMIT,
 	OrderedFrameWriter,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
@@ -1515,14 +1517,23 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
-		case "ops.cycle":
+		case "ops.cycle": {
+			const value = request.params ?? {};
+			if (typeof value !== "object" || value === null || Array.isArray(value))
+				throw new ProtocolError("invalid_params", "ops.cycle parameters must be an object");
+			const { limit = OPS_CYCLE_DEFAULT_LIMIT, offset = 0 } = value as { limit?: unknown; offset?: unknown };
+			if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > OPS_CYCLE_MAX_LIMIT)
+				throw new ProtocolError("invalid_params", `limit must be an integer from 1 to ${OPS_CYCLE_MAX_LIMIT}`);
+			if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0)
+				throw new ProtocolError("invalid_params", "offset must be a non-negative integer");
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: runtime.cycle.project(),
+				result: runtime.cycle.project(new Date(), { limit, offset }),
 			});
 			return;
+		}
 		case "ops.integrity":
 			connection.write({
 				v: PROFILE_VERSION,
