@@ -679,13 +679,13 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 		const cause = Object.assign(new Error("sdk_prompt_terminal_failed"), {
 			code: "sdk_prompt_terminal_failed",
 			reason:
-				"The model is temporarily unavailable; token=ghp_attacker-secret https://secret.example/path /Users/private/token.json /opt/app/credentials.json /etc/gajaeway/token",
+				"The model is temporarily unavailable; token=ghp_attacker-secret https://secret.example/path;/opt/app/credentials with spaces.json",
 		});
 		if (input.originKey?.includes(nestedTerminalMonitor.monitorId))
 			throw new Error("monitor request failed", { cause });
 		throw new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", {
 			code: "internal_error",
-			cause: { code: cause.code, message: "The model is temporarily unavailable" },
+			cause: { code: cause.code, message: "The model is temporarily unavailable >C:\\service\\credentials.json" },
 		});
 	};
 	const previousHome = process.env.HOME;
@@ -712,9 +712,8 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 		for (const detail of [genericError?.detail ?? "", nestedTerminal?.detail ?? "", turnFailure?.detail ?? ""]) {
 			expect(detail).not.toContain("ghp_");
 			expect(detail).not.toContain("secret.example");
-			expect(detail).not.toContain("/Users/");
 			expect(detail).not.toContain("/opt/");
-			expect(detail).not.toContain("/etc/");
+			expect(detail).not.toContain("C:\\service");
 		}
 		for (const detail of [nestedTerminal?.detail ?? "", turnFailure?.detail ?? ""]) {
 			expect(detail).toContain('"causeCode":"sdk_prompt_terminal_failed"');
