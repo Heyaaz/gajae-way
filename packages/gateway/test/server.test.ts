@@ -404,6 +404,74 @@ test("turn readiness details redact broker URLs", async () => {
 	client.close();
 });
 
+test("confirming a valid note does not clear contract-unmet failures in its monitor batch", async () => {
+	const { client, database } = await startDeliveryServer();
+	const ledger = new DeliveryService(database);
+	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
+	const monitor = new MonitorRegistry(database).add({
+		name: "partial-readiness-monitor",
+		trigger: { kind: "cron", schedule: "0 */2 * * *" },
+		eventTypes: ["readiness.partial"],
+		burstPolicy: "serialize",
+		enabled: false,
+	});
+	const createAuthoredEvent = (eventId: string, batchId: string, output: string) => {
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "readiness.partial",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			database.monitors.eventUpdate(tx, eventId, "authored", batchId);
+			database.monitors.authoredOutputCreate(tx, eventId, output);
+		});
+	};
+	for (let index = 0; index < 3; index++) {
+		const batchId = `failed-readiness-batch-${index}`;
+		const eventId = `failed-readiness-event-${index}`;
+		const deliveryId = `failed-readiness-delivery-${index}`;
+		createAuthoredEvent(eventId, batchId, "failed report");
+		expect(ledger.prepare(batchId, origin, "failed report", undefined, deliveryId)).toBeDefined();
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `failed-readiness-${index}`,
+			verb: "delivery.fail",
+			params: { deliveryId, reason: "discord 503", ambiguous: false },
+		});
+		await waitFrame(client.frames, `failed-readiness-${index}`);
+	}
+
+	const batchId = "partially-failed-readiness-batch";
+	const echoEventId = "partially-failed-echo-event";
+	const validEventId = "partially-failed-valid-event";
+	const deliveryId = "partially-failed-readiness-delivery";
+	createAuthoredEvent(echoEventId, batchId, "instruction echo");
+	database.transaction((tx) => {
+		database.monitors.eventUpdate(tx, echoEventId, "contract_unmet", batchId);
+		database.monitors.failureRecord(tx, echoEventId, "authored_echo_suspected", "note echoed monitor contract");
+	});
+	createAuthoredEvent(validEventId, batchId, "verified update");
+	expect(ledger.prepare(batchId, origin, "verified update", undefined, deliveryId)).toBeDefined();
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "partial-batch-confirm",
+		verb: "delivery.confirm",
+		params: { deliveryId },
+	});
+	await waitFrame(client.frames, "partial-batch-confirm");
+	client.send({ v: "0.1", type: "request", id: "partial-batch-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "partial-batch-status");
+	expect(client.frames.find((frame) => frame.id === "partial-batch-status").result.readiness).toMatchObject({
+		ready: false,
+		failure: { category: "monitor_delivery", consecutiveFailures: 3 },
+	});
+	client.close();
+});
+
 test("delivery sweep expirations degrade delivery readiness, including monitor batches", async () => {
 	const { client, config, database } = await startDeliveryServer({ deliverySweepIntervalMs: 20 });
 	const ledger = new DeliveryService(database);

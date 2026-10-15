@@ -1303,12 +1303,15 @@ async function handleRequest(
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
 			const delivery = options.database.outbox.get(id);
 			const batchEvents = delivery ? options.database.monitors.eventsByBatch(delivery.turnId) : [];
+			const hasFailedMonitorEvent = batchEvents.some(
+				({ stage }) => stage === "failed" || stage === "failed_no_retry" || stage === "contract_unmet",
+			);
 			const authoredEvents = batchEvents.filter((row) => row.stage === "authored").map((row) => row.event_id);
 			const confirmOutcome = confirmAndSettleMonitorDelivery(options.database, id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (confirmOutcome === "transitioned") {
 				runtime.readiness.recordSuccess("delivery");
-				if (batchEvents.length > 0) runtime.readiness.recordSuccess("monitor_delivery");
+				if (batchEvents.length > 0 && !hasFailedMonitorEvent) runtime.readiness.recordSuccess("monitor_delivery");
 			}
 			if (confirmOutcome === "transitioned" && authoredEvents.length > 0) {
 				const authoredEventIds = new Set(authoredEvents);
