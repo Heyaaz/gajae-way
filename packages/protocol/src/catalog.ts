@@ -50,8 +50,8 @@ export interface GatewayStatusResult {
 	readonly pid: number;
 	readonly startedAt: string;
 	readonly schemaVersion: number;
-	/** Functional health, independent of whether the gateway process is alive. */
-	readonly readiness: GatewayReadinessResult;
+	/** Functional health when reported; older gateways may omit this additive field. */
+	readonly readiness?: GatewayReadinessResult;
 	/** Session census (grows in later phases). */
 	readonly sessions: { readonly active: number };
 	/** Delivery ledger health (P1+). */

@@ -448,6 +448,12 @@ export interface PersonaSessionManagerOptions {
 		readonly detail: string;
 		readonly at: number;
 	}) => void;
+	/** Reports a session attachment failure before a turn can start. */
+	readonly onSessionAttachmentFailure?: (input: {
+		readonly originKey: string;
+		readonly detail: string;
+		readonly at: number;
+	}) => void;
 	/** Reports failures applying model or service-tier settings before a turn is sent. */
 	readonly onPreSendFailure?: (input: {
 		readonly originKey: string;
@@ -507,6 +513,7 @@ export class PersonaSessionManager {
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
+	readonly #onSessionAttachmentFailure: PersonaSessionManagerOptions["onSessionAttachmentFailure"];
 	readonly #onPreSendFailure: PersonaSessionManagerOptions["onPreSendFailure"];
 	readonly #onSessionCreateSuccess: PersonaSessionManagerOptions["onSessionCreateSuccess"];
 	readonly #log: (line: string, level?: LogLevel) => void;
@@ -549,6 +556,7 @@ export class PersonaSessionManager {
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
 		this.#onBindFailure = options.onBindFailure;
+		this.#onSessionAttachmentFailure = options.onSessionAttachmentFailure;
 		this.#onPreSendFailure = options.onPreSendFailure;
 		this.#onSessionCreateSuccess = options.onSessionCreateSuccess;
 	}
@@ -771,6 +779,14 @@ export class PersonaSessionManager {
 	recordSessionCreateSuccess(originKey: string): void {
 		try {
 			this.#onSessionCreateSuccess?.({ originKey, at: this.#now() });
+		} catch (error) {
+			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
+		}
+	}
+
+	recordSessionAttachmentFailure(originKey: string, detail: string): void {
+		try {
+			this.#onSessionAttachmentFailure?.({ originKey, detail, at: this.#now() });
 		} catch (error) {
 			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
 		}
@@ -1720,7 +1736,6 @@ class OriginActor {
 		const stored = await this.#reuseStoredBinding(epoch);
 		try {
 			binding = stored ?? (await this.#bindSession(epoch));
-			if (!stored) this.#manager.recordSessionCreateSuccess(this.originKey);
 			this.#clearBindWedgeProbe();
 			this.#hostHeldSince = undefined;
 			this.#touchHost(binding.sessionId);
@@ -1768,6 +1783,7 @@ class OriginActor {
 			// proof can therefore release this row without replaying accepted work.
 			// A generic failure alone is not authority to replace the session.
 			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
+			this.#manager.recordSessionAttachmentFailure(this.originKey, safeDiagnostic(error));
 			const nextEpoch = this.#manager.database.transaction((tx) => {
 				retryInboundTurn(this.#manager.database, tx, opRef);
 				return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
@@ -1786,6 +1802,7 @@ class OriginActor {
 				);
 			return;
 		}
+		if (!stored) this.#manager.recordSessionCreateSuccess(this.originKey);
 		// Before the turn starts: the stall clock is not running yet and the
 		// actor queue holds every steer and later send until the context is ready.
 		const context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);

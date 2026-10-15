@@ -115,6 +115,7 @@ async function startDeliveryServer(
 		ownerTarget?: GatewayConfig["ownerTarget"];
 		deliverySweepIntervalMs?: number;
 		bind?: Parameters<typeof sessionPortFromResponder>[0]["bind"];
+		attachTail?: ReturnType<typeof sessionPortFromResponder>["attachTail"];
 		respond?: Parameters<typeof sessionPortFromResponder>[0]["respond"];
 		serviceTier?: GatewayConfig["serviceTier"];
 		setServiceTier?: ReturnType<typeof sessionPortFromResponder>["setServiceTier"];
@@ -138,6 +139,7 @@ async function startDeliveryServer(
 		bind: options.bind ?? ((key, epoch) => bindWorkFixture(key, epoch)),
 		respond: options.respond ?? (async () => "the single reply body"),
 	});
+	if (options.attachTail) sessionPort.attachTail = options.attachTail;
 	if (options.setServiceTier) sessionPort.setServiceTier = options.setServiceTier;
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
@@ -362,6 +364,37 @@ test("session-create readiness details redact absolute paths", async () => {
 	});
 	expect(readiness.failure.detail).toContain("[path]");
 	expect(readiness.failure.detail).not.toContain("/private/gajaeway/workspace");
+	client.close();
+});
+
+test("create-then-disown attachment failures degrade session-create readiness", async () => {
+	let attachmentAttempts = 0;
+	const { client } = await startDeliveryServer({
+		attachTail: async () => {
+			attachmentAttempts += 1;
+			throw new Error("session_unavailable: broker disowned new session");
+		},
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "create-then-disown",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "loopback", kind: "loopback", conversationId: "readiness-disowned-session" },
+			text: "hello",
+		},
+	});
+	await waitFrame(client.frames, "create-then-disown");
+	for (let attempt = 0; attempt < 400 && attachmentAttempts < 3; attempt++) await Bun.sleep(5);
+	expect(attachmentAttempts).toBeGreaterThanOrEqual(3);
+	client.send({ v: "0.1", type: "request", id: "disowned-session-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "disowned-session-status");
+	const readiness = client.frames.find((frame) => frame.id === "disowned-session-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "session_create", code: "session_attach_failed", consecutiveFailures: 3 },
+	});
 	client.close();
 });
 

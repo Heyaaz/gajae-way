@@ -858,6 +858,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				origin: originKey,
 				at,
 			}),
+		onSessionAttachmentFailure: ({ originKey, detail, at }) =>
+			readiness.recordFailure({
+				category: "session_create",
+				code: "session_attach_failed",
+				detail: sanitizeDiagnosticDetail(detail, 200) || "session attachment failed",
+				origin: originKey,
+				at,
+			}),
 		onPreSendFailure: ({ originKey, detail, at }) =>
 			readiness.recordFailure({
 				category: "turn",
