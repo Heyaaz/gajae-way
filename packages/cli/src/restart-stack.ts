@@ -955,18 +955,28 @@ async function releaseRestartDrain(
 		const socketPath =
 			options.gatewaySocketPath ?? options.env?.GAJAEWAY_SOCKET_PATH ?? join(options.home, "gateway.sock");
 		const prepare = options.prepareRestartDrain ?? prepareGatewayRestartDrain;
+		const now = options.now ?? Date.now;
+		const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+		const retryDelayMs = Math.max(1, Math.floor(options.pollMs ?? POLL_MS));
+		const reattachDeadline = now() + Math.max(0, options.verifyTimeoutMs ?? VERIFY_TIMEOUT_MS);
 		let reattached: RestartDrainLease | undefined;
 		try {
-			reattached = await prepare(socketPath, restartId, receipt.trigger, {
-				mode: "reattach",
-				onIndeterminate: async () => {
-					receipt.state = "indeterminate";
-					receipt.finishedAt = new Date().toISOString();
-					receipt.detail = "new gateway did not confirm the restart drain after service restart";
-					await writeReceipt(options.home, receipt);
-				},
-			});
-			if (reattached === undefined) throw new Error("new gateway did not accept the restart drain");
+			for (;;) {
+				reattached = await prepare(socketPath, restartId, receipt.trigger, {
+					mode: "reattach",
+					onIndeterminate: async () => {
+						receipt.state = "indeterminate";
+						receipt.finishedAt = new Date().toISOString();
+						receipt.detail = "new gateway did not confirm the restart drain after service restart";
+						await writeReceipt(options.home, receipt);
+					},
+				});
+				if (reattached !== undefined) break;
+				const remainingMs = reattachDeadline - now();
+				if (remainingMs <= 0)
+					throw new Error("replacement gateway socket did not become ready before the reattach deadline");
+				await sleep(Math.min(retryDelayMs, remainingMs));
+			}
 			await reattached.cancel();
 		} catch (error) {
 			receipt.state = "indeterminate";

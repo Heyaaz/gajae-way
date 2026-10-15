@@ -373,6 +373,85 @@ test("restart-stack waits for persona drain before issuing service restarts", as
 	}
 });
 
+test("restart-stack retries drain reattachment while the replacement gateway socket starts", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	let reattachAttempts = 0;
+	let replacementCancelled = false;
+	let originalCancelled = false;
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "retry-gateway-reattach",
+			prepareRestartDrain: async (_socketPath, _restartId, _trigger, prepareOptions) => {
+				if (prepareOptions?.mode === "reattach") {
+					reattachAttempts++;
+					if (reattachAttempts < 3) return undefined;
+					return {
+						superseded: new AbortController().signal,
+						assertActive: async () => {},
+						cancel: async () => {
+							replacementCancelled = true;
+						},
+						close: async () => {},
+					};
+				}
+				return {
+					superseded: new AbortController().signal,
+					assertActive: async () => {},
+					cancel: async () => {
+						originalCancelled = true;
+					},
+					close: async () => {},
+				};
+			},
+		});
+		expect(receipt.state).toBe("ok");
+		expect(reattachAttempts).toBe(3);
+		expect(replacementCancelled).toBe(true);
+		expect(originalCancelled).toBe(false);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
+test("restart-stack keeps the receipt indeterminate when the replacement socket never becomes ready", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	let reattachAttempts = 0;
+	let originalCancelled = false;
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "gateway-reattach-timeout",
+			pollMs: 10,
+			verifyTimeoutMs: 20,
+			prepareRestartDrain: async (_socketPath, _restartId, _trigger, prepareOptions) => {
+				if (prepareOptions?.mode === "reattach") {
+					reattachAttempts++;
+					return undefined;
+				}
+				return {
+					superseded: new AbortController().signal,
+					assertActive: async () => {},
+					cancel: async () => {
+						originalCancelled = true;
+					},
+					close: async () => {},
+				};
+			},
+		});
+		expect(receipt.state).toBe("indeterminate");
+		expect(receipt.detail).toContain("replacement gateway socket did not become ready");
+		expect(reattachAttempts).toBe(3);
+		expect(originalCancelled).toBe(false);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("restart-stack waits for an in-flight service command before releasing a superseded drain", async () => {
 	const { home, cleanup } = await tempHome();
 	const host = await fakeHost({ home });
