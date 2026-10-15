@@ -636,7 +636,9 @@ describe("runtime cycle projection", () => {
 						tx,
 						eventId,
 						"internal_error",
-						'{"causeCode":"sdk_prompt_terminal_failed","message":"The model is temporarily unavailable"}',
+						index === 5
+							? "delivery failed: https://api.example/private-token; inspect /opt/app/credentials with spaces.json"
+							: '{"causeCode":"sdk_prompt_terminal_failed","message":"The model is temporarily unavailable"}',
 					);
 				});
 			}
@@ -650,9 +652,11 @@ describe("runtime cycle projection", () => {
 			]);
 			expect(result.monitorFailures[0]).toMatchObject({
 				code: "internal_error",
-				detail: '{"causeCode":"sdk_prompt_terminal_failed","message":"The model is temporarily unavailable"}',
+				detail: "delivery failed: [url] inspect [path]",
 				stage: "failed",
 			});
+			expect(result.monitorFailures[0]?.detail).not.toContain("api.example");
+			expect(result.monitorFailures[0]?.detail).not.toContain("/opt/app");
 		} finally {
 			database.close();
 			await rm(directory, { recursive: true, force: true });

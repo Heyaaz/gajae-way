@@ -21,6 +21,7 @@ import { DEFAULT_WORK_MAX_LANES } from "../config";
 import { isBrokerIndexLockBlocked, readBrokerExitRecordSync } from "../orchestrator/broker-liveness";
 import { isVerifiedGjcVersion } from "../orchestrator/gjc-contract";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
+import { sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import type { Store } from "../store";
 import type { ConversationContextDiagnostics } from "../store/groups/inbox";
 import type { MonitorsGroup } from "../store/groups/monitors";
@@ -259,7 +260,7 @@ export class RuntimeCycleProjector {
 			stage: row.stage,
 			failedAt: row.failed_at,
 			code: row.code,
-			detail: row.detail,
+			detail: sanitizeDiagnosticDetail(row.detail, 500),
 		}));
 		const inboundMap = new Map(inbound.map((r) => [r.state, r.n]));
 		const unknownInbound = inbound.map((r) => r.state).filter((state) => !KNOWN_INBOUND_STATES.has(state));

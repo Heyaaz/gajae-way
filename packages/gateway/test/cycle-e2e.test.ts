@@ -685,7 +685,7 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 			throw new Error("monitor request failed", { cause });
 		throw new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", {
 			code: "internal_error",
-			cause: { code: cause.code, message: "The model is temporarily unavailable >C:\\service\\credentials.json" },
+			cause: { code: cause.code, message: cause.code, reason: "model_overloaded" },
 		});
 	};
 	const previousHome = process.env.HOME;
@@ -715,10 +715,10 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 			expect(detail).not.toContain("/opt/");
 			expect(detail).not.toContain("C:\\service");
 		}
-		for (const detail of [nestedTerminal?.detail ?? "", turnFailure?.detail ?? ""]) {
-			expect(detail).toContain('"causeCode":"sdk_prompt_terminal_failed"');
-			expect(detail).toContain("The model is temporarily unavailable");
-		}
+		expect(nestedTerminal?.detail).toContain('"causeCode":"sdk_prompt_terminal_failed"');
+		expect(nestedTerminal?.detail).toContain("The model is temporarily unavailable");
+		expect(turnFailure?.detail).toContain('"causeCode":"sdk_prompt_terminal_failed"');
+		expect(turnFailure?.detail).toContain('"message":"model_overloaded"');
 
 		const frames: unknown[] = [];
 		const conn = await Bun.connect({
@@ -760,10 +760,15 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 			stage: "failed",
 			code: "authoring_turn_failed",
 		});
-		for (const failure of failures.filter((row) => row.eventId !== genericErrorEventId)) {
-			expect(failure.detail).toContain('"causeCode":"sdk_prompt_terminal_failed"');
-			expect(failure.detail).toContain("The model is temporarily unavailable");
-		}
+		expect(failures.find((row) => row.eventId === nestedTerminalEventId)?.detail).toContain(
+			'"causeCode":"sdk_prompt_terminal_failed"',
+		);
+		expect(failures.find((row) => row.eventId === nestedTerminalEventId)?.detail).toContain(
+			"The model is temporarily unavailable",
+		);
+		expect(failures.find((row) => row.eventId === turnFailureEventId)?.detail).toContain(
+			'"message":"model_overloaded"',
+		);
 	} finally {
 		info.mockRestore();
 		await server?.stop("issue #600 regression test");

@@ -15,7 +15,7 @@ import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
-import { sanitizeDiagnostic } from "../orchestrator/rebind";
+import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
 	LastAssistantUnreadableError,
@@ -1952,19 +1952,9 @@ function failureDetail(error: unknown): string {
 		.find((candidate) => candidate !== undefined);
 	const safeMessage = (value: unknown): string | undefined => {
 		if (typeof value !== "string") return undefined;
-		if (sdkToken(value.trim()) !== undefined && !/\s/.test(value.trim())) return undefined;
-		const withoutUrls = sanitizeDiagnostic(value).replace(/\b(?:https?|wss?):\/\/[^\s"'<>]+/gi, "[url]");
-		// An unquoted path may contain spaces, so redact the whole message suffix
-		// after its first absolute-path marker instead of guessing where it ends.
-		const absolutePath = /(^|[^A-Za-z0-9._-])(?:\/{1,2}|[A-Za-z]:\\|\\\\)[^/\s"'<>\\]/.exec(withoutUrls);
-		const pathStart = absolutePath ? absolutePath.index + (absolutePath[1]?.length ?? 0) : -1;
-		const withoutPaths = pathStart < 0 ? withoutUrls : `${withoutUrls.slice(0, pathStart).trimEnd()} [path]`;
-		const cleaned = withoutPaths
-			.replace(/[\r\n\t]+/g, " ")
-			.replace(/\s+/g, " ")
-			.trim();
-		if (!cleaned) return undefined;
-		return Array.from(cleaned).slice(0, 128).join("");
+		const cleaned = sanitizeDiagnosticDetail(value, 128);
+		if (!cleaned || cleaned === causeCode) return undefined;
+		return cleaned;
 	};
 	const message = causes
 		.slice()
