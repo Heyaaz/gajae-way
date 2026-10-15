@@ -185,9 +185,9 @@ export interface SessionPort {
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
 	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
-	/** Presentation/recovery tick; it never kills a running SDK turn. */
+	/** Emits live-tail stall signals; the owning actor applies bounded recovery policy. */
 	checkStalls(now?: number): void;
-	/** Applies the live tail-stall alarm policy; it never aborts a running turn. */
+	/** Sets the tail-silence threshold that triggers stall handling. */
 	setStallTimeoutMs(timeoutMs: number): void;
 	/** Serializes caller-owned workflows without putting chat policy in this port. */
 	runExclusive<T>(key: string, work: () => Promise<T>): Promise<T>;

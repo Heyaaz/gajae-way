@@ -271,6 +271,8 @@ export interface GatewayServerOptions {
 	readonly exitProcess?: (code: number) => void;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
+	/** Test seam for bounded persona recovery deadlines; production uses the system clock. */
+	readonly personaNow?: () => number;
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
 	readonly deliverySweepIntervalMs?: number;
 	/** Mid-work speech gating configuration (issue #71). */
@@ -783,6 +785,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		brokerAgentDir: options.broker?.agentDir,
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
+		...(options.personaNow ? { now: options.personaNow } : {}),
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
@@ -944,9 +947,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.sweep()
 			.catch((error: unknown) => console.error(`panel expiry sweep failed: ${diagnostic(error)}`));
 	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
-	// AC6: the 120s stall alarm is a running-server obligation, not only a
-	// generic-request polling side effect. This heartbeat drives every persona
-	// tail's threshold check; it never aborts a turn (alarm overlay only).
+	// AC6: tail-stall detection is a running-server obligation, not only a
+	// generic-request polling side effect. A stall starts status reconciliation;
+	// only a still-nonterminal operation after the hard grace is cut off.
 	const stallTimer = setInterval(() => {
 		try {
 			personaSessions.checkStalls();
@@ -3645,7 +3648,7 @@ async function createInboundTurnLifecycle(
 		}
 	};
 
-	const onFailure = async ({ error, recoveredText }: PersonaFailureInput) => {
+	const onFailure = async ({ error, recoveredText, forceFailureNotice }: PersonaFailureInput) => {
 		try {
 			const failureNotice = formatFailureNotice(error);
 			console.error(failureNotice);
@@ -3661,10 +3664,12 @@ async function createInboundTurnLifecycle(
 				options.database.transaction((tx) =>
 					options.database.inbox.contextCommitWindow(tx, key, contextMessageIds, contextOmissionRevision),
 				);
-			if (nonLoopback && !assistantDeliveryStarted) {
+			if (nonLoopback && (!assistantDeliveryStarted || forceFailureNotice)) {
 				// Recovery can observe the same failed terminal after the notice was
 				// persisted but before the trigger was settled. Reuse the trigger's
-				// terminal delivery identity instead of emitting another failure.
+				// terminal delivery identity instead of emitting another failure. A
+				// hard stall cutoff also sends this notice after interim speech: that
+				// speech did not answer the trigger.
 				const notice = runtime.delivery.prepare(
 					turnId,
 					origin,
@@ -3726,7 +3731,7 @@ async function createInboundTurnLifecycle(
 		onRetired: endProgress,
 		onReleased: endProgress,
 		onStall: ({ elapsedMs }) =>
-			console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; retaining status reconciliation.`),
+			console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; reconciling status.`),
 	};
 }
 

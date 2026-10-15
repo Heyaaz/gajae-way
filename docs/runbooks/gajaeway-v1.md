@@ -66,7 +66,7 @@ The ActionGuard notice is prompt guidance to use owned start/status/steer lanes 
 
 `monitorCatchUp` (maxSlots 1–1000, default 24; maxAgeMs 60000–604800000, default 86400000) bounds durable cron replay after downtime. Refused slots advance the cursor, are logged as `monitor_slots_skipped`, and appear in `monitors inspect` as `catchUp`; changes require a restart.
 
-`turnTimeoutMs` was removed with the persistent-session cutover. Configuration containing it is rejected; use `stallTimeoutMs` for an alert-only tail silence threshold. It never kills or replaces a running SDK operation.
+`turnTimeoutMs` was removed with the persistent-session cutover. Configuration containing it is rejected; `stallTimeoutMs` remains the alert threshold for tail silence. A current persona turn is status-reconciled at the first stall. If the tail stays silent and status remains nonterminal for ten minutes after that stall, the gateway terminates only its owned session host, fails the accepted trigger without replaying it, posts a cutoff notice, and releases queued inbound messages. Any resumed tail activity resets the deadline; a terminal status follows normal reconciliation instead. An unreadable or `unknown` status is not treated as proof that the turn never terminalized and does not authorize this cutoff.
 
 ### Automatic reset after a recognized provider failure
 

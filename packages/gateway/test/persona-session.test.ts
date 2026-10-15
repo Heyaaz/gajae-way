@@ -14,6 +14,7 @@ import {
 	personaTurnOpRef,
 	resetFailedTurn,
 	retryInboundTurn,
+	STALLED_TURN_TERMINAL_TIMEOUT_MS,
 	WEDGED_TURN_IDLE_MS,
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
@@ -22,7 +23,7 @@ import {
 	type SessionCompactionStatus,
 	type SessionContextUsage,
 } from "../src/orchestrator/session-port";
-import type { TailAttachInput } from "../src/orchestrator/tail-runner";
+import type { TailAttachInput, TailFrame } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
@@ -107,9 +108,10 @@ async function harness(
 		terminal?: (text: string, alreadyPosted?: boolean) => void;
 		retired?: () => void;
 		released?: (opRef: string) => void;
-		failure?: (message: string) => void;
+		failure?: (message: string, forceFailureNotice?: boolean) => void;
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
+		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
@@ -136,9 +138,10 @@ async function harness(
 			return {
 				text: trigger.body,
 				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
+				...(hooks.onFrame ? { onFrame: (input) => hooks.onFrame?.(input.frame) } : {}),
 				onTerminal: ({ text, alreadyPosted }) => hooks.terminal?.(text, alreadyPosted),
-				onFailure: ({ error }) => {
-					hooks.failure?.(error.message);
+				onFailure: ({ error, forceFailureNotice }) => {
+					hooks.failure?.(error.message, forceFailureNotice);
 					hooks.failureError?.(error);
 				},
 				...(hooks.modelRefusal ? { onModelRefusal: hooks.modelRefusal } : {}),
@@ -2198,6 +2201,107 @@ test("a live session that is busy (not idle) past the bound is never released", 
 	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(port.closes).toHaveLength(0);
 	expect(terminal).toEqual([]);
+});
+
+test("a silent in-flight turn is failed after the stall deadline and releases a queued lane report", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const clock = { now: Date.now() };
+	const logs: string[] = [];
+	const failures: Array<{ message: string; forceNotice: boolean | undefined }> = [];
+	let interimSeen = false;
+	await harness(
+		port,
+		{
+			failure: (message, forceNotice) => failures.push({ message, forceNotice }),
+			onFrame: (frame) => {
+				if (!frame.assistantText) return;
+				interimSeen = true;
+				return true;
+			},
+		},
+		(line) => logs.push(line),
+		{ now: () => clock.now },
+	);
+	enqueue("stalled-trigger", "start the lane");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const first = port.sends[0]!;
+	port.emitAssistant(first.sessionId, "The lane is running", "lane-running", first.opRef);
+	await eventually(() => interimSeen, "mid-work frame was not observed before the stall");
+	await manager!.reconcile(KEY);
+	enqueue("stalled-lane-report", "[lane child] complete", "lane_report");
+	await manager!.notifyInbound(KEY);
+	expect(port.steers).toHaveLength(0);
+	expect(database!.inbox.pendingCount(KEY)).toBe(2);
+	port.setActivity(first.sessionId, "tool", clock.now);
+
+	const readsBeforeStall = port.statusReads.length;
+	port.emitStall(first.sessionId);
+	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(port.closes).toHaveLength(0);
+
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS - 1;
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(port.closes).toHaveLength(0);
+	expect(failures).toEqual([]);
+
+	clock.now += 1;
+	await manager!.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
+	await eventually(() => port.sends.length === 2, "queued lane report did not start after cutoff");
+	expect(database!.inbox.turnRow(first.opRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "turn_failed" }));
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(port.closes.map((close) => close.sessionId)).toEqual([first.sessionId]);
+	expect(port.sends[1]?.text).toContain("[lane child] complete");
+	expect(failures).toEqual([
+		{
+			message: expect.stringContaining("no terminal event before the stall deadline"),
+			forceNotice: true,
+		},
+	]);
+	expect(logs.some((line) => line.startsWith("stalled_turn_cutoff ") && line.includes(first.opRef))).toBe(true);
+	port.complete(port.sends[1]!.opRef, "report received");
+	await eventually(() => database!.inbox.pendingCount(KEY) === 0, "lane report did not settle after cutoff");
+});
+
+test("tail activity that resumes after the stall deadline cancels the cutoff", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let assistantFrames = 0;
+	await harness(
+		port,
+		{
+			onFrame: (frame) => {
+				if (!frame.assistantText) return;
+				assistantFrames++;
+				return true;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-resumed", "continue working");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	port.setActivity(send.sessionId, "tool", clock.now);
+	const readsBeforeStall = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	port.emitAssistant(send.sessionId, "The tool is still making progress", "resumed-work", send.opRef);
+	await eventually(() => assistantFrames === 1, "resumed tail frame was not delivered");
+	await manager!.reconcile(KEY);
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+	expect(port.closes).toHaveLength(0);
+
+	port.complete(send.opRef, "finished normally");
+	await eventually(() => database!.inbox.turnRow(send.opRef)?.turn_state === "done", "resumed turn did not finish");
+	expect(port.closes).toHaveLength(0);
 });
 
 test("an unanswerable liveness probe is not wedge evidence: the turn stays held", async () => {
