@@ -222,6 +222,8 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly hostJobs = new Map<string, readonly RunningHostJob[] | Error>();
 	/** Injects tail activity while a caller is awaiting the running-job probe. */
 	beforeRunningJobs?: (input: { sessionId: string; repo: string }) => void | Promise<void>;
+	/** Injects operation changes while a caller is awaiting host inspection. */
+	beforeTerminateHost?: (input: { sessionId: string; repo: string }) => void | Promise<void>;
 
 	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
 		await this.beforeRunningJobs?.(input);
@@ -234,11 +236,12 @@ export class ScriptedSessionPort implements SessionPort {
 	async terminateHost(input: {
 		sessionId: string;
 		repo: string;
-		shouldTerminate?: () => boolean;
+		shouldTerminate?: () => boolean | Promise<boolean>;
 	}): Promise<TerminateHostOutcome> {
 		const state = this.#sessionStates.get(input.sessionId);
 		if (!state || state.live === false) return { outcome: "already_gone" };
-		if (input.shouldTerminate && !input.shouldTerminate())
+		await this.beforeTerminateHost?.({ sessionId: input.sessionId, repo: input.repo });
+		if (input.shouldTerminate && !(await input.shouldTerminate()))
 			return { outcome: "refused", reason: "termination_guard_rejected" };
 		await this.close(input);
 		return { outcome: "terminated", pid: 40_000 + this.closes.length };

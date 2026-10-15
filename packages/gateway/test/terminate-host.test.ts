@@ -155,7 +155,7 @@ test("a rejected final termination guard leaves the session host running", async
 	const child = fakeHost("sdk session-host-internal");
 	const h = await harness(() => child.pid);
 	try {
-		expect(await h.port.terminateHost({ sessionId: "s-7", repo: h.repo, shouldTerminate: () => false })).toEqual({
+		expect(await h.port.terminateHost({ sessionId: "s-7", repo: h.repo, shouldTerminate: async () => false })).toEqual({
 			outcome: "refused",
 			reason: "termination_guard_rejected",
 		});

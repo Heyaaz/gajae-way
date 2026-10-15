@@ -132,12 +132,13 @@ export interface SessionPort {
 	}): Promise<SessionContextUsage | undefined>;
 	/**
 	 * Ends a gateway-owned session host; an optional final guard runs immediately
-	 * before SIGTERM so a concurrent tail event can cancel a stale cutoff.
+	 * before SIGTERM so the caller can revalidate operation status and cancel on
+	 * concurrent tail activity.
 	 */
 	terminateHost?(input: {
 		sessionId: string;
 		repo: string;
-		shouldTerminate?: () => boolean;
+		shouldTerminate?: () => boolean | Promise<boolean>;
 	}): Promise<TerminateHostOutcome>;
 	/** Recognized current-session provider failure, never authorization to replay an operation. */
 	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
@@ -980,7 +981,7 @@ export class BrokerSessionPort implements SessionPort {
 	async terminateHost(input: {
 		sessionId: string;
 		repo: string;
-		shouldTerminate?: () => boolean;
+		shouldTerminate?: () => boolean | Promise<boolean>;
 	}): Promise<TerminateHostOutcome> {
 		this.#assertOwned(input);
 		let pid: number | undefined;
@@ -1031,8 +1032,13 @@ export class BrokerSessionPort implements SessionPort {
 		// The only process shape this gateway may end. The broker, daemon, and anything else are someone else's.
 		if (!/\bsdk session-host-internal\b/.test(command) || /\b(broker|daemon)-internal\b/.test(command))
 			return { outcome: "not_a_host", pid, command: command.slice(0, 160) };
-		if (input.shouldTerminate && !input.shouldTerminate())
-			return { outcome: "refused", reason: "termination_guard_rejected" };
+		if (input.shouldTerminate) {
+			try {
+				if (!(await input.shouldTerminate())) return { outcome: "refused", reason: "termination_guard_rejected" };
+			} catch (error) {
+				return { outcome: "refused", reason: `termination_guard_failed:${sanitizeDiagnostic(String(error))}` };
+			}
+		}
 		try {
 			process.kill(pid, "SIGTERM");
 		} catch (error) {

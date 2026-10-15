@@ -2266,6 +2266,40 @@ test("a silent in-flight turn is failed after the stall deadline and releases a 
 	await eventually(() => database!.inbox.pendingCount(KEY) === 0, "lane report did not settle after cutoff");
 });
 
+test("a terminal operation found by the final cutoff guard is not failed", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	const failures: Array<{ message: string; forceNotice: boolean | undefined }> = [];
+	await harness(port, { failure: (message, forceNotice) => failures.push({ message, forceNotice }) }, undefined, {
+		now: () => clock.now,
+	});
+	enqueue("terminal-before-cutoff", "finish the current turn");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	port.setActivity(send.sessionId, "tool", clock.now);
+	const readsBeforeStall = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	port.beforeTerminateHost = ({ sessionId }) => {
+		port.seedOperation(send.opRef, sessionId, "terminal_ok", "completed during host inspection");
+	};
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+	expect(port.closes).toHaveLength(0);
+	expect(failures).toEqual([]);
+
+	port.complete(send.opRef, "the operation completed before the cutoff");
+	await eventually(
+		() => database!.inbox.turnRow(send.opRef)?.turn_state === "done",
+		"terminal operation was not reconciled",
+	);
+	expect(port.closes).toHaveLength(0);
+	expect(failures).toEqual([]);
+});
+
 test("tail activity that resumes after the stall deadline cancels the cutoff", async () => {
 	const port = new ScriptedSessionPort();
 	const clock = { now: Date.now() };

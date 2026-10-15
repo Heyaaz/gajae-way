@@ -2827,12 +2827,22 @@ class OriginActor {
 			this.#clearStallReconciliation(bound);
 			return false;
 		}
+		const authorizeTermination = async () => {
+			if (!canTerminate()) return false;
+			try {
+				const latest = await this.#statusOf(bound);
+				return canTerminate() && latest.status.status !== "unknown" && !isTerminalStatus(latest.status.status);
+			} catch {
+				// An unreadable final status is not proof that the accepted operation is gone.
+				return false;
+			}
+		};
 		let result: TerminateHostOutcome;
 		try {
 			result = await port.terminateHost({
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
-				shouldTerminate: canTerminate,
+				shouldTerminate: authorizeTermination,
 			});
 		} catch (error) {
 			if (!bound.stallTerminationWarningLogged) {
@@ -2845,7 +2855,7 @@ class OriginActor {
 			return false;
 		}
 		if (result.outcome === "refused" && result.reason === "termination_guard_rejected") {
-			this.#clearStallReconciliation(bound);
+			if (!canTerminate()) this.#clearStallReconciliation(bound);
 			return false;
 		}
 		if (result.outcome !== "terminated" && result.outcome !== "already_gone") {
