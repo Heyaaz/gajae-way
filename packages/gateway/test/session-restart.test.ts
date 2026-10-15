@@ -211,7 +211,7 @@ test("restart drain waits for all active turns and holds new persona dispatches"
 	expect(await Promise.race([draining.then(() => true), Bun.sleep(10).then(() => false)])).toBe(false);
 
 	port.complete(secondSend.opRef, "second delivered");
-	await expect(draining).resolves.toBe(true);
+	await expect(draining).resolves.toBe("drained");
 	await eventually(() => terminal.length === 2, "restart drain completed before all answers were delivered");
 	expect(terminal).toEqual(expect.arrayContaining(["first delivered", "second delivered"]));
 	expect(port.sends).toHaveLength(2);
@@ -219,6 +219,25 @@ test("restart drain waits for all active turns and holds new persona dispatches"
 
 	await expect(manager.cancelRestartDrain("restart-602")).resolves.toBe(true);
 	await eventually(() => port.sends.length === 3, "cancelled restart drain did not resume pending dispatch");
+});
+
+test("restart drain reaches its deadline and keeps new dispatches held for durable recovery", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-drain-timeout-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort({ onBind: ({ originKey, epoch }) => `${originKey}-${epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	const currentManager = makeManager(port, []);
+	manager = currentManager;
+	enqueue("active-timeout", "provider did not finish");
+	await currentManager.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "accepted turn did not start before drain timeout");
+
+	await expect(currentManager.drainForRestart("restart-timeout", 20)).resolves.toBe("timed_out");
+	expect(currentManager.restartDrainActive).toBe(true);
+	enqueue("queued-after-timeout", "resume after restart");
+	await currentManager.notifyInbound(KEY);
+	expect(port.sends).toHaveLength(1);
+	expect(database.inbox.pendingOldest(KEY)?.message_id).toBe("queued-after-timeout");
 });
 
 test("client_ref_conflict reconciles the same deterministic op-ref without a second accepted send, including after restart", async () => {

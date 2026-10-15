@@ -44,6 +44,7 @@ export type RestartStepResult = "pending" | "ok" | "stale" | "failed" | "skipped
 export type RestartState = "queued" | "running" | "ok" | "stale" | "failed";
 
 export interface RestartDrainLease {
+	readonly warning?: string;
 	cancel(): Promise<void>;
 	close(): Promise<void>;
 }
@@ -125,7 +126,8 @@ export interface RunRestartOptions {
 const RECEIPT_FILE = "restart-stack.json";
 const VERIFY_TIMEOUT_MS = 90_000;
 const POLL_MS = 1_000;
-const RESTART_DRAIN_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;
+const RESTART_DRAIN_WAIT_MS = 120_000;
+const RESTART_DRAIN_REQUEST_TIMEOUT_MS = RESTART_DRAIN_WAIT_MS + 15_000;
 
 export function restartReceiptPath(home: string): string {
 	return join(home, RECEIPT_FILE);
@@ -232,8 +234,15 @@ async function prepareGatewayRestartDrain(
 			`gateway restart drain connection failed: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
+	let drained: boolean;
 	try {
-		await client.request("gateway.restart.prepare", { restartId });
+		const result = await client.request<{ ready?: unknown; drained?: unknown }>("gateway.restart.prepare", {
+			restartId,
+			waitMs: RESTART_DRAIN_WAIT_MS,
+		});
+		if (result.ready !== true || typeof result.drained !== "boolean")
+			throw new Error("gateway returned an invalid restart-drain receipt");
+		drained = result.drained;
 	} catch (error) {
 		try {
 			await client.request("gateway.restart.cancel", { restartId });
@@ -246,6 +255,9 @@ async function prepareGatewayRestartDrain(
 		throw new Error(`gateway restart drain failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	return {
+		...(drained
+			? {}
+			: { warning: "active persona turns exceeded the drain grace; durable turn recovery will resume them" }),
 		cancel: async () => {
 			await client.request("gateway.restart.cancel", { restartId });
 		},
@@ -412,6 +424,10 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 			await writeReceipt(options.home, receipt);
 			return receipt;
 		}
+	}
+	if (restartDrain?.warning !== undefined) {
+		receipt.warning = restartDrain.warning;
+		await writeReceipt(options.home, receipt);
 	}
 
 	let issuedAt = now();

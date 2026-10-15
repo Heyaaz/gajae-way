@@ -288,6 +288,29 @@ test("the first update from a pre-drain gateway records its durable-recovery boo
 	}
 });
 
+test("restart-stack reports when active turns exceed the bounded drain grace", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home, installed: async (label) => label === "dev.gajaeway.gateway" });
+	const warning = "active persona turns exceeded the drain grace; durable turn recovery will resume them";
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "drain-grace-expired",
+			prepareRestartDrain: async () => ({
+				warning,
+				cancel: async () => {},
+				close: async () => {},
+			}),
+		});
+		expect(receipt.state).toBe("ok");
+		expect(receipt.warning).toBe(warning);
+		expect(receipt.steps.find((step) => step.label === "dev.gajaeway.gateway")?.result).toBe("ok");
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("manual restart refuses to bypass the drain on a pre-drain gateway", async () => {
 	const { home, cleanup } = await tempHome();
 	const host = await fakeHost({ home });

@@ -1163,8 +1163,8 @@ export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
 	"gateway.restart.prepare": {
-		params: { readonly restartId: string };
-		result: { readonly ready: true };
+		params: { readonly restartId: string; readonly waitMs?: number };
+		result: { readonly ready: true; readonly drained: boolean };
 	};
 	"gateway.restart.cancel": {
 		params: { readonly restartId: string };

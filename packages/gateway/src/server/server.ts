@@ -76,6 +76,8 @@ import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
+	PERSONA_RESTART_DRAIN_MAX_WAIT_MS,
+	PERSONA_RESTART_DRAIN_WAIT_MS,
 	type PersonaBindHoldInput,
 	type PersonaFailureInput,
 	PersonaSessionManager,
@@ -1283,23 +1285,39 @@ async function handleRequest(
 			await stop();
 			return;
 		case "gateway.restart.prepare": {
-			const restartId = (request.params as { restartId?: unknown } | undefined)?.restartId;
+			const params = request.params as { restartId?: unknown; waitMs?: unknown } | undefined;
+			const restartId = params?.restartId;
+			const waitMs = params?.waitMs ?? PERSONA_RESTART_DRAIN_WAIT_MS;
 			if (typeof restartId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(restartId))
 				throw new ProtocolError("invalid_params", "restartId must be a non-empty safe identifier");
+			if (
+				typeof waitMs !== "number" ||
+				!Number.isSafeInteger(waitMs) ||
+				waitMs < 0 ||
+				waitMs > PERSONA_RESTART_DRAIN_MAX_WAIT_MS
+			)
+				throw new ProtocolError("invalid_params", "waitMs is outside the allowed drain interval");
 			const owner = runtime.restartDrainOwners.get(restartId);
 			if (owner !== undefined && owner !== connection)
 				throw new ProtocolError("verb_failed", "restart drain is already owned by another supervisor");
 			runtime.restartDrainOwners.set(restartId, connection);
 			try {
-				if (!(await runtime.personaSessions.drainForRestart(restartId))) {
+				const outcome = await runtime.personaSessions.drainForRestart(restartId, waitMs);
+				if (outcome === "stopped") {
 					runtime.restartDrainOwners.delete(restartId);
 					throw new ProtocolError("gateway_shutting_down", "gateway stopped before persona turns drained");
+				} else {
+					connection.write({
+						v: PROFILE_VERSION,
+						type: "response",
+						id: request.id,
+						result: { ready: true, drained: outcome === "drained" },
+					});
 				}
 			} catch (error) {
 				if (runtime.restartDrainOwners.get(restartId) === connection) runtime.restartDrainOwners.delete(restartId);
 				throw error;
 			}
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { ready: true } });
 			return;
 		}
 		case "gateway.restart.cancel": {
@@ -2266,19 +2284,21 @@ async function sendChat(
 			}
 		}
 		console.info(`gateway restart requested by owner via ${key}`);
-		// Let the ack leave the socket, then hold new persona dispatches until all
-		// active answers have been delivered before the supervisor restarts us.
+		// Let the ack leave the socket, then hold new persona dispatches while
+		// active answers drain; the bounded timeout leaves remaining work durable.
 		setTimeout(() => {
 			// A stack restart already owns the drain and will restart the gateway.
 			if (runtime.personaSessions.restartDrainActive) return;
 			const exit = options.exitProcess ?? ((code: number) => process.exit(code));
 			void runtime.personaSessions
-				.drainForRestart(`owner-${crypto.randomUUID()}`)
-				.then((ready) => {
-					if (!ready) return exit(RESTART_EXIT_CODE);
+				.drainForRestart(`owner-${crypto.randomUUID()}`, PERSONA_RESTART_DRAIN_WAIT_MS)
+				.then((outcome) => {
+					if (outcome === "stopped") return exit(RESTART_EXIT_CODE);
+					if (outcome === "timed_out")
+						console.warn("owner restart drain timed out; active persona turns will recover from durable state");
 					// Exit non-zero on purpose: launchd KeepAlive=true and systemd
 					// Restart=on-failure only relaunch after an unsuccessful exit. The
-					// stop budget begins after persona delivery has drained.
+					// stop budget begins after the bounded drain or its durable-recovery timeout.
 					void runtime.stop?.("owner /restart").then(
 						() => exit(RESTART_EXIT_CODE),
 						() => exit(RESTART_EXIT_CODE),

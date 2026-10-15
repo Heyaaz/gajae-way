@@ -1386,7 +1386,7 @@ test("restart prepare waits for delivered turns and holds new persona dispatches
 		(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "reply-1",
 	);
 	const preparedIndex = client.frames.findIndex((frame) => frame.id === "prepare-restart");
-	expect(client.frames[preparedIndex]?.result).toEqual({ ready: true });
+	expect(client.frames[preparedIndex]?.result).toEqual({ ready: true, drained: true });
 	expect(deliveredIndex).toBeGreaterThan(0);
 	expect(preparedIndex).toBeGreaterThan(deliveredIndex);
 	expect(responses).toBe(1);

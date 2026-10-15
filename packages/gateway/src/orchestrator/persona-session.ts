@@ -275,6 +275,10 @@ const AGENT_ERROR_RETRY_MAX_MS = 10_000;
 
 export type PersonaActorState = "idle" | "turn-running";
 
+export type PersonaRestartDrainOutcome = "drained" | "timed_out" | "stopped";
+export const PERSONA_RESTART_DRAIN_WAIT_MS = 120_000;
+export const PERSONA_RESTART_DRAIN_MAX_WAIT_MS = 300_000;
+
 /**
  * Server-owned chat behavior attached to one durable persona turn. The actor
  * owns session/recovery ordering; this lifecycle owns only presentation,
@@ -740,22 +744,50 @@ export class PersonaSessionManager {
 		}
 	}
 
-	/** Pause new dispatches and wait until every accepted persona turn is delivered or settled. */
-	async drainForRestart(restartId: string): Promise<boolean> {
+	/** Pause new dispatches and wait a bounded interval for accepted turns to deliver. */
+	async drainForRestart(
+		restartId: string,
+		waitMs = PERSONA_RESTART_DRAIN_WAIT_MS,
+	): Promise<PersonaRestartDrainOutcome> {
 		if (!/^[A-Za-z0-9_-]{1,128}$/.test(restartId)) throw new Error("invalid restart id");
-		if (this.#stopped) return false;
+		if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > PERSONA_RESTART_DRAIN_MAX_WAIT_MS)
+			throw new Error("restart drain wait must be an integer within the allowed range");
+		if (this.#stopped) return "stopped";
 		if (this.#restartDrainId !== undefined && this.#restartDrainId !== restartId)
 			throw new Error(`restart drain already owned by ${this.#restartDrainId}`);
 		this.#restartDrainId = restartId;
-		this.#log(`persona_restart_drain_started id=${restartId}`);
+		const deadline = Date.now() + waitMs;
+		this.#log(`persona_restart_drain_started id=${restartId} waitMs=${waitMs}`);
 		for (;;) {
-			if (this.#stopped || this.#restartDrainId !== restartId) return false;
+			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
 			const actors = [...this.#actors.values()];
-			const unsettled = await Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
-			if (this.#stopped || this.#restartDrainId !== restartId) return false;
+			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timedOut = Symbol("restart drain timed out");
+			let unsettled: (boolean | undefined)[] | typeof timedOut;
+			try {
+				unsettled = await Promise.race([
+					checks,
+					new Promise<typeof timedOut>((resolve) => {
+						const remainingMs = Math.max(0, deadline - Date.now());
+						timer = setTimeout(() => resolve(timedOut), remainingMs);
+					}),
+				]);
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+			}
+			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
+			if (unsettled === timedOut) {
+				this.#log(`persona_restart_drain_timed_out id=${restartId} waitMs=${waitMs}`, "warn");
+				return "timed_out";
+			}
 			if (!unsettled.some(Boolean)) {
 				this.#log(`persona_restart_drain_ready id=${restartId}`);
-				return true;
+				return "drained";
+			}
+			if (Date.now() >= deadline) {
+				this.#log(`persona_restart_drain_timed_out id=${restartId} waitMs=${waitMs}`, "warn");
+				return "timed_out";
 			}
 			await Bun.sleep(10);
 		}
@@ -766,7 +798,12 @@ export class PersonaSessionManager {
 		if (this.#restartDrainId !== restartId) return false;
 		this.#restartDrainId = undefined;
 		this.#log(`persona_restart_drain_cancelled id=${restartId}`);
-		await Promise.all([...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.admit())));
+		for (const actor of this.#actors.values())
+			void actor
+				.enqueue(async () => await actor.admit())
+				.catch((error: unknown) =>
+					this.#log(`persona restart resume failed origin=${actor.originKey}: ${safeDiagnostic(error)}`, "error"),
+				);
 		return true;
 	}
 
