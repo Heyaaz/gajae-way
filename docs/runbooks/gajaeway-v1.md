@@ -131,7 +131,7 @@ Memory changes are durable intents stored in the gateway database, committed in 
 
 ## Runtime cycle
 
-`gajaeway ops cycle` projects one operator-readable snapshot of where every runtime cycle stands: aggregate phase, per-origin session identity with epoch, durable inbound queue depth, delivery settlement, memory closure, and monitor settlement:
+`gajaeway ops cycle` projects one operator-readable snapshot of where every runtime cycle stands: aggregate phase, per-origin session identity with epoch, durable inbound queue depth, delivery settlement, memory closure, and monitor settlement. The result includes up to the five newest monitor dispatch failures with their event, code, and sanitized detail:
 
 ```sh
 gajaeway ops cycle                                  # first 100 sessions; exits 1 when any gate is present
@@ -139,11 +139,11 @@ gajaeway ops cycle --offset 100                     # next session page
 gajaeway ops cycle --limit 500 --offset 1000 --json # typed page and summary for scripting
 ```
 
-The `sessions` details are paged (`--limit` 1–500, default 100; `--offset` defaults to 0). JSON includes `sessionsTotal` and `sessionsOffset`; aggregate counts, phase, and gates always cover the full home, not just the displayed session page. Older parameterless protocol clients receive an explicit error when the result has more than one page rather than a silently incomplete session list. An upgraded CLI rejects responses from a pre-pagination gateway; restart the daemon after updating it.
+The `sessions` details are paged (`--limit` 1–500, default 100; `--offset` defaults to 0). JSON includes `sessionsTotal` and `sessionsOffset`; aggregate counts, phase, and gates always cover the full home, not just the displayed session page. Older parameterless protocol clients receive an explicit error when the result has more than one page rather than a silently incomplete session list. An upgraded CLI rejects responses from a gateway that lacks pagination or monitor-failure diagnostics; restart the daemon after updating it.
 
 Phases are `idle`, `dispatching` (turn work accepted or claimed from the durable queue), `delivering` (unsettled ledger deliveries), `draining` (memory closure in flight or durable unsettled intents), and `degraded`. A session shown as `(rebinding)` has a bumped epoch with no bound session yet — the next turn rebinds it.
 
-`gajaeway ops cycle` is a read-only projection; any gate makes it exit 1. Its gates include session/delivery uncertainty, memory closure and `memory_git_index_locked`, monitor settlement, lane capacity, inbound starvation, GJC version verification, broker churn/index-lock conditions, and broker-agent provisioning. The result also includes `brokerAgent` source/copy drift and `agentDisk` headroom. A `memory_git_index_locked` gate means Git reports the memory repository's index lock path; identify the Git process that owns it and let it finish rather than deleting the lock by age. For `broker_agent_unprovisioned` or broker-agent drift, inspect `gajaeway-gateway broker-agent status [--json]`. `setup --broker-agent` is a force provision, not a harmless status check; review drift and stop the broker service before applying it.
+`gajaeway ops cycle` is a read-only projection; any gate makes it exit 1. Its gates include session/delivery uncertainty, memory closure and `memory_git_index_locked`, monitor settlement, lane capacity, inbound starvation, GJC version verification, broker churn/index-lock conditions, and broker-agent provisioning. The JSON field `monitorFailures` exposes the five newest failure rows; details are sanitized and bounded when projected, including URLs and absolute paths retained in older records, while raw SDK payloads are not included. Use these details to diagnose dispatch failures without querying the database. The result also includes `brokerAgent` source/copy drift and `agentDisk` headroom. A `memory_git_index_locked` gate means Git reports the memory repository's index lock path; identify the Git process that owns it and let it finish rather than deleting the lock by age. For `broker_agent_unprovisioned` or broker-agent drift, inspect `gajaeway-gateway broker-agent status [--json]`. `setup --broker-agent` is a force provision, not a harmless status check; review drift and the pending-invitation queue before running it.
 
 ## Backup and restore drill
 

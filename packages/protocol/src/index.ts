@@ -40,6 +40,7 @@ export {
 	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
 	type MonitorEventRecovery,
+	type MonitorFailureDiagnostic,
 	type MonitorOverlapPolicy,
 	type MonitorProcedureVersion,
 	type MonitorProtocolFailureRecord,
