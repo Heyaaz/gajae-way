@@ -1,31 +1,55 @@
 export const SLACK_MESSAGE_LIMIT = 4000;
 
+const CODE_SEGMENTS =
+	/(^[ \t]*```[^\n]*\n[\s\S]*?^[ \t]*```[^\n]*(?:\n|$)|^[ \t]*```[^\n]*(?:\n[\s\S]*)?$|`+[^`\n]*`+)/gm;
+
 /** Protect Slack links before parsing code spans; code then retains literal markup and language tags. */
 export function markdownToMrkdwn(text: string): string {
 	const links: string[] = [];
 	let markerPrefix = "\u0000SLACKLINK";
 	while (text.includes(markerPrefix)) markerPrefix += "X";
-	let angleDepth = 0;
-	let scannedTo = 0;
-	const protectedText = text.replace(SLACK_LINK, (link, offset: number) => {
-		while (scannedTo < offset) {
-			if (text[scannedTo] === "<") angleDepth++;
-			else if (text[scannedTo] === ">" && angleDepth > 0) angleDepth--;
-			scannedTo++;
-		}
-		const nestedInAngleText = angleDepth > 0;
-		scannedTo = offset + link.length;
-		if (nestedInAngleText) return link;
+	const protectedText = text.replace(SLACK_LINK, (link) => {
 		const index = links.push(link) - 1;
 		return `${markerPrefix}${index}\u0000`;
 	});
-	const segments = protectedText.split(
-		/(^[ \t]*```[^\n]*\n[\s\S]*?^[ \t]*```[^\n]*(?:\n|$)|^[ \t]*```[^\n]*(?:\n[\s\S]*)?$|`+[^`\n]*`+)/gm,
-	);
-	const converted = segments.map((segment, index) => (index % 2 === 1 ? segment : convertText(segment))).join("");
-	if (links.length === 0) return converted;
+	if (links.length === 0) {
+		const segments = text.split(CODE_SEGMENTS);
+		return segments.map((segment, index) => (index % 2 === 1 ? segment : convertText(segment))).join("");
+	}
 	const linkMarkers = new RegExp(`${markerPrefix}(\\d+)\\u0000`, "g");
-	return converted.replace(linkMarkers, (marker, index: string) => links[Number(index)] ?? marker);
+	const keepLink = links.map(() => false);
+	const scanSegments = protectedText.split(CODE_SEGMENTS);
+	let angleDepth = 0;
+	const updateAngleDepth = (segment: string): void => {
+		for (const character of segment) {
+			if (character === "<") angleDepth++;
+			else if (character === ">" && angleDepth > 0) angleDepth--;
+		}
+	};
+	// Ignore literal angle brackets in code while retaining unmatched prose brackets across code segments.
+	for (let segmentIndex = 0; segmentIndex < scanSegments.length; segmentIndex++) {
+		const segment = scanSegments[segmentIndex] ?? "";
+		linkMarkers.lastIndex = 0;
+		if (segmentIndex % 2 === 1) {
+			for (const match of segment.matchAll(linkMarkers)) keepLink[Number(match[1])] = true;
+			continue;
+		}
+		let last = 0;
+		for (const match of segment.matchAll(linkMarkers)) {
+			updateAngleDepth(segment.slice(last, match.index));
+			keepLink[Number(match[1])] = angleDepth === 0;
+			last = match.index + match[0].length;
+		}
+		updateAngleDepth(segment.slice(last));
+	}
+	linkMarkers.lastIndex = 0;
+	const textForConversion = protectedText.replace(linkMarkers, (marker, index: string) =>
+		keepLink[Number(index)] ? marker : (links[Number(index)] ?? marker),
+	);
+	const segments = textForConversion.split(CODE_SEGMENTS);
+	const converted = segments.map((segment, index) => (index % 2 === 1 ? segment : convertText(segment))).join("");
+	linkMarkers.lastIndex = 0;
+	return converted.replace(linkMarkers, (_marker, index: string) => links[Number(index)] ?? _marker);
 }
 
 /**
