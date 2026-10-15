@@ -13,8 +13,8 @@ import {
 	launchRestartStack,
 	parseSystemdJobs,
 	readRestartReceipt,
-	renderRestartReceipt,
 	recoverRestartStack,
+	renderRestartReceipt,
 	runRestartStack,
 	supervisorArgv,
 } from "../src/restart-stack";
