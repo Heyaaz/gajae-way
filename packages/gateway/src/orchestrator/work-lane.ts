@@ -161,7 +161,7 @@ export interface CheckStatusSnapshot {
 export interface CheckStatusClient {
 	/**
 	 * Snapshot the PR whose head is `headSha`: null when no matching PR exists,
-	 * undefined when the lookup failed or timed out. Must not throw.
+	 * undefined when lookup failed, timed out, or a bounded result could not prove absence. Must not throw.
 	 */
 	getCheckStatus(headSha: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
 }

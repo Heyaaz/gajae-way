@@ -3328,6 +3328,31 @@ test("#595 GH check lookup prefers the open PR when duplicate PR heads match the
 	});
 });
 
+test("#595 GH check lookup keeps a full bounded search retryable when no exact head is found", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const headSha = "f".repeat(40);
+	const ghPath = join(directory, "gh");
+	const client = ghCheckStatusClient(1_000, ghPath);
+	const nonMatchingPrs = (count: number) =>
+		Array.from({ length: count }, (_, index) => ({
+			number: index + 1,
+			state: "CLOSED",
+			mergedAt: null,
+			headRefOid: (index + 1).toString(16).padStart(40, "0"),
+			statusCheckRollup: [],
+		}));
+	const lookup = async (count: number) => {
+		const response = JSON.stringify(nonMatchingPrs(count));
+		await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(response)}\n`);
+		await chmod(ghPath, 0o755);
+		return client.getCheckStatus(headSha, directory);
+	};
+
+	expect(await lookup(99)).toBeNull();
+	expect(await lookup(100)).toBeUndefined();
+});
+
 /** A check client whose answer the test changes between polls. */
 function scriptedChecks(initial: CheckStatusAnswer | null | undefined) {
 	let answer = initial;

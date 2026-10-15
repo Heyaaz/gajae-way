@@ -13,6 +13,7 @@ interface RollupEntry {
 }
 
 const FAILED_LOG_TAIL_LIMIT_BYTES = 3_200;
+const PR_LOOKUP_LIMIT = 100;
 
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const SUCCESS_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
@@ -67,7 +68,7 @@ export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): Check
 						"--search",
 						headSha,
 						"--limit",
-						"100",
+						`${PR_LOOKUP_LIMIT}`,
 						"--json",
 						"number,headRefOid,state,mergedAt,statusCheckRollup",
 					],
@@ -83,6 +84,7 @@ export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): Check
 					statusCheckRollup?: RollupEntry[] | null;
 				}>;
 				const matchingPrs = prs.filter((candidate) => candidate.headRefOid === headSha);
+				if (matchingPrs.length === 0) return prs.length >= PR_LOOKUP_LIMIT ? undefined : null;
 				// A SHA can be shared across PRs; the active PR must outrank stale closed matches.
 				const pr =
 					matchingPrs.find((candidate) => candidate.state.toUpperCase() === "OPEN") ??
