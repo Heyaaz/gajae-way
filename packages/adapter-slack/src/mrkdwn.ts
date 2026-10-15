@@ -4,7 +4,7 @@ const CODE_SEGMENTS =
 	/(^[ \t]*```[^\n]*\n[\s\S]*?^[ \t]*```[^\n]*(?:\n|$)|^[ \t]*```[^\n]*(?:\n[\s\S]*)?$|`+[^`\n]*`+)/gm;
 const UNICODE_WORD_CHARACTER = /[\p{L}\p{N}_$]/u;
 const UNICODE_LETTER = /\p{L}/u;
-type AngleOpener = { readonly markup: boolean; quote?: '"' | "'" };
+type AngleOpener = { readonly markup: boolean; quote?: '"' | "'"; linkInside?: boolean; closePosition?: number };
 
 /** Protect Slack links before parsing code spans; code then retains literal markup and language tags. */
 export function markdownToMrkdwn(text: string): string {
@@ -23,13 +23,23 @@ export function markdownToMrkdwn(text: string): string {
 	const scanSegments = protectedText.split(CODE_SEGMENTS);
 	const angleOpeners: AngleOpener[] = [];
 	let markupDepth = 0;
-	const updateAngleDepth = (segment: string, ignoreBrackets = false, linkFollows = false): void => {
+	const candidates: {
+		readonly index: number;
+		readonly inCode: boolean;
+		readonly markupDepth: number;
+		readonly offset: number;
+		readonly opener: AngleOpener | undefined;
+	}[] = [];
+	let baseOffset = 0;
+	const scanAngleSegment = (segment: string, offset: number, ignoreBrackets = false, linkFollows = false): void => {
 		for (let index = 0; index < segment.length; index++) {
 			const character = segment[index];
 			if (character === "\n" || character === "\r") {
 				angleOpeners.length = 0;
 				markupDepth = 0;
-			} else if (ignoreBrackets) continue;
+				continue;
+			}
+			if (ignoreBrackets) continue;
 			const currentOpener = angleOpeners[angleOpeners.length - 1];
 			if (currentOpener?.quote !== undefined) {
 				if (character === currentOpener.quote) currentOpener.quote = undefined;
@@ -52,42 +62,39 @@ export function markdownToMrkdwn(text: string): string {
 				angleOpeners.push({ markup: looksLikeMarkup });
 				if (looksLikeMarkup) markupDepth++;
 			} else if (character === ">") {
-				if (angleOpeners.pop()?.markup) markupDepth--;
+				const opener = angleOpeners.pop();
+				if (opener) opener.closePosition = offset + index;
+				if (opener?.markup) markupDepth--;
 			} else if (markupDepth === 0 && ";,.!?".includes(character)) {
 				for (let openerIndex = angleOpeners.length - 1; openerIndex >= 0; openerIndex--) {
-					if (!angleOpeners[openerIndex]?.markup) angleOpeners.splice(openerIndex, 1);
+					const opener = angleOpeners[openerIndex];
+					if (!opener?.markup && !opener?.linkInside) angleOpeners.splice(openerIndex, 1);
 				}
 			}
 		}
 	};
-	const hasOuterCloser = (suffix: string): boolean => {
-		let quote = angleOpeners[angleOpeners.length - 1]?.quote;
-		for (const character of suffix) {
-			if (character === "\n" || character === "\r") return false;
-			if (quote !== undefined) {
-				if (character === quote) quote = undefined;
-			} else if (character === '"' || character === "'") quote = character;
-			else if (character === ">") return true;
-		}
-		return false;
-	};
-	// Ignore code brackets and reset at line boundaries, including newlines within code segments.
+	// Scan code/newline boundaries too; code brackets stay literal but cannot bridge an angle construct across lines.
 	for (let segmentIndex = 0; segmentIndex < scanSegments.length; segmentIndex++) {
 		const segment = scanSegments[segmentIndex] ?? "";
+		const inCode = segmentIndex % 2 === 1;
 		linkMarkers.lastIndex = 0;
-		if (segmentIndex % 2 === 1) {
-			updateAngleDepth(segment, true);
-			for (const match of segment.matchAll(linkMarkers)) keepLink[Number(match[1])] = true;
-			continue;
-		}
-		let last = 0;
+		let cursor = 0;
 		for (const match of segment.matchAll(linkMarkers)) {
-			updateAngleDepth(segment.slice(last, match.index), false, true);
-			const afterLink = segment.slice(match.index + match[0].length);
-			keepLink[Number(match[1])] = markupDepth === 0 && !(angleOpeners.length > 0 && hasOuterCloser(afterLink));
-			last = match.index + match[0].length;
+			scanAngleSegment(segment.slice(cursor, match.index), baseOffset + cursor, inCode, !inCode);
+			const index = Number(match[1]);
+			const opener = angleOpeners[angleOpeners.length - 1];
+			if (!inCode && opener && !opener.markup) opener.linkInside = true;
+			candidates.push({ index, inCode, markupDepth, offset: baseOffset + match.index, opener });
+			cursor = match.index + match[0].length;
 		}
-		updateAngleDepth(segment.slice(last));
+		scanAngleSegment(segment.slice(cursor), baseOffset + cursor, inCode);
+		baseOffset += segment.length;
+	}
+	for (const candidate of candidates) {
+		keepLink[candidate.index] =
+			candidate.inCode ||
+			(candidate.markupDepth === 0 &&
+				!(candidate.opener?.closePosition !== undefined && candidate.opener.closePosition > candidate.offset));
 	}
 	linkMarkers.lastIndex = 0;
 	const textForConversion = protectedText.replace(linkMarkers, (marker, index: string) =>
