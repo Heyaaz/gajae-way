@@ -31,6 +31,8 @@ test("Slack entities survive escaping; everything else in angle brackets is esca
 		["<script>x</script>", "&lt;script&gt;x&lt;/script&gt;"],
 		["<javascript:alert(1)|click>", "&lt;javascript:alert(1)|click&gt;"],
 		["<https://example.com|<script>>", "&lt;https://example.com|&lt;script&gt;&gt;"],
+		["<<https://example.com>>", "&lt;&lt;https://example.com&gt;&gt;"],
+		["<tag <https://example.com>>", "&lt;tag &lt;https://example.com&gt;&gt;"],
 		["<@lowercase> <@> <#notachannel>", "&lt;@lowercase&gt; &lt;@&gt; &lt;#notachannel&gt;"],
 		["a < b and c > d", "a &lt; b and c &gt; d"],
 	])

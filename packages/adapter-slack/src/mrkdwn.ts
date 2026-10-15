@@ -5,7 +5,17 @@ export function markdownToMrkdwn(text: string): string {
 	const links: string[] = [];
 	let markerPrefix = "\u0000SLACKLINK";
 	while (text.includes(markerPrefix)) markerPrefix += "X";
-	const protectedText = text.replace(SLACK_LINK, (link) => {
+	let angleDepth = 0;
+	let scannedTo = 0;
+	const protectedText = text.replace(SLACK_LINK, (link, offset: number) => {
+		while (scannedTo < offset) {
+			if (text[scannedTo] === "<") angleDepth++;
+			else if (text[scannedTo] === ">" && angleDepth > 0) angleDepth--;
+			scannedTo++;
+		}
+		const nestedInAngleText = angleDepth > 0;
+		scannedTo = offset + link.length;
+		if (nestedInAngleText) return link;
 		const index = links.push(link) - 1;
 		return `${markerPrefix}${index}\u0000`;
 	});
