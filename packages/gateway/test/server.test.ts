@@ -1225,6 +1225,91 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	client.close();
 });
 
+test("graceful server restart recovers an accepted turn on its original live session", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
+	const startGateway = async () => {
+		const database = await Store.open(config.dbPath);
+		attachTestBrokerOwnership(database, port, join(directory, "agent"));
+		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+		return database;
+	};
+	let database = await startGateway();
+	const firstClient = await connect(config.socketPath);
+	firstClient.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(firstClient.frames, 1);
+	firstClient.send({
+		v: "0.1",
+		type: "request",
+		id: "in-flight-turn",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "restart-lifecycle", peerId: "p1" },
+			messageId: "restart-lifecycle-message",
+			text: "finish after the gateway restarts",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 400 && port.sends.length === 0; attempt++) await Bun.sleep(5);
+	const accepted = port.sends[0];
+	if (!accepted) throw new Error("gateway did not accept the in-flight turn");
+	expect(database.inbox.turnRow(accepted.opRef)).toMatchObject({
+		state: "pending",
+		turn_state: "accepted",
+		bound_session_id: accepted.sessionId,
+	});
+	const readsBeforeRestart = port.statusReads.length;
+	firstClient.close();
+	const stoppingServer = server;
+	if (!stoppingServer) throw new Error("gateway server disappeared before restart");
+	await stoppingServer.stop("test gateway restart");
+	server = undefined;
+	expect(port.closes).toHaveLength(0);
+
+	database = await startGateway();
+	const secondClient = await connect(config.socketPath);
+	secondClient.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(secondClient.frames, 1);
+	for (
+		let attempt = 0;
+		attempt < 400 && !port.statusReads.slice(readsBeforeRestart).some((read) => read.opRef === accepted.opRef);
+		attempt++
+	)
+		await Bun.sleep(5);
+	expect(port.statusReads.slice(readsBeforeRestart).some((read) => read.opRef === accepted.opRef)).toBe(true);
+	expect(port.sends).toHaveLength(1);
+	expect(port.sends[0]).toMatchObject({ opRef: accepted.opRef, sessionId: accepted.sessionId });
+	expect(database.inbox.turnRow(accepted.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+
+	port.complete(accepted.opRef, "answer after gateway restart");
+	for (
+		let attempt = 0;
+		attempt < 800 &&
+		!secondClient.frames.some(
+			(frame) => frame.event === "chat.message" && frame.payload?.text === "answer after gateway restart",
+		);
+		attempt++
+	)
+		await Bun.sleep(5);
+	const replies = secondClient.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.text === "answer after gateway restart",
+	);
+	expect(replies).toHaveLength(1);
+	expect(database.inbox.turnRow(accepted.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(port.sends).toHaveLength(1);
+	secondClient.close();
+}, 30_000);
+
 test("unengaged messages before a mention arrive as the unread diff with speaker attribution; the mention is the trigger", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
