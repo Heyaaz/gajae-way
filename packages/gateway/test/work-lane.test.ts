@@ -352,6 +352,118 @@ test("work.start retries when the broker restarts before a cold-created session 
 	expect(f.port.sends[0]?.sessionId).toBe(sessionId);
 });
 
+test("managed repo cold binding retains its worktree across a broker readiness timeout", async () => {
+	const sourceRepo = await mkdtemp(join(tmpdir(), "test-repo-cold-bind-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-cold-bind-"));
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", sourceRepo, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial commit");
+		Bun.spawnSync(["git", "clone", "--bare", sourceRepo, bareRepo], { stdout: "ignore", stderr: "ignore" });
+
+		let clock = 0;
+		let brokerAvailable = false;
+		let inspectCount = 0;
+		const createKeys: string[] = [];
+		const createInputs: string[] = [];
+		const sessionId = "7d1f2c3a-0b4e-4c5d-8e6f-9a0b1c2d3e4f";
+		const f = await fixture({
+			brokerWait: {
+				initialMs: 100,
+				maxMs: 100,
+				deadlineMs: 350,
+				now: () => clock,
+				log: () => {},
+				sleep: async (ms) => {
+					clock += ms;
+				},
+			},
+		});
+		const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
+		const cli: CliRunner = async (args) => {
+			const operationIndex = args.indexOf("--op");
+			if (operationIndex >= 0 && args[operationIndex + 1] === "session.create") {
+				createKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+				createInputs.push(args[args.indexOf("--json-input") + 1] ?? "{}");
+				return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId } }), stderr: "" };
+			}
+			if (args.includes("inspect")) {
+				inspectCount++;
+				if (!brokerAvailable) throw new GjcCliUnavailableError("broker unavailable while indexing");
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: true,
+						result: { session: { sessionId, live: true, deleted: false, locator: { repo: worktreePath } } },
+					}),
+					stderr: "",
+				};
+			}
+			throw new Error(`unexpected command ${args.join(" ")}`);
+		};
+		const brokerPort = new BrokerSessionPort({
+			database: f.db,
+			authority,
+			cli,
+			tailRunner: new TailRunner({ stream: noRelay, repo: f.directory }),
+			sleep: async () => {},
+		});
+		f.port.bind = (input) => brokerPort.bind(input);
+		const name = "cold-repo";
+		const worktreePath = managedLaneWorktreePath(f.gajaewayHome, name);
+		const input = { name, text: "work", repo: bareRepo };
+
+		await expect(f.manager.start(input)).rejects.toMatchObject({
+			code: "verb_failed",
+			detail: { reasonCode: "bind_failed", cause: "broker_unavailable" },
+		});
+		expect(createKeys).toHaveLength(1);
+		expect(JSON.parse(createInputs[0] ?? "{}")).toMatchObject({ cwd: worktreePath });
+		expect(f.db.bindings.getSessionRecord(workSessionKey(name))).toMatchObject({ sessionId, epoch: 0 });
+		expect(
+			f.db.bindings.brokerOperation(authority, "session.create", JSON.stringify([workSessionKey(name), 0])),
+		).toMatchObject({
+			state: "pending",
+		});
+		expect(f.job(name)).toMatchObject({
+			lane: { repositoryPath: managedLaneRepositoryPath(f.gajaewayHome, name), worktreePath },
+			attempts: [],
+		});
+		const retainedWorktree = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--show-toplevel"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(retainedWorktree.exitCode).toBe(0);
+		expect(retainedWorktree.stdout?.toString().trim()).toBe(worktreePath);
+
+		brokerAvailable = true;
+		const retried = await f.manager.start(input);
+		expect(retried.started).toBe(true);
+		expect(createKeys).toHaveLength(1);
+		expect(createInputs).toHaveLength(1);
+		expect(f.job(name)).toMatchObject({ lane: { worktreePath }, attempts: [{ sessionId }] });
+		expect(f.port.sends).toHaveLength(1);
+		expect(f.port.sends[0]?.sessionId).toBe(sessionId);
+		expect(inspectCount).toBe(5);
+	} finally {
+		await rm(sourceRepo, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
 test("work.start fails bind_failed once the broker readiness wait is exhausted", async () => {
 	const errors = spyOn(console, "error").mockImplementation(() => {});
 	cleanups.push(async () => errors.mockRestore());
@@ -3827,7 +3939,7 @@ test("work.start with special characters in lane name uses hex-encoded branch na
 	}
 });
 
-test("repo-bound work.start removes a newly created worktree after bind failure so retry can create it", async () => {
+test("repo-bound work.start retains its created worktree after bind failure so retry reuses it", async () => {
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-bind-retry-"));
 	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-bind-retry-"));
 	try {
@@ -3864,16 +3976,13 @@ test("repo-bound work.start removes a newly created worktree after bind failure 
 			detail: { reasonCode: "bind_failed", cause: "broker_unavailable" },
 		});
 		const worktreePath = join(f.gajaewayHome, "lanes", Buffer.from("bind-retry", "utf8").toString("hex"));
-		const branch = Bun.spawnSync(
-			["git", "-C", bareRepo, "show-ref", "--verify", "--quiet", "refs/heads/work/bind-retry"],
-			{ stdout: "ignore", stderr: "ignore" },
-		);
-		const worktrees = Bun.spawnSync(["git", "-C", bareRepo, "worktree", "list", "--porcelain"], {
+		const retainedWorktree = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--show-toplevel"], {
 			stdout: "pipe",
 			stderr: "pipe",
 		});
-		expect(branch.exitCode).not.toBe(0);
-		expect(worktrees.stdout?.toString()).not.toContain(worktreePath);
+		expect(retainedWorktree.exitCode).toBe(0);
+		expect(retainedWorktree.stdout?.toString().trim()).toBe(worktreePath);
+		expect(f.job("bind-retry")).toMatchObject({ lane: { worktreePath }, attempts: [] });
 
 		const retried = await f.manager.start(input);
 		expect(retried.started).toBe(true);

@@ -888,8 +888,12 @@ export class WorkLaneManager {
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
 		}
-		const worktreePath = job.lane.worktreePath;
+		const initialJob = job;
+		if (!initialJob) throw new Error("work lane record was not initialized");
+		const worktreePath = initialJob.lane.worktreePath;
 		input = { ...input, cwd: worktreePath };
+		let bindAttemptStarted = false;
+		let worktreePersisted = false;
 		let binding: Awaited<ReturnType<SessionPort["bind"]>>;
 		try {
 			// Each try re-takes the admission lock and re-checks capacity, so a
@@ -912,6 +916,11 @@ export class WorkLaneManager {
 					this.#port.runExclusive("work/admission", async () => {
 						this.#live();
 						this.#options.lanes.assertAdmission(input.name);
+						if (createdWorktree && !worktreePersisted) {
+							this.#putJob(input.name, initialJob);
+							worktreePersisted = true;
+						}
+						bindAttemptStarted = true;
 						try {
 							return await this.#port.bind({
 								originKey: sessionKey,
@@ -929,7 +938,9 @@ export class WorkLaneManager {
 				throw isBrokerUnavailable(error) ? bindFailed(error) : error;
 			});
 		} catch (error) {
-			if (createdWorktree) {
+			if (createdWorktree && bindAttemptStarted) {
+				console.error(`worktree_creation_retained name=${input.name} reason=session_bind_may_reference_worktree`);
+			} else if (createdWorktree) {
 				try {
 					await discardCreatedWorktree(input.name, createdWorktree);
 				} catch (cleanupError) {
@@ -956,7 +967,7 @@ export class WorkLaneManager {
 			context.wakeReportId ?? null,
 			notice?.hash ?? null,
 		);
-		job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
+		job = appendAttempt(initialJob, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
 		this.#prepareAttempt(runtime, job);
 
 		const observer = this.#register(runtime);
