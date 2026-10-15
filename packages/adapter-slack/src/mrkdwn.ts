@@ -25,10 +25,20 @@ export function markdownToMrkdwn(text: string): string {
 			if (character === "\n" || character === "\r") angleDepth = 0;
 			else if (!ignoreBrackets && character === "<") {
 				const next = segment[index + 1];
+				const previous = segment[index - 1];
+				const previousIsWord =
+					previous !== undefined &&
+					((previous >= "A" && previous <= "Z") ||
+						(previous >= "a" && previous <= "z") ||
+						(previous >= "0" && previous <= "9") ||
+						previous === "_" ||
+						previous === "$");
+				const nextIsLetter = next !== undefined && ((next >= "A" && next <= "Z") || (next >= "a" && next <= "z"));
 				const looksLikeMarkup =
 					(linkFollows && index === segment.length - 1) ||
-					(next !== undefined &&
-						((next >= "A" && next <= "Z") || (next >= "a" && next <= "z") || "!/?<@#:".includes(next)));
+					next === "<" ||
+					(nextIsLetter && !previousIsWord) ||
+					(next !== undefined && "!/?@#:".includes(next));
 				if (looksLikeMarkup) angleDepth++;
 			} else if (!ignoreBrackets && character === ">" && angleDepth > 0) angleDepth--;
 		}
