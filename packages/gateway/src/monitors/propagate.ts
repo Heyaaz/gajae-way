@@ -123,7 +123,7 @@ const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode
 /**
  * How long shutdown waits for in-flight authoring turns before marking them
  * interrupted. The monitor and persona drains run concurrently; together with
- * the 5s connection settle this keeps an ordered stop inside a 30s
+ * the 5s connection settle this keeps an ordered stop inside a 40s
  * `TimeoutStopSec` (#225).
  */
 export const MONITOR_SHUTDOWN_DRAIN_MS = 10_000;
