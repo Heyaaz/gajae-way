@@ -2380,6 +2380,51 @@ test("resumed activity clears an unknown-status recovery hold before a later sta
 	expect(database!.inbox.pendingCount(KEY)).toBe(2);
 });
 
+test("an uncorrelated idle broadcast does not retire a turn with stalled-status polling", async () => {
+	class UnknownStatusPort extends ScriptedSessionPort {
+		unknown = false;
+
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			const report = await super.status(input);
+			return this.unknown ? { ...report, status: { status: "unknown" as const }, summaryCompleted: false } : report;
+		}
+	}
+	const port = new UnknownStatusPort();
+	let idleFrameSeen = false;
+	await harness(port, {
+		onFrame: (frame) => {
+			if (frame.idle && frame.rawKind === "activity") idleFrameSeen = true;
+		},
+	});
+	enqueue("idle-unknown-stall-trigger", "keep working");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const first = port.sends[0]!;
+	port.unknown = true;
+
+	let statusReads = port.statusReads.length;
+	port.emitStall(first.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "first stall did not reconcile unknown status");
+	enqueue("idle-unknown-stall-lane", "remain queued", "lane_report");
+	await manager!.notifyInbound(KEY);
+
+	statusReads = port.statusReads.length;
+	for (const tail of port.tailsOf(first.sessionId))
+		tail.emit({ kind: "activity", rawKind: "activity", payload: { state: "idle" }, steerEcho: false, idle: true });
+	await eventually(() => idleFrameSeen, "uncorrelated idle broadcast was not delivered");
+	await manager!.reconcile(KEY);
+	expect(port.statusReads.length).toBeGreaterThan(statusReads);
+
+	statusReads = port.statusReads.length;
+	port.emitStall(first.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "second stall did not reconcile the current turn");
+	await manager!.reconcile(KEY);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(port.sends).toHaveLength(1);
+	expect(port.closes).toHaveLength(0);
+	expect(database!.inbox.pendingCount(KEY)).toBe(2);
+});
+
 test("an unanswerable liveness probe is not wedge evidence: the turn stays held", async () => {
 	class UnanswerablePort extends WedgedSessionPort {
 		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {

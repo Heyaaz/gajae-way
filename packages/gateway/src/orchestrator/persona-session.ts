@@ -3023,7 +3023,8 @@ class OriginActor {
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`, "warn");
 		// If turn is in recovery_hold and not already retired, retire it so pending inbound
 		// can start a fresh trigger turn in the next epoch.
-		const inRecoveryHold = !bound.retired && !retired && this.#holdSweeps.has(bound.turn.opRef);
+		const inRecoveryHold =
+			!bound.retired && !retired && !bound.statusRecheckAfterStall && this.#holdSweeps.has(bound.turn.opRef);
 		if (inRecoveryHold) {
 			bound.retired = true;
 		}
