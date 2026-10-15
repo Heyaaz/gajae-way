@@ -19,11 +19,19 @@ export function markdownToMrkdwn(text: string): string {
 	const keepLink = links.map(() => false);
 	const scanSegments = protectedText.split(CODE_SEGMENTS);
 	let angleDepth = 0;
-	const updateAngleDepth = (segment: string, ignoreBrackets = false): void => {
-		for (const character of segment) {
+	const updateAngleDepth = (segment: string, ignoreBrackets = false, linkFollows = false): void => {
+		for (let index = 0; index < segment.length; index++) {
+			const character = segment[index];
 			if (character === "\n" || character === "\r") angleDepth = 0;
-			else if (!ignoreBrackets && character === "<") angleDepth++;
-			else if (!ignoreBrackets && character === ">" && angleDepth > 0) angleDepth--;
+			else if (!ignoreBrackets && character === "<") {
+				const next = segment[index + 1];
+				const looksLikeMarkup =
+					segment.startsWith(markerPrefix, index + 1) ||
+					(linkFollows && index === segment.length - 1) ||
+					(next !== undefined &&
+						((next >= "A" && next <= "Z") || (next >= "a" && next <= "z") || "!/?<@#:".includes(next)));
+				if (looksLikeMarkup) angleDepth++;
+			} else if (!ignoreBrackets && character === ">" && angleDepth > 0) angleDepth--;
 		}
 	};
 	// Ignore code brackets and reset at line boundaries, including newlines within code segments.
@@ -37,7 +45,7 @@ export function markdownToMrkdwn(text: string): string {
 		}
 		let last = 0;
 		for (const match of segment.matchAll(linkMarkers)) {
-			updateAngleDepth(segment.slice(last, match.index));
+			updateAngleDepth(segment.slice(last, match.index), false, true);
 			keepLink[Number(match[1])] = angleDepth === 0;
 			last = match.index + match[0].length;
 		}

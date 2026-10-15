@@ -39,6 +39,7 @@ test("Slack entities survive escaping; everything else in angle brackets is esca
 		["<tag <https://example.com>>", "&lt;tag &lt;https://example.com&gt;&gt;"],
 		["<@lowercase> <@> <#notachannel>", "&lt;@lowercase&gt; &lt;@&gt; &lt;#notachannel&gt;"],
 		["a < b and c > d", "a &lt; b and c &gt; d"],
+		["1 < 2; see <https://example.com>", "1 &lt; 2; see <https://example.com>"],
 	])
 		expect(markdownToMrkdwn(input as string)).toBe(output);
 });
