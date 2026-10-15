@@ -160,10 +160,11 @@ export interface CheckStatusSnapshot {
 
 export interface CheckStatusClient {
 	/**
-	 * Snapshot the PR whose head is `headSha`: null when no matching PR exists,
-	 * undefined when lookup failed, timed out, or results are incomplete or ambiguous. Must not throw.
+	 * Snapshot the PR for `headSha`, preferring `prNumber` when supplied. Returns null only when an
+	 * unqualified lookup proves no match exists; returns undefined when lookup failed, timed out, or results are incomplete or ambiguous.
+	 * Must not throw.
 	 */
-	getCheckStatus(headSha: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
+	getCheckStatus(headSha: string, cwd: string, prNumber?: number): Promise<CheckStatusSnapshot | null | undefined>;
 }
 
 export interface WorkLaneManagerOptions {
@@ -1756,7 +1757,13 @@ export class WorkLaneManager {
 		const observed = this.#job(name);
 		const cycle = observed?.awaitingChecks;
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
-		const facts = await collectRepoFacts(observed.lane.worktreePath, client, true, cycle.headSha);
+		const facts = await collectRepoFacts(
+			observed.lane.worktreePath,
+			client,
+			true,
+			cycle.headSha,
+			cycle.prNumber ?? undefined,
+		);
 		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
 			if (this.#stopped) return undefined;
 			let job = this.#job(name);
@@ -3055,6 +3062,7 @@ async function collectRepoFacts(
 	checkClient?: CheckStatusClient,
 	includePushStatus = true,
 	checkHeadSha?: string,
+	checkPrNumber?: number,
 ): Promise<
 	| {
 			headSha?: string;
@@ -3122,6 +3130,7 @@ async function collectRepoFacts(
 				const checkStatus = await checkClient.getCheckStatus(
 					checkHeadSha ?? result.remoteHeadSha ?? headSha,
 					worktreePath,
+					checkPrNumber,
 				);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}

@@ -3356,6 +3356,40 @@ test("#595 GH check lookup retries when multiple open PRs share the requested he
 	expect(snapshot).toBeUndefined();
 });
 
+test("#595 GH check lookup preserves the persisted PR over another open duplicate", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const headSha = "e".repeat(40);
+	const response = [
+		{
+			number: 574,
+			state: "OPEN",
+			mergedAt: null,
+			headRefOid: headSha,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+		{
+			number: 575,
+			state: "CLOSED",
+			mergedAt: "2026-10-14T12:00:00Z",
+			headRefOid: headSha,
+			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
+		},
+	];
+	const ghPath = join(directory, "gh");
+	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
+	await chmod(ghPath, 0o755);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, 575);
+	expect(snapshot).toMatchObject({
+		prNumber: 575,
+		headSha,
+		status: "green",
+		prState: "closed",
+		merged: true,
+	});
+});
+
 test("#595 GH check lookup treats a full result page as ambiguous, with or without a match", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
@@ -3386,15 +3420,18 @@ test("#595 GH check lookup treats a full result page as ambiguous, with or witho
 function scriptedChecks(initial: CheckStatusAnswer | null | undefined) {
 	let answer = initial;
 	const calls: Array<{ headSha: string; cwd: string }> = [];
+	const requestedPrNumbers: Array<number | undefined> = [];
 	const client: CheckStatusClient = {
-		async getCheckStatus(headSha, cwd) {
+		async getCheckStatus(headSha, cwd, prNumber) {
 			calls.push({ headSha, cwd });
+			requestedPrNumbers.push(prNumber);
 			return withHeadSha(answer, cwd);
 		},
 	};
 	return {
 		client,
 		calls,
+		requestedPrNumbers,
 		set(next: CheckStatusAnswer | null | undefined) {
 			answer = next;
 		},
@@ -3621,6 +3658,7 @@ test("#595 a green fast path cannot settle a different PR than the persisted che
 
 	await pollUntil(f, () => f.job().state !== "awaiting_checks");
 	expect(f.job().state).toBe("attempt_ended");
+	expect(checks.requestedPrNumbers.at(-1)).toBe(596);
 	expect(f.job().escalations.at(-1)).toContain("awaiting_checks ended: pr_closed pr=596");
 	const resumed = await f.manager.start({ name: "a", text: "resume after PR changed", cwd: f.directory });
 	expect(resumed).toMatchObject({ started: true });
@@ -3904,6 +3942,7 @@ test("#481 an exact merged PR snapshot settles before later source-branch moveme
 	checks.set({ prNumber: 503, headSha: head, status: "pending", failingChecks: [], prState: "closed", merged: true });
 	await pollUntil(f, () => f.job().state === "done");
 	expect(checks.calls.at(-1)?.headSha).toBe(head);
+	expect(checks.requestedPrNumbers.at(-1)).toBe(503);
 	expect(checksNotice(f, "[lane a] checks passed")).toContain(
 		`pr=503 checks=green prHead=${head.slice(0, 12)} remoteHead=${advancedHead.slice(0, 12)}`,
 	);
