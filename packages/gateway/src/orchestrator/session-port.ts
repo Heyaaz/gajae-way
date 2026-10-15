@@ -131,9 +131,9 @@ export interface SessionPort {
 		relay: TailHandle;
 	}): Promise<SessionContextUsage | undefined>;
 	/**
-	 * Ends a gateway-owned session host; an optional final guard runs immediately
-	 * before SIGTERM so the caller can revalidate operation status and cancel on
-	 * concurrent tail activity.
+	 * Ends a gateway-owned session host; the optional final guard revalidates
+	 * operation status before final process-identity validation and also gates
+	 * already-gone outcomes.
 	 */
 	terminateHost?(input: {
 		sessionId: string;
@@ -1038,6 +1038,12 @@ export class BrokerSessionPort implements SessionPort {
 			return { outcome: "not_a_host", pid, command: command.slice(0, 160) };
 		const refusal = await finalGuardRefusal();
 		if (refusal) return refusal;
+		const revalidated = await processCommand(pid);
+		if (revalidated.outcome === "gone") return await alreadyGone();
+		if (revalidated.outcome === "unreadable")
+			return { outcome: "refused", reason: `process_inspection_failed:${revalidated.reason}` };
+		if (revalidated.identity !== inspection.identity || revalidated.command !== command)
+			return { outcome: "refused", reason: "process_identity_changed" };
 		try {
 			process.kill(pid, "SIGTERM");
 		} catch (error) {
@@ -2124,14 +2130,18 @@ function normalizeSdkEnvelopeFailure(result: CliResult): CliResult {
 }
 
 type ProcessCommandInspection =
-	| { readonly outcome: "live"; readonly command: string }
+	| { readonly outcome: "live"; readonly command: string; readonly identity: string }
 	| { readonly outcome: "gone" }
 	| { readonly outcome: "unreadable"; readonly reason: string };
 
 /** `ps` is the portable process read on macOS and Linux; only a clean no-match proves the pid is gone. */
 async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 	try {
-		const proc = Bun.spawn(["ps", "-o", "pid=,command=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
+		const proc = Bun.spawn(["ps", "-o", "pid=,lstart=,command=", "-p", String(pid)], {
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { ...process.env, LC_ALL: "C" },
+		});
 		const [stdout, stderr, exitCode] = await Promise.all([
 			new Response(proc.stdout).text(),
 			new Response(proc.stderr).text(),
@@ -2139,9 +2149,15 @@ async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 		]);
 		const line = stdout.trim();
 		if (exitCode === 0 && line.length > 0) {
-			const match = /^(\d+)(?:\s+(.*))?$/.exec(line);
+			const match = /^(\d+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(
+				line,
+			);
 			if (!match || Number(match[1]) !== pid) return { outcome: "unreadable", reason: "ps_pid_mismatch" };
-			return { outcome: "live", command: match[2]?.trim() ?? "" };
+			return {
+				outcome: "live",
+				identity: `${match[1]}:${match[2]}`,
+				command: match[3]?.trim() ?? "",
+			};
 		}
 		if (exitCode === 1 && line.length === 0 && stderr.trim().length === 0) return { outcome: "gone" };
 		return { outcome: "unreadable", reason: `ps_exit_${exitCode}` };
