@@ -1412,6 +1412,18 @@ test("restart prepare waits for delivered turns and holds new persona dispatches
 	expect(deliveredIndex).toBeGreaterThan(0);
 	expect(preparedIndex).toBeGreaterThan(deliveredIndex);
 	expect(responses).toBe(1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "recheck-restart-drain",
+		verb: "gateway.restart.prepare",
+		params: { restartId: "restart-602", waitMs: 1_000 },
+	});
+	await client.waitForFrame("recheck-restart-drain");
+	expect(client.frames.find((frame) => frame.id === "recheck-restart-drain")?.result).toEqual({
+		ready: true,
+		drained: true,
+	});
 
 	client.send({
 		v: "0.1",
@@ -1526,6 +1538,83 @@ test("restart prepare fails closed until an unconfirmed terminal reply is delive
 		expect(client.frames.find((frame) => frame.id === "cancel-timeout")?.result).toEqual({ cancelled: true });
 		for (let attempt = 0; attempt < 400 && responses < 2; attempt++) await Bun.sleep(5);
 		expect(responses).toBe(2);
+	} finally {
+		releaseTurn();
+		client.close();
+	}
+});
+
+test("restart prepare settles a silent turn without waiting for a nonexistent delivery", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-silent-turn-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	let turnEntered!: () => void;
+	let releaseTurn!: () => void;
+	const entered = new Promise<void>((resolve) => (turnEntered = resolve));
+	const turnRelease = new Promise<void>((resolve) => (releaseTurn = resolve));
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => {
+			turnEntered();
+			await turnRelease;
+			return "[SILENT]";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "silent-turn",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "dm", conversationId: "silent", peerId: "p1" },
+				text: "no reply is needed",
+				engagement: { mentioned: false, group: false, authorId: "p1" },
+			},
+		});
+		await entered;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "prepare-silent-turn",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "silent-turn-restart", waitMs: 1_000 },
+		});
+		client.send({ v: "0.1", type: "request", id: "silent-drain-observed", verb: "gateway.status" });
+		await client.waitForFrame("silent-drain-observed");
+		releaseTurn();
+		await client.waitForFrame("prepare-silent-turn");
+		expect(client.frames.find((frame) => frame.id === "prepare-silent-turn")?.result).toEqual({
+			ready: true,
+			drained: true,
+		});
+		expect(
+			client.frames.some(
+				(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "[SILENT]",
+			),
+		).toBe(false);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "cancel-silent-turn",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "silent-turn-restart" },
+		});
+		await client.waitForFrame("cancel-silent-turn");
 	} finally {
 		releaseTurn();
 		client.close();
@@ -1832,8 +1921,6 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 			},
 		});
 		await client.waitForFrame("owner-restart");
-		for (let attempt = 0; attempt < 500 && exitCode === undefined; attempt++) await Bun.sleep(5);
-		expect(exitCode).toBe(75);
 		for (
 			let attempt = 0;
 			attempt < 400 && !client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping");
@@ -1841,6 +1928,19 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 		)
 			await Bun.sleep(5);
 		expect(client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")).toBe(true);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "stale-stack-recheck",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "stalled-stack-supervisor", waitMs: 1_000 },
+		});
+		await client.waitForFrame("stale-stack-recheck");
+		expect(client.frames.find((frame) => frame.id === "stale-stack-recheck")?.error?.code).toBe(
+			"gateway_shutting_down",
+		);
+		for (let attempt = 0; attempt < 500 && exitCode === undefined; attempt++) await Bun.sleep(5);
+		expect(exitCode).toBe(75);
 	} finally {
 		client.close();
 	}

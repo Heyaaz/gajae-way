@@ -20,7 +20,6 @@ import { launchRestartStack } from "./restart-stack";
 import {
 	type InstallServicesOptions,
 	installServices,
-	removeStaleServices,
 	type ServicePlatform,
 	serviceSpecs,
 	systemdUnitName,
@@ -290,16 +289,6 @@ async function installUpdatedServices(options: {
 		const exitCode = await run(command);
 		if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
 	};
-	if (!noRestart) {
-		await removeStaleServices({
-			binDir,
-			platform,
-			env,
-			reloadSystemd: false,
-			...deps.serviceOptions,
-			run,
-		});
-	}
 	await installServices({
 		binDir,
 		platform,

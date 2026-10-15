@@ -44,6 +44,7 @@ export type RestartStepResult = "pending" | "ok" | "stale" | "failed" | "skipped
 export type RestartState = "queued" | "running" | "ok" | "stale" | "failed";
 
 export interface RestartDrainLease {
+	assertActive(): Promise<void>;
 	cancel(): Promise<void>;
 	close(): Promise<void>;
 }
@@ -252,6 +253,13 @@ async function prepareGatewayRestartDrain(
 		throw new Error(`gateway restart drain failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	return {
+		assertActive: async () => {
+			const result = await client.request<{ ready?: unknown; drained?: unknown }>("gateway.restart.prepare", {
+				restartId,
+				waitMs: RESTART_DRAIN_WAIT_MS,
+			});
+			if (result.ready !== true || result.drained !== true) throw new Error("gateway restart drain ownership was lost");
+		},
 		cancel: async () => {
 			await client.request("gateway.restart.cancel", { restartId });
 		},
@@ -381,17 +389,6 @@ async function runRestartStackWithLease(
 			? dirname(deployedExecutable)
 			: undefined);
 	const binDir = installedBinDir ?? dirname(process.execPath);
-	if (installedBinDir !== undefined) {
-		await removeStaleServices({
-			binDir: installedBinDir,
-			platform,
-			uid: options.uid,
-			env,
-			...(options.launchAgentsDir === undefined ? {} : { launchAgentsDir: options.launchAgentsDir }),
-			...(options.unitDir === undefined ? {} : { unitDir: options.unitDir }),
-			run: runner,
-		});
-	}
 
 	const originalPids = new Map<string, number | undefined>();
 	for (const spec of restartOrder()) {
@@ -431,6 +428,33 @@ async function runRestartStackWithLease(
 		}
 	}
 	if (restartDrain !== undefined) onDrainPrepared(restartDrain, receipt);
+	let gatewayRestarted = false;
+	const assertRestartDrain = async (): Promise<void> => {
+		if (restartDrain !== undefined && !gatewayRestarted) await restartDrain.assertActive();
+	};
+	if (installedBinDir !== undefined) {
+		try {
+			await removeStaleServices({
+				binDir: installedBinDir,
+				platform,
+				uid: options.uid,
+				env,
+				...(options.launchAgentsDir === undefined ? {} : { launchAgentsDir: options.launchAgentsDir }),
+				...(options.unitDir === undefined ? {} : { unitDir: options.unitDir }),
+				run: async (command) => {
+					await assertRestartDrain();
+					return await runner(command);
+				},
+			});
+		} catch (error) {
+			receipt.state = "failed";
+			receipt.finishedAt = new Date(now()).toISOString();
+			receipt.detail = `stale service cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+			for (const step of receipt.steps) step.result = "skipped";
+			await writeReceipt(options.home, receipt);
+			return receipt;
+		}
+	}
 	let issuedAt = now();
 	for (const step of receipt.steps) {
 		if (receipt.state !== "running") {
@@ -471,6 +495,7 @@ async function runRestartStackWithLease(
 
 			if (step.label === "dev.gajaeway.broker" && receipt.trigger === "update") {
 				const stopCommand = serviceStopCommand(platform, options.uid);
+				await assertRestartDrain();
 				const stopStatus = await runner(stopCommand);
 				if (stopStatus !== 0 && !(platform === "darwin" && (await probe(step.label)) === undefined))
 					throw new Error(`${stopCommand.join(" ")} exited with status ${stopStatus}`);
@@ -484,6 +509,7 @@ async function runRestartStackWithLease(
 					"--lease-wait-ms",
 					"35000",
 				];
+				await assertRestartDrain();
 				const provisionStatus = await runner(provisionCommand);
 				step.agentSync = {
 					command: provisionCommand,
@@ -503,6 +529,7 @@ async function runRestartStackWithLease(
 					const startCommand = serviceBootstrapCommand(options, platform, step.label);
 					step.command = startCommand;
 					issuedAt = now();
+					await assertRestartDrain();
 					const startStatus = await runner(startCommand);
 					step.exitStatus = startStatus;
 					if (startStatus !== 0) {
@@ -519,11 +546,13 @@ async function runRestartStackWithLease(
 				if (step.command !== undefined) {
 					issuedAt = now();
 					let command = step.command;
+					await assertRestartDrain();
 					let status = await runner(command);
 					if (status !== 0 && platform === "darwin" && (await probe(step.label)) === undefined) {
 						command = serviceBootstrapCommand(options, platform, step.label);
 						step.command = command;
 						issuedAt = now();
+						await assertRestartDrain();
 						status = await runner(command);
 					}
 					step.exitStatus = status;
@@ -538,6 +567,7 @@ async function runRestartStackWithLease(
 			step.result = "failed";
 			step.detail = error instanceof Error ? error.message : String(error);
 		}
+		if (step.label === "dev.gajaeway.gateway" && step.result === "ok") gatewayRestarted = true;
 		if (step.result !== "ok" && step.result !== "skipped") {
 			receipt.state = step.result === "stale" ? "stale" : "failed";
 		}

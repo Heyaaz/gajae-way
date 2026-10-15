@@ -493,18 +493,17 @@ async function releaseOrTransferRestartDrain(runtime: Runtime, restartId: string
 
 async function waitForRestartTerminalDelivery(runtime: Runtime, terminalDeliveryId: string | null): Promise<void> {
 	const deliveryIds = terminalDeliveryId === null ? [] : terminalDeliveryIds(terminalDeliveryId);
+	if (deliveryIds.length === 0) return;
 	let probeFailureLogged = false;
 	while (runtime.personaSessions.restartDrainActive && !runtime.stopping) {
-		if (deliveryIds.length > 0) {
-			try {
-				const deliveries = runtime.delivery.getMany(deliveryIds);
-				if (deliveries.length === deliveryIds.length && deliveries.every((delivery) => delivery.state === "confirmed"))
-					return;
-			} catch (error) {
-				if (!probeFailureLogged) {
-					console.error(`restart terminal delivery probe failed: ${diagnostic(error)}`);
-					probeFailureLogged = true;
-				}
+		try {
+			const deliveries = runtime.delivery.getMany(deliveryIds);
+			if (deliveries.length === deliveryIds.length && deliveries.every((delivery) => delivery.state === "confirmed"))
+				return;
+		} catch (error) {
+			if (!probeFailureLogged) {
+				console.error(`restart terminal delivery probe failed: ${diagnostic(error)}`);
+				probeFailureLogged = true;
 			}
 		}
 		await Bun.sleep(25);
@@ -1362,6 +1361,8 @@ async function handleRequest(
 			const owner = runtime.restartDrainOwners.get(restartId);
 			if (owner !== undefined && owner !== connection)
 				throw new ProtocolError("verb_failed", "restart drain is already owned by another supervisor");
+			if (runtime.personaSessions.restartDrainId !== undefined && runtime.personaSessions.restartDrainId !== restartId)
+				throw new ProtocolError("verb_failed", "restart drain ownership is no longer active");
 			runtime.restartDrainOwners.set(restartId, connection);
 			try {
 				const outcome = await runtime.personaSessions.drainForRestart(restartId, waitMs);

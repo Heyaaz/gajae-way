@@ -213,6 +213,7 @@ test("restart-stack waits for persona drain before issuing service restarts", as
 				started.resolve();
 				await release.promise;
 				return {
+					assertActive: async () => {},
 					cancel: async () => {
 						throw new Error("successful gateway restart must not cancel its drain");
 					},
@@ -235,6 +236,42 @@ test("restart-stack waits for persona drain before issuing service restarts", as
 	}
 });
 
+test("restart-stack fences a stale supervisor before restarting the gateway", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	let assertions = 0;
+	let cancelled = false;
+	let closed = false;
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "fenced-supervisor",
+			prepareRestartDrain: async () => ({
+				assertActive: async () => {
+					assertions++;
+					if (assertions > 1) throw new Error("restart drain ownership was transferred");
+				},
+				cancel: async () => {
+					cancelled = true;
+				},
+				close: async () => {
+					closed = true;
+				},
+			}),
+		});
+		expect(receipt.state).toBe("failed");
+		expect(receipt.steps[1]?.detail).toContain("restart drain ownership was transferred");
+		expect(assertions).toBe(2);
+		expect(cancelled).toBe(true);
+		expect(closed).toBe(true);
+		expect(host.ran).toEqual(["dev.gajaeway.broker"]);
+		expect(receipt.steps.slice(2).every((step) => step.result === "skipped")).toBe(true);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("restart-stack cancels the persona drain when a service restart fails before the gateway", async () => {
 	const { home, cleanup } = await tempHome();
 	const host = await fakeHost({ home, fail: "dev.gajaeway.broker" });
@@ -245,6 +282,7 @@ test("restart-stack cancels the persona drain when a service restart fails befor
 			...host.options,
 			id: "cancel-drain-on-failure",
 			prepareRestartDrain: async () => ({
+				assertActive: async () => {},
 				cancel: async () => {
 					cancelled = true;
 				},
@@ -276,6 +314,7 @@ test("restart-stack cancels and closes the persona drain when receipt persistenc
 				prepareRestartDrain: async () => {
 					await mkdir(join(home, `restart-stack.json.${process.pid}.tmp`));
 					return {
+						assertActive: async () => {},
 						cancel: async () => {
 							cancelled++;
 						},
@@ -456,6 +495,7 @@ for (const platform of ["darwin", "linux"] as const) {
 				? launchAgentPlistPath(staleAdmin, definitionDir)
 				: systemdUnitPath(staleAdmin, definitionDir);
 		const commands: string[][] = [];
+		let drainPrepared = false;
 		try {
 			await mkdir(binDir);
 			await mkdir(definitionDir);
@@ -468,7 +508,13 @@ for (const platform of ["darwin", "linux"] as const) {
 				binDir,
 				env: { ...process.env, HOME: home },
 				...(platform === "darwin" ? { launchAgentsDir: definitionDir } : { unitDir: definitionDir }),
+				probe: async () => undefined,
+				prepareRestartDrain: async () => {
+					drainPrepared = true;
+					return { assertActive: async () => {}, cancel: async () => {}, close: async () => {} };
+				},
 				runner: async (command) => {
+					expect(drainPrepared).toBe(true);
 					commands.push([...command]);
 					return 0;
 				},
@@ -493,7 +539,7 @@ for (const platform of ["darwin", "linux"] as const) {
 	});
 }
 
-test("Linux restart-stack preserves a stale unit when systemd cannot stop it", async () => {
+test("restart-stack does not stop stale services when persona drain fails", async () => {
 	const { home, cleanup } = await tempHome();
 	const binDir = join(home, "bin");
 	const unitDir = join(home, "units");
@@ -505,21 +551,70 @@ test("Linux restart-stack preserves a stale unit when systemd cannot stop it", a
 		await mkdir(binDir);
 		await mkdir(unitDir);
 		await writeFile(stalePath, "stale systemd unit");
-		await expect(
-			runRestartStack({
-				home,
-				id: "failed-stale-unit-cleanup",
-				platform: "linux",
-				binDir,
-				unitDir,
-				env: { ...process.env, HOME: home },
-				runner: async (command) => {
-					commands.push([...command]);
-					return 1;
+		const receipt = await runRestartStack({
+			home,
+			id: "drain-fails-before-stale-cleanup",
+			platform: "linux",
+			binDir,
+			unitDir,
+			env: { ...process.env, HOME: home },
+			prepareRestartDrain: async () => {
+				throw new ProtocolError("verb_failed", "persona reply delivery was not confirmed");
+			},
+			runner: async (command) => {
+				commands.push([...command]);
+				return 0;
+			},
+		});
+		expect(receipt.state).toBe("failed");
+		expect(receipt.detail).toContain("persona turn drain failed");
+		expect(commands).toEqual([]);
+		expect(await Bun.file(stalePath).exists()).toBe(true);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("Linux restart-stack preserves a stale unit when systemd cannot stop it", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	const unitDir = join(home, "units");
+	const admin = serviceSpecs().find((spec) => spec.id === "admin");
+	if (!admin) throw new Error("admin service spec not found");
+	const stalePath = systemdUnitPath(admin, unitDir);
+	const commands: string[][] = [];
+	let drainCancelled = false;
+	let drainClosed = false;
+	try {
+		await mkdir(binDir);
+		await mkdir(unitDir);
+		await writeFile(stalePath, "stale systemd unit");
+		const receipt = await runRestartStack({
+			home,
+			id: "failed-stale-unit-cleanup",
+			platform: "linux",
+			binDir,
+			unitDir,
+			env: { ...process.env, HOME: home },
+			prepareRestartDrain: async () => ({
+				assertActive: async () => {},
+				cancel: async () => {
+					drainCancelled = true;
+				},
+				close: async () => {
+					drainClosed = true;
 				},
 			}),
-		).rejects.toThrow("systemctl --user disable --now gajaeway-admin.service exited with status 1");
+			runner: async (command) => {
+				commands.push([...command]);
+				return 1;
+			},
+		});
+		expect(receipt.state).toBe("failed");
+		expect(receipt.detail).toContain("systemctl --user disable --now gajaeway-admin.service exited with status 1");
 		expect(commands).toEqual([["systemctl", "--user", "disable", "--now", "gajaeway-admin.service"]]);
+		expect(drainCancelled).toBe(true);
+		expect(drainClosed).toBe(true);
 		expect(await Bun.file(stalePath).exists()).toBe(true);
 	} finally {
 		await cleanup();

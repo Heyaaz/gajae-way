@@ -240,6 +240,22 @@ test("restart drain reaches its deadline and keeps new dispatches held for durab
 	expect(database.inbox.pendingOldest(KEY)?.message_id).toBe("queued-after-timeout");
 });
 
+test("a transferred restart drain rejects assertions from the prior supervisor", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-transfer-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort({ onBind: ({ originKey, epoch }) => `${originKey}-${epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	manager = makeManager(port, []);
+	await expect(manager.drainForRestart("stack-supervisor")).resolves.toBe("drained");
+	expect(manager.transferRestartDrain("stack-supervisor", "owner-restart")).toBe(true);
+	await expect(manager.drainForRestart("stack-supervisor", 0)).rejects.toThrow(
+		"restart drain already owned by owner-restart",
+	);
+	expect(manager.restartDrainId).toBe("owner-restart");
+	await expect(manager.drainForRestart("owner-restart", 0)).resolves.toBe("drained");
+	await expect(manager.cancelRestartDrain("owner-restart")).resolves.toBe(true);
+});
+
 test("client_ref_conflict reconciles the same deterministic op-ref without a second accepted send, including after restart", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await Store.open(join(home, "gateway.db"));
