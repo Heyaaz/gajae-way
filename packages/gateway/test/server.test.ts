@@ -1834,6 +1834,12 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 		await client.waitForFrame("owner-restart");
 		for (let attempt = 0; attempt < 500 && exitCode === undefined; attempt++) await Bun.sleep(5);
 		expect(exitCode).toBe(75);
+		for (
+			let attempt = 0;
+			attempt < 400 && !client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping");
+			attempt++
+		)
+			await Bun.sleep(5);
 		expect(client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")).toBe(true);
 	} finally {
 		client.close();
