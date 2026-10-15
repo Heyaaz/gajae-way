@@ -1304,7 +1304,7 @@ export class MonitorPropagator {
 					// until the next adapter reconnect flushed redeliveries (live finding:
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
-				} else if (noDeliveryRecorded) this.#recordReadinessSuccess(sessionOriginKey);
+				} else if (noDeliveryRecorded && !readinessFailure) this.#recordReadinessSuccess(sessionOriginKey);
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
