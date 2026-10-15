@@ -958,6 +958,15 @@ export class MonitorPropagator {
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
 			let readinessFailure: { readonly code: string; readonly detail: string } | undefined;
+			const flushReadinessFailure = () => {
+				if (!readinessFailure) return;
+				this.#recordReadinessFailure({
+					...readinessFailure,
+					originKey: sessionOriginKey,
+					at: this.#now(),
+				});
+				readinessFailure = undefined;
+			};
 			try {
 				// A completed saved turn must be harvested before a pending roll changes
 				// its session ID. Fresh dispatches still roll at this boundary (#68).
@@ -1335,6 +1344,7 @@ export class MonitorPropagator {
 					}
 				});
 				if (transitionedFailure) readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
+				flushReadinessFailure();
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 				await this.#recordAuthoringFailure({
 					sessionOriginKey,
@@ -1348,12 +1358,7 @@ export class MonitorPropagator {
 					monitor,
 				});
 			} finally {
-				if (readinessFailure)
-					this.#recordReadinessFailure({
-						...readinessFailure,
-						originKey: sessionOriginKey,
-						at: this.#now(),
-					});
+				flushReadinessFailure();
 				stopHeartbeat();
 				for (const row of claimed) this.#claims.delete(row.event_id);
 				// Release the leases this attempt holds. Lease-guarded: if this attempt
