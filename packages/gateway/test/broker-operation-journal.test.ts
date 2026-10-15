@@ -272,6 +272,97 @@ test("bind of a persisted binding surfaces an unavailable broker instead of reus
 	expect(database!.bindings.getSessionRecord("lane/a")).toMatchObject({ sessionId: "sdk-1", epoch: 0 });
 });
 
+test("bind preserves thrown and enveloped broker outages from saved-session resume liveness", async () => {
+	const { authority, repo } = await setup();
+	for (const [originKey, sessionId] of [
+		["lane/throw", "sdk-throw"],
+		["lane/envelope", "sdk-envelope"],
+	] as const) {
+		await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
+	}
+	const calls: string[] = [];
+	const inspected = new Map<string, number>();
+	const cli: CliRunner = async (args) => {
+		calls.push(args.join(" "));
+		if (!args.includes("inspect")) throw new Error(`unexpected command ${args.join(" ")}`);
+		const sessionId = args[args.indexOf("inspect") + 1] ?? "";
+		const count = (inspected.get(sessionId) ?? 0) + 1;
+		inspected.set(sessionId, count);
+		if (count === 1) return ok({ session: { live: false, deleted: false } });
+		if (sessionId === "sdk-throw") throw new GjcCliUnavailableError("broker restarting");
+		return {
+			exitCode: 1,
+			stdout: JSON.stringify({ ok: false, error: { code: "broker_unavailable", message: "supervisor restart" } }),
+			stderr: "",
+		};
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+
+	await expect(port.bind({ originKey: "lane/throw", epoch: 0, repo })).rejects.toBeInstanceOf(GjcCliUnavailableError);
+	await expect(port.bind({ originKey: "lane/envelope", epoch: 0, repo })).rejects.toBeInstanceOf(
+		GjcCliUnavailableError,
+	);
+	expect(calls).toEqual([
+		"sdk session inspect sdk-throw",
+		"sdk session inspect sdk-throw",
+		"sdk session inspect sdk-envelope",
+		"sdk session inspect sdk-envelope",
+	]);
+	expect(database!.bindings.getSessionRecord("lane/throw")).toMatchObject({ sessionId: "sdk-throw", epoch: 0 });
+	expect(database!.bindings.getSessionRecord("lane/envelope")).toMatchObject({
+		sessionId: "sdk-envelope",
+		epoch: 0,
+	});
+});
+
+test("cold-create readiness surfaces a broker-unavailable envelope after persisting the binding", async () => {
+	const { authority, repo } = await setup();
+	let creates = 0;
+	let inspects = 0;
+	const cli: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			creates++;
+			return ok({ sessionId: "cold-created-session" });
+		}
+		if (args.includes("inspect")) {
+			inspects++;
+			if (inspects === 1)
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({ ok: false, error: { code: "broker_unavailable", message: "broker restarted" } }),
+					stderr: "",
+				};
+			return ok({ session: { live: true, deleted: false } });
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+
+	await expect(port.bind({ originKey: "lane/cold", epoch: 0, repo })).rejects.toBeInstanceOf(GjcCliUnavailableError);
+	expect(database!.bindings.getSessionRecord("lane/cold")).toMatchObject({
+		sessionId: "cold-created-session",
+		epoch: 0,
+	});
+	await expect(port.bind({ originKey: "lane/cold", epoch: 0, repo })).resolves.toMatchObject({
+		sessionId: "cold-created-session",
+		epoch: 0,
+	});
+	expect(creates).toBe(1);
+	expect(inspects).toBe(2);
+});
+
 test("a finished create is never served to a later bind after the lane's session died", async () => {
 	const { path, authority, repo } = await setup();
 	const broker = new FakeBroker();

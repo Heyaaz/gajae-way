@@ -283,6 +283,75 @@ test("work.start reusing a persisted binding during a broker restart waits in th
 	expect(f.port.sends[0]?.sessionId).toBe("7d1f2c3a-0b4e-4c5d-8e6f-9a0b1c2d3e4f");
 });
 
+test("work.start retries when the broker restarts before a cold-created session is indexed", async () => {
+	const logs: string[] = [];
+	const sleeps: number[] = [];
+	const commands: string[][] = [];
+	const f = await fixture({
+		brokerWait: {
+			initialMs: 100,
+			maxMs: 400,
+			deadlineMs: 10_000,
+			log: (line) => logs.push(line),
+			sleep: async (ms) => {
+				sleeps.push(ms);
+			},
+		},
+	});
+	const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
+	const createKeys: string[] = [];
+	const sessionId = "7d1f2c3a-0b4e-4c5d-8e6f-9a0b1c2d3e4f";
+	let inspects = 0;
+	const cli: CliRunner = async (args) => {
+		commands.push([...args]);
+		const operationIndex = args.indexOf("--op");
+		if (operationIndex >= 0 && args[operationIndex + 1] === "session.create") {
+			createKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId } }), stderr: "" };
+		}
+		if (args.includes("inspect")) {
+			inspects++;
+			if (inspects === 1) throw new GjcCliUnavailableError("broker restarted after create");
+			if (inspects === 2)
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({ ok: false, error: { code: "broker_unavailable", message: "supervisor restart" } }),
+					stderr: "",
+				};
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { session: { live: true, deleted: false } } }),
+				stderr: "",
+			};
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const brokerPort = new BrokerSessionPort({
+		database: f.db,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo: f.directory }),
+		sleep: async () => {},
+	});
+	f.port.bind = (input) => brokerPort.bind(input);
+
+	const result = await f.manager.start({ name: "a", text: "work", cwd: f.directory });
+
+	expect(result).toMatchObject({ started: true, sessionKey: workSessionKey("a") });
+	expect(createKeys).toHaveLength(1);
+	expect(inspects).toBe(3);
+	expect(sleeps).toEqual([100, 200]);
+	expect(logs).toHaveLength(2);
+	expect(logs[0]).toStartWith("gateway_waiting_for_broker step=work.bind:a attempt=1 retry_in_ms=100 ");
+	expect(commands.filter((command) => command.includes("session.create"))).toHaveLength(1);
+	expect(f.db.bindings.getSessionRecord(workSessionKey("a"))).toMatchObject({
+		sessionId,
+		epoch: 0,
+	});
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.sends[0]?.sessionId).toBe(sessionId);
+});
+
 test("work.start fails bind_failed once the broker readiness wait is exhausted", async () => {
 	const errors = spyOn(console, "error").mockImplementation(() => {});
 	cleanups.push(async () => errors.mockRestore());

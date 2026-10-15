@@ -783,29 +783,18 @@ export class BrokerSessionPort implements SessionPort {
 
 	#createChain: Promise<unknown> = Promise.resolve();
 
-	/** Judged on the raw inspect envelope (gjc >= 0.16.0 omits locator.repo, which the subsession normalizer requires). */
+	/** Wait for the broker to index a created session; broker outages must reach the caller's readiness retry. */
 	async #awaitIndexed(sessionId: string, repo: string): Promise<void> {
 		this.#assertOwned({ sessionId, repo });
 		const deadline = Date.now() + SESSION_READY_TIMEOUT_MS;
 		let lastCode: string | undefined;
 		for (;;) {
 			try {
-				const result = await this.#cli(["sdk", "session", "inspect", sessionId], { timeoutMs: 10_000 });
-				const envelope = JSON.parse(result.stdout) as {
-					ok?: unknown;
-					result?: { session?: { live?: unknown } };
-					error?: { code?: unknown };
-				};
-				// Only a broker that explicitly reports the id as not indexed / not
-				// live keeps us waiting; anything else is treated as ready (the send
-				// path still has its own recovery if that turns out to be wrong).
-				const disowned = envelope.ok === false && isSessionGoneCode(envelope.error?.code);
-				const notLive =
-					envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
-				if (!disowned && !notLive) return;
-				lastCode = disowned ? "session_unavailable" : "not_live";
+				const state = await this.#readLiveness({ sessionId, repo });
+				if (!state.disowned && state.live !== false) return;
+				lastCode = state.disowned ? "session_unavailable" : "not_live";
 			} catch (error) {
-				if (error instanceof BrokerAuthorityError) throw error;
+				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
 				const code = sdkErrorCode(error);
 				if (!isSessionGoneCode(code)) return;
 				lastCode = code;
@@ -862,47 +851,59 @@ export class BrokerSessionPort implements SessionPort {
 	 * `locator.repo`, which makes the subsession normalizer return undefined for a
 	 * perfectly well-known session. `disowned` = the broker rejects the id.
 	 * `activity` is the host's own `{state, at}` when inspect reports one.
+	 * External probes keep transient failures unknown; resume/readiness use the
+	 * strict helper so broker outages remain retryable.
 	 */
 	async liveness(input: { sessionId: string; repo: string }): Promise<SessionLiveness> {
-		this.#assertOwned(input);
 		try {
-			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], {
-				timeoutMs: 10_000,
-			});
-			const envelope = JSON.parse(result.stdout) as {
-				ok?: unknown;
-				result?: {
-					session?: {
-						live?: unknown;
-						deleted?: unknown;
-						locator?: { repo?: unknown; cwd?: unknown };
-						activity?: { state?: unknown; at?: unknown };
-						hostIncarnation?: unknown;
-					};
-				};
-				error?: { code?: unknown };
-			};
-			if (envelope.ok === false) return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
-			const session = envelope.result?.session;
-			const live = session?.live;
-			const state = session?.activity?.state;
-			const at = session?.activity?.at;
-			const workspace = session?.locator?.repo ?? session?.locator?.cwd;
-			const host = session?.hostIncarnation;
-			return {
-				live: typeof live === "boolean" ? live : undefined,
-				disowned: false,
-				...(session?.deleted === true ? { deleted: true } : {}),
-				...(typeof workspace === "string" ? { workspace } : {}),
-				...(typeof host === "string" && /^[A-Za-z0-9:._-]{1,128}$/.test(host) ? { hostIncarnation: host } : {}),
-				...(typeof state === "string" && typeof at === "number" && Number.isFinite(at) && at > 0
-					? { activity: { state, at } }
-					: {}),
-			};
+			return await this.#readLiveness(input);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return { live: undefined, disowned: isSessionGoneCode(sdkErrorCode(error)) };
 		}
+	}
+
+	/** Raw probe for recovery paths that must preserve broker-unavailable errors. */
+	async #readLiveness(input: { sessionId: string; repo: string }): Promise<SessionLiveness> {
+		this.#assertOwned(input);
+		const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], { timeoutMs: 10_000 });
+		const envelope = JSON.parse(result.stdout) as {
+			ok?: unknown;
+			result?: {
+				session?: {
+					live?: unknown;
+					deleted?: unknown;
+					locator?: { repo?: unknown; cwd?: unknown };
+					activity?: { state?: unknown; at?: unknown };
+					hostIncarnation?: unknown;
+				};
+			};
+			error?: { code?: unknown; message?: unknown };
+		};
+		if (envelope.ok === false) {
+			if (envelope.error?.code === "broker_unavailable")
+				throw new GjcCliUnavailableError(
+					sanitizeDiagnostic(typeof envelope.error.message === "string" ? envelope.error.message : "") ||
+						"broker unavailable",
+				);
+			return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
+		}
+		const session = envelope.result?.session;
+		const live = session?.live;
+		const state = session?.activity?.state;
+		const at = session?.activity?.at;
+		const workspace = session?.locator?.repo ?? session?.locator?.cwd;
+		const host = session?.hostIncarnation;
+		return {
+			live: typeof live === "boolean" ? live : undefined,
+			disowned: false,
+			...(session?.deleted === true ? { deleted: true } : {}),
+			...(typeof workspace === "string" ? { workspace } : {}),
+			...(typeof host === "string" && /^[A-Za-z0-9:._-]{1,128}$/.test(host) ? { hostIncarnation: host } : {}),
+			...(typeof state === "string" && typeof at === "number" && Number.isFinite(at) && at > 0
+				? { activity: { state, at } }
+				: {}),
+		};
 	}
 
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
@@ -973,7 +974,7 @@ export class BrokerSessionPort implements SessionPort {
 			state.live !== undefined &&
 			state.deleted !== true &&
 			(state.workspace === undefined || state.workspace === input.repo);
-		const existing = await this.liveness(input);
+		const existing = await this.#readLiveness(input);
 		if (!resumable(existing))
 			throw new Error(`cannot resume session ${input.sessionId}: saved authority is unavailable`);
 		if (!existing.live) {
@@ -1016,7 +1017,7 @@ export class BrokerSessionPort implements SessionPort {
 					throw sanitizeSdkFailure(error);
 				failure = error;
 			}
-			const resumed = await this.liveness(input);
+			const resumed = await this.#readLiveness(input);
 			if (!resumable(resumed) || resumed.live !== true) {
 				if (failure !== undefined) throw sanitizeSdkFailure(failure);
 				throw new Error(`session.resume did not restore live authority for ${input.sessionId}`);
