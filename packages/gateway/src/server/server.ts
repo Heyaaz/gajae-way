@@ -58,6 +58,7 @@ import {
 	threadFollowUpEngaged,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
+import { FunctionalReadiness } from "../functional-readiness";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
@@ -88,7 +89,12 @@ import {
 	type PersonaTurnSettledInput,
 	type PersonaTurnStartInput,
 } from "../orchestrator/persona-session";
-import { formatFailureChatNotice, formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
+import {
+	formatFailureChatNotice,
+	formatFailureNotice,
+	sanitizeDiagnostic,
+	sanitizeDiagnosticDetail,
+} from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
 import {
 	deterministicHeldPostDeliveryId,
@@ -100,11 +106,7 @@ import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } fro
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
-import {
-	type InboundMessageRow,
-	type TerminalUnlinkedReason,
-	terminalDeliveryIds,
-} from "../store/groups/inbox";
+import { type InboundMessageRow, type TerminalUnlinkedReason, terminalDeliveryIds } from "../store/groups/inbox";
 import type { MonitorEventStage } from "../store/groups/monitors";
 import type { ExpiredDeliveryRow } from "../store/groups/outbox";
 import { deriveActivity } from "./activity";
@@ -287,6 +289,8 @@ export interface GatewayServerOptions {
 	readonly ownerRestartDrainWaitMs?: number;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
+	/** Test seam for bounded persona recovery deadlines; production uses the system clock. */
+	readonly personaNow?: () => number;
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
 	readonly deliverySweepIntervalMs?: number;
 	/** Mid-work speech gating configuration (issue #71). */
@@ -438,6 +442,7 @@ interface Runtime {
 	readonly persona: PersonaLoader;
 	readonly sessionPort: SessionPort;
 	readonly personaSessions: PersonaSessionManager;
+	readonly readiness: FunctionalReadiness;
 	/** Ordered shutdown, wired after construction; owner `/restart` uses it. */
 	stop?: (reason?: string) => Promise<void>;
 	/** Mirrors producer quiescence so restart paths can defer to a live supervisor. */
@@ -944,6 +949,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const botAudienceTurns = new BotAudienceTurnGuard(options.database.core);
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
+	const readiness = new FunctionalReadiness();
 	let runtime!: Runtime;
 	const workspacePath = options.workspace ?? join(options.config.home, "workspace");
 	// gjc rejects a session cwd that is a symlink: `session.create` comes back
@@ -960,6 +966,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		brokerAgentDir: options.broker?.agentDir,
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
+		...(options.personaNow ? { now: options.personaNow } : {}),
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
@@ -1019,12 +1026,39 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			});
 		},
 		onSloEvent: (code, at) => options.slo?.note(code, at),
+		onBindFailure: ({ originKey, detail, at }) =>
+			readiness.recordFailure({
+				category: "session_create",
+				code: "persona_bind_failed",
+				detail: sanitizeDiagnosticDetail(detail, 200) || "session creation failed",
+				origin: originKey,
+				at,
+			}),
+		onSessionCreateFailure: ({ originKey, code, detail, at }) =>
+			readiness.recordFailure({
+				category: "session_create",
+				code,
+				detail: sanitizeDiagnosticDetail(detail, 200) || "session attachment failed",
+				origin: originKey,
+				at,
+			}),
+		onPreSendFailure: ({ originKey, detail, at }) =>
+			readiness.recordFailure({
+				category: "turn",
+				code: "pre_send_configuration_failed",
+				detail: sanitizeDiagnosticDetail(detail, 200) || "pre-send turn configuration failed",
+				origin: originKey,
+				at,
+			}),
+		onSessionReady: () => readiness.recordSuccess("session_create"),
 	});
 	const restartDrainId = persistedRestartDrainId(options.config.home);
 	if (restartDrainId !== undefined) {
-		void personaSessions.drainForRestart(restartDrainId, 0).catch((error: unknown) =>
-			console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`),
-		);
+		void personaSessions
+			.drainForRestart(restartDrainId, 0)
+			.catch((error: unknown) =>
+				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`),
+			);
 	}
 	const permissionPanels = new PermissionPanels({
 		deliver: (payload) => {
@@ -1046,6 +1080,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
 		repo: workspace,
+		onReadinessFailure: ({ code, detail, originKey, at }) =>
+			readiness.recordFailure({
+				category: "monitor_delivery",
+				code,
+				detail,
+				origin: originKey,
+				at,
+			}),
+		onReadinessSuccess: () => readiness.recordSuccess("monitor_delivery"),
 		// AC7: the ONE production compaction seam. Native compaction runs through the
 		// broker-bound SessionPort, whose authenticated control receipt is the only
 		// affirmative compaction observation (logged by the TailRunner); the monitor
@@ -1127,9 +1170,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.sweep()
 			.catch((error: unknown) => console.error(`panel expiry sweep failed: ${diagnostic(error)}`));
 	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
-	// AC6: the 120s stall alarm is a running-server obligation, not only a
-	// generic-request polling side effect. This heartbeat drives every persona
-	// tail's threshold check; it never aborts a turn (alarm overlay only).
+	// AC6: tail-stall detection is a running-server obligation, not only a
+	// generic-request polling side effect. A stall starts status reconciliation;
+	// only a still-nonterminal operation after the hard grace is cut off.
 	const stallTimer = setInterval(() => {
 		try {
 			personaSessions.checkStalls();
@@ -1219,6 +1262,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		sessionPort,
 		personaSessions,
+		readiness,
 		connections,
 		memory,
 		registry,
@@ -1427,6 +1471,7 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
+					readiness: runtime.readiness.snapshot(),
 					sessions: { active: options.database.bindings.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.inbox.contextDiagnostics(),
@@ -1526,15 +1571,18 @@ async function handleRequest(
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
 			const delivery = options.database.outbox.get(id);
-			const authoredEvents = delivery
-				? options.database.monitors
-						.eventsByBatch(delivery.turnId)
-						.filter((row) => row.stage === "authored")
-						.map((row) => row.event_id)
-				: [];
+			const batchEvents = delivery ? options.database.monitors.eventsByBatch(delivery.turnId) : [];
+			const hasFailedMonitorEvent = batchEvents.some(
+				({ stage }) => stage === "failed" || stage === "failed_no_retry" || stage === "contract_unmet",
+			);
+			const authoredEvents = batchEvents.filter((row) => row.stage === "authored").map((row) => row.event_id);
 			const confirmOutcome = confirmAndSettleMonitorDelivery(options.database, id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (runtime.delivery.get(id)?.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(id);
+			if (confirmOutcome === "transitioned") {
+				runtime.readiness.recordSuccess("delivery");
+				if (batchEvents.length > 0 && !hasFailedMonitorEvent) runtime.readiness.recordSuccess("monitor_delivery");
+			}
 			if (confirmOutcome === "transitioned" && authoredEvents.length > 0) {
 				const authoredEventIds = new Set(authoredEvents);
 				for (const row of options.database.monitors.eventsByIds(authoredEvents)) {
@@ -1570,12 +1618,29 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack (the
 			// adapter may be retrying a stale outcome).
+			const pendingDelivery = runtime.delivery.get(params.deliveryId);
+			const batchEvents = pendingDelivery ? options.database.monitors.eventsByBatch(pendingDelivery.turnId) : [];
 			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous, params.reason);
 			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);
+				const code = failedRow?.lastError ?? "other";
+				runtime.readiness.recordFailure({
+					category: "delivery",
+					code,
+					detail: `delivery failed (${code})`,
+					...(failedRow ? { origin: failedRow.originKey } : {}),
+				});
+				if (batchEvents.length > 0) {
+					runtime.readiness.recordFailure({
+						category: "monitor_delivery",
+						code,
+						detail: `monitor delivery failed (${code})`,
+						...(failedRow ? { origin: failedRow.originKey } : {}),
+					});
+				}
 				if (failedRow?.state === "expired")
-					reportDeliveryExpired(runtime, options.database, failedRow, safeDiagnosticField(params.reason));
+					reportDeliveryExpired(runtime, options.database, failedRow, safeDiagnosticField(params.reason), true);
 			}
 			// A failed monitor-batch delivery stays distinguishable: its events keep
 			// stage `authored` (or `batched` before authoring) so reconcile and the
@@ -3851,6 +3916,7 @@ async function createInboundTurnLifecycle(
 		acknowledgeSteer(runtime, steered, turnId);
 	};
 	const onTerminal = async ({ text, alreadyPosted }: PersonaTerminalInput) => {
+		runtime.readiness.recordSuccess("turn");
 		let threw = false;
 		try {
 			const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
@@ -3931,6 +3997,12 @@ async function createInboundTurnLifecycle(
 	};
 
 	const onModelRefusal = ({ error }: PersonaFailureInput) => {
+		runtime.readiness.recordFailure({
+			category: "turn",
+			code: "model_not_selected",
+			detail: sanitizeDiagnosticDetail(error.message, 200) || "model not selected",
+			origin: key,
+		});
 		const notice = `${formatFailureNotice(error)} Send /model <id> or /new`;
 		console.error(notice);
 		if (nonLoopback) {
@@ -3956,7 +4028,13 @@ async function createInboundTurnLifecycle(
 		}
 	};
 
-	const onFailure = async ({ error, recoveredText }: PersonaFailureInput) => {
+	const onFailure = async ({ error, recoveredText, forceFailureNotice }: PersonaFailureInput) => {
+		runtime.readiness.recordFailure({
+			category: "turn",
+			code: "turn_failed",
+			detail: sanitizeDiagnosticDetail(error.message, 200) || "turn failed",
+			origin: key,
+		});
 		try {
 			const failureNotice = formatFailureNotice(error);
 			console.error(failureNotice);
@@ -3972,10 +4050,12 @@ async function createInboundTurnLifecycle(
 				options.database.transaction((tx) =>
 					options.database.inbox.contextCommitWindow(tx, key, contextMessageIds, contextOmissionRevision),
 				);
-			if (nonLoopback && !assistantDeliveryStarted) {
+			if (nonLoopback && (!assistantDeliveryStarted || forceFailureNotice)) {
 				// Recovery can observe the same failed terminal after the notice was
 				// persisted but before the trigger was settled. Reuse the trigger's
-				// terminal delivery identity instead of emitting another failure.
+				// terminal delivery identity instead of emitting another failure. A
+				// hard stall cutoff also sends this notice after interim speech: that
+				// speech did not answer the trigger.
 				const notice = runtime.delivery.prepare(
 					turnId,
 					origin,
@@ -4038,7 +4118,7 @@ async function createInboundTurnLifecycle(
 		onRetired: endProgress,
 		onReleased: endProgress,
 		onStall: ({ elapsedMs }) =>
-			console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; retaining status reconciliation.`),
+			console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; reconciling status.`),
 	};
 }
 
@@ -4240,6 +4320,7 @@ function reportDeliveryExpired(
 	database: Store,
 	expired: Pick<ExpiredDeliveryRow, "deliveryId" | "originKey" | "attempts">,
 	reason: string,
+	readinessFailureRecorded = false,
 ): void {
 	const deliveryId = safeDiagnosticField(expired.deliveryId);
 	const origin = safeDiagnosticField(expired.originKey);
@@ -4250,9 +4331,10 @@ function reportDeliveryExpired(
 	// A monitor batch riding on this delivery can never be confirmed now: fail its
 	// events terminally with the delivery evidence instead of leaving them
 	// `authored` forever (#94).
-	database.transaction((tx) => {
+	const expiration = database.transaction((tx) => {
 		const current = database.outbox.get(expired.deliveryId);
-		if (current?.state !== "expired") return;
+		if (current?.state !== "expired") return undefined;
+		const hasMonitorEvents = database.monitors.eventsByBatch(current.turnId).length > 0;
 		database.monitors.eventsFailExpiredDelivery(
 			tx,
 			current.turnId,
@@ -4260,7 +4342,26 @@ function reportDeliveryExpired(
 			current.attempts,
 			safeDiagnosticField(reason),
 		);
+		return { current, hasMonitorEvents };
 	});
+	if (!expiration) return;
+	if (!readinessFailureRecorded) {
+		const code = expiration.current.lastError ?? "delivery_expired";
+		runtime.readiness.recordFailure({
+			category: "delivery",
+			code,
+			detail: `delivery expired before confirmation (${code})`,
+			origin: expiration.current.originKey,
+		});
+		if (expiration.hasMonitorEvents) {
+			runtime.readiness.recordFailure({
+				category: "monitor_delivery",
+				code,
+				detail: `monitor delivery expired before confirmation (${code})`,
+				origin: expiration.current.originKey,
+			});
+		}
+	}
 	if (expired.deliveryId.startsWith("gw-x-")) return;
 	const ownerTarget = runtime.config.ownerTarget?.origin;
 	if (!ownerTarget) return;

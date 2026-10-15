@@ -223,7 +223,11 @@ function newReceipt(
 	};
 }
 
-async function waitForChildExit(child: Bun.Subprocess, command: readonly string[], signal?: AbortSignal): Promise<number> {
+async function waitForChildExit(
+	child: Bun.Subprocess,
+	command: readonly string[],
+	signal?: AbortSignal,
+): Promise<number> {
 	if (signal === undefined) return await child.exited;
 	let abortResolve!: () => void;
 	const aborted = new Promise<void>((resolve) => (abortResolve = resolve));
@@ -237,10 +241,7 @@ async function waitForChildExit(child: Bun.Subprocess, command: readonly string[
 		]);
 		if ("status" in first) return first.status;
 		child.kill("SIGTERM");
-		let status = await Promise.race([
-			child.exited,
-			Bun.sleep(SERVICE_COMMAND_KILL_GRACE_MS).then(() => undefined),
-		]);
+		let status = await Promise.race([child.exited, Bun.sleep(SERVICE_COMMAND_KILL_GRACE_MS).then(() => undefined)]);
 		if (status === undefined) {
 			child.kill("SIGKILL");
 			status = await Promise.race([child.exited, Bun.sleep(SERVICE_COMMAND_KILL_GRACE_MS).then(() => undefined)]);
@@ -262,7 +263,10 @@ async function defaultCommandRunner(command: readonly string[], options?: Comman
 	return await waitForChildExit(child, command, options?.signal);
 }
 
-async function capture(command: readonly string[], timeoutMs = SYSTEMD_JOB_PROBE_TIMEOUT_MS): Promise<string | undefined> {
+async function capture(
+	command: readonly string[],
+	timeoutMs = SYSTEMD_JOB_PROBE_TIMEOUT_MS,
+): Promise<string | undefined> {
 	const child = Bun.spawn([...command], {
 		stdin: "ignore",
 		stdout: "pipe",
@@ -562,7 +566,9 @@ export async function recoverRestartStack(options: RecoverRestartStackOptions): 
 				(job) => job.unit.startsWith("gajaeway-") || receipt.steps.some((step) => step.command?.includes(job.unit)),
 			);
 			if (active.length > 0)
-				throw new Error(`systemd still has restart-stack jobs: ${active.map((job) => `${job.id}:${job.unit}`).join(", ")}`);
+				throw new Error(
+					`systemd still has restart-stack jobs: ${active.map((job) => `${job.id}:${job.unit}`).join(", ")}`,
+				);
 		}
 
 		const socketPath = options.gatewaySocketPath ?? join(options.home, "gateway.sock");
@@ -946,7 +952,8 @@ async function releaseRestartDrain(
 	}
 	const gatewayRestarted = receipt.steps.some((step) => step.label === "dev.gajaeway.gateway" && step.result === "ok");
 	if (gatewayRestarted && receipt.drainPrepared) {
-		const socketPath = options.gatewaySocketPath ?? options.env?.GAJAEWAY_SOCKET_PATH ?? join(options.home, "gateway.sock");
+		const socketPath =
+			options.gatewaySocketPath ?? options.env?.GAJAEWAY_SOCKET_PATH ?? join(options.home, "gateway.sock");
 		const prepare = options.prepareRestartDrain ?? prepareGatewayRestartDrain;
 		let reattached: RestartDrainLease | undefined;
 		try {

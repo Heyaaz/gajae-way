@@ -421,6 +421,7 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 export function cycleExitCode(cycle: OpsCycleResult): number {
 	return cycle.gates.length > 0 ? 1 : 0;
 }
+
 export function renderSlo(result: OpsSloResult): string[] {
 	const message = result.ok
 		? `SLO ok: ${result.days.length} consecutive UTC days`
@@ -771,8 +772,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					// has to come back, so it must not need the gateway to answer first.
 					// It also runs detached: restarting the gateway kills a persona turn that
 					// invoked it, which must not end the sequence half-applied (issue #54).
-					const usage =
-						"usage: gajaeway ops restart-stack [--status]|--recover --confirm-service-manager-settled";
+					const usage = "usage: gajaeway ops restart-stack [--status]|--recover --confirm-service-manager-settled";
 					const home = gatewayHome();
 					const flag = parsed.rest[1];
 					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {

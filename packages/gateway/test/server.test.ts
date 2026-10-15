@@ -111,7 +111,16 @@ async function waitFrame(frames: any[], id: string): Promise<void> {
 }
 
 async function startDeliveryServer(
-	options: { ownerTarget?: GatewayConfig["ownerTarget"]; deliverySweepIntervalMs?: number } = {},
+	options: {
+		ownerTarget?: GatewayConfig["ownerTarget"];
+		deliverySweepIntervalMs?: number;
+		bind?: Parameters<typeof sessionPortFromResponder>[0]["bind"];
+		attachTail?: ReturnType<typeof sessionPortFromResponder>["attachTail"];
+		respond?: Parameters<typeof sessionPortFromResponder>[0]["respond"];
+		send?: ReturnType<typeof sessionPortFromResponder>["send"];
+		serviceTier?: GatewayConfig["serviceTier"];
+		setServiceTier?: ReturnType<typeof sessionPortFromResponder>["setServiceTier"];
+	} = {},
 ) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-delivery-server-"));
 	const config: GatewayConfig = {
@@ -124,12 +133,16 @@ async function startDeliveryServer(
 		logVerbosity: "info",
 		dmPolicy: "open",
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
+		...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
 	};
 	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
-		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		respond: async () => "the single reply body",
+		bind: options.bind ?? ((key, epoch) => bindWorkFixture(key, epoch)),
+		respond: options.respond ?? (async () => "the single reply body"),
 	});
+	if (options.attachTail) sessionPort.attachTail = options.attachTail;
+	if (options.send) sessionPort.send = options.send;
+	if (options.setServiceTier) sessionPort.setServiceTier = options.setServiceTier;
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
@@ -183,6 +196,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	await waitFor(client.frames, 3);
 	expect(client.frames[2].result.schemaVersion).toBe(37);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
+	expect(client.frames[2].result.readiness).toMatchObject({ ready: true, state: "ready", reason: null, failure: null });
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
 		expired: 0,
@@ -279,6 +293,413 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	expect(
 		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId),
 	).toHaveLength(2);
+	client.close();
+});
+
+test("status readiness degrades on sustained delivery failure and recovers after a confirmed delivery", async () => {
+	const { client, database } = await startDeliveryServer();
+	const origin = { platform: "discord", kind: "dm", conversationId: "readiness-test", peerId: "owner" } as const;
+	const delivery = new DeliveryService(database);
+	for (let index = 0; index < 3; index++) {
+		const deliveryId = `readiness-failed-${index}`;
+		expect(delivery.prepare(`turn-${index}`, origin, "reply", undefined, deliveryId)).toBeDefined();
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `fail-${index}`,
+			verb: "delivery.fail",
+			params: { deliveryId, reason: "upstream rejected token=secret-value", ambiguous: false },
+		});
+		await waitFrame(client.frames, `fail-${index}`);
+	}
+	client.send({ v: "0.1", type: "request", id: "degraded-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "degraded-status");
+	const degraded = client.frames.find((frame) => frame.id === "degraded-status").result.readiness;
+	expect(degraded).toMatchObject({ ready: false, state: "degraded", failureThreshold: 3 });
+	expect(degraded.reason).toContain("delivery: other");
+	expect(degraded.failure).toMatchObject({ category: "delivery", code: "other", consecutiveFailures: 3 });
+	expect(JSON.stringify(degraded)).not.toContain("secret-value");
+
+	expect(delivery.prepare("recovered-turn", origin, "reply", undefined, "readiness-recovered")).toBeDefined();
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "confirm-recovered",
+		verb: "delivery.confirm",
+		params: { deliveryId: "readiness-recovered" },
+	});
+	await waitFrame(client.frames, "confirm-recovered");
+	client.send({ v: "0.1", type: "request", id: "recovered-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "recovered-status");
+	expect(client.frames.find((frame) => frame.id === "recovered-status").result.readiness).toMatchObject({
+		ready: true,
+		state: "ready",
+		reason: null,
+		failure: null,
+	});
+	client.close();
+});
+
+test("session-create readiness details redact absolute paths", async () => {
+	const { client } = await startDeliveryServer({
+		bind: () => {
+			throw new Error("broker bind failed at /private/gajaeway/workspace");
+		},
+	});
+	for (let index = 0; index < 3; index++) {
+		const conversationId = `readiness-bind-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `bind-failure-${index}`,
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, `bind-failure-${index}`);
+	}
+	client.send({ v: "0.1", type: "request", id: "bind-failure-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "bind-failure-status");
+	const readiness = client.frames.find((frame) => frame.id === "bind-failure-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "session_create", code: "persona_bind_failed", consecutiveFailures: 3 },
+	});
+	expect(readiness.failure.detail).toContain("[path]");
+	expect(readiness.failure.detail).not.toContain("/private/gajaeway/workspace");
+	client.close();
+});
+
+test("create-then-disown attachment failures degrade session-create readiness", async () => {
+	let attachmentAttempts = 0;
+	const { client } = await startDeliveryServer({
+		attachTail: async () => {
+			attachmentAttempts += 1;
+			throw new Error("session_unavailable: broker disowned new session");
+		},
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "create-then-disown",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "loopback", kind: "loopback", conversationId: "readiness-disowned-session" },
+			text: "hello",
+		},
+	});
+	await waitFrame(client.frames, "create-then-disown");
+	for (let attempt = 0; attempt < 400 && attachmentAttempts < 3; attempt++) await Bun.sleep(5);
+	expect(attachmentAttempts).toBeGreaterThanOrEqual(3);
+	client.send({ v: "0.1", type: "request", id: "disowned-session-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "disowned-session-status");
+	const readiness = client.frames.find((frame) => frame.id === "disowned-session-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "session_create", code: "session_attach_failed", consecutiveFailures: 3 },
+	});
+	client.close();
+});
+
+test("generic tail attachment failures degrade session-create readiness without rebinding", async () => {
+	let attachmentAttempts = 0;
+	const { client } = await startDeliveryServer({
+		attachTail: async () => {
+			attachmentAttempts += 1;
+			throw new Error("protocol_error: broker tail timeout");
+		},
+	});
+	for (let index = 0; index < 3; index++) {
+		const conversationId = `readiness-generic-attach-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `generic-attach-${index}`,
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, `generic-attach-${index}`);
+		for (let attempt = 0; attempt < 400 && attachmentAttempts < index + 1; attempt++) await Bun.sleep(5);
+	}
+	expect(attachmentAttempts).toBe(3);
+	client.send({ v: "0.1", type: "request", id: "generic-attach-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "generic-attach-status");
+	const readiness = client.frames.find((frame) => frame.id === "generic-attach-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "session_create", code: "session_attach_failed", consecutiveFailures: 3 },
+	});
+	client.close();
+});
+
+test("create-attach-send-disown cycles degrade session-create readiness", async () => {
+	let sendAttempts = 0;
+	const { client } = await startDeliveryServer({
+		send: async () => {
+			sendAttempts += 1;
+			throw new Error("session_unavailable: broker disowned new session");
+		},
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "send-disowned-session",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "loopback", kind: "loopback", conversationId: "readiness-send-disowned-session" },
+			text: "hello",
+		},
+	});
+	await waitFrame(client.frames, "send-disowned-session");
+	for (let attempt = 0; attempt < 400 && sendAttempts < 3; attempt++) await Bun.sleep(5);
+	expect(sendAttempts).toBeGreaterThanOrEqual(3);
+	client.send({ v: "0.1", type: "request", id: "send-disowned-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "send-disowned-status");
+	const readiness = client.frames.find((frame) => frame.id === "send-disowned-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "session_create", code: "session_send_disowned", consecutiveFailures: 3 },
+	});
+	client.close();
+});
+
+test("turn readiness details redact broker URLs", async () => {
+	const { client } = await startDeliveryServer({
+		respond: async () => {
+			throw new Error("turn failed via https://broker.example/private/session");
+		},
+	});
+	for (let index = 0; index < 3; index++) {
+		const conversationId = `readiness-turn-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `turn-failure-${index}`,
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, `turn-failure-${index}`);
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some(
+				(frame) => frame.event === "chat.message" && frame.payload?.origin?.conversationId === conversationId,
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		expect(
+			client.frames.some(
+				(frame) => frame.event === "chat.message" && frame.payload?.origin?.conversationId === conversationId,
+			),
+		).toBe(true);
+	}
+	client.send({ v: "0.1", type: "request", id: "turn-failure-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "turn-failure-status");
+	const readiness = client.frames.find((frame) => frame.id === "turn-failure-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "turn", code: "turn_failed", consecutiveFailures: 3 },
+	});
+	expect(readiness.failure.detail).toContain("[url]");
+	expect(readiness.failure.detail).not.toContain("broker.example");
+	client.close();
+});
+
+test("pre-send service-tier configuration failures degrade turn readiness", async () => {
+	const { client } = await startDeliveryServer({
+		serviceTier: "priority",
+		setServiceTier: async () => {
+			throw new Error("service-tier configuration failed at /private/service-tier/config");
+		},
+	});
+	for (let index = 0; index < 3; index++) {
+		const conversationId = `readiness-pre-send-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `pre-send-failure-${index}`,
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, `pre-send-failure-${index}`);
+	}
+	client.send({ v: "0.1", type: "request", id: "pre-send-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "pre-send-status");
+	const readiness = client.frames.find((frame) => frame.id === "pre-send-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "turn", code: "pre_send_configuration_failed", consecutiveFailures: 3 },
+	});
+	expect(readiness.failure.detail).toContain("[path]");
+	expect(readiness.failure.detail).not.toContain("/private/service-tier/config");
+	client.close();
+});
+
+test("confirming a valid note does not clear contract-unmet failures in its monitor batch", async () => {
+	const { client, database } = await startDeliveryServer();
+	const ledger = new DeliveryService(database);
+	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
+	const monitor = new MonitorRegistry(database).add({
+		name: "partial-readiness-monitor",
+		trigger: { kind: "cron", schedule: "0 */2 * * *" },
+		eventTypes: ["readiness.partial"],
+		burstPolicy: "serialize",
+		enabled: false,
+	});
+	const createAuthoredEvent = (eventId: string, batchId: string, output: string) => {
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "readiness.partial",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			database.monitors.eventUpdate(tx, eventId, "authored", batchId);
+			database.monitors.authoredOutputCreate(tx, eventId, output);
+		});
+	};
+	for (let index = 0; index < 3; index++) {
+		const batchId = `failed-readiness-batch-${index}`;
+		const eventId = `failed-readiness-event-${index}`;
+		const deliveryId = `failed-readiness-delivery-${index}`;
+		createAuthoredEvent(eventId, batchId, "failed report");
+		expect(ledger.prepare(batchId, origin, "failed report", undefined, deliveryId)).toBeDefined();
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `failed-readiness-${index}`,
+			verb: "delivery.fail",
+			params: { deliveryId, reason: "discord 503", ambiguous: false },
+		});
+		await waitFrame(client.frames, `failed-readiness-${index}`);
+	}
+
+	const batchId = "partially-failed-readiness-batch";
+	const echoEventId = "partially-failed-echo-event";
+	const validEventId = "partially-failed-valid-event";
+	const deliveryId = "partially-failed-readiness-delivery";
+	createAuthoredEvent(echoEventId, batchId, "instruction echo");
+	database.transaction((tx) => {
+		database.monitors.eventUpdate(tx, echoEventId, "contract_unmet", batchId);
+		database.monitors.failureRecord(tx, echoEventId, "authored_echo_suspected", "note echoed monitor contract");
+	});
+	createAuthoredEvent(validEventId, batchId, "verified update");
+	expect(ledger.prepare(batchId, origin, "verified update", undefined, deliveryId)).toBeDefined();
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "partial-batch-confirm",
+		verb: "delivery.confirm",
+		params: { deliveryId },
+	});
+	await waitFrame(client.frames, "partial-batch-confirm");
+	client.send({ v: "0.1", type: "request", id: "partial-batch-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "partial-batch-status");
+	expect(client.frames.find((frame) => frame.id === "partial-batch-status").result.readiness).toMatchObject({
+		ready: false,
+		failure: { category: "monitor_delivery", consecutiveFailures: 3 },
+	});
+	client.close();
+});
+
+test("delivery sweep expirations degrade delivery readiness, including monitor batches", async () => {
+	const { client, config, database } = await startDeliveryServer({ deliverySweepIntervalMs: 20 });
+	const ledger = new DeliveryService(database);
+	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
+	const staleAt = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+	const setStale = (deliveryId: string) => {
+		const raw = new Database(config.dbPath);
+		try {
+			raw.query("UPDATE deliveries SET created_at = ? WHERE delivery_id = ?").run(staleAt, deliveryId);
+		} finally {
+			raw.close();
+		}
+	};
+	const expire = async (deliveryId: string) => {
+		for (let attempt = 0; attempt < 500 && ledger.get(deliveryId)?.state !== "expired"; attempt++) await Bun.sleep(5);
+		expect(ledger.get(deliveryId)?.state).toBe("expired");
+	};
+	const confirm = async (deliveryId: string) => {
+		expect(ledger.prepare(`recovery-${deliveryId}`, origin, "reply", undefined, deliveryId)).toBeDefined();
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `confirm-${deliveryId}`,
+			verb: "delivery.confirm",
+			params: { deliveryId },
+		});
+		await waitFrame(client.frames, `confirm-${deliveryId}`);
+	};
+
+	for (let index = 0; index < 3; index++) {
+		const deliveryId = `readiness-expired-${index}`;
+		expect(
+			ledger.createPending({
+				deliveryId,
+				turnId: `ordinary-${index}`,
+				originKey: originKey(origin),
+				payloadJson: "{}",
+			}),
+		).toBe(true);
+		setStale(deliveryId);
+	}
+	await Promise.all([0, 1, 2].map((index) => expire(`readiness-expired-${index}`)));
+	client.send({ v: "0.1", type: "request", id: "delivery-expiry-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "delivery-expiry-status");
+	expect(client.frames.find((frame) => frame.id === "delivery-expiry-status").result.readiness).toMatchObject({
+		ready: false,
+		failure: { category: "delivery", code: "delivery_expired", consecutiveFailures: 3 },
+	});
+	await confirm("clear-expired-delivery-streak");
+
+	const monitor = new MonitorRegistry(database).add({
+		name: "readiness-expiry-monitor",
+		trigger: { kind: "cron", schedule: "0 */2 * * *" },
+		eventTypes: ["readiness.expiry"],
+		burstPolicy: "serialize",
+		enabled: false,
+	});
+	for (let index = 0; index < 3; index++) {
+		const batchId = `monitor-batch-${index}`;
+		const eventId = `monitor-event-${index}`;
+		const deliveryId = `monitor-readiness-expired-${index}`;
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "readiness.expiry",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			database.monitors.eventUpdate(tx, eventId, "authored", batchId);
+			database.monitors.authoredOutputCreate(tx, eventId, "monitor report");
+		});
+		expect(
+			ledger.createPending({
+				deliveryId,
+				turnId: batchId,
+				originKey: originKey(origin),
+				payloadJson: JSON.stringify({
+					turnId: batchId,
+					origin,
+					role: "assistant",
+					text: "monitor report",
+					final: true,
+					deliveryId,
+				}),
+			}),
+		).toBe(true);
+		setStale(deliveryId);
+		await expire(deliveryId);
+		await confirm(`clear-monitor-delivery-${index}`);
+	}
+	client.send({ v: "0.1", type: "request", id: "monitor-expiry-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "monitor-expiry-status");
+	expect(client.frames.find((frame) => frame.id === "monitor-expiry-status").result.readiness).toMatchObject({
+		ready: false,
+		failure: { category: "monitor_delivery", code: "delivery_expired", consecutiveFailures: 3 },
+	});
 	client.close();
 });
 
@@ -1809,9 +2230,9 @@ test("restart prepare includes unconfirmed terminal deliveries persisted by the 
 		const deliveryId = terminalReply.payload.deliveryId;
 		expect(firstDatabase.outbox.unsettledTerminalDeliveryIds()).toContain(deliveryId);
 		const oldTriggerAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000).toISOString();
-		const triggerRows = firstDatabase.core.groupDb("inbox").prepare(
-			"UPDATE inbound_messages SET received_at = ? WHERE turn_role = 'trigger' AND turn_state = 'done'",
-		);
+		const triggerRows = firstDatabase.core
+			.groupDb("inbox")
+			.prepare("UPDATE inbound_messages SET received_at = ? WHERE turn_role = 'trigger' AND turn_state = 'done'");
 		expect(firstDatabase.transaction((tx) => triggerRows.run(tx, oldTriggerAt).changes)).toBeGreaterThan(0);
 		await Bun.sleep(30);
 		firstClient.close();

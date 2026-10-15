@@ -62,6 +62,9 @@ export function splitThinkingSuffix(selection: string): { readonly model: string
  */
 export type TerminateHostOutcome =
 	| { readonly outcome: "terminated"; readonly pid: number }
+	/** SIGTERM/SIGKILL was accepted, but the inspected process identity remains live or unverifiable. */
+	| { readonly outcome: "terminating"; readonly pid: number }
+	/** Positive process evidence that the host is gone; broker session absence alone is `refused`. */
 	| { readonly outcome: "already_gone" }
 	| { readonly outcome: "not_a_host"; readonly pid: number; readonly command: string }
 	| { readonly outcome: "refused"; readonly reason: string };
@@ -130,12 +133,17 @@ export interface SessionPort {
 		relay: TailHandle;
 	}): Promise<SessionContextUsage | undefined>;
 	/**
-	 * Ends the host process of a session this gateway created and has retired.
-	 * Ownership is the point: the shared GJC daemon and broker are never touched,
-	 * only a `session-host-internal` whose pid the broker reports for THIS
-	 * session id. Returns what it did so the caller can log it; never throws.
+	 * Ends a gateway-owned session host; the optional final guard revalidates
+	 * operation status before signaling. If it cancels SIGKILL after SIGTERM,
+	 * a later unguarded reconciliation may escalate after a grace period so a
+	 * host that ignores SIGTERM cannot hold capacity indefinitely. A process is
+	 * reported terminated only after its inspected identity is confirmed absent.
 	 */
-	terminateHost?(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome>;
+	terminateHost?(input: {
+		sessionId: string;
+		repo: string;
+		shouldTerminate?: () => boolean | Promise<boolean>;
+	}): Promise<TerminateHostOutcome>;
 	/** Recognized current-session provider failure, never authorization to replay an operation. */
 	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
 	/** Transport failure cause from the same session transcript. */
@@ -185,9 +193,9 @@ export interface SessionPort {
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
 	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
-	/** Presentation/recovery tick; it never kills a running SDK turn. */
+	/** Emits live-tail stall signals; the owning actor applies bounded recovery policy. */
 	checkStalls(now?: number): void;
-	/** Applies the live tail-stall alarm policy; it never aborts a running turn. */
+	/** Sets the tail-silence threshold that triggers stall handling. */
 	setStallTimeoutMs(timeoutMs: number): void;
 	/** Serializes caller-owned workflows without putting chat policy in this port. */
 	runExclusive<T>(key: string, work: () => Promise<T>): Promise<T>;
@@ -473,6 +481,15 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
 
+type SignaledHost = {
+	readonly pid: number;
+	readonly identity: string;
+	readonly command: string;
+	readonly signaledAtMs: number;
+	escalationAfterMs?: number;
+	killSentAtMs?: number;
+};
+
 /**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
  * transport: it neither discovers an endpoint nor opens an authenticated socket.
@@ -485,6 +502,7 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
 	readonly #bindings = new Map<string, Promise<SessionBinding>>();
+	readonly #signaledHosts = new Map<string, SignaledHost>();
 	readonly #authority: BrokerAuthority;
 
 	constructor(options: BrokerSessionPortOptions) {
@@ -980,8 +998,24 @@ export class BrokerSessionPort implements SessionPort {
 	 * broker reports for the session is signalled directly - after proving it is
 	 * a session host and not the shared daemon/broker.
 	 */
-	async terminateHost(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome> {
+	async terminateHost(input: {
+		sessionId: string;
+		repo: string;
+		shouldTerminate?: () => boolean | Promise<boolean>;
+	}): Promise<TerminateHostOutcome> {
 		this.#assertOwned(input);
+		const finalGuardRefusal = async () => {
+			if (!input.shouldTerminate) return undefined;
+			try {
+				return (await input.shouldTerminate())
+					? undefined
+					: ({ outcome: "refused", reason: "termination_guard_rejected" } as const);
+			} catch (error) {
+				return { outcome: "refused", reason: `termination_guard_failed:${sanitizeDiagnostic(String(error))}` } as const;
+			}
+		};
+		const signaledHost = this.#signaledHosts.get(input.sessionId);
+		if (signaledHost) return await this.#checkSignaledHost(input, signaledHost, finalGuardRefusal);
 		let pid: number | undefined;
 		let live: boolean | undefined;
 		try {
@@ -991,8 +1025,14 @@ export class BrokerSessionPort implements SessionPort {
 			const envelope = JSON.parse(result.stdout) as {
 				ok?: unknown;
 				result?: { session?: { pid?: unknown; live?: unknown } };
+				error?: { code?: unknown; message?: unknown };
 			};
-			if (envelope.ok !== true) return { outcome: "already_gone" };
+			if (envelope.ok !== true) {
+				const code = stableErrorCode(envelope.error?.code);
+				return isSessionGoneCode(code)
+					? { outcome: "refused", reason: "inspect_failed:session_gone_without_process_identity" }
+					: { outcome: "refused", reason: `inspect_failed:${code ?? "invalid_envelope"}` };
+			}
 			const session = envelope.result?.session;
 			pid =
 				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
@@ -1002,22 +1042,143 @@ export class BrokerSessionPort implements SessionPort {
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return isSessionGoneCode(sdkErrorCode(error))
-				? { outcome: "already_gone" }
+				? { outcome: "refused", reason: "inspect_failed:session_gone_without_process_identity" }
 				: { outcome: "refused", reason: `inspect_failed:${sanitizeDiagnostic(String(error))}` };
 		}
-		if (pid === undefined || live === false) return { outcome: "already_gone" };
-		const command = await processCommand(pid);
-		if (command === undefined) return { outcome: "already_gone" };
+		if (live === false) {
+			if (pid === undefined) return { outcome: "refused", reason: "inspect_incomplete:missing_host_pid" };
+			const deadCheck = await processCommand(pid);
+			if (deadCheck.outcome === "gone") return { outcome: "already_gone" };
+			if (deadCheck.outcome === "unreadable")
+				return { outcome: "refused", reason: `process_inspection_failed:${deadCheck.reason}` };
+			return { outcome: "refused", reason: "session_not_live_but_process_live" };
+		}
+		if (pid === undefined || live !== true)
+			return { outcome: "refused", reason: "inspect_incomplete:missing_live_host_identity" };
+		const inspection = await processCommand(pid);
+		if (inspection.outcome === "gone") return { outcome: "already_gone" };
+		if (inspection.outcome === "unreadable")
+			return { outcome: "refused", reason: `process_inspection_failed:${inspection.reason}` };
+		const command = inspection.command;
 		// The only process shape this gateway may end. The broker, daemon, and anything else are someone else's.
 		if (!/\bsdk session-host-internal\b/.test(command) || /\b(broker|daemon)-internal\b/.test(command))
 			return { outcome: "not_a_host", pid, command: command.slice(0, 160) };
+		const refusal = await finalGuardRefusal();
+		if (refusal) return refusal;
+		const revalidated = await processCommand(pid);
+		if (revalidated.outcome === "gone") return { outcome: "already_gone" };
+		if (revalidated.outcome === "unreadable")
+			return { outcome: "refused", reason: `process_inspection_failed:${revalidated.reason}` };
+		if (
+			revalidated.identity !== inspection.identity ||
+			revalidated.context !== inspection.context ||
+			revalidated.command !== command
+		)
+			return { outcome: "refused", reason: "process_identity_changed" };
 		try {
 			process.kill(pid, "SIGTERM");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ESRCH") return { outcome: "already_gone" };
 			return { outcome: "refused", reason: `kill_failed:${(error as NodeJS.ErrnoException).code ?? "unknown"}` };
 		}
-		return { outcome: "terminated", pid };
+		const signaled = {
+			pid,
+			identity: revalidated.identity,
+			command: revalidated.command,
+			signaledAtMs: Date.now(),
+		};
+		this.#signaledHosts.set(input.sessionId, signaled);
+		const gracefulExit = await waitForProcessExit(pid, revalidated, HOST_SIGTERM_GRACE_MS);
+		if (gracefulExit === "exited") {
+			this.#signaledHosts.delete(input.sessionId);
+			return { outcome: "terminated", pid };
+		}
+		if (gracefulExit === "changed" || gracefulExit === "unreadable") return { outcome: "terminating", pid };
+
+		const escalationRefusal = await finalGuardRefusal();
+		if (escalationRefusal) {
+			this.#signaledHosts.set(input.sessionId, {
+				...signaled,
+				escalationAfterMs: Date.now() + HOST_SIGTERM_ESCALATION_GRACE_MS,
+			});
+			return { outcome: "terminating", pid };
+		}
+		const beforeKill = await processCommand(pid);
+		if (beforeKill.outcome === "gone") {
+			this.#signaledHosts.delete(input.sessionId);
+			return { outcome: "already_gone" };
+		}
+		if (beforeKill.outcome === "unreadable") return { outcome: "terminating", pid };
+		if (
+			beforeKill.identity !== inspection.identity ||
+			beforeKill.context !== inspection.context ||
+			beforeKill.command !== command
+		)
+			return { outcome: "terminating", pid };
+		return await this.#signalKillAndConfirm(input.sessionId, signaled, beforeKill);
+	}
+
+	async #checkSignaledHost(
+		input: { sessionId: string; shouldTerminate?: () => boolean | Promise<boolean> },
+		expected: SignaledHost,
+		finalGuardRefusal: () => Promise<{ readonly outcome: "refused"; readonly reason: string } | undefined>,
+	): Promise<TerminateHostOutcome> {
+		const inspection = await processCommand(expected.pid);
+		if (inspection.outcome === "gone") {
+			this.#signaledHosts.delete(input.sessionId);
+			return { outcome: "already_gone" };
+		}
+		if (inspection.outcome === "unreadable")
+			return { outcome: "refused", reason: `process_inspection_failed:${inspection.reason}` };
+		if (inspection.identity !== expected.identity || inspection.command !== expected.command) {
+			this.#signaledHosts.delete(input.sessionId);
+			return { outcome: "already_gone" };
+		}
+		if (expected.killSentAtMs !== undefined)
+			return await this.#signalKillAndConfirm(input.sessionId, expected, inspection);
+		const now = Date.now();
+		if (now - expected.signaledAtMs < HOST_SIGTERM_GRACE_MS) return { outcome: "terminating", pid: expected.pid };
+		if (expected.escalationAfterMs !== undefined && now < expected.escalationAfterMs)
+			return { outcome: "terminating", pid: expected.pid };
+		if (expected.escalationAfterMs === undefined) {
+			const refusal = await finalGuardRefusal();
+			if (refusal) {
+				this.#signaledHosts.set(input.sessionId, {
+					...expected,
+					escalationAfterMs: Date.now() + HOST_SIGTERM_ESCALATION_GRACE_MS,
+				});
+				return { outcome: "terminating", pid: expected.pid };
+			}
+		}
+		return await this.#signalKillAndConfirm(input.sessionId, expected, inspection);
+	}
+
+	async #signalKillAndConfirm(
+		sessionId: string,
+		expected: SignaledHost,
+		inspection: Extract<ProcessCommandInspection, { readonly outcome: "live" }>,
+	): Promise<TerminateHostOutcome> {
+		try {
+			process.kill(expected.pid, "SIGKILL");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+				this.#signaledHosts.delete(sessionId);
+				return { outcome: "already_gone" };
+			}
+			this.#signaledHosts.set(sessionId, {
+				...expected,
+				escalationAfterMs: Date.now() + HOST_SIGTERM_ESCALATION_GRACE_MS,
+			});
+			return { outcome: "terminating", pid: expected.pid };
+		}
+		const killSent = { ...expected, killSentAtMs: Date.now() };
+		this.#signaledHosts.set(sessionId, killSent);
+		const forcedExit = await waitForProcessExit(expected.pid, inspection, HOST_SIGKILL_GRACE_MS);
+		if (forcedExit === "exited") {
+			this.#signaledHosts.delete(sessionId);
+			return { outcome: "terminated", pid: expected.pid };
+		}
+		return { outcome: "terminating", pid: expected.pid };
 	}
 
 	/**
@@ -2096,15 +2257,67 @@ function normalizeSdkEnvelopeFailure(result: CliResult): CliResult {
 	return result;
 }
 
-/** The command line of a live pid, or undefined when it is gone. `ps` is the portable read on macOS and Linux. */
-async function processCommand(pid: number): Promise<string | undefined> {
+const HOST_SIGTERM_GRACE_MS = 1_000;
+/** Extra time after terminal status cancels SIGKILL before a signaled host is force-retired. */
+const HOST_SIGTERM_ESCALATION_GRACE_MS = 1_000;
+const HOST_SIGKILL_GRACE_MS = 1_000;
+const HOST_EXIT_POLL_MS = 100;
+
+type ProcessCommandInspection =
+	| { readonly outcome: "live"; readonly command: string; readonly identity: string; readonly context: string }
+	| { readonly outcome: "gone" }
+	| { readonly outcome: "unreadable"; readonly reason: string };
+
+type ProcessExitWait = "exited" | "changed" | "unreadable" | "timeout";
+
+async function waitForProcessExit(
+	pid: number,
+	expected: Extract<ProcessCommandInspection, { readonly outcome: "live" }>,
+	timeoutMs: number,
+): Promise<ProcessExitWait> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const current = await processCommand(pid);
+		if (current.outcome === "gone") return "exited";
+		if (current.outcome === "unreadable") return "unreadable";
+		if (current.identity !== expected.identity || current.command !== expected.command) return "changed";
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return "timeout";
+		await Bun.sleep(Math.min(HOST_EXIT_POLL_MS, remaining));
+	}
+}
+
+/** `ps` is the portable process read on macOS and Linux; only a clean no-match proves the pid is gone. */
+async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 	try {
-		const proc = Bun.spawn(["ps", "-o", "command=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
-		const out = (await new Response(proc.stdout).text()).trim();
-		await proc.exited;
-		return out.length > 0 ? out : undefined;
-	} catch {
-		return undefined;
+		const proc = Bun.spawn(["ps", "-o", "pid=,ppid=,pgid=,lstart=,command=", "-p", String(pid)], {
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { ...process.env, LC_ALL: "C" },
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		const line = stdout.trim();
+		if (exitCode === 0 && line.length > 0) {
+			const match =
+				/^(\d+)\s+(\d+)\s+(\d+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(
+					line,
+				);
+			if (!match || Number(match[1]) !== pid) return { outcome: "unreadable", reason: "ps_pid_mismatch" };
+			return {
+				outcome: "live",
+				identity: `${match[1]}:${match[4]}`,
+				context: `${match[2]}:${match[3]}`,
+				command: match[5]?.trim() ?? "",
+			};
+		}
+		if (exitCode === 1 && line.length === 0 && stderr.trim().length === 0) return { outcome: "gone" };
+		return { outcome: "unreadable", reason: `ps_exit_${exitCode}` };
+	} catch (error) {
+		return { outcome: "unreadable", reason: sanitizeDiagnostic(String(error)) };
 	}
 }
 

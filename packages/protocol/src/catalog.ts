@@ -24,12 +24,34 @@ export type DeliveryErrorCode =
 	| "invalid_request"
 	| "other";
 
+export type FunctionalReadinessCategory = "session_create" | "turn" | "delivery" | "monitor_delivery";
+
+export interface FunctionalReadinessFailure {
+	readonly category: FunctionalReadinessCategory;
+	readonly code: string;
+	readonly detail: string;
+	readonly at: string;
+	readonly origin?: string;
+	readonly consecutiveFailures: number;
+}
+
+export interface GatewayReadinessResult {
+	readonly ready: boolean;
+	readonly state: "ready" | "degraded";
+	readonly windowMs: number;
+	readonly failureThreshold: number;
+	readonly reason: string | null;
+	readonly failure: FunctionalReadinessFailure | null;
+}
+
 export interface GatewayStatusResult {
 	readonly profileVersion: string;
 	readonly capabilities: readonly string[];
 	readonly pid: number;
 	readonly startedAt: string;
 	readonly schemaVersion: number;
+	/** Functional health when reported; older gateways may omit this additive field. */
+	readonly readiness?: GatewayReadinessResult;
 	/** Session census (grows in later phases). */
 	readonly sessions: { readonly active: number };
 	/** Delivery ledger health (P1+). */
