@@ -536,13 +536,22 @@ export class BrokerSessionPort implements SessionPort {
 			throw new Error("session epoch must be a non-negative integer");
 		const existing = this.#database.bindings.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
-			this.#assertOwned({ sessionId: existing.sessionId, repo: input.repo });
 			const pendingCreate = this.#database.bindings.brokerOperation(
 				this.#authority,
 				"session.create",
 				createScope(input),
 			);
 			if (pendingCreate?.state === "pending") {
+				let createdRepo: unknown;
+				try {
+					createdRepo = recordOf(JSON.parse(pendingCreate.requestJson))?.cwd;
+				} catch {
+					// The stored create request is internal journal state; malformed
+					// evidence cannot authorize touching this persisted session.
+				}
+				if (typeof createdRepo !== "string")
+					throw new Error("pending session.create intent does not contain a valid workspace");
+				this.#assertOwned({ sessionId: existing.sessionId, repo: createdRepo });
 				if (pendingCreate.requestJson !== sessionCreateInput(input.repo, input.model)) {
 					assertControlAllowed("session.close", { operatorApproval: true });
 					try {
@@ -575,6 +584,7 @@ export class BrokerSessionPort implements SessionPort {
 					...(input.model ? { startupModelApplied: true } : {}),
 				};
 			}
+			this.#assertOwned({ sessionId: existing.sessionId, repo: input.repo });
 			// Only owned bindings may be inspected, resumed, or replaced.
 			let indexed = true;
 			try {

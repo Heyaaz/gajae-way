@@ -456,19 +456,27 @@ test("a changed startup model retires a pending cold binding before rotating its
 		sleep: async () => {},
 	});
 	const originalModel = "anthropic/claude-sonnet";
+	const changedRepo = join(home, "workspace-retargeted");
 
 	await expect(
 		port.bind({ originKey: "lane/cold-model", epoch: 0, repo, model: originalModel }),
 	).rejects.toBeInstanceOf(GjcCliUnavailableError);
 	const originalSessionId = required(sessions.get(createKeys[0]!), "original cold session id");
-	const binding = await port.bind({ originKey: "lane/cold-model", epoch: 0, repo, model: "openai/gpt-4" });
+	const binding = await port.bind({
+		originKey: "lane/cold-model",
+		epoch: 0,
+		repo: changedRepo,
+		model: "openai/gpt-4",
+	});
 
 	expect(binding).toMatchObject({ epoch: 1 });
 	expect(binding.sessionId).toBe(required(sessions.get(createKeys[1]!), "replacement cold session id"));
+	expect(binding.repo).toBe(changedRepo);
 	expect(createKeys).toHaveLength(2);
 	expect(createKeys[1]).not.toBe(createKeys[0]);
 	expect(closed).toEqual([originalSessionId]);
 	expect(createInputs.map((input) => JSON.parse(input).modelId)).toEqual([originalModel, "openai/gpt-4"]);
+	expect(createInputs.map((input) => JSON.parse(input).cwd)).toEqual([repo, changedRepo]);
 	expect(inspections).toBe(2);
 	expect(database!.bindings.getSessionRecord("lane/cold-model")).toMatchObject({
 		epoch: 1,
