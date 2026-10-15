@@ -2,6 +2,8 @@ export const SLACK_MESSAGE_LIMIT = 4000;
 
 const CODE_SEGMENTS =
 	/(^[ \t]*```[^\n]*\n[\s\S]*?^[ \t]*```[^\n]*(?:\n|$)|^[ \t]*```[^\n]*(?:\n[\s\S]*)?$|`+[^`\n]*`+)/gm;
+const UNICODE_WORD_CHARACTER = /[\p{L}\p{N}_$]/u;
+const UNICODE_LETTER = /\p{L}/u;
 
 /** Protect Slack links before parsing code spans; code then retains literal markup and language tags. */
 export function markdownToMrkdwn(text: string): string {
@@ -18,29 +20,29 @@ export function markdownToMrkdwn(text: string): string {
 	const linkMarkers = new RegExp(`${markerPrefix}(\\d+)\\u0000`, "g");
 	const keepLink = links.map(() => false);
 	const scanSegments = protectedText.split(CODE_SEGMENTS);
-	let angleDepth = 0;
+	const angleOpeners: boolean[] = [];
+	let markupDepth = 0;
 	const updateAngleDepth = (segment: string, ignoreBrackets = false, linkFollows = false): void => {
 		for (let index = 0; index < segment.length; index++) {
 			const character = segment[index];
-			if (character === "\n" || character === "\r") angleDepth = 0;
-			else if (!ignoreBrackets && character === "<") {
+			if (character === "\n" || character === "\r") {
+				angleOpeners.length = 0;
+				markupDepth = 0;
+			} else if (!ignoreBrackets && character === "<") {
 				const next = segment[index + 1];
 				const previous = segment[index - 1];
-				const previousIsWord =
-					previous !== undefined &&
-					((previous >= "A" && previous <= "Z") ||
-						(previous >= "a" && previous <= "z") ||
-						(previous >= "0" && previous <= "9") ||
-						previous === "_" ||
-						previous === "$");
-				const nextIsLetter = next !== undefined && ((next >= "A" && next <= "Z") || (next >= "a" && next <= "z"));
+				const previousIsWord = previous !== undefined && UNICODE_WORD_CHARACTER.test(previous);
+				const nextIsLetter = next !== undefined && UNICODE_LETTER.test(next);
 				const looksLikeMarkup =
 					(linkFollows && index === segment.length - 1) ||
 					next === "<" ||
 					(nextIsLetter && !previousIsWord) ||
 					(next !== undefined && "!/?@#:".includes(next));
-				if (looksLikeMarkup) angleDepth++;
-			} else if (!ignoreBrackets && character === ">" && angleDepth > 0) angleDepth--;
+				angleOpeners.push(looksLikeMarkup);
+				if (looksLikeMarkup) markupDepth++;
+			} else if (!ignoreBrackets && character === ">") {
+				if (angleOpeners.pop()) markupDepth--;
+			}
 		}
 	};
 	// Ignore code brackets and reset at line boundaries, including newlines within code segments.
@@ -55,7 +57,9 @@ export function markdownToMrkdwn(text: string): string {
 		let last = 0;
 		for (const match of segment.matchAll(linkMarkers)) {
 			updateAngleDepth(segment.slice(last, match.index), false, true);
-			keepLink[Number(match[1])] = angleDepth === 0;
+			const afterLink = segment.slice(match.index + match[0].length);
+			const hasOuterCloser = /^[ \t]*>/.test(afterLink);
+			keepLink[Number(match[1])] = markupDepth === 0 && !(angleOpeners.length > 0 && hasOuterCloser);
 			last = match.index + match[0].length;
 		}
 		updateAngleDepth(segment.slice(last));
