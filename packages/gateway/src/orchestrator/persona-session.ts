@@ -448,6 +448,12 @@ export interface PersonaSessionManagerOptions {
 		readonly detail: string;
 		readonly at: number;
 	}) => void;
+	/** Reports failures applying model or service-tier settings before a turn is sent. */
+	readonly onPreSendFailure?: (input: {
+		readonly originKey: string;
+		readonly detail: string;
+		readonly at: number;
+	}) => void;
 	/** Reports a newly created session; reusing a stored binding is not a create success. */
 	readonly onSessionCreateSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
 	/** Cap on concurrently live persona session hosts; default DEFAULT_SESSIONS_MAX_LIVE_HOSTS. */
@@ -501,6 +507,7 @@ export class PersonaSessionManager {
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
+	readonly #onPreSendFailure: PersonaSessionManagerOptions["onPreSendFailure"];
 	readonly #onSessionCreateSuccess: PersonaSessionManagerOptions["onSessionCreateSuccess"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
@@ -542,6 +549,7 @@ export class PersonaSessionManager {
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
 		this.#onBindFailure = options.onBindFailure;
+		this.#onPreSendFailure = options.onPreSendFailure;
 		this.#onSessionCreateSuccess = options.onSessionCreateSuccess;
 	}
 
@@ -765,6 +773,14 @@ export class PersonaSessionManager {
 			this.#onSessionCreateSuccess?.({ originKey, at: this.#now() });
 		} catch (error) {
 			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
+		}
+	}
+
+	recordPreSendFailure(originKey: string, detail: string): void {
+		try {
+			this.#onPreSendFailure?.({ originKey, detail, at: this.#now() });
+		} catch (error) {
+			this.#log(`persona pre-send readiness observer failed: ${safeDiagnostic(error)}`, "error");
 		}
 	}
 
@@ -1851,6 +1867,7 @@ class OriginActor {
 			await this.#notifyReleased(current);
 			this.#preSendFailures += 1;
 			const failures = this.#preSendFailures;
+			this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
 			this.#manager.log(
 				`persona_model_failed origin=${this.originKey} epoch=${epoch}${nextEpoch === undefined ? "" : ` nextEpoch=${nextEpoch}`} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
 				"error",

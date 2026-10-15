@@ -116,6 +116,8 @@ async function startDeliveryServer(
 		deliverySweepIntervalMs?: number;
 		bind?: Parameters<typeof sessionPortFromResponder>[0]["bind"];
 		respond?: Parameters<typeof sessionPortFromResponder>[0]["respond"];
+		serviceTier?: GatewayConfig["serviceTier"];
+		setServiceTier?: ReturnType<typeof sessionPortFromResponder>["setServiceTier"];
 	} = {},
 ) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-delivery-server-"));
@@ -129,12 +131,14 @@ async function startDeliveryServer(
 		logVerbosity: "info",
 		dmPolicy: "open",
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
+		...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
 	};
 	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: options.bind ?? ((key, epoch) => bindWorkFixture(key, epoch)),
 		respond: options.respond ?? (async () => "the single reply body"),
 	});
+	if (options.setServiceTier) sessionPort.setServiceTier = options.setServiceTier;
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
@@ -401,6 +405,36 @@ test("turn readiness details redact broker URLs", async () => {
 	});
 	expect(readiness.failure.detail).toContain("[url]");
 	expect(readiness.failure.detail).not.toContain("broker.example");
+	client.close();
+});
+
+test("pre-send service-tier configuration failures degrade turn readiness", async () => {
+	const { client } = await startDeliveryServer({
+		serviceTier: "priority",
+		setServiceTier: async () => {
+			throw new Error("service-tier configuration failed at /private/service-tier/config");
+		},
+	});
+	for (let index = 0; index < 3; index++) {
+		const conversationId = `readiness-pre-send-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `pre-send-failure-${index}`,
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, `pre-send-failure-${index}`);
+	}
+	client.send({ v: "0.1", type: "request", id: "pre-send-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "pre-send-status");
+	const readiness = client.frames.find((frame) => frame.id === "pre-send-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "turn", code: "pre_send_configuration_failed", consecutiveFailures: 3 },
+	});
+	expect(readiness.failure.detail).toContain("[path]");
+	expect(readiness.failure.detail).not.toContain("/private/service-tier/config");
 	client.close();
 });
 

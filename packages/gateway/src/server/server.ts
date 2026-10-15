@@ -858,6 +858,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				origin: originKey,
 				at,
 			}),
+		onPreSendFailure: ({ originKey, detail, at }) =>
+			readiness.recordFailure({
+				category: "turn",
+				code: "pre_send_configuration_failed",
+				detail: sanitizeDiagnosticDetail(detail, 200) || "pre-send turn configuration failed",
+				origin: originKey,
+				at,
+			}),
 		onSessionCreateSuccess: () => readiness.recordSuccess("session_create"),
 	});
 	const permissionPanels = new PermissionPanels({
