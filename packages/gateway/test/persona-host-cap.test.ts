@@ -172,28 +172,56 @@ test("a stalled-turn cutoff frees its dead host slot without an idle-retirement 
 	const sessionA = h.sessionOf("a1");
 	await h.send("b", "b1");
 	await eventually(() => h.manager.admissionHold(origin("b").key) === "host_capacity", "b1 was not held at capacity");
+	await h.send("c", "c1");
+	await eventually(() => h.manager.admissionHold(origin("c").key) === "host_capacity", "c1 was not held at capacity");
 	expect(h.sent("b1")).toBeUndefined();
+	expect(h.sent("c1")).toBeUndefined();
 	expect(h.manager.liveHostCount()).toBe(1);
 
 	const originalTerminate = h.port.terminateHost.bind(h.port);
+	const originalBind = h.port.bind.bind(h.port);
 	let terminationCalls = 0;
+	let bindCalls = 0;
+	let releaseBinds!: () => void;
+	const bindGate = new Promise<void>((resolve) => {
+		releaseBinds = resolve;
+	});
 	h.port.terminateHost = async (input) => {
 		terminationCalls++;
 		if (terminationCalls > 1) return { outcome: "refused", reason: "inspect_failed:broker_unavailable" };
 		return await originalTerminate(input);
+	};
+	h.port.bind = async (input) => {
+		if (input.originKey === origin("b").key || input.originKey === origin("c").key) {
+			bindCalls++;
+			await bindGate;
+		}
+		return await originalBind(input);
 	};
 	h.port.setActivity(sessionA, "tool", clock);
 	const statusReads = h.port.statusReads.length;
 	h.port.emitStall(sessionA);
 	await eventually(() => h.port.statusReads.length > statusReads, "stalled turn did not reconcile status");
 	clock += STALLED_TURN_TERMINAL_TIMEOUT_MS;
-	await h.manager.tick(origin("a").key);
-
-	await eventually(() => h.sent("b1") !== undefined, "b1 did not start after the dead host was removed from capacity");
-	expect(terminationCalls).toBe(1);
-	expect(h.port.closes.map((close) => close.sessionId)).toContain(sessionA);
-	expect(h.manager.admissionHold(origin("b").key)).toBeUndefined();
-	expect(h.manager.liveHostCount()).toBe(1);
+	try {
+		await h.manager.tick(origin("a").key);
+		await eventually(() => bindCalls > 0, "no capacity waiter started binding after the dead host was removed");
+		await Bun.sleep(50);
+		expect(bindCalls).toBe(1);
+		expect(h.manager.admissionHold(origin("c").key)).toBe("host_capacity");
+		releaseBinds();
+		await eventually(
+			() => h.sent("b1") !== undefined,
+			"b1 did not start after the dead host was removed from capacity",
+		);
+		expect(h.manager.admissionHold(origin("b").key)).toBeUndefined();
+		expect(h.sent("c1")).toBeUndefined();
+		expect(terminationCalls).toBe(1);
+		expect(h.port.closes.map((close) => close.sessionId)).toContain(sessionA);
+		expect(h.manager.liveHostCount()).toBe(1);
+	} finally {
+		releaseBinds();
+	}
 });
 
 test("idle hosts past the retire window are ended by the sweep and busy ones are left alone", async () => {

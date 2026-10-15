@@ -3684,7 +3684,7 @@ class OriginActor {
 				if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
 			} else this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
-			if (bound.stallHostTerminated || this.hostIdle) this.#manager.hostFreed();
+			if (!bound.stallHostTerminated && this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
@@ -3868,7 +3868,7 @@ class OriginActor {
 				if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
 			} else this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
-			if (bound.stallHostTerminated || this.hostIdle) this.#manager.hostFreed();
+			if (!bound.stallHostTerminated && this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
