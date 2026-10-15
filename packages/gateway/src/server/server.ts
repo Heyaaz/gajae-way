@@ -142,6 +142,7 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
 const DEFAULT_DELIVERY_SWEEP_INTERVAL_MS = 15_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+const CONNECTION_SETTLE_TIMEOUT_MS = 5_000;
 /** /restart allows the 15s persona drain plus ordered monitor, connection, and storage teardown. */
 const RESTART_HARD_EXIT_MS = 30_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
@@ -512,7 +513,9 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			await options.broker?.stop();
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-			await Promise.all([...runtime.connections].map((connection) => settleConnection(connection, 5_000)));
+			await Promise.all(
+				[...runtime.connections].map((connection) => settleConnection(connection, CONNECTION_SETTLE_TIMEOUT_MS)),
+			);
 			listener.stop(true);
 			await settleMemory(runtime);
 			await options.onStop?.();
@@ -602,7 +605,22 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		},
 		close: () => process.stdin.pause(),
 		settle: async () => {
-			while (pendingStdoutWrites.size > 0) await Promise.all([...pendingStdoutWrites]);
+			const deadline = Date.now() + CONNECTION_SETTLE_TIMEOUT_MS;
+			while (pendingStdoutWrites.size > 0) {
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) break;
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const settled = await Promise.race([
+					Promise.all([...pendingStdoutWrites]).then(() => true),
+					new Promise<boolean>((resolve) => {
+						timer = setTimeout(() => resolve(false), remainingMs);
+					}),
+				]);
+				if (timer !== undefined) clearTimeout(timer);
+				if (!settled) break;
+			}
+			if (pendingStdoutWrites.size > 0)
+				console.error(`gateway stdio output flush timed out pending=${pendingStdoutWrites.size}`);
 		},
 	};
 	runtime.connections.add(connection);
