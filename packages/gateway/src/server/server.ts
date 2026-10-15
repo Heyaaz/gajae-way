@@ -147,6 +147,8 @@ const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 const CONNECTION_SETTLE_TIMEOUT_MS = 5_000;
 /** /restart allows the 15s persona drain plus ordered monitor, connection, and storage teardown. */
 const RESTART_HARD_EXIT_MS = 35_000;
+/** Maximum time an owner restart defers to an already-running stack supervisor. */
+const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
@@ -271,6 +273,8 @@ export interface GatewayServerOptions {
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
 	/** Test seam: how /restart ends the process after the ordered stop (default process.exit). */
 	readonly exitProcess?: (code: number) => void;
+	/** Test seam for the owner restart's wait on an active stack supervisor. */
+	readonly ownerRestartSupervisorWaitMs?: number;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
@@ -2307,10 +2311,19 @@ async function sendChat(
 			void (async () => {
 				// A detached stack restart owns an existing drain. If it fails and
 				// releases the gate, its cancellation atomically transfers the hold.
+				const supervisorDeadline =
+					Date.now() + (options.ownerRestartSupervisorWaitMs ?? OWNER_RESTART_SUPERVISOR_WAIT_MS);
 				while (!runtime.stopping) {
 					const activeId = runtime.personaSessions.restartDrainId;
 					if (activeId === undefined || activeId === ownerRestartId) break;
-					await Bun.sleep(25);
+					if (Date.now() >= supervisorDeadline) {
+						if (runtime.personaSessions.transferRestartDrain(activeId, ownerRestartId)) {
+							console.warn(`owner restart taking over stalled stack supervisor id=${activeId}`);
+							break;
+						}
+						continue;
+					}
+					await Bun.sleep(Math.min(25, Math.max(1, supervisorDeadline - Date.now())));
 				}
 				if (runtime.stopping) return;
 				const outcome = await runtime.personaSessions.drainForRestart(ownerRestartId, PERSONA_RESTART_DRAIN_WAIT_MS);

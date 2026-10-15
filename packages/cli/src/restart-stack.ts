@@ -343,14 +343,25 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 		else console.error(`lease_failed name=update detail=${error instanceof Error ? error.message : String(error)}`);
 		throw error;
 	}
+	let preparedDrain: { readonly lease: RestartDrainLease; readonly receipt: RestartReceipt } | undefined;
 	try {
-		return await runRestartStackWithLease(options);
+		return await runRestartStackWithLease(options, (drain, receipt) => {
+			preparedDrain = { lease: drain, receipt };
+		});
 	} finally {
-		await lease.release();
+		try {
+			if (preparedDrain !== undefined)
+				await releaseRestartDrain(preparedDrain.lease, preparedDrain.receipt, options.id);
+		} finally {
+			await lease.release();
+		}
 	}
 }
 
-async function runRestartStackWithLease(options: RunRestartOptions): Promise<RestartReceipt> {
+async function runRestartStackWithLease(
+	options: RunRestartOptions,
+	onDrainPrepared: (drain: RestartDrainLease, receipt: RestartReceipt) => void,
+): Promise<RestartReceipt> {
 	const platform = options.platform ?? currentPlatform();
 	const runner = options.runner ?? defaultCommandRunner;
 	const probe = options.probe ?? defaultServiceProbe(platform, options.uid);
@@ -425,6 +436,7 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 			return receipt;
 		}
 	}
+	if (restartDrain !== undefined) onDrainPrepared(restartDrain, receipt);
 	if (restartDrain?.warning !== undefined) {
 		receipt.warning = restartDrain.warning;
 		await writeReceipt(options.home, receipt);
@@ -545,23 +557,6 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 	if (receipt.state === "running") receipt.state = "ok";
 	receipt.finishedAt = new Date(now()).toISOString();
 	await writeReceipt(options.home, receipt);
-	if (restartDrain !== undefined) {
-		const gatewayRestarted = receipt.steps.some(
-			(step) => step.label === "dev.gajaeway.gateway" && step.result === "ok",
-		);
-		if (!gatewayRestarted) {
-			try {
-				await restartDrain.cancel();
-			} catch (error) {
-				console.error(`restart drain cancellation failed id=${options.id} detail=${String(error)}`);
-			}
-		}
-		try {
-			await restartDrain.close();
-		} catch (error) {
-			console.error(`restart drain socket close failed id=${options.id} detail=${String(error)}`);
-		}
-	}
 	return receipt;
 
 	async function verifyStep(step: RestartStep, since: number): Promise<void> {
@@ -622,6 +617,26 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 			}
 			await sleep(pollMs);
 		}
+	}
+}
+
+async function releaseRestartDrain(
+	restartDrain: RestartDrainLease,
+	receipt: RestartReceipt,
+	restartId: string,
+): Promise<void> {
+	const gatewayRestarted = receipt.steps.some((step) => step.label === "dev.gajaeway.gateway" && step.result === "ok");
+	if (!gatewayRestarted) {
+		try {
+			await restartDrain.cancel();
+		} catch (error) {
+			console.error(`restart drain cancellation failed id=${restartId} detail=${String(error)}`);
+		}
+	}
+	try {
+		await restartDrain.close();
+	} catch (error) {
+		console.error(`restart drain socket close failed id=${restartId} detail=${String(error)}`);
 	}
 }
 

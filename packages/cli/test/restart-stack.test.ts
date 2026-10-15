@@ -263,6 +263,39 @@ test("restart-stack cancels the persona drain when a service restart fails befor
 	}
 });
 
+test("restart-stack cancels and closes the persona drain when receipt persistence fails", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	let cancelled = 0;
+	let closed = 0;
+	try {
+		await expect(
+			runRestartStack({
+				...host.options,
+				id: "drain-receipt-write-failure",
+				prepareRestartDrain: async () => {
+					await mkdir(join(home, `restart-stack.json.${process.pid}.tmp`));
+					return {
+						warning: "force receipt persistence after drain preparation",
+						cancel: async () => {
+							cancelled++;
+						},
+						close: async () => {
+							closed++;
+						},
+					};
+				},
+			}),
+		).rejects.toThrow();
+		expect(cancelled).toBe(1);
+		expect(closed).toBe(1);
+		expect(host.ran).toEqual([]);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("the first update from a pre-drain gateway records its durable-recovery bootstrap", async () => {
 	const { home, cleanup } = await tempHome();
 	const host = await fakeHost({ home, installed: async (label) => label === "dev.gajaeway.gateway" });
