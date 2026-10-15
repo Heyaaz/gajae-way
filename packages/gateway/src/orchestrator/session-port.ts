@@ -62,6 +62,7 @@ export function splitThinkingSuffix(selection: string): { readonly model: string
  */
 export type TerminateHostOutcome =
 	| { readonly outcome: "terminated"; readonly pid: number }
+	/** Positive evidence that the session or its process is gone; transient inspect errors are `refused`. */
 	| { readonly outcome: "already_gone" }
 	| { readonly outcome: "not_a_host"; readonly pid: number; readonly command: string }
 	| { readonly outcome: "refused"; readonly reason: string };
@@ -130,12 +131,14 @@ export interface SessionPort {
 		relay: TailHandle;
 	}): Promise<SessionContextUsage | undefined>;
 	/**
-	 * Ends the host process of a session this gateway created and has retired.
-	 * Ownership is the point: the shared GJC daemon and broker are never touched,
-	 * only a `session-host-internal` whose pid the broker reports for THIS
-	 * session id. Returns what it did so the caller can log it; never throws.
+	 * Ends a gateway-owned session host; an optional final guard runs immediately
+	 * before SIGTERM so a concurrent tail event can cancel a stale cutoff.
 	 */
-	terminateHost?(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome>;
+	terminateHost?(input: {
+		sessionId: string;
+		repo: string;
+		shouldTerminate?: () => boolean;
+	}): Promise<TerminateHostOutcome>;
 	/** Recognized current-session provider failure, never authorization to replay an operation. */
 	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
 	/** Transport failure cause from the same session transcript. */
@@ -974,7 +977,11 @@ export class BrokerSessionPort implements SessionPort {
 	 * broker reports for the session is signalled directly - after proving it is
 	 * a session host and not the shared daemon/broker.
 	 */
-	async terminateHost(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome> {
+	async terminateHost(input: {
+		sessionId: string;
+		repo: string;
+		shouldTerminate?: () => boolean;
+	}): Promise<TerminateHostOutcome> {
 		this.#assertOwned(input);
 		let pid: number | undefined;
 		let live: boolean | undefined;
@@ -985,8 +992,14 @@ export class BrokerSessionPort implements SessionPort {
 			const envelope = JSON.parse(result.stdout) as {
 				ok?: unknown;
 				result?: { session?: { pid?: unknown; live?: unknown } };
+				error?: { code?: unknown; message?: unknown };
 			};
-			if (envelope.ok !== true) return { outcome: "already_gone" };
+			if (envelope.ok !== true) {
+				const code = stableErrorCode(envelope.error?.code);
+				return isSessionGoneCode(code)
+					? { outcome: "already_gone" }
+					: { outcome: "refused", reason: `inspect_failed:${code ?? "invalid_envelope"}` };
+			}
 			const session = envelope.result?.session;
 			pid =
 				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
@@ -999,12 +1012,27 @@ export class BrokerSessionPort implements SessionPort {
 				? { outcome: "already_gone" }
 				: { outcome: "refused", reason: `inspect_failed:${sanitizeDiagnostic(String(error))}` };
 		}
-		if (pid === undefined || live === false) return { outcome: "already_gone" };
+		if (live === false) return { outcome: "already_gone" };
+		if (pid === undefined || live !== true)
+			return { outcome: "refused", reason: "inspect_incomplete:missing_live_host_identity" };
 		const command = await processCommand(pid);
-		if (command === undefined) return { outcome: "already_gone" };
+		if (command === undefined) {
+			try {
+				process.kill(pid, 0);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return { outcome: "already_gone" };
+				return {
+					outcome: "refused",
+					reason: `process_probe_failed:${(error as NodeJS.ErrnoException).code ?? "unknown"}`,
+				};
+			}
+			return { outcome: "refused", reason: "process_command_unreadable" };
+		}
 		// The only process shape this gateway may end. The broker, daemon, and anything else are someone else's.
 		if (!/\bsdk session-host-internal\b/.test(command) || /\b(broker|daemon)-internal\b/.test(command))
 			return { outcome: "not_a_host", pid, command: command.slice(0, 160) };
+		if (input.shouldTerminate && !input.shouldTerminate())
+			return { outcome: "refused", reason: "termination_guard_rejected" };
 		try {
 			process.kill(pid, "SIGTERM");
 		} catch (error) {

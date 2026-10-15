@@ -2292,10 +2292,13 @@ test("tail activity that resumes after the stall deadline cancels the cutoff", a
 	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
 
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
-	port.emitAssistant(send.sessionId, "The tool is still making progress", "resumed-work", send.opRef);
+	port.beforeRunningJobs = async ({ sessionId }) => {
+		port.emitAssistant(sessionId, "The tool is still making progress", "resumed-work", send.opRef);
+		await Bun.sleep(5);
+	};
+	await manager!.tick(KEY);
 	await eventually(() => assistantFrames === 1, "resumed tail frame was not delivered");
 	await manager!.reconcile(KEY);
-	await manager!.tick(KEY);
 	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
 	expect(port.closes).toHaveLength(0);
 

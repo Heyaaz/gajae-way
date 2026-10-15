@@ -220,17 +220,26 @@ export class ScriptedSessionPort implements SessionPort {
 
 	/** Background jobs each scripted host reports as running; an Error makes the read fail. */
 	readonly hostJobs = new Map<string, readonly RunningHostJob[] | Error>();
+	/** Injects tail activity while a caller is awaiting the running-job probe. */
+	beforeRunningJobs?: (input: { sessionId: string; repo: string }) => void | Promise<void>;
 
 	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
+		await this.beforeRunningJobs?.(input);
 		const jobs = this.hostJobs.get(input.sessionId) ?? [];
 		if (jobs instanceof Error) throw jobs;
 		return jobs;
 	}
 
 	/** Ends the host of a retired session; a live seeded session is "terminated", anything else "already_gone". */
-	async terminateHost(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome> {
+	async terminateHost(input: {
+		sessionId: string;
+		repo: string;
+		shouldTerminate?: () => boolean;
+	}): Promise<TerminateHostOutcome> {
 		const state = this.#sessionStates.get(input.sessionId);
 		if (!state || state.live === false) return { outcome: "already_gone" };
+		if (input.shouldTerminate && !input.shouldTerminate())
+			return { outcome: "refused", reason: "termination_guard_rejected" };
 		await this.close(input);
 		return { outcome: "terminated", pid: 40_000 + this.closes.length };
 	}

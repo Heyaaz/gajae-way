@@ -14,7 +14,7 @@ import { noRelay } from "./session-port.fake";
  * to be a `sdk session-host-internal`. A real child process stands in for the
  * host so the SIGTERM path is exercised for real, not mocked.
  */
-async function harness(pidFor: (sessionId: string) => number | undefined, live = true) {
+async function harness(pidFor: (sessionId: string) => number | undefined, live = true, inspectErrorCode?: string) {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-terminate-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
@@ -25,6 +25,12 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 		if (args.includes("inspect")) {
 			const sessionId = args[args.indexOf("inspect") + 1]!;
 			const pid = pidFor(sessionId);
+			if (inspectErrorCode)
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({ ok: false, error: { code: inspectErrorCode, message: "inspect unavailable" } }),
+					stderr: "",
+				};
 			if (pid === undefined)
 				return {
 					exitCode: 1,
@@ -49,7 +55,7 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 	});
 	// The port refuses any session it does not own (#assertOwned): register the
 	// ids these tests will name, exactly as bind() would have.
-	for (const sessionId of ["s-1", "s-2", "s-3", "s-4", "s-5"]) {
+	for (const sessionId of ["s-1", "s-2", "s-3", "s-4", "s-5", "s-6", "s-7"]) {
 		const owned = database.transaction((tx) =>
 			database.bindings.recordOwnedBinding(tx, {
 				authority,
@@ -127,6 +133,36 @@ test("a session the broker no longer knows, or reports not live, is already gone
 	} finally {
 		child.kill();
 		await notLive.close();
+	}
+});
+
+test("a transient inspect envelope refuses termination without killing the live host", async () => {
+	const child = fakeHost("sdk session-host-internal");
+	const h = await harness(() => child.pid, true, "broker_unavailable");
+	try {
+		expect(await h.port.terminateHost({ sessionId: "s-6", repo: h.repo })).toEqual({
+			outcome: "refused",
+			reason: "inspect_failed:broker_unavailable",
+		});
+		expect(child.killed).toBe(false);
+	} finally {
+		child.kill();
+		await h.close();
+	}
+});
+
+test("a rejected final termination guard leaves the session host running", async () => {
+	const child = fakeHost("sdk session-host-internal");
+	const h = await harness(() => child.pid);
+	try {
+		expect(await h.port.terminateHost({ sessionId: "s-7", repo: h.repo, shouldTerminate: () => false })).toEqual({
+			outcome: "refused",
+			reason: "termination_guard_rejected",
+		});
+		expect(child.killed).toBe(false);
+	} finally {
+		child.kill();
+		await h.close();
 	}
 });
 

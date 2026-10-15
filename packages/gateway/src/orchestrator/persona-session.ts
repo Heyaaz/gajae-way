@@ -881,6 +881,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusRecheckAfterStall: boolean;
 	/** First live-tail stall timestamp; only a nonterminal operation can expire against this deadline. */
 	stallStartedAtMs?: number;
+	/** Tail activity version captured when the current stall began. */
+	stallActivityVersion?: number;
 	/** A refused/unavailable host termination has already been logged for this stall. */
 	stallTerminationWarningLogged?: boolean;
 	/** The host was stopped by the terminal-event cutoff; retry durable failure closure if needed. */
@@ -917,6 +919,8 @@ class OriginActor {
 	#dispatchRetry: unknown;
 	readonly #retired = new Map<string, BoundTurn>();
 	readonly #retiredReattachTimers = new Map<string, unknown>();
+	/** Updated before the frame's actor-mailbox callback so cutoff guards see concurrent activity. */
+	readonly #tailActivityVersions = new WeakMap<TailHandle, { version: number }>();
 	readonly #graceTimers = new Set<unknown>();
 	readonly #appliedModel = new Map<string, string>();
 	readonly #appliedServiceTier = new Map<string, GjcServiceTier>();
@@ -2475,6 +2479,7 @@ class OriginActor {
 		// a handle this turn no longer holds (or a previous turn's handle on the
 		// same session) must never act on the current binding.
 		let self: TailHandle | undefined;
+		const activity = { version: 0 };
 		const owns = (bound: BoundTurn | undefined): bound is BoundTurn => bound !== undefined && bound.tail === self;
 		const handle = await this.#manager.port.attachTail({
 			sessionId,
@@ -2486,6 +2491,14 @@ class OriginActor {
 			// side effects (ledger, delivery, terminal) before the next. The handle
 			// never calls back from inside a mailbox turn, so re-entrancy is safe.
 			onFrame: async (frame) => {
+				if (
+					!frame.idle ||
+					frame.assistantText !== undefined ||
+					frame.payload.toolCallStarted === true ||
+					frame.rawKind === "agent_end" ||
+					frame.rawKind === "agent_failed"
+				)
+					activity.version += 1;
 				await this.enqueue(async () => {
 					const bound = this.#findBound(sessionId, epoch, generation);
 					if (bound && (!owns(bound) || bound.detached)) return;
@@ -2534,6 +2547,7 @@ class OriginActor {
 			onDiagnostic: (line, level) => this.#manager.log(line, level),
 		});
 		self = handle;
+		this.#tailActivityVersions.set(handle, activity);
 		return handle;
 	}
 
@@ -2773,6 +2787,21 @@ class OriginActor {
 	async #terminateStalledTurn(bound: BoundTurn): Promise<boolean> {
 		if (!this.#stillTracked(bound) || this.#current !== bound || bound.retired || !bound.statusRecheckAfterStall)
 			return false;
+		const tail = bound.tail;
+		const activityVersion = bound.stallActivityVersion;
+		const canTerminate = () =>
+			this.#stillTracked(bound) &&
+			this.#current === bound &&
+			!bound.retired &&
+			bound.statusRecheckAfterStall &&
+			tail !== undefined &&
+			bound.tail === tail &&
+			activityVersion !== undefined &&
+			this.#tailActivityVersions.get(tail)?.version === activityVersion;
+		if (!canTerminate()) {
+			this.#clearStallReconciliation(bound);
+			return false;
+		}
 		const port = this.#manager.port;
 		if (!port.terminateHost) {
 			if (!bound.stallTerminationWarningLogged) {
@@ -2794,9 +2823,17 @@ class OriginActor {
 				jobs = `count=unknown detail=${safeDiagnostic(error)}`;
 			}
 		}
+		if (!canTerminate()) {
+			this.#clearStallReconciliation(bound);
+			return false;
+		}
 		let result: TerminateHostOutcome;
 		try {
-			result = await port.terminateHost({ sessionId: bound.sessionId, repo: this.#manager.repo });
+			result = await port.terminateHost({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				shouldTerminate: canTerminate,
+			});
 		} catch (error) {
 			if (!bound.stallTerminationWarningLogged) {
 				this.#manager.log(
@@ -2805,6 +2842,10 @@ class OriginActor {
 				);
 				bound.stallTerminationWarningLogged = true;
 			}
+			return false;
+		}
+		if (result.outcome === "refused" && result.reason === "termination_guard_rejected") {
+			this.#clearStallReconciliation(bound);
 			return false;
 		}
 		if (result.outcome !== "terminated" && result.outcome !== "already_gone") {
@@ -2978,6 +3019,7 @@ class OriginActor {
 		if (!bound.retired && !retired) {
 			bound.statusRecheckAfterStall = true;
 			bound.stallStartedAtMs ??= this.#manager.now();
+			bound.stallActivityVersion ??= bound.tail ? this.#tailActivityVersions.get(bound.tail)?.version : undefined;
 			try {
 				await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
 			} catch (error) {
@@ -3877,6 +3919,7 @@ class OriginActor {
 		if (!bound.statusRecheckAfterStall) return;
 		bound.statusRecheckAfterStall = false;
 		bound.stallStartedAtMs = undefined;
+		bound.stallActivityVersion = undefined;
 		bound.stallTerminationWarningLogged = false;
 		if (!bound.tailEvidenceUnavailable) this.#cancelStatusRecheck(bound);
 	}
