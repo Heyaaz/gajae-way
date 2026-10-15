@@ -469,15 +469,6 @@ export class InboxGroup {
 		return { done: row?.done ?? 0, unlinked: row?.unlinked ?? 0 };
 	}
 
-	completedTerminalDeliveryIds(sinceIso: string): string[] {
-		const rows = this.#db
-			.prepare(
-				"SELECT terminal_delivery_id FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state = 'done' AND terminal_delivery_id IS NOT NULL AND received_at >= ?",
-			)
-			.all(sinceIso) as Array<{ terminal_delivery_id: string }>;
-		return [...new Set(rows.flatMap((row) => terminalDeliveryIds(row.terminal_delivery_id)))];
-	}
-
 	turnComplete(tx: WriteTx, opRef: string, unlinkedReason: TerminalUnlinkedReason = "no_delivery"): number {
 		const unlinked = JSON.stringify({ none: unlinkedReason });
 		const completed = this.#db

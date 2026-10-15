@@ -278,10 +278,10 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 		spec.id === "broker" ? "RestartSec=2s" : "RestartSec=2",
 		...(spec.id === "broker"
 			? // The host propagates `gjc sdk broker run`'s exit code: 143 is its clean SIGTERM stop.
-				["KillMode=control-group", "TimeoutStopSec=30s", "SuccessExitStatus=143"]
+				["KillMode=control-group", "TimeoutStartSec=60s", "TimeoutStopSec=30s", "SuccessExitStatus=143"]
 			: spec.id === "gateway"
-				? ["KillMode=mixed", "TimeoutStopSec=40s"]
-				: []),
+				? ["KillMode=mixed", "TimeoutStartSec=60s", "TimeoutStopSec=40s"]
+				: ["TimeoutStartSec=60s", "TimeoutStopSec=60s"]),
 		"",
 		"[Install]",
 		`WantedBy=${spec.dependsOnGateway ? GATEWAY_UNIT : "default.target"}`,

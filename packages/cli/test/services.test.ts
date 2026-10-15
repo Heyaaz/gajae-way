@@ -55,12 +55,14 @@ test("a linux install writes one bound systemd user unit per service", async () 
 				expect(unit).toContain("RestartSec=2s");
 				expect(unit).toContain("KillMode=control-group");
 				expect(unit).toContain("SuccessExitStatus=143\n");
+				expect(unit).toContain("TimeoutStartSec=60s");
 				expect(unit).toContain("TimeoutStopSec=30s");
 			} else if (spec.id === "gateway") {
 				expect(unit).toContain(`Wants=${BROKER_UNIT}`);
 				expect(unit).toContain(`After=${BROKER_UNIT}`);
 				expect(unit).not.toContain("Requires=");
 				expect(unit).toContain("KillMode=mixed");
+				expect(unit).toContain("TimeoutStartSec=60s");
 				expect(unit).toContain("TimeoutStopSec=40s");
 			} else {
 				expect(unit).toContain(`BindsTo=${GATEWAY_UNIT}`);
@@ -68,7 +70,8 @@ test("a linux install writes one bound systemd user unit per service", async () 
 				expect(unit).toContain(`PartOf=${GATEWAY_UNIT}`);
 				expect(unit).toContain(`WantedBy=${GATEWAY_UNIT}`);
 				expect(unit).not.toContain("KillMode=process");
-				expect(unit).not.toContain("TimeoutStopSec=");
+				expect(unit).toContain("TimeoutStartSec=60s");
+				expect(unit).toContain("TimeoutStopSec=60s");
 			}
 		}
 	} finally {

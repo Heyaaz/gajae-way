@@ -11,8 +11,10 @@ import {
 	defaultServiceProbe,
 	effectiveRestartState,
 	launchRestartStack,
+	parseSystemdJobs,
 	readRestartReceipt,
 	renderRestartReceipt,
+	recoverRestartStack,
 	runRestartStack,
 	supervisorArgv,
 } from "../src/restart-stack";
@@ -148,6 +150,129 @@ test("defaultServiceProbe reads MainPID from launchd and systemd", async () => {
 	}
 });
 
+test("systemd job output is parsed without mistaking the empty summary for a job", () => {
+	expect(parseSystemdJobs("No jobs running.\n")).toEqual([]);
+	expect(parseSystemdJobs(" 42 gajaeway-gateway.service restart running\n")).toEqual([
+		{ id: 42, unit: "gajaeway-gateway.service" },
+	]);
+});
+
+test("a timed-out systemd command continues only after the manager reports no matching jobs", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "fake-bin");
+	await mkdir(binDir);
+	const systemctl = join(binDir, "systemctl");
+	await writeFile(
+		systemctl,
+		'#!/bin/sh\ncase "$2" in\n  restart) exec /bin/sleep 30 ;;\n  list-jobs) printf "No jobs running.\\n" ;;\n  *) exit 0 ;;\nesac\n',
+	);
+	await chmod(systemctl, 0o755);
+	const host = await fakeHost({ home, platform: "linux" });
+	const previousPath = process.env.PATH;
+	try {
+		process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+		const receipt = await runRestartStack({
+			...host.options,
+			platform: "linux",
+			runner: undefined,
+			commandTimeoutMs: 20,
+		});
+		expect(receipt.state).toBe("stale");
+		expect(receipt.steps[0]?.result).toBe("stale");
+		expect(receipt.steps[0]?.detail).toContain("no lease owner after restart");
+	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		await host.close();
+		await cleanup();
+	}
+});
+
+test("a timed-out launchd command retains the drain until explicit operator recovery", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "fake-bin");
+	await mkdir(binDir);
+	const pidPath = join(home, "child.pid");
+	const launchctl = join(binDir, "launchctl");
+	await writeFile(launchctl, `#!/bin/sh\nprintf '%s\\n' "$$" > "$RESTART_CHILD_PID"\nexec /bin/sleep 30\n`);
+	await chmod(launchctl, 0o755);
+	const host = await fakeHost({ home });
+	const previousPath = process.env.PATH;
+	const previousPidPath = process.env.RESTART_CHILD_PID;
+	let cancelled = false;
+	let closed = false;
+	try {
+		process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+		process.env.RESTART_CHILD_PID = pidPath;
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "launchd-command-timeout",
+			runner: undefined,
+			commandTimeoutMs: 20,
+			prepareRestartDrain: async () => ({
+				superseded: new AbortController().signal,
+				assertActive: async () => {},
+				cancel: async () => {
+					cancelled = true;
+				},
+				close: async () => {
+					closed = true;
+				},
+			}),
+		});
+		expect(receipt.state).toBe("indeterminate");
+		expect(receipt.detail).toContain("launchd operation could not be confirmed");
+		expect(cancelled).toBe(false);
+		expect(closed).toBe(true);
+		const childPid = Number(await Bun.file(pidPath).text());
+		expect(() => process.kill(childPid, 0)).toThrow();
+		expect(await leaseHeld(home, "update")).toBe(false);
+		expect((await readRestartReceipt(home))?.state).toBe("indeterminate");
+		const recovered = await recoverRestartStack({
+			home,
+			confirmServiceManagerSettled: true,
+		});
+		expect(recovered.state).toBe("failed");
+		expect(recovered.detail).toContain("operator recovered");
+	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		if (previousPidPath === undefined) delete process.env.RESTART_CHILD_PID;
+		else process.env.RESTART_CHILD_PID = previousPidPath;
+		await host.close();
+		await cleanup();
+	}
+});
+
+test("an unverified gateway restart keeps the drain recoverable", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home, fail: "dev.gajaeway.gateway" });
+	let cancelled = false;
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "unverified-gateway-restart",
+			prepareRestartDrain: async () => ({
+				superseded: new AbortController().signal,
+				assertActive: async () => {},
+				cancel: async () => {
+					cancelled = true;
+				},
+				close: async () => {},
+			}),
+		});
+		expect(receipt.state).toBe("indeterminate");
+		expect(receipt.detail).toContain("gateway restart did not verify");
+		expect(cancelled).toBe(false);
+		expect(await leaseHeld(home, "update")).toBe(false);
+		const recovered = await recoverRestartStack({ home, confirmServiceManagerSettled: true });
+		expect(recovered.state).toBe("failed");
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("restarting the gateway as part of the sequence still completes the remaining labels", async () => {
 	const { home, cleanup } = await tempHome();
 	try {
@@ -202,12 +327,22 @@ test("restart-stack waits for persona drain before issuing service restarts", as
 	const started = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
 	let closed = false;
+	let reattached = false;
 	try {
 		const running = runRestartStack({
 			...host.options,
 			id: "drain-before-restart",
 			gatewaySocketPath: join(home, "custom-gateway.sock"),
-			prepareRestartDrain: async (socketPath, restartId) => {
+			prepareRestartDrain: async (socketPath, restartId, _trigger, prepareOptions) => {
+				if (prepareOptions?.mode === "reattach") {
+					reattached = true;
+					return {
+						superseded: new AbortController().signal,
+						assertActive: async () => {},
+						cancel: async () => {},
+						close: async () => {},
+					};
+				}
 				expect(socketPath).toBe(join(home, "custom-gateway.sock"));
 				expect(restartId).toBe("drain-before-restart");
 				started.resolve();
@@ -231,6 +366,7 @@ test("restart-stack waits for persona drain before issuing service restarts", as
 		expect(receipt.state).toBe("ok");
 		expect(host.ran).toContain("dev.gajaeway.broker");
 		expect(closed).toBe(true);
+		expect(reattached).toBe(true);
 	} finally {
 		await host.close();
 		await cleanup();
@@ -298,20 +434,32 @@ test("macOS restarts gateway last so the old gateway holds the drain through ada
 	const host = await fakeHost({ home });
 	const order: string[] = [];
 	let drainClosed = false;
+	let reattached = false;
 	try {
 		const receipt = await runRestartStack({
 			...host.options,
 			id: "gateway-last-for-drain",
-			prepareRestartDrain: async () => ({
-				superseded: new AbortController().signal,
-				assertActive: async () => {},
-				cancel: async () => {
-					throw new Error("successful gateway restart must not cancel its drain");
-				},
-				close: async () => {
-					drainClosed = true;
-				},
-			}),
+			prepareRestartDrain: async (_socketPath, _restartId, _trigger, prepareOptions) => {
+				if (prepareOptions?.mode === "reattach") {
+					reattached = true;
+					return {
+						superseded: new AbortController().signal,
+						assertActive: async () => {},
+						cancel: async () => {},
+						close: async () => {},
+					};
+				}
+				return {
+					superseded: new AbortController().signal,
+					assertActive: async () => {},
+					cancel: async () => {
+						throw new Error("successful gateway restart must not cancel its drain");
+					},
+					close: async () => {
+						drainClosed = true;
+					},
+				};
+			},
 			runner: async (command) => {
 				const label = command.at(-1)?.split("/").at(-1);
 				if (!label) throw new Error("restart command has no service label");
@@ -333,6 +481,7 @@ test("macOS restarts gateway last so the old gateway holds the drain through ada
 		expect(receipt.state).toBe("ok");
 		expect(order.at(-1)).toBe("dev.gajaeway.gateway");
 		expect(drainClosed).toBe(true);
+		expect(reattached).toBe(true);
 	} finally {
 		await host.close();
 		await cleanup();

@@ -1807,9 +1807,12 @@ test("restart prepare includes unconfirmed terminal deliveries persisted by the 
 		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
 			throw new Error("terminal reply was not persisted by the first gateway");
 		const deliveryId = terminalReply.payload.deliveryId;
-		expect(firstDatabase.inbox.completedTerminalDeliveryIds(new Date(Date.now() - 60_000).toISOString())).toContain(
-			deliveryId,
+		expect(firstDatabase.outbox.unsettledTerminalDeliveryIds()).toContain(deliveryId);
+		const oldTriggerAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000).toISOString();
+		const triggerRows = firstDatabase.core.groupDb("inbox").prepare(
+			"UPDATE inbound_messages SET received_at = ? WHERE turn_role = 'trigger' AND turn_state = 'done'",
 		);
+		expect(firstDatabase.transaction((tx) => triggerRows.run(tx, oldTriggerAt).changes)).toBeGreaterThan(0);
 		await Bun.sleep(30);
 		firstClient.close();
 		await server.stop();
@@ -1870,6 +1873,73 @@ test("restart prepare includes unconfirmed terminal deliveries persisted by the 
 	} finally {
 		firstClient.close();
 		client?.close();
+		await server?.stop();
+		server = undefined;
+	}
+});
+
+test("gateway restores an indeterminate restart drain from its persisted receipt", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-restart-receipt-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	await writeFile(
+		join(directory, "restart-stack.json"),
+		JSON.stringify({ id: "interrupted-stack", state: "indeterminate", drainPrepared: true }),
+		{ mode: 0o600 },
+	);
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "unused",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	let client: Awaited<ReturnType<typeof connect>> | undefined;
+	let reconnect: Awaited<ReturnType<typeof connect>> | undefined;
+	try {
+		client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "reattach-interrupted-stack",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "interrupted-stack", waitMs: 0 },
+		});
+		await client.waitForFrame("reattach-interrupted-stack");
+		expect(client.frames.find((frame) => frame.id === "reattach-interrupted-stack")?.result).toEqual({
+			ready: true,
+			drained: true,
+		});
+		client.close();
+		await Bun.sleep(30);
+
+		reconnect = await connect(config.socketPath);
+		reconnect.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(reconnect.frames, 1);
+		reconnect.send({
+			v: "0.1",
+			type: "request",
+			id: "recover-interrupted-stack",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "interrupted-stack" },
+		});
+		await reconnect.waitForFrame("recover-interrupted-stack");
+		expect(reconnect.frames.find((frame) => frame.id === "recover-interrupted-stack")?.result).toEqual({
+			cancelled: true,
+		});
+	} finally {
+		client?.close();
+		reconnect?.close();
 		await server?.stop();
 		server = undefined;
 	}

@@ -43,6 +43,7 @@ import {
 	effectiveRestartState,
 	type LaunchRestartOptions,
 	launchRestartStack,
+	recoverRestartStack,
 	type RunRestartOptions,
 	readRestartReceipt,
 	renderRestartReceipt,
@@ -86,7 +87,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -445,7 +446,7 @@ export function sloExitCode(result: OpsSloResult): number {
 }
 
 const OPS_USAGE =
-	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|restart-stack [--status]";
+	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|restart-stack [--status|--recover --confirm-service-manager-settled]";
 
 const OPS_CYCLE_USAGE = "usage: gajaeway ops cycle [--limit N] [--offset N] [--json]";
 
@@ -770,7 +771,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					// has to come back, so it must not need the gateway to answer first.
 					// It also runs detached: restarting the gateway kills a persona turn that
 					// invoked it, which must not end the sequence half-applied (issue #54).
-					const usage = "usage: gajaeway ops restart-stack [--status]";
+					const usage =
+						"usage: gajaeway ops restart-stack [--status]|--recover --confirm-service-manager-settled";
 					const home = gatewayHome();
 					const flag = parsed.rest[1];
 					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
@@ -789,6 +791,18 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						for (const line of renderRestartReceipt(receipt, state)) console.log(line);
 						// Only a completed, verified sequence exits 0; queued or running is not yet success.
 						if (state !== "ok") process.exitCode = 1;
+					} else if (
+						flag === "--recover" &&
+						parsed.rest.length === 3 &&
+						parsed.rest[2] === "--confirm-service-manager-settled"
+					) {
+						const receipt = await recoverRestartStack({
+							home,
+							gatewaySocketPath: parsed.socket,
+							confirmServiceManagerSettled: true,
+						});
+						for (const line of renderRestartReceipt(receipt)) console.log(line);
+						process.exitCode = 1;
 					} else if (parsed.rest.length === 1) {
 						const { receipt, supervisorPid } = await launchRestartStack({
 							...options.restartStack?.launch,

@@ -481,9 +481,12 @@ On Linux, the gateway unit has `Wants=` and `After=` for the broker unit; adapte
 ```sh
 gajaeway ops restart-stack
 gajaeway ops restart-stack --status
+gajaeway ops restart-stack --recover --confirm-service-manager-settled
 ```
 
-The command returns after a detached supervisor is queued. The supervisor restarts the broker, gateway, then connected adapters and admin; on Linux it restarts the broker and gateway units and lets gateway dependencies restart clients, while on macOS it kickstarts each job in order and bootstraps the LaunchAgent plist when a job has not been loaded. It verifies process start and deployed binary; lease-backed services additionally require the lease owner's PID to match the service manager's main PID. The receipt is `$GAJAEWAY_HOME/restart-stack.json`; `--status` is successful only when it reports `ok` and exits 0.
+The command returns after a detached supervisor is queued. The supervisor restarts the broker, gateway, then connected adapters and admin; on Linux it restarts the broker and gateway units and lets gateway dependencies restart clients, while on macOS it restarts gateway-dependent jobs before the gateway so the old gateway holds the drain through those restarts. It bootstraps a LaunchAgent plist when a job has not been loaded. It verifies process start and deployed binary; lease-backed services additionally require the lease owner's PID to match the service manager's main PID. The receipt is `$GAJAEWAY_HOME/restart-stack.json`; `--status` is successful only when it reports `ok` and exits 0.
+
+If a service command times out with an indeterminate outcome, the restart receipt records that state and the gateway keeps persona dispatch fenced rather than guessing whether a restart is still in flight. Inspect `--status` and the service manager first. Run `--recover --confirm-service-manager-settled` only after confirming no restart operation remains active; Linux also checks for pending Gajaeway systemd jobs. Recovery releases the fence but does not retry the interrupted sequence, so queue a new `ops restart-stack` after checking service health.
 
 An update-triggered restart stops the broker, runs journaled `broker-agent provision --mode update` under the broker lease, then starts the broker. If provisioning is unrecoverable, the restart receipt says to run `gajaeway setup --broker-agent`; inspect the provision status before restarting. On Linux, the service manager names the broker unit `gajaeway-broker.service`; on macOS the supervisor uses `dev.gajaeway.broker`.
 

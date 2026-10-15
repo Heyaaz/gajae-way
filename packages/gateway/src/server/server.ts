@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
@@ -101,7 +101,6 @@ import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
 import {
-	CONVERSATION_CONTEXT_RETENTION_MS,
 	type InboundMessageRow,
 	type TerminalUnlinkedReason,
 	terminalDeliveryIds,
@@ -488,9 +487,44 @@ function cancelRestartDrainsForConnection(runtime: Runtime, connection: Connecti
 	for (const [restartId, owner] of runtime.restartDrainOwners) {
 		if (owner !== connection) continue;
 		runtime.restartDrainOwners.delete(restartId);
+		if (restartReceiptKeepsDrain(runtime.config.home, restartId)) continue;
 		void releaseOrTransferRestartDrain(runtime, restartId).catch((error: unknown) =>
 			console.error(`restart drain cancellation failed id=${restartId} detail=${diagnostic(error)}`),
 		);
+	}
+}
+
+function restartReceiptKeepsDrain(home: string, restartId?: string): boolean {
+	try {
+		const receipt = JSON.parse(readFileSync(join(home, "restart-stack.json"), "utf8")) as {
+			id?: unknown;
+			state?: unknown;
+			drainPrepared?: unknown;
+		};
+		return (
+			receipt.id === restartId &&
+			(receipt.state === "indeterminate" || (receipt.state === "running" && receipt.drainPrepared === true))
+		);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		// A corrupt receipt cannot prove the service-manager operation settled.
+		return true;
+	}
+}
+
+function persistedRestartDrainId(home: string): string | undefined {
+	try {
+		const receipt = JSON.parse(readFileSync(join(home, "restart-stack.json"), "utf8")) as {
+			id?: unknown;
+			state?: unknown;
+			drainPrepared?: unknown;
+		};
+		if (typeof receipt.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(receipt.id)) return undefined;
+		if (receipt.state === "indeterminate" || (receipt.state === "running" && receipt.drainPrepared === true))
+			return receipt.id;
+		return undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -532,8 +566,7 @@ async function waitForRestartTerminalDeliveries(runtime: Runtime, database: Stor
 	const deadline = Date.now() + waitMs;
 	let probeFailureLogged = false;
 	try {
-		const since = new Date(Date.now() - CONVERSATION_CONTEXT_RETENTION_MS).toISOString();
-		for (const id of database.inbox.completedTerminalDeliveryIds(since)) runtime.restartTerminalDeliveryIds.add(id);
+		for (const id of database.outbox.unsettledTerminalDeliveryIds()) runtime.restartTerminalDeliveryIds.add(id);
 		const deliveries = runtime.delivery.getMany([...runtime.restartTerminalDeliveryIds]);
 		for (const delivery of deliveries)
 			if (delivery.state === "confirmed" || delivery.state === "expired")
@@ -987,6 +1020,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		onSloEvent: (code, at) => options.slo?.note(code, at),
 	});
+	const restartDrainId = persistedRestartDrainId(options.config.home);
+	if (restartDrainId !== undefined) {
+		void personaSessions.drainForRestart(restartDrainId, 0).catch((error: unknown) =>
+			console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`),
+		);
+	}
 	const permissionPanels = new PermissionPanels({
 		deliver: (payload) => {
 			if (options.database.transaction((tx) => runtime.delivery.persistInTransaction(tx, payload))) {

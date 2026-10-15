@@ -41,7 +41,7 @@ import {
  */
 
 export type RestartStepResult = "pending" | "ok" | "stale" | "failed" | "skipped";
-export type RestartState = "queued" | "running" | "ok" | "stale" | "failed";
+export type RestartState = "queued" | "running" | "ok" | "stale" | "failed" | "indeterminate";
 
 export interface RestartDrainLease {
 	readonly superseded: AbortSignal;
@@ -70,6 +70,8 @@ export interface RestartReceipt {
 	readonly id: string;
 	readonly trigger: RestartTrigger;
 	state: RestartState;
+	/** A live Gateway accepted this drain and must remain fenced across its own restart. */
+	drainPrepared?: boolean;
 	readonly platform: ServicePlatform;
 	readonly requestedAt: string;
 	supervisorPid?: number;
@@ -86,7 +88,14 @@ export interface ServiceProcess {
 	readonly pid: number;
 }
 
-export type CommandRunner = (command: readonly string[]) => number | PromiseLike<number>;
+export interface CommandRunnerOptions {
+	readonly allowFailure?: boolean;
+	readonly signal?: AbortSignal;
+}
+export type CommandRunner = (
+	command: readonly string[],
+	options?: CommandRunnerOptions,
+) => number | PromiseLike<number>;
 export type ServiceProbe = (label: string) => Promise<ServiceProcess | undefined>;
 export type IsServiceInstalled = (label: string) => Promise<boolean>;
 
@@ -101,11 +110,17 @@ export interface RunRestartOptions {
 		socketPath: string,
 		restartId: string,
 		trigger: RestartTrigger,
+		options?: {
+			readonly mode?: "prepare" | "reattach";
+			onIndeterminate?: () => Promise<void>;
+		},
 	) => Promise<RestartDrainLease | undefined>;
 	readonly trigger?: RestartTrigger;
 	readonly platform?: ServicePlatform;
 	readonly uid?: number;
 	readonly runner?: CommandRunner;
+	/** Maximum time a service command may keep the restart drain before it is cancelled. */
+	readonly commandTimeoutMs?: number;
 	readonly probe?: ServiceProbe;
 	/** Checks if a service is installed; if not provided, defaults to checking the service manager's files. */
 	readonly isServiceInstalled?: IsServiceInstalled;
@@ -129,6 +144,32 @@ const VERIFY_TIMEOUT_MS = 90_000;
 const POLL_MS = 1_000;
 const RESTART_DRAIN_WAIT_MS = 120_000;
 const RESTART_DRAIN_REQUEST_TIMEOUT_MS = RESTART_DRAIN_WAIT_MS + 15_000;
+const SERVICE_COMMAND_TIMEOUT_MS = 180_000;
+const SERVICE_COMMAND_KILL_GRACE_MS = 2_000;
+const SYSTEMD_JOB_PROBE_TIMEOUT_MS = 5_000;
+const SYSTEMD_JOB_SETTLE_TIMEOUT_MS = 60_000;
+const SYSTEMD_JOB_POLL_MS = 250;
+
+class RestartOperationIndeterminateError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RestartOperationIndeterminateError";
+	}
+}
+
+class CommandTimedOutError extends Error {
+	constructor(command: readonly string[]) {
+		super(`command timed out: ${command.join(" ")}`);
+		this.name = "CommandTimedOutError";
+	}
+}
+
+class CommandUnsettledError extends Error {
+	constructor(command: readonly string[]) {
+		super(`command did not exit after SIGKILL: ${command.join(" ")}`);
+		this.name = "CommandUnsettledError";
+	}
+}
 
 export function restartReceiptPath(home: string): string {
 	return join(home, RECEIPT_FILE);
@@ -165,6 +206,7 @@ function newReceipt(
 		id,
 		trigger,
 		state: "queued",
+		drainPrepared: false,
 		platform,
 		requestedAt: new Date(now).toISOString(),
 		steps: restartOrder(platform).map((spec, index) => ({
@@ -181,20 +223,126 @@ function newReceipt(
 	};
 }
 
-async function defaultCommandRunner(command: readonly string[]): Promise<number> {
-	const child = Bun.spawn([...command], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-	return await child.exited;
+async function waitForChildExit(child: Bun.Subprocess, command: readonly string[], signal?: AbortSignal): Promise<number> {
+	if (signal === undefined) return await child.exited;
+	let abortResolve!: () => void;
+	const aborted = new Promise<void>((resolve) => (abortResolve = resolve));
+	const onAbort = () => abortResolve();
+	if (signal.aborted) onAbort();
+	else signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		const first = await Promise.race([
+			child.exited.then((status) => ({ status })),
+			aborted.then(() => ({ aborted: true as const })),
+		]);
+		if ("status" in first) return first.status;
+		child.kill("SIGTERM");
+		let status = await Promise.race([
+			child.exited,
+			Bun.sleep(SERVICE_COMMAND_KILL_GRACE_MS).then(() => undefined),
+		]);
+		if (status === undefined) {
+			child.kill("SIGKILL");
+			status = await Promise.race([child.exited, Bun.sleep(SERVICE_COMMAND_KILL_GRACE_MS).then(() => undefined)]);
+		}
+		if (status === undefined) throw new CommandUnsettledError(command);
+		throw new CommandTimedOutError(command);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
 }
 
-async function capture(command: readonly string[]): Promise<string | undefined> {
+async function defaultCommandRunner(command: readonly string[], options?: CommandRunnerOptions): Promise<number> {
+	const child = Bun.spawn([...command], {
+		stdin: "ignore",
+		stdout: "ignore",
+		stderr: "ignore",
+		env: { ...process.env },
+	});
+	return await waitForChildExit(child, command, options?.signal);
+}
+
+async function capture(command: readonly string[], timeoutMs = SYSTEMD_JOB_PROBE_TIMEOUT_MS): Promise<string | undefined> {
 	const child = Bun.spawn([...command], {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "ignore",
 		env: { ...process.env, LC_ALL: "C" },
 	});
-	const output = await new Response(child.stdout).text();
-	return (await child.exited) === 0 ? output : undefined;
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
+	const output = new Response(child.stdout).text().catch(() => undefined);
+	try {
+		const status = await waitForChildExit(child, command, controller.signal);
+		const text = await output;
+		return status === 0 ? text : undefined;
+	} catch {
+		return undefined;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+interface SystemdJob {
+	readonly id: number;
+	readonly unit: string;
+}
+
+export function parseSystemdJobs(output: string): SystemdJob[] {
+	const jobs: SystemdJob[] = [];
+	for (const line of output.split(/\r?\n/)) {
+		const match = line.match(/^\s*(\d+)\s+(\S+)(?:\s+\S+\s+\S+)?\s*$/);
+		if (!match) continue;
+		const id = Number(match[1]);
+		if (Number.isSafeInteger(id)) jobs.push({ id, unit: match[2] as string });
+	}
+	return jobs;
+}
+
+function isSystemdServiceOperation(command: readonly string[]): boolean {
+	if (command[0] !== "systemctl" || !command.includes("--user")) return false;
+	const verb = command.find((part) => ["start", "stop", "restart", "try-restart", "reload", "disable"].includes(part));
+	if (verb === undefined) return false;
+	return command.some((part) => part.endsWith(".service")) && (verb !== "disable" || command.includes("--now"));
+}
+
+async function timedSystemdCommand(command: readonly string[], timeoutMs: number): Promise<number | undefined> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		return await defaultCommandRunner(command, { signal: controller.signal });
+	} catch {
+		return undefined;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+async function systemdJobs(): Promise<SystemdJob[] | undefined> {
+	const output = await capture(["systemctl", "--user", "list-jobs", "--no-legend", "--no-pager"]);
+	return output === undefined ? undefined : parseSystemdJobs(output);
+}
+
+async function waitForSystemdServiceJobs(command: readonly string[]): Promise<boolean> {
+	const targets = new Set(command.filter((part) => part.endsWith(".service")));
+	const relevant = (job: SystemdJob) => targets.has(job.unit) || job.unit.startsWith("gajaeway-");
+	const deadline = Date.now() + SYSTEMD_JOB_SETTLE_TIMEOUT_MS;
+	let cancelRequested = false;
+	for (;;) {
+		const jobs = await systemdJobs();
+		if (jobs === undefined) return false;
+		const pending = jobs.filter(relevant);
+		if (pending.length === 0) return true;
+		if (!cancelRequested) {
+			cancelRequested = true;
+			await timedSystemdCommand(
+				["systemctl", "--user", "cancel", ...pending.map((job) => String(job.id))],
+				SYSTEMD_JOB_PROBE_TIMEOUT_MS,
+			);
+		}
+		if (Date.now() >= deadline) return false;
+		await Bun.sleep(SYSTEMD_JOB_POLL_MS);
+	}
 }
 
 /** Reads the current main PID directly from launchd or systemd. */
@@ -221,6 +369,7 @@ async function prepareGatewayRestartDrain(
 	socketPath: string,
 	restartId: string,
 	_trigger: RestartTrigger,
+	options?: { readonly mode?: "prepare" | "reattach"; onIndeterminate?: () => Promise<void> },
 ): Promise<RestartDrainLease | undefined> {
 	let client: GajaewayClient;
 	try {
@@ -249,11 +398,19 @@ async function prepareGatewayRestartDrain(
 		if (result.ready !== true || result.drained !== true)
 			throw new Error("gateway did not confirm restart-drain delivery readiness");
 	} catch (error) {
-		try {
-			await client.request("gateway.restart.cancel", { restartId });
-		} catch {
-			// The gateway may have stopped or failed after it accepted the drain;
-			// closing the socket also releases an uncommitted hold.
+		if (options?.mode === "reattach") {
+			try {
+				await options.onIndeterminate?.();
+			} catch (persistError) {
+				console.error(`restart drain indeterminate receipt failed id=${restartId} detail=${String(persistError)}`);
+			}
+		} else {
+			try {
+				await client.request("gateway.restart.cancel", { restartId });
+			} catch {
+				// The gateway may have stopped or failed after it accepted the drain;
+				// closing the socket also releases an uncommitted hold.
+			}
 		}
 		offSuperseded();
 		await client.close();
@@ -366,17 +523,75 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 		throw error;
 	}
 	let preparedDrain: { readonly lease: RestartDrainLease; readonly receipt: RestartReceipt } | undefined;
+	let receipt: RestartReceipt | undefined;
 	try {
-		return await runRestartStackWithLease(options, (drain, receipt) => {
-			preparedDrain = { lease: drain, receipt };
+		receipt = await runRestartStackWithLease(options, (drain, preparedReceipt) => {
+			preparedDrain = { lease: drain, receipt: preparedReceipt };
 		});
+		return receipt;
 	} finally {
 		try {
-			if (preparedDrain !== undefined)
-				await releaseRestartDrain(preparedDrain.lease, preparedDrain.receipt, options.id);
+			const completedReceipt = receipt ?? preparedDrain?.receipt;
+			if (completedReceipt !== undefined)
+				await releaseRestartDrain(preparedDrain?.lease, completedReceipt, options.id, options);
 		} finally {
 			await lease.release();
 		}
+	}
+}
+
+export interface RecoverRestartStackOptions {
+	readonly home: string;
+	readonly gatewaySocketPath?: string;
+	readonly confirmServiceManagerSettled: boolean;
+}
+
+/** Clears a persisted restart fence only after an operator confirms the manager has no work in flight. */
+export async function recoverRestartStack(options: RecoverRestartStackOptions): Promise<RestartReceipt> {
+	if (!options.confirmServiceManagerSettled)
+		throw new Error("restart-stack recovery requires --confirm-service-manager-settled");
+	const lease = await acquireLease(options.home, "update");
+	try {
+		const receipt = await readRestartReceipt(options.home);
+		if (receipt === undefined || (receipt.state !== "running" && receipt.state !== "indeterminate"))
+			throw new Error("restart-stack has no interrupted or indeterminate drain to recover");
+		if (receipt.platform === "linux") {
+			const jobs = await systemdJobs();
+			if (jobs === undefined) throw new Error("could not verify systemd jobs; restart drain remains held");
+			const active = jobs.filter(
+				(job) => job.unit.startsWith("gajaeway-") || receipt.steps.some((step) => step.command?.includes(job.unit)),
+			);
+			if (active.length > 0)
+				throw new Error(`systemd still has restart-stack jobs: ${active.map((job) => `${job.id}:${job.unit}`).join(", ")}`);
+		}
+
+		const socketPath = options.gatewaySocketPath ?? join(options.home, "gateway.sock");
+		let client: GajaewayClient | undefined;
+		try {
+			client = await GajaewayClient.connectSocket(socketPath, { clientName: "gajaeway-restart-recovery" });
+		} catch (error) {
+			const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+			if (code !== "ENOENT" && code !== "ECONNREFUSED" && code !== "ENOTSOCK") throw error;
+		}
+		if (client !== undefined) {
+			try {
+				await client.request("gateway.restart.cancel", { restartId: receipt.id });
+			} finally {
+				await client.close();
+			}
+		}
+		receipt.state = "failed";
+		receipt.finishedAt = new Date().toISOString();
+		receipt.detail = "operator recovered after confirming the service manager has no operation in flight";
+		for (const step of receipt.steps)
+			if (step.result === "pending") {
+				step.result = "skipped";
+				step.detail = "not run; restart sequence was recovered by the operator";
+			}
+		await writeReceipt(options.home, receipt);
+		return receipt;
+	} finally {
+		await lease.release();
 	}
 }
 
@@ -400,6 +615,7 @@ async function runRestartStackWithLease(
 	const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 	const timeoutMs = options.verifyTimeoutMs ?? VERIFY_TIMEOUT_MS;
 	const pollMs = options.pollMs ?? POLL_MS;
+	const commandTimeoutMs = options.commandTimeoutMs ?? SERVICE_COMMAND_TIMEOUT_MS;
 	const env = options.env ?? process.env;
 	const deployedExecutable = await realpath(process.execPath).catch(() => undefined);
 	const installedBinDir =
@@ -447,7 +663,11 @@ async function runRestartStackWithLease(
 			return receipt;
 		}
 	}
-	if (restartDrain !== undefined) onDrainPrepared(restartDrain, receipt);
+	if (restartDrain !== undefined) {
+		receipt.drainPrepared = true;
+		onDrainPrepared(restartDrain, receipt);
+		await writeReceipt(options.home, receipt);
+	}
 	let gatewayRestarted = false;
 	const assertRestartDrain = async (): Promise<void> => {
 		if (restartDrain?.superseded.aborted)
@@ -460,9 +680,38 @@ async function runRestartStackWithLease(
 				? restartDrain.superseded.reason
 				: new Error("gateway restart drain was superseded");
 	};
-	const runServiceCommand = async (command: readonly string[]): Promise<number> => {
+	const runServiceCommand = async (
+		command: readonly string[],
+		_runOptions?: { readonly allowFailure?: boolean },
+	): Promise<number> => {
 		await assertRestartDrain();
-		const status = await runner(command);
+		const controller = new AbortController();
+		let timedOut = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, commandTimeoutMs);
+		let status: number;
+		try {
+			status = await runner(command, { signal: controller.signal });
+		} catch (error) {
+			if (!timedOut) throw error;
+			if (platform === "linux" && isSystemdServiceOperation(command)) {
+				if (!(await waitForSystemdServiceJobs(command)))
+					throw new RestartOperationIndeterminateError(
+						`systemd operation did not settle after command timeout: ${command.join(" ")}`,
+					);
+				status = 0;
+			} else if (platform === "darwin" && command[0] === "launchctl") {
+				throw new RestartOperationIndeterminateError(
+					`launchd operation could not be confirmed after command timeout: ${command.join(" ")}`,
+				);
+			} else if (error instanceof CommandUnsettledError) {
+				throw new RestartOperationIndeterminateError(error.message);
+			} else throw new Error(`command timed out after ${commandTimeoutMs}ms: ${command.join(" ")}`);
+		} finally {
+			clearTimeout(timeout);
+		}
 		// Keep the lease until the manager command settles; a pending owner restart
 		// can then take over without racing the operation already in flight.
 		if (restartDrain?.superseded.aborted)
@@ -483,7 +732,7 @@ async function runRestartStackWithLease(
 				run: runServiceCommand,
 			});
 		} catch (error) {
-			receipt.state = "failed";
+			receipt.state = error instanceof RestartOperationIndeterminateError ? "indeterminate" : "failed";
 			receipt.finishedAt = new Date(now()).toISOString();
 			receipt.detail = `stale service cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
 			for (const step of receipt.steps) step.result = "skipped";
@@ -492,6 +741,7 @@ async function runRestartStackWithLease(
 		}
 	}
 	let issuedAt = now();
+	let gatewayRestartAttempted = false;
 	for (const step of receipt.steps) {
 		if (receipt.state !== "running") {
 			step.result = "skipped";
@@ -577,6 +827,7 @@ async function runRestartStackWithLease(
 				}
 			} else {
 				if (step.command !== undefined) {
+					if (step.label === "dev.gajaeway.gateway") gatewayRestartAttempted = true;
 					issuedAt = now();
 					let command = step.command;
 					let status = await runServiceCommand(command);
@@ -597,9 +848,22 @@ async function runRestartStackWithLease(
 		} catch (error) {
 			step.result = "failed";
 			step.detail = error instanceof Error ? error.message : String(error);
+			if (error instanceof RestartOperationIndeterminateError) {
+				receipt.state = "indeterminate";
+				receipt.detail = step.detail;
+			}
 		}
 		if (step.label === "dev.gajaeway.gateway" && step.result === "ok") gatewayRestarted = true;
-		if (step.result !== "ok" && step.result !== "skipped") {
+		if (
+			gatewayRestartAttempted &&
+			step.label === "dev.gajaeway.gateway" &&
+			step.result !== "ok" &&
+			receipt.state !== "indeterminate"
+		) {
+			receipt.state = "indeterminate";
+			receipt.detail = `gateway restart did not verify; operator recovery is required: ${step.detail ?? "unknown outcome"}`;
+		}
+		if (receipt.state !== "indeterminate" && step.result !== "ok" && step.result !== "skipped") {
 			receipt.state = step.result === "stale" ? "stale" : "failed";
 		}
 		await writeReceipt(options.home, receipt);
@@ -671,18 +935,56 @@ async function runRestartStackWithLease(
 }
 
 async function releaseRestartDrain(
-	restartDrain: RestartDrainLease,
+	restartDrain: RestartDrainLease | undefined,
 	receipt: RestartReceipt,
 	restartId: string,
+	options: RunRestartOptions,
 ): Promise<void> {
+	if (receipt.state === "indeterminate") {
+		await closeRestartDrain(restartDrain, restartId);
+		return;
+	}
 	const gatewayRestarted = receipt.steps.some((step) => step.label === "dev.gajaeway.gateway" && step.result === "ok");
-	if (!gatewayRestarted) {
+	if (gatewayRestarted && receipt.drainPrepared) {
+		const socketPath = options.gatewaySocketPath ?? options.env?.GAJAEWAY_SOCKET_PATH ?? join(options.home, "gateway.sock");
+		const prepare = options.prepareRestartDrain ?? prepareGatewayRestartDrain;
+		let reattached: RestartDrainLease | undefined;
+		try {
+			reattached = await prepare(socketPath, restartId, receipt.trigger, {
+				mode: "reattach",
+				onIndeterminate: async () => {
+					receipt.state = "indeterminate";
+					receipt.finishedAt = new Date().toISOString();
+					receipt.detail = "new gateway did not confirm the restart drain after service restart";
+					await writeReceipt(options.home, receipt);
+				},
+			});
+			if (reattached === undefined) throw new Error("new gateway did not accept the restart drain");
+			await reattached.cancel();
+		} catch (error) {
+			receipt.state = "indeterminate";
+			receipt.finishedAt = new Date().toISOString();
+			receipt.detail = `restart drain reattachment failed: ${error instanceof Error ? error.message : String(error)}`;
+			await writeReceipt(options.home, receipt);
+			console.error(`restart drain reattachment failed id=${restartId} detail=${receipt.detail}`);
+		} finally {
+			await closeRestartDrain(reattached, restartId);
+			await closeRestartDrain(restartDrain, restartId);
+		}
+		return;
+	}
+	if (restartDrain !== undefined) {
 		try {
 			await restartDrain.cancel();
 		} catch (error) {
 			console.error(`restart drain cancellation failed id=${restartId} detail=${String(error)}`);
 		}
 	}
+	await closeRestartDrain(restartDrain, restartId);
+}
+
+async function closeRestartDrain(restartDrain: RestartDrainLease | undefined, restartId: string): Promise<void> {
+	if (restartDrain === undefined) return;
 	try {
 		await restartDrain.close();
 	} catch (error) {
