@@ -1755,7 +1755,7 @@ export class WorkLaneManager {
 		const observed = this.#job(name);
 		const cycle = observed?.awaitingChecks;
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
-		const facts = await collectRepoFacts(observed.lane.worktreePath, client, true);
+		const facts = await collectRepoFacts(observed.lane.worktreePath, client, true, cycle.headSha);
 		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
 			if (this.#stopped) return undefined;
 			let job = this.#job(name);
@@ -3053,6 +3053,7 @@ async function collectRepoFacts(
 	worktreePath: string,
 	checkClient?: CheckStatusClient,
 	includePushStatus = true,
+	checkHeadSha?: string,
 ): Promise<
 	| {
 			headSha?: string;
@@ -3117,7 +3118,10 @@ async function collectRepoFacts(
 
 			// Query even when the source ref is absent: GitHub retains merged PRs after branch deletion.
 			if (checkClient) {
-				const checkStatus = await checkClient.getCheckStatus(result.remoteHeadSha ?? headSha, worktreePath);
+				const checkStatus = await checkClient.getCheckStatus(
+					checkHeadSha ?? result.remoteHeadSha ?? headSha,
+					worktreePath,
+				);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
 		}

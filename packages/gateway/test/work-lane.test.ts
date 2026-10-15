@@ -3827,6 +3827,7 @@ test("#481 an exact merged PR snapshot settles before later source-branch moveme
 	expect(Bun.spawnSync(["git", "-C", f.directory, "reset", "-q", "--hard", head]).exitCode).toBe(0);
 	checks.set({ prNumber: 503, headSha: head, status: "pending", failingChecks: [], prState: "closed", merged: true });
 	await pollUntil(f, () => f.job().state === "done");
+	expect(checks.calls.at(-1)?.headSha).toBe(head);
 	expect(checksNotice(f, "[lane a] checks passed")).toContain(
 		`pr=503 checks=green prHead=${head.slice(0, 12)} remoteHead=${advancedHead.slice(0, 12)}`,
 	);
