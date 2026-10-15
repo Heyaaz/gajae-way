@@ -82,7 +82,12 @@ export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): Check
 					mergedAt?: string | null;
 					statusCheckRollup?: RollupEntry[] | null;
 				}>;
-				const pr = prs.find((candidate) => candidate.headRefOid === headSha);
+				const matchingPrs = prs.filter((candidate) => candidate.headRefOid === headSha);
+				// A SHA can be shared across PRs; the active PR must outrank stale closed matches.
+				const pr =
+					matchingPrs.find((candidate) => candidate.state.toUpperCase() === "OPEN") ??
+					matchingPrs.find((candidate) => Boolean(candidate.mergedAt)) ??
+					matchingPrs[0];
 				if (!pr) return null;
 				const rollup = pr.statusCheckRollup ?? [];
 				const snapshot = classifyCheckRollup(pr.number, headSha, rollup);

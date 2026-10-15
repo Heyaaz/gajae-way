@@ -3287,6 +3287,47 @@ test("#595 GH check lookup finds the PR whose current head exactly matches the r
 	]);
 });
 
+test("#595 GH check lookup prefers the open PR when duplicate PR heads match the requested SHA", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const headSha = "c".repeat(40);
+	const response = [
+		{
+			number: 569,
+			state: "CLOSED",
+			mergedAt: null,
+			headRefOid: headSha,
+			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
+		},
+		{
+			number: 571,
+			state: "OPEN",
+			mergedAt: null,
+			headRefOid: headSha,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+		{
+			number: 570,
+			state: "CLOSED",
+			mergedAt: "2026-10-14T12:00:00Z",
+			headRefOid: headSha,
+			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
+		},
+	];
+	const ghPath = join(directory, "gh");
+	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
+	await chmod(ghPath, 0o755);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory);
+	expect(snapshot).toMatchObject({
+		prNumber: 571,
+		headSha,
+		status: "pending",
+		prState: "open",
+		merged: false,
+	});
+});
+
 /** A check client whose answer the test changes between polls. */
 function scriptedChecks(initial: CheckStatusAnswer | null | undefined) {
 	let answer = initial;
