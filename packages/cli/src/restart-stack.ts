@@ -383,21 +383,18 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 	await writeReceipt(options.home, receipt);
 
 	let restartDrain: RestartDrainLease | undefined;
-	const gatewayInstalled = await isInstalled("dev.gajaeway.gateway");
-	if (gatewayInstalled) {
-		try {
-			restartDrain = await (options.prepareRestartDrain ?? prepareGatewayRestartDrain)(
-				options.gatewaySocketPath ?? env.GAJAEWAY_SOCKET_PATH ?? join(options.home, "gateway.sock"),
-				options.id,
-			);
-		} catch (error) {
-			receipt.state = "failed";
-			receipt.finishedAt = new Date(now()).toISOString();
-			receipt.detail = `persona turn drain failed: ${error instanceof Error ? error.message : String(error)}`;
-			for (const step of receipt.steps) step.result = "skipped";
-			await writeReceipt(options.home, receipt);
-			return receipt;
-		}
+	try {
+		restartDrain = await (options.prepareRestartDrain ?? prepareGatewayRestartDrain)(
+			options.gatewaySocketPath ?? env.GAJAEWAY_SOCKET_PATH ?? join(options.home, "gateway.sock"),
+			options.id,
+		);
+	} catch (error) {
+		receipt.state = "failed";
+		receipt.finishedAt = new Date(now()).toISOString();
+		receipt.detail = `persona turn drain failed: ${error instanceof Error ? error.message : String(error)}`;
+		for (const step of receipt.steps) step.result = "skipped";
+		await writeReceipt(options.home, receipt);
+		return receipt;
 	}
 
 	let issuedAt = now();
