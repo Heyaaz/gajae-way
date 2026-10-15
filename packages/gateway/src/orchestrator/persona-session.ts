@@ -448,9 +448,10 @@ export interface PersonaSessionManagerOptions {
 		readonly detail: string;
 		readonly at: number;
 	}) => void;
-	/** Reports a session attachment failure before a turn can start. */
-	readonly onSessionAttachmentFailure?: (input: {
+	/** Reports a session failure before an inbound turn is accepted. */
+	readonly onSessionCreateFailure?: (input: {
 		readonly originKey: string;
+		readonly code: string;
 		readonly detail: string;
 		readonly at: number;
 	}) => void;
@@ -513,7 +514,7 @@ export class PersonaSessionManager {
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
-	readonly #onSessionAttachmentFailure: PersonaSessionManagerOptions["onSessionAttachmentFailure"];
+	readonly #onSessionCreateFailure: PersonaSessionManagerOptions["onSessionCreateFailure"];
 	readonly #onPreSendFailure: PersonaSessionManagerOptions["onPreSendFailure"];
 	readonly #onSessionCreateSuccess: PersonaSessionManagerOptions["onSessionCreateSuccess"];
 	readonly #log: (line: string, level?: LogLevel) => void;
@@ -556,7 +557,7 @@ export class PersonaSessionManager {
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
 		this.#onBindFailure = options.onBindFailure;
-		this.#onSessionAttachmentFailure = options.onSessionAttachmentFailure;
+		this.#onSessionCreateFailure = options.onSessionCreateFailure;
 		this.#onPreSendFailure = options.onPreSendFailure;
 		this.#onSessionCreateSuccess = options.onSessionCreateSuccess;
 	}
@@ -784,9 +785,9 @@ export class PersonaSessionManager {
 		}
 	}
 
-	recordSessionAttachmentFailure(originKey: string, detail: string): void {
+	recordSessionCreateFailure(originKey: string, code: string, detail: string): void {
 		try {
-			this.#onSessionAttachmentFailure?.({ originKey, detail, at: this.#now() });
+			this.#onSessionCreateFailure?.({ originKey, code, detail, at: this.#now() });
 		} catch (error) {
 			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
 		}
@@ -1783,7 +1784,7 @@ class OriginActor {
 			// proof can therefore release this row without replaying accepted work.
 			// A generic failure alone is not authority to replace the session.
 			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
-			this.#manager.recordSessionAttachmentFailure(this.originKey, safeDiagnostic(error));
+			this.#manager.recordSessionCreateFailure(this.originKey, "session_attach_failed", safeDiagnostic(error));
 			const nextEpoch = this.#manager.database.transaction((tx) => {
 				retryInboundTurn(this.#manager.database, tx, opRef);
 				return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
@@ -1802,7 +1803,6 @@ class OriginActor {
 				);
 			return;
 		}
-		if (!stored) this.#manager.recordSessionCreateSuccess(this.originKey);
 		// Before the turn starts: the stall clock is not running yet and the
 		// actor queue holds every steer and later send until the context is ready.
 		const context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
@@ -1910,6 +1910,7 @@ class OriginActor {
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
+			if (!stored) this.#manager.recordSessionCreateSuccess(this.originKey);
 			if (preamble.next) this.#personaPreamble.set(binding.sessionId, preamble.next);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
@@ -1949,6 +1950,7 @@ class OriginActor {
 			// not land. A session_not_found returned after port.send is ambiguous:
 			// the broker may have accepted the operation before the CLI failed.
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
+				this.#manager.recordSessionCreateFailure(this.originKey, "session_send_disowned", safeDiagnostic(error));
 				await tail.close();
 				const nextEpoch = this.#manager.database.transaction((tx) => {
 					retryInboundTurn(this.#manager.database, tx, opRef);

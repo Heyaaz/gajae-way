@@ -117,6 +117,7 @@ async function startDeliveryServer(
 		bind?: Parameters<typeof sessionPortFromResponder>[0]["bind"];
 		attachTail?: ReturnType<typeof sessionPortFromResponder>["attachTail"];
 		respond?: Parameters<typeof sessionPortFromResponder>[0]["respond"];
+		send?: ReturnType<typeof sessionPortFromResponder>["send"];
 		serviceTier?: GatewayConfig["serviceTier"];
 		setServiceTier?: ReturnType<typeof sessionPortFromResponder>["setServiceTier"];
 	} = {},
@@ -140,6 +141,7 @@ async function startDeliveryServer(
 		respond: options.respond ?? (async () => "the single reply body"),
 	});
 	if (options.attachTail) sessionPort.attachTail = options.attachTail;
+	if (options.send) sessionPort.send = options.send;
 	if (options.setServiceTier) sessionPort.setServiceTier = options.setServiceTier;
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
@@ -394,6 +396,37 @@ test("create-then-disown attachment failures degrade session-create readiness", 
 	expect(readiness).toMatchObject({
 		ready: false,
 		failure: { category: "session_create", code: "session_attach_failed", consecutiveFailures: 3 },
+	});
+	client.close();
+});
+
+test("create-attach-send-disown cycles degrade session-create readiness", async () => {
+	let sendAttempts = 0;
+	const { client } = await startDeliveryServer({
+		send: async () => {
+			sendAttempts += 1;
+			throw new Error("session_unavailable: broker disowned new session");
+		},
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "send-disowned-session",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "loopback", kind: "loopback", conversationId: "readiness-send-disowned-session" },
+			text: "hello",
+		},
+	});
+	await waitFrame(client.frames, "send-disowned-session");
+	for (let attempt = 0; attempt < 400 && sendAttempts < 3; attempt++) await Bun.sleep(5);
+	expect(sendAttempts).toBeGreaterThanOrEqual(3);
+	client.send({ v: "0.1", type: "request", id: "send-disowned-status", verb: "gateway.status" });
+	await waitFrame(client.frames, "send-disowned-status");
+	const readiness = client.frames.find((frame) => frame.id === "send-disowned-status").result.readiness;
+	expect(readiness).toMatchObject({
+		ready: false,
+		failure: { category: "session_create", code: "session_send_disowned", consecutiveFailures: 3 },
 	});
 	client.close();
 });
