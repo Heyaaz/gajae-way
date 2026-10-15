@@ -6,8 +6,7 @@ const CODE_SEGMENTS =
 /** Protect Slack links before parsing code spans; code then retains literal markup and language tags. */
 export function markdownToMrkdwn(text: string): string {
 	const links: string[] = [];
-	let markerPrefix = "\u0000SLACKLINK";
-	while (text.includes(markerPrefix)) markerPrefix += "X";
+	const markerPrefix = `\u0000SLACKLINK${crypto.randomUUID()}\u0000`;
 	const protectedText = text.replace(SLACK_LINK, (link) => {
 		const index = links.push(link) - 1;
 		return `${markerPrefix}${index}\u0000`;
@@ -46,8 +45,14 @@ export function markdownToMrkdwn(text: string): string {
 	const textForConversion = protectedText.replace(linkMarkers, (marker, index: string) =>
 		keepLink[Number(index)] ? marker : (links[Number(index)] ?? marker),
 	);
+	const escapeProtectedLinks = (value: string): string => {
+		linkMarkers.lastIndex = 0;
+		return value.replace(linkMarkers, (marker, index: string) => escapeHtml(links[Number(index)] ?? marker));
+	};
 	const segments = textForConversion.split(CODE_SEGMENTS);
-	const converted = segments.map((segment, index) => (index % 2 === 1 ? segment : convertText(segment))).join("");
+	const converted = segments
+		.map((segment, index) => (index % 2 === 1 ? segment : convertText(segment, escapeProtectedLinks)))
+		.join("");
 	linkMarkers.lastIndex = 0;
 	return converted.replace(linkMarkers, (_marker, index: string) => links[Number(index)] ?? _marker);
 }
@@ -79,7 +84,7 @@ function escapeHtml(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function convertText(text: string): string {
+function convertText(text: string, escapeProtectedLinks?: (value: string) => string): string {
 	const escaped = escapeKeepingEntities(text);
 	// One pass prevents the bold tokens we emit from being converted again as italics.
 	return escaped.replace(
@@ -97,7 +102,8 @@ function convertText(text: string): string {
 			italic: string | undefined,
 			underItalic: string | undefined,
 		) => {
-			if (label !== undefined) return `<${url}|${label}>`;
+			if (label !== undefined)
+				return `<${escapeProtectedLinks?.(url) ?? url}|${escapeProtectedLinks?.(label) ?? label}>`;
 			if (heading !== undefined) return `*${title}*`;
 			if (indent !== undefined) return `${indent}• `;
 			if (bold !== undefined || underBold !== undefined) return `*${bold ?? underBold}*`;

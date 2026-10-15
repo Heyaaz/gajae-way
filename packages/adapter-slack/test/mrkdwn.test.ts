@@ -5,6 +5,7 @@ test("Slack markdown conversion handles emphasis, links, headings, lists and esc
 	for (const [input, output] of [
 		["**bold** __bold__ *italic* _italic_ ~~gone~~", "*bold* *bold* _italic_ _italic_ ~gone~"],
 		["[label](https://x?a=1&b=2)", "<https://x?a=1&amp;b=2|label>"],
+		["[<https://x>](https://y)", "<https://y|&lt;https://x&gt;>"],
 		["# Heading\n### Third", "*Heading*\n*Third*"],
 		["- **bold**\n* item\n  - nested\n1. numbered", "• *bold*\n• item\n  • nested\n1. numbered"],
 		["a & b < c > d", "a &amp; b &lt; c &gt; d"],
