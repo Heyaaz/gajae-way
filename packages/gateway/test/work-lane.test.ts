@@ -3539,6 +3539,27 @@ test("#595 an initially unknown PR is found from the lane head and terminal-gree
 	expect(checksNotice(f, "[lane a] checks passed")).toContain(`head=${head.slice(0, 12)} pr=595 checks=green`);
 });
 
+test("#595 an exact PR head settles checks when its ref is not the worktree's local branch", async () => {
+	const checks = scriptedChecks({ prNumber: 599, status: "pending", failingChecks: [], prState: "open" });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "review/fork-head", false);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "review-only branch");
+	await until(() => f.job().state === "awaiting_checks");
+	expect(f.job().awaitingChecks).toMatchObject({ prNumber: 599, headSha: head });
+
+	checks.set({ prNumber: 599, headSha: head, status: "red", failingChecks: ["lint"], prState: "open" });
+	await pollUntil(f, () => f.port.sends.length === 2);
+	expect(f.job().awaitingChecks).toMatchObject({ prNumber: 599, retries: 1 });
+	checks.set({ prNumber: 599, headSha: head, status: "green", failingChecks: [], prState: "open" });
+	const repair = f.port.sends[1];
+	if (!repair) throw new Error("red checks did not start a repair attempt");
+	f.port.complete(repair.opRef, "checks fixed");
+	await until(() => f.job().state === "done");
+	expect(f.job().state).toBe("done");
+	expect(f.job().awaitingChecks).toBeUndefined();
+});
+
 test("#595 an unresolved PR lookup settles the checks cycle instead of waiting for its timeout", async () => {
 	const checks = scriptedChecks(undefined);
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });

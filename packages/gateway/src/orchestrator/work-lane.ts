@@ -1604,9 +1604,7 @@ export class WorkLaneManager {
 					checks?.status === "green" &&
 					(job.awaitingChecks?.prNumber === null || job.awaitingChecks?.prNumber === checks.prNumber) &&
 					(checks.prState === "open" || checks.merged === true) &&
-					facts?.pushed === true &&
-					facts.remoteHeadSha === facts.headSha &&
-					checks.headSha === facts.remoteHeadSha
+					checks.headSha === facts?.headSha
 				)
 					job = settleAwaitingChecks(job, at, { kind: "passed" });
 			}
@@ -2957,6 +2955,9 @@ function checksOutcome(
 			kind: "ended",
 			reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.remoteHeadSha.slice(0, 12)}`,
 		};
+	const headIsPublished =
+		(facts?.pushed === true && facts.remoteHeadSha === cycle.headSha) ||
+		(checks?.headSha === cycle.headSha && (cycle.prNumber === null || checks.prNumber === cycle.prNumber));
 	if (cycle.prNumber === null) {
 		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
 		if (checks?.prState === "closed") {
@@ -2968,7 +2969,7 @@ function checksOutcome(
 			return { kind: "ended", reason: `pr_closed pr=${checks.prNumber}` };
 		}
 		if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-		if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+		if (!headIsPublished) {
 			if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 				return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 			return { kind: "wait" };
@@ -2996,7 +2997,7 @@ function checksOutcome(
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	}
 	if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-	if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+	if (!headIsPublished) {
 		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 		return { kind: "wait" };
