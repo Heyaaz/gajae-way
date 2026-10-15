@@ -44,6 +44,7 @@ export type RestartStepResult = "pending" | "ok" | "stale" | "failed" | "skipped
 export type RestartState = "queued" | "running" | "ok" | "stale" | "failed";
 
 export interface RestartDrainLease {
+	readonly superseded: AbortSignal;
 	assertActive(): Promise<void>;
 	cancel(): Promise<void>;
 	close(): Promise<void>;
@@ -234,6 +235,12 @@ async function prepareGatewayRestartDrain(
 			`gateway restart drain connection failed: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
+	const superseded = new AbortController();
+	const offSuperseded = client.on("gateway.restart.superseded", (payload) => {
+		const event = payload as { restartId?: unknown } | undefined;
+		if (event?.restartId === restartId)
+			superseded.abort(new Error("gateway restart drain was superseded by an owner restart"));
+	});
 	try {
 		const result = await client.request<{ ready?: unknown; drained?: unknown }>("gateway.restart.prepare", {
 			restartId,
@@ -248,22 +255,35 @@ async function prepareGatewayRestartDrain(
 			// The gateway may have stopped or failed after it accepted the drain;
 			// closing the socket also releases an uncommitted hold.
 		}
+		offSuperseded();
 		await client.close();
 		if (error instanceof ProtocolError && error.code === "unknown_verb") throw error;
 		throw new Error(`gateway restart drain failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	return {
+		superseded: superseded.signal,
 		assertActive: async () => {
+			if (superseded.signal.aborted)
+				throw superseded.signal.reason instanceof Error
+					? superseded.signal.reason
+					: new Error("gateway restart drain was superseded");
 			const result = await client.request<{ ready?: unknown; drained?: unknown }>("gateway.restart.prepare", {
 				restartId,
 				waitMs: RESTART_DRAIN_WAIT_MS,
 			});
+			if (superseded.signal.aborted)
+				throw superseded.signal.reason instanceof Error
+					? superseded.signal.reason
+					: new Error("gateway restart drain was superseded");
 			if (result.ready !== true || result.drained !== true) throw new Error("gateway restart drain ownership was lost");
 		},
 		cancel: async () => {
 			await client.request("gateway.restart.cancel", { restartId });
 		},
-		close: async () => await client.close(),
+		close: async () => {
+			offSuperseded();
+			await client.close();
+		},
 	};
 }
 
@@ -430,7 +450,26 @@ async function runRestartStackWithLease(
 	if (restartDrain !== undefined) onDrainPrepared(restartDrain, receipt);
 	let gatewayRestarted = false;
 	const assertRestartDrain = async (): Promise<void> => {
+		if (restartDrain?.superseded.aborted)
+			throw restartDrain.superseded.reason instanceof Error
+				? restartDrain.superseded.reason
+				: new Error("gateway restart drain was superseded");
 		if (restartDrain !== undefined && !gatewayRestarted) await restartDrain.assertActive();
+		if (restartDrain?.superseded.aborted)
+			throw restartDrain.superseded.reason instanceof Error
+				? restartDrain.superseded.reason
+				: new Error("gateway restart drain was superseded");
+	};
+	const runServiceCommand = async (command: readonly string[]): Promise<number> => {
+		await assertRestartDrain();
+		const status = await runner(command);
+		// Keep the lease until the manager command settles; a pending owner restart
+		// can then take over without racing the operation already in flight.
+		if (restartDrain?.superseded.aborted)
+			throw restartDrain.superseded.reason instanceof Error
+				? restartDrain.superseded.reason
+				: new Error("gateway restart drain was superseded");
+		return status;
 	};
 	if (installedBinDir !== undefined) {
 		try {
@@ -441,10 +480,7 @@ async function runRestartStackWithLease(
 				env,
 				...(options.launchAgentsDir === undefined ? {} : { launchAgentsDir: options.launchAgentsDir }),
 				...(options.unitDir === undefined ? {} : { unitDir: options.unitDir }),
-				run: async (command) => {
-					await assertRestartDrain();
-					return await runner(command);
-				},
+				run: runServiceCommand,
 			});
 		} catch (error) {
 			receipt.state = "failed";
@@ -495,8 +531,7 @@ async function runRestartStackWithLease(
 
 			if (step.label === "dev.gajaeway.broker" && receipt.trigger === "update") {
 				const stopCommand = serviceStopCommand(platform, options.uid);
-				await assertRestartDrain();
-				const stopStatus = await runner(stopCommand);
+				const stopStatus = await runServiceCommand(stopCommand);
 				if (stopStatus !== 0 && !(platform === "darwin" && (await probe(step.label)) === undefined))
 					throw new Error(`${stopCommand.join(" ")} exited with status ${stopStatus}`);
 
@@ -509,8 +544,7 @@ async function runRestartStackWithLease(
 					"--lease-wait-ms",
 					"35000",
 				];
-				await assertRestartDrain();
-				const provisionStatus = await runner(provisionCommand);
+				const provisionStatus = await runServiceCommand(provisionCommand);
 				step.agentSync = {
 					command: provisionCommand,
 					exitStatus: provisionStatus,
@@ -529,8 +563,7 @@ async function runRestartStackWithLease(
 					const startCommand = serviceBootstrapCommand(options, platform, step.label);
 					step.command = startCommand;
 					issuedAt = now();
-					await assertRestartDrain();
-					const startStatus = await runner(startCommand);
+					const startStatus = await runServiceCommand(startCommand);
 					step.exitStatus = startStatus;
 					if (startStatus !== 0) {
 						step.result = "failed";
@@ -546,14 +579,12 @@ async function runRestartStackWithLease(
 				if (step.command !== undefined) {
 					issuedAt = now();
 					let command = step.command;
-					await assertRestartDrain();
-					let status = await runner(command);
+					let status = await runServiceCommand(command);
 					if (status !== 0 && platform === "darwin" && (await probe(step.label)) === undefined) {
 						command = serviceBootstrapCommand(options, platform, step.label);
 						step.command = command;
 						issuedAt = now();
-						await assertRestartDrain();
-						status = await runner(command);
+						status = await runServiceCommand(command);
 					}
 					step.exitStatus = status;
 					if (status !== 0) {

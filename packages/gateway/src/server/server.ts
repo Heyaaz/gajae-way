@@ -147,8 +147,10 @@ const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 const CONNECTION_SETTLE_TIMEOUT_MS = 5_000;
 /** /restart allows the 15s persona drain plus ordered monitor, connection, and storage teardown. */
 const RESTART_HARD_EXIT_MS = 35_000;
-/** Maximum time an owner restart defers to an already-running stack supervisor. */
-const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS;
+/** Bounded grace for a superseded supervisor to finish its current service-manager command. */
+const OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS = 30_000;
+/** Owner restart gives the supervisor the rest of the drain maximum to finish or settle. */
+const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS - OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
@@ -275,6 +277,8 @@ export interface GatewayServerOptions {
 	readonly exitProcess?: (code: number) => void;
 	/** Test seam for the owner restart's wait on an active stack supervisor. */
 	readonly ownerRestartSupervisorWaitMs?: number;
+	/** Test seam for the owner restart's wait for a superseded service command to settle. */
+	readonly ownerRestartSupervisorCancelWaitMs?: number;
 	/** Test seam for the owner restart's persona-turn delivery drain. */
 	readonly ownerRestartDrainWaitMs?: number;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
@@ -515,12 +519,13 @@ function notifyOwnerRestartCancelled(
 	runtime: Runtime,
 	requestId: string,
 	origin: OriginRef,
+	reason = "a persona reply was not confirmed as delivered before the drain deadline",
 ): void {
 	const payload = {
 		turnId: crypto.randomUUID(),
 		origin,
 		role: "assistant" as const,
-		text: "Restart cancelled: a persona reply was not confirmed as delivered before the drain deadline.",
+		text: `Restart cancelled: ${reason}.`,
 		final: true,
 	};
 	if (origin.platform === "loopback") {
@@ -1358,6 +1363,8 @@ async function handleRequest(
 				waitMs > PERSONA_RESTART_DRAIN_MAX_WAIT_MS
 			)
 				throw new ProtocolError("invalid_params", "waitMs is outside the allowed drain interval");
+			if (runtime.pendingOwnerRestartId !== undefined && runtime.pendingOwnerRestartId !== restartId)
+				throw new ProtocolError("verb_failed", "restart drain is being superseded by an owner restart");
 			const owner = runtime.restartDrainOwners.get(restartId);
 			if (owner !== undefined && owner !== connection)
 				throw new ProtocolError("verb_failed", "restart drain is already owned by another supervisor");
@@ -2362,21 +2369,40 @@ async function sendChat(
 		runtime.pendingOwnerRestartId = ownerRestartId;
 		const exit = options.exitProcess ?? ((code: number) => process.exit(code));
 		void (async () => {
-			// A detached stack restart owns an existing drain. If it fails and
-			// releases the gate, its cancellation atomically transfers the hold.
+			// A detached stack restart owns an existing drain. Supersede it, then
+			// wait for its current command to settle before taking over the lease.
 			const supervisorDeadline =
 				Date.now() + (options.ownerRestartSupervisorWaitMs ?? OWNER_RESTART_SUPERVISOR_WAIT_MS);
+			let supervisorCancelDeadline: number | undefined;
 			while (!runtime.stopping) {
 				const activeId = runtime.personaSessions.restartDrainId;
 				if (activeId === undefined || activeId === ownerRestartId) break;
-				if (Date.now() >= supervisorDeadline) {
-					if (runtime.personaSessions.transferRestartDrain(activeId, ownerRestartId)) {
-						console.warn(`owner restart taking over stalled stack supervisor id=${activeId}`);
-						break;
-					}
-					continue;
+				const now = Date.now();
+				if (now >= supervisorDeadline && supervisorCancelDeadline === undefined) {
+					const supervisor = runtime.restartDrainOwners.get(activeId);
+					supervisor?.write({
+						v: PROFILE_VERSION,
+						type: "event",
+						event: "gateway.restart.superseded",
+						payload: { restartId: activeId, ownerRestartId },
+					});
+					supervisorCancelDeadline =
+						now + (options.ownerRestartSupervisorCancelWaitMs ?? OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS);
+					console.warn(`owner restart requested a settled handoff from stack supervisor id=${activeId}`);
 				}
-				await Bun.sleep(Math.min(25, Math.max(1, supervisorDeadline - Date.now())));
+				if (supervisorCancelDeadline !== undefined && now >= supervisorCancelDeadline) {
+					console.warn("owner restart cancelled; stack supervisor did not settle its active service command");
+					notifyOwnerRestartCancelled(
+						connection,
+						runtime,
+						request.id,
+						origin,
+						"the stack supervisor did not finish its current service command before the takeover deadline",
+					);
+					return;
+				}
+				const deadline = supervisorCancelDeadline ?? supervisorDeadline;
+				await Bun.sleep(Math.min(25, Math.max(1, deadline - now)));
 			}
 			if (runtime.stopping) return;
 			const outcome = await runtime.personaSessions.drainForRestart(

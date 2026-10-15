@@ -1891,6 +1891,7 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 			exitCode = code;
 		},
 		ownerRestartSupervisorWaitMs: 20,
+		ownerRestartSupervisorCancelWaitMs: 1_000,
 	});
 	const client = await connect(config.socketPath);
 	try {
@@ -1919,6 +1920,33 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 		await client.waitForFrame("owner-restart");
 		for (
 			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.restart.superseded");
+			attempt++
+		)
+			await Bun.sleep(5);
+		const superseded = client.frames.find(
+			(frame) => frame.type === "event" && frame.event === "gateway.restart.superseded",
+		);
+		expect(superseded?.type === "event" ? superseded.payload : undefined).toEqual({
+			restartId: "stalled-stack-supervisor",
+			ownerRestartId: expect.any(String),
+		});
+		expect(exitCode).toBeUndefined();
+		expect(client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")).toBe(false);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "ack-stack-supervisor-cancel",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "stalled-stack-supervisor" },
+		});
+		await client.waitForFrame("ack-stack-supervisor-cancel");
+		expect(client.frames.find((frame) => frame.id === "ack-stack-supervisor-cancel")?.result).toEqual({
+			cancelled: true,
+		});
+		for (
+			let attempt = 0;
 			attempt < 400 && !client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping");
 			attempt++
 		)
@@ -1937,6 +1965,100 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 		);
 		for (let attempt = 0; attempt < 500 && exitCode === undefined; attempt++) await Bun.sleep(5);
 		expect(exitCode).toBe(75);
+	} finally {
+		client.close();
+	}
+});
+
+test("owner /restart fails closed when a superseded stack supervisor does not settle", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-owner-restart-command-stuck-"));
+	const ownerOrigin = { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } as const;
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		ownerTarget: { origin: ownerOrigin },
+	};
+	let exitCode: number | undefined;
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "reply",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort,
+		onStop: () => database.close(),
+		exitProcess: (code) => {
+			exitCode = code;
+		},
+		ownerRestartSupervisorWaitMs: 20,
+		ownerRestartSupervisorCancelWaitMs: 30,
+	});
+	const client = await connect(config.socketPath);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "stalled-prepare",
+			verb: "gateway.restart.prepare",
+			params: { restartId: "unsettled-stack-supervisor", waitMs: 120_000 },
+		});
+		await client.waitForFrame("stalled-prepare");
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "owner-restart",
+			verb: "chat.send",
+			params: {
+				origin: ownerOrigin,
+				text: "/restart",
+				engagement: { mentioned: false, group: false, authorId: "owner" },
+			},
+		});
+		await client.waitForFrame("owner-restart");
+		for (
+			let attempt = 0;
+			attempt < 400 &&
+			!client.frames.some(
+				(frame) =>
+					frame.type === "event" &&
+					frame.event === "chat.message" &&
+					frame.payload.text.includes("did not finish its current service command"),
+			);
+			attempt++
+		)
+			await Bun.sleep(5);
+		expect(
+			client.frames.some(
+				(frame) =>
+					frame.type === "event" &&
+					frame.event === "chat.message" &&
+					frame.payload.text.includes("did not finish its current service command"),
+			),
+		).toBe(true);
+		expect(exitCode).toBeUndefined();
+		expect(client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")).toBe(false);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "release-stalled-drain",
+			verb: "gateway.restart.cancel",
+			params: { restartId: "unsettled-stack-supervisor" },
+		});
+		await client.waitForFrame("release-stalled-drain");
+		expect(client.frames.find((frame) => frame.id === "release-stalled-drain")?.result).toEqual({
+			cancelled: true,
+		});
 	} finally {
 		client.close();
 	}

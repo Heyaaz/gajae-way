@@ -213,6 +213,7 @@ test("restart-stack waits for persona drain before issuing service restarts", as
 				started.resolve();
 				await release.promise;
 				return {
+					superseded: new AbortController().signal,
 					assertActive: async () => {},
 					cancel: async () => {
 						throw new Error("successful gateway restart must not cancel its drain");
@@ -236,6 +237,62 @@ test("restart-stack waits for persona drain before issuing service restarts", as
 	}
 });
 
+test("restart-stack waits for an in-flight service command before releasing a superseded drain", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	const commandStarted = Promise.withResolvers<void>();
+	const finishCommand = Promise.withResolvers<void>();
+	const superseded = new AbortController();
+	const commands: string[][] = [];
+	let commandFinished = false;
+	let drainCancelled = false;
+	let drainClosed = false;
+	try {
+		const running = runRestartStack({
+			...host.options,
+			id: "settle-command-before-takeover",
+			binDir: join(home, "bin"),
+			prepareRestartDrain: async () => ({
+				superseded: superseded.signal,
+				assertActive: async () => {},
+				cancel: async () => {
+					expect(commandFinished).toBe(true);
+					drainCancelled = true;
+				},
+				close: async () => {
+					expect(commandFinished).toBe(true);
+					drainClosed = true;
+				},
+			}),
+			runner: async (command) => {
+				commands.push([...command]);
+				commandStarted.resolve();
+				await finishCommand.promise;
+				commandFinished = true;
+				return 0;
+			},
+		});
+		await commandStarted.promise;
+		superseded.abort(new Error("owner restart requested"));
+		await Bun.sleep(10);
+		expect(drainCancelled).toBe(false);
+		expect(drainClosed).toBe(false);
+		expect(commands).toHaveLength(1);
+		finishCommand.resolve();
+		const receipt = await running;
+		expect(receipt.state).toBe("failed");
+		expect(receipt.steps[0]?.detail).toContain("owner restart requested");
+		expect(receipt.steps.slice(1).every((step) => step.result === "skipped")).toBe(true);
+		expect(drainCancelled).toBe(true);
+		expect(drainClosed).toBe(true);
+		expect(commands).toHaveLength(1);
+	} finally {
+		finishCommand.resolve();
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("restart-stack fences a stale supervisor before restarting the gateway", async () => {
 	const { home, cleanup } = await tempHome();
 	const host = await fakeHost({ home });
@@ -247,6 +304,7 @@ test("restart-stack fences a stale supervisor before restarting the gateway", as
 			...host.options,
 			id: "fenced-supervisor",
 			prepareRestartDrain: async () => ({
+				superseded: new AbortController().signal,
 				assertActive: async () => {
 					assertions++;
 					if (assertions > 1) throw new Error("restart drain ownership was transferred");
@@ -282,6 +340,7 @@ test("restart-stack cancels the persona drain when a service restart fails befor
 			...host.options,
 			id: "cancel-drain-on-failure",
 			prepareRestartDrain: async () => ({
+				superseded: new AbortController().signal,
 				assertActive: async () => {},
 				cancel: async () => {
 					cancelled = true;
@@ -314,6 +373,7 @@ test("restart-stack cancels and closes the persona drain when receipt persistenc
 				prepareRestartDrain: async () => {
 					await mkdir(join(home, `restart-stack.json.${process.pid}.tmp`));
 					return {
+						superseded: new AbortController().signal,
 						assertActive: async () => {},
 						cancel: async () => {
 							cancelled++;
@@ -511,7 +571,12 @@ for (const platform of ["darwin", "linux"] as const) {
 				probe: async () => undefined,
 				prepareRestartDrain: async () => {
 					drainPrepared = true;
-					return { assertActive: async () => {}, cancel: async () => {}, close: async () => {} };
+					return {
+						superseded: new AbortController().signal,
+						assertActive: async () => {},
+						cancel: async () => {},
+						close: async () => {},
+					};
 				},
 				runner: async (command) => {
 					expect(drainPrepared).toBe(true);
@@ -599,6 +664,7 @@ test("Linux restart-stack preserves a stale unit when systemd cannot stop it", a
 			env: { ...process.env, HOME: home },
 			probe: async () => undefined,
 			prepareRestartDrain: async () => ({
+				superseded: new AbortController().signal,
 				assertActive: async () => {},
 				cancel: async () => {
 					drainCancelled = true;

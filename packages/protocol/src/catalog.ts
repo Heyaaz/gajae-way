@@ -1238,6 +1238,7 @@ export interface EventCatalogV01 {
 	"chat.message": ChatMessagePayload;
 	"chat.progress": ChatProgressPayload;
 	"gateway.stopping": { readonly reason: string };
+	"gateway.restart.superseded": { readonly restartId: string; readonly ownerRestartId: string };
 	"monitor.event": MonitorEventRecord;
 }
 
@@ -1282,7 +1283,13 @@ export const VERBS_V01 = [
 	"ops.slo",
 	"ops.cycle",
 ] as const;
-export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
+export const EVENTS_V01 = [
+	"chat.message",
+	"chat.progress",
+	"gateway.restart.superseded",
+	"gateway.stopping",
+	"monitor.event",
+] as const;
 
 export type VerbName = keyof VerbCatalogV01;
 export type EventName = keyof EventCatalogV01;
