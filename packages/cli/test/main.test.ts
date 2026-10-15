@@ -189,6 +189,26 @@ describe("ops cycle paging CLI", () => {
 		expect(defaultPage.requests).toEqual([{ verb: "ops.cycle", params: {} }]);
 	});
 
+	test("rejects responses from a pre-pagination gateway instead of rendering invalid page metadata", async () => {
+		const session = {
+			originKey: "discord/channel/c1",
+			epoch: 0,
+			sessionId: "session-1",
+			pendingInbound: 0,
+			unsettledDeliveries: 0,
+			oldestUnsettledAgeMs: null,
+		} as OpsCycleResult["sessions"][number];
+		const paged = cycleResult({ sessions: [session], sessionsTotal: 1 });
+		const legacy = { ...paged, sessionsTotal: undefined, sessionsOffset: undefined } as unknown as OpsCycleResult;
+		for (const args of [[], ["--limit", "25"]]) {
+			const output = await runOpsCycleCli(legacy, args);
+			expect(output.lines).toEqual([]);
+			expect(output.errors[0]).toContain("paging is unsupported by the running gateway");
+			expect(output.exitCode).toBe(1);
+		}
+		expect(() => renderCycle(legacy)).toThrow("paging is unsupported by the running gateway");
+	});
+
 	test("rejects malformed paging options before connecting", async () => {
 		for (const args of [
 			["--limit"],

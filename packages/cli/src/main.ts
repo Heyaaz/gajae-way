@@ -314,7 +314,20 @@ function waitForMonitorStage(client: GajaewayClient, eventId: string, timeoutSec
  * - `--json` emits the typed OpsCycleResult verbatim; the exit-code contract
  *   is identical.
  */
+const OPS_CYCLE_PAGING_UNSUPPORTED =
+	"ops.cycle paging is unsupported by the running gateway; restart the gateway after updating it";
+
+function hasCyclePagingMetadata(cycle: OpsCycleResult): boolean {
+	return (
+		Number.isSafeInteger(cycle.sessionsTotal) &&
+		cycle.sessionsTotal >= 0 &&
+		Number.isSafeInteger(cycle.sessionsOffset) &&
+		cycle.sessionsOffset >= 0
+	);
+}
+
 export function renderCycle(cycle: OpsCycleResult): string[] {
+	if (!hasCyclePagingMetadata(cycle)) throw new Error(OPS_CYCLE_PAGING_UNSUPPORTED);
 	const lines: string[] = [];
 	lines.push(`phase: ${cycle.phase}`);
 	if (cycle.gates.length > 0) lines.push(`gates: ${cycle.gates.join(", ")}`);
@@ -791,6 +804,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					else if (command === "integrity") console.log(JSON.stringify(await client.request("ops.integrity")));
 					else if (cycle) {
 						const result = await client.opsCycle(cycle.params);
+						if (!hasCyclePagingMetadata(result)) throw new Error(OPS_CYCLE_PAGING_UNSUPPORTED);
 						if (cycle.json) console.log(JSON.stringify(result));
 						else for (const line of renderCycle(result)) console.log(line);
 						// Fail-closed: a gated/degraded cycle exits non-zero even though the
