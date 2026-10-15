@@ -2266,7 +2266,7 @@ test("a silent in-flight turn is failed after the stall deadline and releases a 
 	await eventually(() => database!.inbox.pendingCount(KEY) === 0, "lane report did not settle after cutoff");
 });
 
-test("a terminal operation found by the final cutoff guard is not failed", async () => {
+test("a terminal operation found after host exit is not failed", async () => {
 	const port = new ScriptedSessionPort();
 	const clock = { now: Date.now() };
 	const failures: Array<{ message: string; forceNotice: boolean | undefined }> = [];
@@ -2285,6 +2285,7 @@ test("a terminal operation found by the final cutoff guard is not failed", async
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
 	port.beforeTerminateHost = ({ sessionId }) => {
 		port.seedOperation(send.opRef, sessionId, "terminal_ok", "completed during host inspection");
+		port.setSessionState(sessionId, { live: false });
 	};
 	await manager!.tick(KEY);
 	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");

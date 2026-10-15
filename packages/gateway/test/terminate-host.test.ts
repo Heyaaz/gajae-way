@@ -55,7 +55,7 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 	});
 	// The port refuses any session it does not own (#assertOwned): register the
 	// ids these tests will name, exactly as bind() would have.
-	for (const sessionId of ["s-1", "s-2", "s-3", "s-4", "s-5", "s-6", "s-7"]) {
+	for (const sessionId of ["s-1", "s-2", "s-3", "s-4", "s-5", "s-6", "s-7", "s-8"]) {
 		const owned = database.transaction((tx) =>
 			database.bindings.recordOwnedBinding(tx, {
 				authority,
@@ -174,6 +174,22 @@ test("a pid that already exited is already gone, not an error", async () => {
 	const h = await harness(() => pid);
 	try {
 		expect(await h.port.terminateHost({ sessionId: "s-5", repo: h.repo })).toEqual({ outcome: "already_gone" });
+	} finally {
+		await h.close();
+	}
+});
+
+test("a dead host still checks the final cutoff guard before authorizing turn closure", async () => {
+	const child = fakeHost("sdk session-host-internal");
+	const pid = child.pid;
+	child.kill();
+	await child.exited;
+	const h = await harness(() => pid);
+	try {
+		expect(await h.port.terminateHost({ sessionId: "s-8", repo: h.repo, shouldTerminate: () => false })).toEqual({
+			outcome: "refused",
+			reason: "termination_guard_rejected",
+		});
 	} finally {
 		await h.close();
 	}

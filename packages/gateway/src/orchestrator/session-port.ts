@@ -984,6 +984,18 @@ export class BrokerSessionPort implements SessionPort {
 		shouldTerminate?: () => boolean | Promise<boolean>;
 	}): Promise<TerminateHostOutcome> {
 		this.#assertOwned(input);
+		const finalGuardRefusal = async () => {
+			if (!input.shouldTerminate) return undefined;
+			try {
+				return (await input.shouldTerminate())
+					? undefined
+					: ({ outcome: "refused", reason: "termination_guard_rejected" } as const);
+			} catch (error) {
+				return { outcome: "refused", reason: `termination_guard_failed:${sanitizeDiagnostic(String(error))}` } as const;
+			}
+		};
+		const alreadyGone = async (): Promise<TerminateHostOutcome> =>
+			(await finalGuardRefusal()) ?? { outcome: "already_gone" };
 		let pid: number | undefined;
 		let live: boolean | undefined;
 		try {
@@ -998,7 +1010,7 @@ export class BrokerSessionPort implements SessionPort {
 			if (envelope.ok !== true) {
 				const code = stableErrorCode(envelope.error?.code);
 				return isSessionGoneCode(code)
-					? { outcome: "already_gone" }
+					? await alreadyGone()
 					: { outcome: "refused", reason: `inspect_failed:${code ?? "invalid_envelope"}` };
 			}
 			const session = envelope.result?.session;
@@ -1010,31 +1022,26 @@ export class BrokerSessionPort implements SessionPort {
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return isSessionGoneCode(sdkErrorCode(error))
-				? { outcome: "already_gone" }
+				? await alreadyGone()
 				: { outcome: "refused", reason: `inspect_failed:${sanitizeDiagnostic(String(error))}` };
 		}
-		if (live === false) return { outcome: "already_gone" };
+		if (live === false) return await alreadyGone();
 		if (pid === undefined || live !== true)
 			return { outcome: "refused", reason: "inspect_incomplete:missing_live_host_identity" };
 		const inspection = await processCommand(pid);
-		if (inspection.outcome === "gone") return { outcome: "already_gone" };
+		if (inspection.outcome === "gone") return await alreadyGone();
 		if (inspection.outcome === "unreadable")
 			return { outcome: "refused", reason: `process_inspection_failed:${inspection.reason}` };
 		const command = inspection.command;
 		// The only process shape this gateway may end. The broker, daemon, and anything else are someone else's.
 		if (!/\bsdk session-host-internal\b/.test(command) || /\b(broker|daemon)-internal\b/.test(command))
 			return { outcome: "not_a_host", pid, command: command.slice(0, 160) };
-		if (input.shouldTerminate) {
-			try {
-				if (!(await input.shouldTerminate())) return { outcome: "refused", reason: "termination_guard_rejected" };
-			} catch (error) {
-				return { outcome: "refused", reason: `termination_guard_failed:${sanitizeDiagnostic(String(error))}` };
-			}
-		}
+		const refusal = await finalGuardRefusal();
+		if (refusal) return refusal;
 		try {
 			process.kill(pid, "SIGTERM");
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ESRCH") return { outcome: "already_gone" };
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return await alreadyGone();
 			return { outcome: "refused", reason: `kill_failed:${(error as NodeJS.ErrnoException).code ?? "unknown"}` };
 		}
 		return { outcome: "terminated", pid };
