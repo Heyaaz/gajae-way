@@ -6,6 +6,12 @@ export const BROKER_WATCHDOG_INTERVAL_MS = 15_000;
 /** Bound on one probe; a broker that cannot answer in this time counts as failed. */
 export const BROKER_WATCHDOG_PROBE_TIMEOUT_MS = 10_000;
 /**
+ * Inter-iteration gap that means this process was suspended (lid closed, VM
+ * pause) rather than that the broker is wedged. One awake iteration costs at
+ * most `intervalMs` plus a probe, so no probe failed during a longer gap.
+ */
+export const BROKER_WATCHDOG_SUSPEND_GAP_MS = 60_000;
+/**
  * How long every probe must fail before the host restarts the broker. Well under
  * the gateway's live-outage exit so recovery happens before clients give up.
  */
@@ -24,6 +30,8 @@ export type BrokerWatchdogOptions = {
 	readonly intervalMs?: number;
 	readonly unresponsiveMs?: number;
 	readonly startupMs?: number;
+	/** Inter-iteration gap treated as a suspend; defaults to `BROKER_WATCHDOG_SUSPEND_GAP_MS`. */
+	readonly suspendGapMs?: number;
 	/** Returns true when the broker answered a request. Tests replace the network probe. */
 	readonly probe?: (childPid: number, discoveryPath: string) => Promise<boolean>;
 	readonly now?: () => number;
@@ -34,12 +42,14 @@ export type BrokerWatchdogOptions = {
  * Resolves with a diagnostic once the broker has failed every probe for
  * `unresponsiveMs`, or with undefined when aborted. A live process with a fresh
  * heartbeat that cannot answer requests is exactly the wedge the service manager
- * cannot see, so the host has to.
+ * cannot see, so the host has to. The window measures awake time: a gap in which
+ * this process was suspended restarts the window instead of counting downtime.
  */
 export async function watchBrokerLiveness(options: BrokerWatchdogOptions): Promise<string | undefined> {
 	const intervalMs = options.intervalMs ?? BROKER_WATCHDOG_INTERVAL_MS;
 	const unresponsiveMs = options.unresponsiveMs ?? BROKER_WATCHDOG_UNRESPONSIVE_MS;
 	const startupMs = options.startupMs ?? BROKER_WATCHDOG_STARTUP_MS;
+	const suspendGapMs = options.suspendGapMs ?? Math.max(BROKER_WATCHDOG_SUSPEND_GAP_MS, intervalMs * 3);
 	const probe = options.probe ?? probeOwnBroker;
 	const now = options.now ?? Date.now;
 	const sleep = options.sleep ?? abortableSleep;
@@ -48,9 +58,21 @@ export async function watchBrokerLiveness(options: BrokerWatchdogOptions): Promi
 	let failingSince = now();
 	let answered = false;
 	let failures = 0;
+	let lastTick = failingSince;
 	while (!options.signal.aborted) {
 		await sleep(intervalMs, options.signal);
 		if (options.signal.aborted) return undefined;
+		const tick = now();
+		if (tick - lastTick > suspendGapMs) {
+			// The loop did not run for the gap (lid closed, VM pause), so no probe
+			// failed during it: restart the window at the wake instead of killing a
+			// broker that was never asked.
+			if (failures > 0)
+				console.log(`broker_watchdog_suspended pid=${options.childPid} gapMs=${tick - lastTick} failures=${failures}`);
+			failingSince = tick;
+			failures = 0;
+		}
+		lastTick = tick;
 		let healthy: boolean;
 		try {
 			healthy = await probe(options.childPid, options.discoveryPath);

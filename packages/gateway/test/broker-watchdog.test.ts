@@ -77,6 +77,41 @@ test("one answered probe restarts the window, so a slow broker is not killed", a
 	expect(time.now()).toBe(75 + 90);
 });
 
+test("a system-suspend gap restarts the window instead of counting as broker downtime", async () => {
+	const lines: string[] = [];
+	const log = spyOn(console, "log").mockImplementation((line) => lines.push(String(line)));
+	const error = spyOn(console, "error").mockImplementation(() => {});
+	let at = 0;
+	let sleeps = 0;
+	try {
+		const reason = await watchBrokerLiveness({
+			childPid: 5,
+			discoveryPath: "/unused",
+			signal: new AbortController().signal,
+			intervalMs: 15,
+			unresponsiveMs: 90,
+			startupMs: 90,
+			probe: async () => false,
+			now: () => at,
+			sleep: async (ms) => {
+				at += ms;
+				// The lid closes after two failed probes and the process freezes for ten minutes.
+				if (++sleeps === 3) at += 600_000;
+			},
+		});
+		// The failures before the gap are discarded, so the trip needs a whole fresh
+		// window of awake time (7 probes including the one at the wake).
+		expect(reason).toMatch(/^broker pid 5 unresponsive for 0s \(7 failed probes\)$/);
+		expect(at).toBe(600_135);
+		expect(lines.some((line) => line.startsWith("broker_watchdog_suspended") && line.includes("failures=2"))).toBe(
+			true,
+		);
+	} finally {
+		log.mockRestore();
+		error.mockRestore();
+	}
+});
+
 test("before its first answer a broker gets the startup budget, then the shorter window", async () => {
 	const time = clock();
 	let calls = 0;
